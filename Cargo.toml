@@ -9,3 +9,6 @@ repository = "https://github.com/stefanobaldo/seedstone"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [] }
+
+[workspace.lints.clippy]
+disallowed_methods = "deny"
