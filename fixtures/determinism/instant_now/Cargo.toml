@@ -1,0 +1,6 @@
+[workspace]
+
+[package]
+name = "fixture-instant-now"
+version = "0.0.0"
+edition = "2024"

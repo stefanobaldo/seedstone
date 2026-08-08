@@ -1,0 +1,6 @@
+[workspace]
+
+[package]
+name = "fixture-thread-spawn"
+version = "0.0.0"
+edition = "2024"
