@@ -1,0 +1,3 @@
+#!/bin/sh
+# Simulation builds get their own cache; simulation flags land here in Phase 1.2.
+exec env CARGO_TARGET_DIR=target/sim cargo "$@"
