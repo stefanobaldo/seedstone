@@ -1,0 +1,6 @@
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "non-deterministic: use the simulator clock" },
+  { path = "std::time::SystemTime::now", reason = "non-deterministic: use the simulator clock" },
+  { path = "std::thread::spawn", reason = "non-deterministic: the simulator owns scheduling" },
+  { path = "rand::rng", reason = "non-deterministic: use a seeded RNG", allow-invalid = true },
+]
