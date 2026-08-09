@@ -25,7 +25,7 @@ pub enum Frame {
     /// Null bulk string: `$-1\r\n`
     Null,
     /// Array of frames: `*2\r\n...`
-    Array(Vec<Frame>),
+    Array(Vec<Self>),
 }
 
 /// Encodes a RESP2 frame to its wire representation, appending bytes to `out`.
@@ -121,7 +121,7 @@ pub fn encode(frame: &Frame, out: &mut Vec<u8>) {
 /// This is distinct from "not enough bytes yet", which `parse` reports as
 /// `Ok(None)` instead. A `ParseError` is terminal: the caller should not
 /// retry parsing on the same connection.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ParseError(pub String);
 
 impl std::fmt::Display for ParseError {
@@ -272,87 +272,101 @@ fn parse_frame(buf: &[u8], pos: usize, depth: usize) -> Result<Option<(Frame, us
             let n = parse_i64(&buf[content_start..line_end])?;
             Ok(Some((Frame::Integer(n), next)))
         }
-        b'$' => {
-            let Some((line_end, next)) = read_line(buf, content_start) else {
-                return Ok(None);
-            };
-            let len = parse_i64(&buf[content_start..line_end])?;
-            if len == -1 {
-                return Ok(Some((Frame::Null, next)));
-            }
-            if len < -1 {
-                return Err(ParseError(format!("negative bulk length: {len}")));
-            }
-            if len > ceiling(MAX_BULK_LEN) {
-                return Err(ParseError(format!(
-                    "bulk length {len} exceeds the {MAX_BULK_LEN}-byte limit"
-                )));
-            }
-            // The ceiling above already puts this in range on any target with
-            // a 32-bit-or-wider `usize`; the conversion stays so the function
-            // has no panicking path at all.
-            let len =
-                usize::try_from(len).map_err(|_| ParseError("bulk length too large".into()))?;
-            let payload_start = next;
-            let payload_end = payload_start
-                .checked_add(len)
-                .ok_or_else(|| ParseError("bulk length overflows buffer offset".into()))?;
-            let term_end = payload_end
-                .checked_add(2)
-                .ok_or_else(|| ParseError("bulk length overflows buffer offset".into()))?;
-            if term_end > buf.len() {
-                return Ok(None);
-            }
-            if &buf[payload_end..term_end] != b"\r\n" {
-                return Err(ParseError("bulk payload missing CRLF terminator".into()));
-            }
-            Ok(Some((
-                Frame::Bulk(buf[payload_start..payload_end].to_vec()),
-                term_end,
-            )))
-        }
-        b'*' => {
-            let Some((line_end, next)) = read_line(buf, content_start) else {
-                return Ok(None);
-            };
-            let count = parse_i64(&buf[content_start..line_end])?;
-            if count < 0 {
-                // `*-1\r\n` (the null array) is not supported; every negative
-                // count, including -1, is rejected.
-                return Err(ParseError(format!(
-                    "negative array length is not supported: {count}"
-                )));
-            }
-            let depth = depth + 1;
-            if depth > MAX_ARRAY_DEPTH {
-                return Err(ParseError(format!(
-                    "array nesting exceeds the depth limit of {MAX_ARRAY_DEPTH}"
-                )));
-            }
-            if count > ceiling(MAX_ARRAY_LEN) {
-                return Err(ParseError(format!(
-                    "array length {count} exceeds the limit of {MAX_ARRAY_LEN}"
-                )));
-            }
-            // In range by the ceiling above; kept for the same reason as the
-            // bulk conversion.
-            let count =
-                usize::try_from(count).map_err(|_| ParseError("array length too large".into()))?;
-            let mut frames = Vec::new();
-            let mut cursor = next;
-            for _ in 0..count {
-                match parse_frame(buf, cursor, depth)? {
-                    None => return Ok(None),
-                    Some((frame, after_frame)) => {
-                        frames.push(frame);
-                        cursor = after_frame;
-                    }
-                }
-            }
-            Ok(Some((Frame::Array(frames), cursor)))
-        }
+        b'$' => parse_bulk(buf, content_start),
+        b'*' => parse_array(buf, content_start, depth),
         other => Err(ParseError(format!("unknown RESP2 type byte: {other:#04x}"))),
     }
+}
+
+/// Parses the body of a `$` frame, whose length line starts at `content_start`.
+///
+/// Both null (`$-1`) and ordinary bulk strings come through here; the caller
+/// has consumed only the type byte.
+fn parse_bulk(buf: &[u8], content_start: usize) -> Result<Option<(Frame, usize)>, ParseError> {
+    let Some((line_end, next)) = read_line(buf, content_start) else {
+        return Ok(None);
+    };
+    let len = parse_i64(&buf[content_start..line_end])?;
+    if len == -1 {
+        return Ok(Some((Frame::Null, next)));
+    }
+    if len < -1 {
+        return Err(ParseError(format!("negative bulk length: {len}")));
+    }
+    if len > ceiling(MAX_BULK_LEN) {
+        return Err(ParseError(format!(
+            "bulk length {len} exceeds the {MAX_BULK_LEN}-byte limit"
+        )));
+    }
+    // The ceiling above already puts this in range on any target with a
+    // 32-bit-or-wider `usize`; the conversion stays so the function has no
+    // panicking path at all.
+    let len = usize::try_from(len).map_err(|_| ParseError("bulk length too large".into()))?;
+    let payload_start = next;
+    let payload_end = payload_start
+        .checked_add(len)
+        .ok_or_else(|| ParseError("bulk length overflows buffer offset".into()))?;
+    let term_end = payload_end
+        .checked_add(2)
+        .ok_or_else(|| ParseError("bulk length overflows buffer offset".into()))?;
+    if term_end > buf.len() {
+        return Ok(None);
+    }
+    if &buf[payload_end..term_end] != b"\r\n" {
+        return Err(ParseError("bulk payload missing CRLF terminator".into()));
+    }
+    Ok(Some((
+        Frame::Bulk(buf[payload_start..payload_end].to_vec()),
+        term_end,
+    )))
+}
+
+/// Parses the body of a `*` frame, whose count line starts at `content_start`.
+///
+/// `depth` is the nesting level of the array's *parent*, so the array itself
+/// sits one level deeper — which is what [`MAX_ARRAY_DEPTH`] is checked against.
+fn parse_array(
+    buf: &[u8],
+    content_start: usize,
+    depth: usize,
+) -> Result<Option<(Frame, usize)>, ParseError> {
+    let Some((line_end, next)) = read_line(buf, content_start) else {
+        return Ok(None);
+    };
+    let count = parse_i64(&buf[content_start..line_end])?;
+    if count < 0 {
+        // `*-1\r\n` (the null array) is not supported; every negative count,
+        // including -1, is rejected.
+        return Err(ParseError(format!(
+            "negative array length is not supported: {count}"
+        )));
+    }
+    let depth = depth + 1;
+    if depth > MAX_ARRAY_DEPTH {
+        return Err(ParseError(format!(
+            "array nesting exceeds the depth limit of {MAX_ARRAY_DEPTH}"
+        )));
+    }
+    if count > ceiling(MAX_ARRAY_LEN) {
+        return Err(ParseError(format!(
+            "array length {count} exceeds the limit of {MAX_ARRAY_LEN}"
+        )));
+    }
+    // In range by the ceiling above; kept for the same reason as the bulk
+    // conversion.
+    let count = usize::try_from(count).map_err(|_| ParseError("array length too large".into()))?;
+    let mut frames = Vec::new();
+    let mut cursor = next;
+    for _ in 0..count {
+        match parse_frame(buf, cursor, depth)? {
+            None => return Ok(None),
+            Some((frame, after_frame)) => {
+                frames.push(frame);
+                cursor = after_frame;
+            }
+        }
+    }
+    Ok(Some((Frame::Array(frames), cursor)))
 }
 
 /// Parses one RESP2 frame from the start of `buf`.
@@ -367,6 +381,13 @@ fn parse_frame(buf: &[u8], pos: usize, depth: usize) -> Result<Option<(Frame, us
 ///   from the connection and call `parse` again.
 /// - `Err(ParseError)` — `buf` can never be a valid frame. This is terminal
 ///   for the connection; do not retry.
+///
+/// # Errors
+///
+/// When `buf` starts with bytes no continuation can rescue: an unknown type
+/// byte, a malformed or out-of-range length field, a negative bulk or array
+/// length, a bulk payload whose terminator is not `\r\n`, a length above
+/// [`MAX_BULK_LEN`] or [`MAX_ARRAY_LEN`], or nesting past the depth limit.
 ///
 /// # Example
 ///
