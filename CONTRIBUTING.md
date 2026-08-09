@@ -7,6 +7,7 @@ declined for now — open an issue first so we can talk before you write code.
 ## Ground rules
 
 - Everything in this repository is written in English.
+- Code follows the conventions in [docs/coding-guide.md](docs/coding-guide.md).
 - Commits follow [Conventional Commits](https://www.conventionalcommits.org/)
   (`feat:`, `fix:`, `docs:`, `test:`, `chore:`, `ci:`). One commit per
   coherent change.
