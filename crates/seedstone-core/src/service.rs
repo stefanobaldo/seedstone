@@ -10,6 +10,11 @@
 //! It is the only place where bytes a peer chose become something the rest of
 //! the system acts on, so it owns the limits:
 //!
+//! - **Where a command is answered.** A command about the connection itself —
+//!   `PING`, `ECHO`, `QUIT`, `HELLO` — has no key, so there is no shard it
+//!   could belong to; it is answered here and no shard hears of it. Only keyed
+//!   commands become messages. [`Action`] is that decision made explicit.
+//!
 //! - **Bounded buffering.** [`MAX_REQUEST_BYTES`] caps what one connection can
 //!   make the server hold, on top of the per-frame ceilings the codec
 //!   enforces ([`seedstone_resp::MAX_BULK_LEN`],
@@ -51,6 +56,31 @@ const READ_CHUNK: usize = 16 * 1024;
 /// How much of a peer-supplied byte string an error message may quote.
 const QUOTE_LIMIT: usize = 32;
 
+/// What a peer asking for a protocol this server does not speak is told.
+///
+/// Byte-exact to Redis, and load-bearing rather than cosmetic: go-redis v9
+/// opens every connection with `HELLO 3` and downgrades to RESP2 on exactly
+/// this prefix. A clearer message would break the client.
+pub const NOPROTO: &str = "NOPROTO unsupported protocol version";
+
+/// What this server answers `HELLO` with, and what it calls itself.
+const SERVER_NAME: &str = "seedstone";
+
+/// What to do with one request frame.
+///
+/// The distinction the type draws is where a command is answered.
+/// [`Command`]s belong to a shard and travel; the rest — the connection's own
+/// business, and everything the peer got wrong — is answered right here,
+/// without a message ever leaving the connection task.
+enum Action {
+    /// A keyed command: route it and reply with what the shard says.
+    Dispatch(Command),
+    /// Answer with this frame; the connection continues.
+    Reply(Frame),
+    /// Answer with this frame, then hang up.
+    ReplyThenClose(Frame),
+}
+
 /// Serves one connection until the peer disconnects or sends something that
 /// can never be a valid frame.
 ///
@@ -67,6 +97,10 @@ const QUOTE_LIMIT: usize = 32;
 /// well-formed RESP is answered with an error frame and the connection
 /// closes: the byte stream is desynchronised at that point and nothing after
 /// it can be trusted.
+///
+/// `QUIT` is the third case: the reply is written and flushed, and then this
+/// returns. Anything the peer pipelined behind it is deliberately not read —
+/// it asked to leave.
 pub async fn serve_connection<S, R>(stream: S, router: R)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -96,12 +130,15 @@ where
         // the transport for more.
         let mut consumed = 0;
         loop {
-            let reply = match parse(&buf[consumed..]) {
+            let (reply, hang_up) = match parse(&buf[consumed..]) {
                 Ok(Some((frame, used))) => {
                     consumed += used;
-                    match frame_to_command(frame) {
-                        Ok(cmd) => reply_to_frame(router.dispatch(cmd).await),
-                        Err(message) => safe_error(&message),
+                    match frame_to_action(frame) {
+                        Action::Dispatch(cmd) => {
+                            (reply_to_frame(router.dispatch(cmd).await), false)
+                        }
+                        Action::Reply(frame) => (frame, false),
+                        Action::ReplyThenClose(frame) => (frame, true),
                     }
                 }
                 // A proper prefix of a valid frame: read more.
@@ -114,7 +151,7 @@ where
                     return;
                 }
             };
-            if !write_frame(&mut stream, &reply, &mut out).await {
+            if !write_frame(&mut stream, &reply, &mut out).await || hang_up {
                 return;
             }
         }
@@ -224,11 +261,22 @@ fn quote(bytes: &[u8]) -> String {
     rendered
 }
 
-/// Maps a request frame to the command it names.
+/// Maps a request frame to what should happen because of it.
 ///
-/// `Err` carries the text of the error frame to send back; the connection
-/// survives it. Command names are matched case-insensitively, as Redis does.
-fn frame_to_command(frame: Frame) -> Result<Command, String> {
+/// Every failure below is answered and survived: a frame that is well-formed
+/// RESP but not a command this server can run is the peer's mistake, not a
+/// reason to desynchronise the stream.
+fn frame_to_action(frame: Frame) -> Action {
+    match action_for(frame) {
+        Ok(action) => action,
+        Err(message) => Action::Reply(safe_error(&message)),
+    }
+}
+
+/// [`frame_to_action`]'s body, with the error path expressed as `Err`.
+///
+/// Command names are matched case-insensitively, as Redis does.
+fn action_for(frame: Frame) -> Result<Action, String> {
     let Frame::Array(parts) = frame else {
         return Err("ERR Protocol error: expected an array of bulk strings".into());
     };
@@ -248,7 +296,88 @@ fn frame_to_command(frame: Frame) -> Result<Command, String> {
     // ASCII-uppercase only, which is what the command names are.
     let upper: Vec<u8> = name.to_ascii_uppercase();
 
+    // The connection's own commands, answered without a shard hearing of
+    // them: they are about this socket, and there is no key to route on.
     match upper.as_slice() {
+        b"PING" => {
+            return match args {
+                [] => Ok(Action::Reply(Frame::Simple("PONG".into()))),
+                [message] => Ok(Action::Reply(Frame::Bulk(message.clone()))),
+                _ => Err(wrong_arity("ping")),
+            };
+        }
+        b"ECHO" => {
+            return match args {
+                [message] => Ok(Action::Reply(Frame::Bulk(message.clone()))),
+                _ => Err(wrong_arity("echo")),
+            };
+        }
+        b"QUIT" => {
+            return match args {
+                [] => Ok(Action::ReplyThenClose(Frame::Simple("OK".into()))),
+                _ => Err(wrong_arity("quit")),
+            };
+        }
+        b"HELLO" => return hello(args),
+        _ => {}
+    }
+
+    keyed_command(&upper, name, args).map(Action::Dispatch)
+}
+
+/// Answers `HELLO`, which is how a client asks what it is talking to.
+///
+/// This server speaks RESP2 and only RESP2, so the version argument has
+/// exactly one accepted value. The refusal for every other one is
+/// [`NOPROTO`] — see that constant for why the exact text is a contract.
+fn hello(args: &[Vec<u8>]) -> Result<Action, String> {
+    let version = match args {
+        [] => 2,
+        [version, rest @ ..] => {
+            if let Some(option) = rest.first() {
+                // Redis takes AUTH and SETNAME here. This server has neither
+                // to offer, and saying so is better than ignoring the option
+                // and letting a client believe it authenticated.
+                return Err(format!(
+                    "ERR Syntax error in HELLO option '{}'",
+                    quote(option)
+                ));
+            }
+            parse_i64(version).ok_or_else(|| {
+                "ERR Protocol version is not an integer or out of range".to_owned()
+            })?
+        }
+    };
+    if version == 2 {
+        Ok(Action::Reply(hello_frame()))
+    } else {
+        Err(NOPROTO.to_owned())
+    }
+}
+
+/// The `HELLO` reply: a flat array of key-value pairs, which is how RESP2
+/// carries a map.
+fn hello_frame() -> Frame {
+    Frame::Array(vec![
+        Frame::Bulk(b"server".to_vec()),
+        Frame::Bulk(SERVER_NAME.as_bytes().to_vec()),
+        Frame::Bulk(b"version".to_vec()),
+        Frame::Bulk(env!("CARGO_PKG_VERSION").as_bytes().to_vec()),
+        Frame::Bulk(b"proto".to_vec()),
+        Frame::Integer(2),
+        Frame::Bulk(b"mode".to_vec()),
+        Frame::Bulk(b"standalone".to_vec()),
+        Frame::Bulk(b"role".to_vec()),
+        Frame::Bulk(b"master".to_vec()),
+    ])
+}
+
+/// Maps a keyed command to the [`Command`] a shard will run.
+///
+/// `upper` is the uppercased name matched on; `name` is the original bytes,
+/// kept only so an unknown command can be quoted back as the peer spelled it.
+fn keyed_command(upper: &[u8], name: &[u8], args: &[Vec<u8>]) -> Result<Command, String> {
+    match upper {
         b"GET" => match args {
             [key] => Ok(Command::Get { key: key.clone() }),
             _ => Err(wrong_arity("get")),
@@ -342,6 +471,132 @@ mod tests {
             "{:?}",
             frames[7]
         );
+    }
+
+    /// A router that cannot be dispatched to.
+    ///
+    /// The whole claim of this layer is that a connection-level command is
+    /// answered here and never becomes a message to a shard. Asserting the
+    /// reply alone would not show that: a router *could* answer `PING`
+    /// correctly and the test would not notice. This one makes the trip
+    /// impossible instead.
+    #[derive(Clone)]
+    struct UnreachableRouter;
+
+    impl Router for UnreachableRouter {
+        async fn dispatch(&self, _cmd: Command) -> Reply {
+            unreachable!("a connection command reached the router")
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_commands_never_reach_the_router() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(serve_connection(server, UnreachableRouter));
+        let (mut r, mut w) = tokio::io::split(client);
+
+        let mut out = Vec::new();
+        for parts in [
+            &["PING"][..],
+            &["ping"],
+            &["PING", "hi"],
+            &["PING", "a", "b"],
+            &["ECHO", "x"],
+            &["ECHO"],
+            &["HELLO"],
+            &["HELLO", "2"],
+            &["HELLO", "3"],
+            // Last: it closes the connection.
+            &["QUIT"],
+        ] {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 10).await;
+        assert_eq!(frames[0], Frame::Simple("PONG".into()));
+        assert_eq!(frames[1], Frame::Simple("PONG".into()), "case-insensitive");
+        assert_eq!(frames[2], Frame::Bulk(b"hi".to_vec()));
+        assert!(matches!(&frames[3], Frame::Error(e) if e.contains("wrong number of arguments")));
+        assert_eq!(frames[4], Frame::Bulk(b"x".to_vec()));
+        assert!(matches!(&frames[5], Frame::Error(e) if e.contains("wrong number of arguments")));
+        assert_eq!(frames[6], frames[7], "HELLO and HELLO 2 answer the same");
+        assert_eq!(frames[8], Frame::Error(NOPROTO.into()));
+        assert_eq!(
+            frames[9],
+            Frame::Simple("OK".into()),
+            "QUIT is acknowledged"
+        );
+
+        // ...and then the server goes, without waiting for the peer.
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "the server kept talking after QUIT");
+    }
+
+    /// `HELLO 3` must be refused with the `NOPROTO` prefix specifically.
+    ///
+    /// go-redis v9 opens every connection with `HELLO 3` and downgrades to
+    /// RESP2 on exactly this reply. Any other error text — including a
+    /// perfectly reasonable `ERR unsupported protocol` — makes the client give
+    /// up instead of falling back, so the string is a compatibility contract
+    /// and not a message.
+    #[test]
+    fn the_noproto_text_is_byte_exact_to_redis() {
+        assert_eq!(NOPROTO, "NOPROTO unsupported protocol version");
+    }
+
+    #[tokio::test]
+    async fn hello_reply_shape() {
+        let (mut r, mut w, _pool) = connected(4);
+        let mut out = Vec::new();
+        encode(&req(&["HELLO"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 1).await;
+        assert_eq!(
+            frames[0],
+            Frame::Array(vec![
+                Frame::Bulk(b"server".to_vec()),
+                Frame::Bulk(b"seedstone".to_vec()),
+                Frame::Bulk(b"version".to_vec()),
+                Frame::Bulk(env!("CARGO_PKG_VERSION").as_bytes().to_vec()),
+                Frame::Bulk(b"proto".to_vec()),
+                Frame::Integer(2),
+                Frame::Bulk(b"mode".to_vec()),
+                Frame::Bulk(b"standalone".to_vec()),
+                Frame::Bulk(b"role".to_vec()),
+                Frame::Bulk(b"master".to_vec()),
+            ])
+        );
+    }
+
+    /// A connection command sits in the same stream as a keyed one, and the
+    /// pipeline must not reorder or lose either.
+    #[tokio::test]
+    async fn connection_and_keyed_commands_interleave_in_one_pipeline() {
+        let (mut r, mut w, _pool) = connected(8);
+        let mut out = Vec::new();
+        for parts in [
+            &["HELLO", "2"][..],
+            &["SET", "k", "v"],
+            &["PING"],
+            &["GET", "k"],
+            &["ECHO", "done"],
+        ] {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 5).await;
+        assert!(matches!(frames[0], Frame::Array(_)));
+        assert_eq!(frames[1], Frame::Simple("OK".into()));
+        assert_eq!(frames[2], Frame::Simple("PONG".into()));
+        assert_eq!(frames[3], Frame::Bulk(b"v".to_vec()));
+        assert_eq!(frames[4], Frame::Bulk(b"done".to_vec()));
     }
 
     #[tokio::test]
