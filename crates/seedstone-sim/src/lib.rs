@@ -45,7 +45,13 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use seedstone_core::dict::DictSeed;
 use seedstone_core::service::serve_connection;
-use seedstone_core::shard::{Command, Reply, Router, ShardPool, TraceSink, parse_i64};
+// The two error texts are imported, not copied. The planted router has to be
+// indistinguishable from the honest one except in its atomicity, and these
+// strings enter the trace hash — a private copy that drifted would make a
+// planted trace differ for a reason unrelated to the race.
+use seedstone_core::shard::{
+    Command, NOT_AN_INTEGER, Reply, Router, ShardPool, TraceSink, WOULD_OVERFLOW, parse_i64,
+};
 use seedstone_resp::{Frame, encode, parse};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -331,16 +337,6 @@ fn fold_reply(h: u64, reply: &Reply) -> u64 {
 /// invariant.
 #[derive(Clone)]
 pub struct PlantedRouter(pub ShardPool);
-
-/// The reply text the shard gives a non-numeric `INCRBY` target.
-///
-/// Duplicated from `seedstone-core` (where it is private) rather than
-/// approximated: the planted router must be indistinguishable from the honest
-/// one except in its atomicity, and these strings enter the trace hash.
-const NOT_AN_INTEGER: &str = "ERR value is not an integer or out of range";
-
-/// The reply text the shard gives an `INCRBY` that would leave `i64`.
-const WOULD_OVERFLOW: &str = "ERR increment or decrement would overflow";
 
 impl Router for PlantedRouter {
     // Spelled `async fn` rather than the trait's desugared `-> impl Future`:
