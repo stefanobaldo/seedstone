@@ -132,9 +132,23 @@ fn workspace_denies_the_prohibition_lints() {
 fn every_select_in_simulated_code_is_biased() {
     let root = repo_root();
     let mut checked = 0;
-    for crate_name in ["seedstone-core", "seedstone-sim", "seedstone-resp"] {
-        for file in rust_sources(&root.join("crates").join(crate_name).join("src")) {
+    let mut crates_scanned = 0;
+    // Every crate, discovered from the filesystem rather than listed here. A
+    // hardcoded list is a silent green waiting to happen: the crate that grows
+    // the next `select!` is exactly the one nobody remembers to add.
+    for src in crate_source_dirs(&root) {
+        crates_scanned += 1;
+        for file in rust_sources(&src) {
             let source = std::fs::read_to_string(&file).unwrap();
+            // The scan below matches the qualified spelling, so an unqualified
+            // `select!` would be invisible to it. Rather than teach the grep to
+            // parse imports, forbid the import.
+            assert!(
+                !source.contains("use tokio::select"),
+                "{}: importing `select!` unqualified hides it from this gate. \
+                 Call it as `tokio::select!`.",
+                file.display()
+            );
             for (offset, _) in source.match_indices("tokio::select!") {
                 // The line the macro opens on, plus what follows it. `biased;`
                 // must be the first statement inside the braces.
@@ -161,14 +175,30 @@ fn every_select_in_simulated_code_is_biased() {
             }
         }
     }
-    // The rule is worthless if it silently matches nothing — a renamed crate
-    // directory, or `select!` imported unqualified, would make this test pass
-    // over an empty set forever.
+    // The rule is worthless if it silently matches nothing.
+    assert!(
+        crates_scanned > 0,
+        "no crate source directories found under crates/: this gate is looking \
+         at nothing at all"
+    );
     assert!(
         checked > 0,
-        "no `tokio::select!` found in any simulated crate: this gate has stopped \
-         looking at the code it exists to check"
+        "no `tokio::select!` found in any crate: this gate has stopped looking \
+         at the code it exists to check"
     );
+}
+
+/// The `src` directory of every crate in the workspace.
+fn crate_source_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
+        .expect("the workspace has a crates/ directory")
+        .map(|entry| entry.expect("readable crates/ entry").path().join("src"))
+        .filter(|src| src.is_dir())
+        .collect();
+    // `read_dir` order is filesystem-defined; a gate that reports a different
+    // file first on a different machine is a gate nobody trusts.
+    dirs.sort();
+    dirs
 }
 
 /// Every `.rs` file under `dir`, recursively.
