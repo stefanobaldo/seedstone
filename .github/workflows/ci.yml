@@ -51,6 +51,12 @@ jobs:
               - '!docs/**'
       # Pushes to `main` always sweep; a pull request skips only when it
       # touched nothing but prose.
+      # Calibrated against this workflow's own first run: 100 seeds took 546 s of
+      # sweep on a GitHub runner, 5.5 s per seed, against 2.1 s per seed on the
+      # maintainer's machine. That fits the ~10 minute budget with nothing to
+      # spare, and runner speed varies. 75 seeds lands near 7 minutes and keeps
+      # the headroom. Raising detection power without paying for it in wall clock
+      # is a later subphase's problem, not a knob to turn here.
       - name: DST sweep
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
-        run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 100 --workload-seed 1
+        run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 75 --workload-seed 1
