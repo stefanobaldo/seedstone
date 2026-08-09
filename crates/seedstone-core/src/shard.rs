@@ -34,7 +34,17 @@ const REHASH_TICK: Duration = Duration::from_millis(100);
 /// Writes already migrate as they go; the tick exists so a table that stopped
 /// receiving writes mid-rehash still finishes, rather than sitting split
 /// across two tables forever.
-const REHASH_BUCKETS_PER_TICK: usize = 4;
+///
+/// The number has to answer that "forever" and nothing else, because only
+/// writes advance a rehash: [`Dict::get`] deliberately does not, and a `Del`
+/// that removed nothing returns before reaching `remove`. So a shard that
+/// grows and then goes read-only is draining at exactly this rate. At four
+/// buckets per tick — forty a second — a table grown to 65 536 buckets stays
+/// split for twenty-seven minutes, holding two tables and probing both on
+/// every miss. At 1024 the same table drains in six seconds, and the tick's
+/// own cost stays in the same class as one large command, which is what the
+/// no-await rule actually constrains.
+const REHASH_BUCKETS_PER_TICK: usize = 1024;
 
 /// Reply text for a numeric operation on a value that is not an integer.
 ///
