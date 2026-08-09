@@ -319,7 +319,21 @@ pub fn decode_record(buf: &[u8]) -> Decoded<'_> {
 /// The seam exists from day one even though nothing yet writes bytes, so that
 /// the call sits in the flow of every mutating command from the beginning
 /// rather than being threaded through later. Phase 3 replaces the
-/// implementation, not the callers.
+/// implementation, not the callers: `ShardPool::spawn_with_log` takes a
+/// per-shard factory, so a real log arrives as an argument at one call site.
+///
+/// # Where each method is called from
+///
+/// `append` runs inside the shard's command handler, which is a plain `fn`
+/// that cannot `await` — so an implementation must keep it cheap. Buffering in
+/// memory is the shape this split anticipates. `sync` is called from the shard
+/// task's housekeeping tick, which is `async` and may block; that is the only
+/// place in a shard where durability can be paid for.
+///
+/// What is *not* settled here, deliberately: whether `append` buffers or
+/// writes through, the fsync cadence, and whether shards sync independently or
+/// group-commit behind one shared writer. The factory admits all three — a
+/// shared writer is a factory returning clones of one handle.
 ///
 /// `Send + 'static` because a shard task owns its log and is moved onto the
 /// runtime with it: the bound is what lets a shard hold a `Box<dyn
