@@ -211,6 +211,104 @@ impl Dict {
         }
     }
 
+    /// Visits one step's worth of entries and returns the cursor for the next
+    /// call.
+    ///
+    /// This is the only traversal this type offers, and it is deliberately not
+    /// an iterator. A `SCAN` command has to hand its position back to a client
+    /// between calls and resume from it later, with the dict mutating in
+    /// between — a borrow-holding iterator cannot express that, and neither can
+    /// anything whose order depends on more than the seed and the operation
+    /// sequence.
+    ///
+    /// # Contract
+    ///
+    /// - A full cycle starts at cursor `0` and ends when a call returns `0`.
+    ///   Any other return value is opaque: it must be passed back unchanged.
+    /// - A key that is present for the whole cycle is visited **at least
+    ///   once**.
+    /// - A key may be visited **more than once**, so a caller that needs
+    ///   distinct keys has to deduplicate.
+    /// - A key added or removed part-way through a cycle may or may not be
+    ///   visited. No guarantee either way.
+    /// - A single call visits a bounded number of *buckets* — one bucket of the
+    ///   smaller table, plus the two buckets of the larger one it expands into
+    ///   — which is what keeps a step short enough for a shard to stay
+    ///   responsive.
+    /// - A single call visits an **unbounded number of entries**: a bucket is a
+    ///   chain and nothing here caps its length. A caller that turns a step into
+    ///   a reply has to bound what it serialises itself rather than assume a
+    ///   step is small.
+    /// - An empty dict ends the cycle immediately, whatever cursor it is given.
+    ///
+    /// # Algorithm
+    ///
+    /// The cursor is incremented in *reverse binary* order: the bucket bits are
+    /// reversed, one is added, and the result is reversed back, so the carry
+    /// propagates from the high bit of the bucket index downwards. What that
+    /// buys under a table that doubles is a cycle that still *ends*. A step
+    /// under a mask of `m` moves the cursor forward by exactly `1 / (m + 1)` of
+    /// the keyspace, so a doubling halves the size of every later step instead
+    /// of doubling the number of steps left, and a whole cycle costs no more
+    /// calls than the table it ends on has buckets — however much the table
+    /// grew along the way. A cursor that simply counted buckets upwards would
+    /// advance one bucket per call, and a keyspace doubling faster than that
+    /// would outrun it: the cursor would chase the mask and never come back to
+    /// `0`. The same order is what would keep the guarantee if a table ever
+    /// halved, where two buckets merge into one the cursor may already have
+    /// passed; nothing shrinks a table today, and this costs nothing.
+    ///
+    /// The bits above the mask take part in the arithmetic — the cursor is
+    /// widened to all ones outside the mask before the increment, so the carry
+    /// runs out of the masked region and off the top of the reversed word. That
+    /// is what makes the cycle end on exactly `0`, and it is why the cursor
+    /// stays a full `u64` rather than being narrowed to the table's width.
+    ///
+    /// While a rehash is in flight the dict holds two tables and an entry may
+    /// be in either, so a step visits the smaller table's bucket for the cursor
+    /// and then every bucket of the larger table that bucket expands into,
+    /// which is exactly the cursors sharing its low bits. The loop ends when
+    /// the increment carries back into the bits the smaller mask covers.
+    pub fn scan<F: FnMut(&[u8], &[u8])>(&self, cursor: u64, mut visit: F) -> u64 {
+        // Nothing to hand back and nothing to come back for. Redis does the
+        // same, and it is what lets a caller sweep an empty keyspace in one
+        // call instead of one per bucket. It cannot weaken the guarantee: if
+        // the dict is empty at any point of a cycle, no key was present for the
+        // whole of it.
+        if self.is_empty() {
+            return 0;
+        }
+
+        let Some(new) = self.new.as_ref() else {
+            visit_bucket(&self.old, cursor, &mut visit);
+            return reverse_increment(cursor, mask_of(&self.old));
+        };
+
+        // `new` is allocated at exactly twice `old`, so `old` is always the
+        // smaller of the two and `small ^ large` is exactly the bits the
+        // doubling added. That coupling lives in `start_rehash` and is
+        // invisible from here, and breaking it would not fault: with
+        // `large <= small` the xor loses the discriminating bit, the loop below
+        // returns after a single `new` bucket, and the scan quietly
+        // under-visits for the rest of the cycle.
+        debug_assert!(
+            self.old.len() < new.len(),
+            "scan assumes old is the smaller table"
+        );
+        let small = mask_of(&self.old);
+        let large = mask_of(new);
+
+        let mut v = cursor;
+        visit_bucket(&self.old, v, &mut visit);
+        loop {
+            visit_bucket(new, v, &mut visit);
+            v = reverse_increment(v, large);
+            if v & (small ^ large) == 0 {
+                return v;
+            }
+        }
+    }
+
     /// Allocates the new table and puts the dict into the rehashing state.
     ///
     /// Growth is triggered at a load factor of 1 — one entry per bucket on
@@ -258,6 +356,30 @@ fn hash_key(seed: DictSeed, key: &[u8]) -> u64 {
 /// the table doubles.
 fn bucket_index(hash: u64, buckets: usize) -> usize {
     (hash & (buckets as u64 - 1)) as usize
+}
+
+/// The bucket-selecting mask of a table: its length minus one, which is a run
+/// of low bits because the length is a power of two.
+fn mask_of(table: &Table) -> u64 {
+    debug_assert!(!table.is_empty(), "mask_of: a table is never empty");
+    table.len() as u64 - 1
+}
+
+/// Hands every entry of the bucket `cursor` selects in `table` to `visit`.
+fn visit_bucket<F: FnMut(&[u8], &[u8])>(table: &Table, cursor: u64, visit: &mut F) {
+    for (key, value) in &table[(cursor & mask_of(table)) as usize] {
+        visit(key, value);
+    }
+}
+
+/// Advances a scan cursor one step in reverse binary order under `mask`.
+///
+/// See [`Dict::scan`] for why the bits outside the mask are set first: the
+/// increment has to carry off the top of the reversed word so that a completed
+/// cycle lands back on exactly `0`.
+fn reverse_increment(cursor: u64, mask: u64) -> u64 {
+    let widened = cursor | !mask;
+    widened.reverse_bits().wrapping_add(1).reverse_bits()
 }
 
 fn find<'a>(table: &'a Table, hash: u64, key: &[u8]) -> Option<&'a (Vec<u8>, Vec<u8>)> {
@@ -590,5 +712,310 @@ mod tests {
         }
         assert_eq!(d.len(), 0);
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn scan_visits_every_key_when_static() {
+        let mut d = Dict::with_seed(seed());
+        for i in 0..500u32 {
+            d.insert(i.to_string().into_bytes(), vec![]);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut c = 0;
+        let mut steps = 0;
+        loop {
+            c = d.scan(c, |k, _| {
+                seen.insert(k.to_vec());
+            });
+            if c == 0 {
+                break;
+            }
+            // Purely a guard, not an acceptance criterion: the failure this
+            // test exists to catch includes a cursor that never comes back to
+            // 0, and without a bound that failure wedges the process instead of
+            // reporting itself.
+            steps += 1;
+            assert!(steps < 10_000, "the cursor never returned to 0");
+        }
+        assert_eq!(seen.len(), 500);
+    }
+
+    #[test]
+    fn scan_sees_every_stable_key_across_growth() {
+        // Keys inserted before the scan starts and never removed must be visited
+        // at least once even though the table grows (and rehashes) mid-scan.
+        let mut d = Dict::with_seed(seed());
+        for i in 0..64u32 {
+            d.insert(format!("stable-{i}").into_bytes(), vec![]);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut c = 0;
+        let mut extra = 0u32;
+        let mut steps = 0;
+        loop {
+            c = d.scan(c, |k, _| {
+                seen.insert(k.to_vec());
+            });
+            if c == 0 {
+                break;
+            }
+            // As above, a guard rather than an assertion about the keyspace:
+            // this is the test a cursor outrun by a growing table hangs in.
+            steps += 1;
+            assert!(steps < 10_000, "the cursor never returned to 0");
+
+            for _ in 0..8 {
+                d.insert(format!("noise-{extra}").into_bytes(), vec![]);
+                extra += 1;
+            }
+            d.rehash_step(1);
+        }
+        for i in 0..64u32 {
+            assert!(
+                seen.contains(format!("stable-{i}").as_bytes()),
+                "lost stable-{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn scanning_an_empty_dict_ends_the_cycle_without_visiting_anything() {
+        let d = Dict::with_seed(seed());
+        // Not "returns 0 eventually": an empty keyspace must cost one call, not
+        // one call per bucket, or a node full of empty shards would answer a
+        // sweep with a long run of empty replies.
+        assert_eq!(
+            d.scan(0, |k, _| panic!("visited {k:?} in an empty dict")),
+            0
+        );
+    }
+
+    #[test]
+    fn a_full_cycle_at_rest_visits_every_bucket_exactly_once() {
+        use std::collections::BTreeSet;
+
+        let mut d = Dict::with_seed(seed());
+        for i in 0..100u32 {
+            d.insert(i.to_string().into_bytes(), vec![]);
+        }
+        drain_rehash(&mut d);
+
+        // The keys alone cannot show this: several share a bucket and some
+        // buckets are empty, so a cursor that skipped or repeated a bucket
+        // could still deliver every key. Read the buckets directly.
+        let buckets = d.old.len();
+        let mask = buckets as u64 - 1;
+        let mut visited = Vec::new();
+        let mut c = 0;
+        loop {
+            visited.push((c & mask) as usize);
+            c = d.scan(c, |_, _| {});
+            if c == 0 {
+                break;
+            }
+            assert!(visited.len() <= buckets, "the cursor never returned to 0");
+        }
+
+        assert_eq!(visited.len(), buckets, "wrong number of steps in a cycle");
+        let distinct: BTreeSet<usize> = visited.iter().copied().collect();
+        assert_eq!(distinct.len(), buckets, "a bucket repeated: {visited:?}");
+    }
+
+    #[test]
+    fn a_cycle_spanning_the_end_of_a_rehash_still_sees_every_stable_key() {
+        use std::collections::BTreeSet;
+
+        let mut d = Dict::with_seed(seed());
+        let inserted = fill_until_rehashing(&mut d);
+        assert!(
+            d.is_rehashing(),
+            "the cycle must start with two tables live"
+        );
+
+        let mut seen = BTreeSet::new();
+        let mut c = 0;
+        let mut steps = 0;
+        let mut finished_mid_cycle = false;
+        loop {
+            c = d.scan(c, |k, _| {
+                seen.insert(k.to_vec());
+            });
+            if c == 0 {
+                break;
+            }
+            steps += 1;
+            // Collapse the two tables into one part-way through, so the rest of
+            // the cycle runs against the larger table alone with a cursor that
+            // was produced while both were live.
+            if steps == 2 {
+                drain_rehash(&mut d);
+                finished_mid_cycle = true;
+            }
+            assert!(steps < 10_000, "the cursor never returned to 0");
+        }
+
+        assert!(finished_mid_cycle, "the cycle ended before the rehash did");
+        assert!(!d.is_rehashing());
+        for i in 0..inserted {
+            assert!(seen.contains(i.to_string().as_bytes()), "lost key {i}");
+        }
+    }
+
+    #[test]
+    fn the_growth_guarantee_holds_wherever_in_the_cycle_the_growth_starts() {
+        use std::collections::BTreeSet;
+
+        // The tests above each exercise one interleaving of growth and cursor,
+        // and a cursor that advanced in plain binary order would survive some
+        // of them. Sweep every position in the cycle at which the table can
+        // start doubling and demand the guarantee at each one.
+        let mut d = Dict::with_seed(seed());
+        for i in 0..100u32 {
+            d.insert(format!("stable-{i}").into_bytes(), vec![]);
+        }
+        drain_rehash(&mut d);
+        let cycle = d.old.len();
+
+        for grow_at in 0..cycle {
+            let mut d = Dict::with_seed(seed());
+            for i in 0..100u32 {
+                d.insert(format!("stable-{i}").into_bytes(), vec![]);
+            }
+            drain_rehash(&mut d);
+            assert_eq!(d.old.len(), cycle);
+
+            let mut seen = BTreeSet::new();
+            let mut c = 0;
+            let mut step = 0usize;
+            let mut noise = 0u32;
+            loop {
+                if step == grow_at {
+                    // Write until the table starts doubling, exactly here.
+                    while !d.is_rehashing() {
+                        d.insert(format!("noise-{noise}").into_bytes(), vec![]);
+                        noise += 1;
+                    }
+                }
+                c = d.scan(c, |k, _| {
+                    seen.insert(k.to_vec());
+                });
+                if c == 0 {
+                    break;
+                }
+                // Let the migration run alongside the rest of the cycle, so the
+                // cursor also crosses the moment the two tables collapse back
+                // into one.
+                d.rehash_step(3);
+                step += 1;
+                assert!(step < 10_000, "the cursor never returned to 0");
+            }
+
+            assert!(noise > 0, "the table never grew (grow_at {grow_at})");
+            for i in 0..100u32 {
+                assert!(
+                    seen.contains(format!("stable-{i}").as_bytes()),
+                    "lost stable-{i} when growth started at step {grow_at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cycle_under_continuous_growth_converges_instead_of_chasing_the_table() {
+        // Coverage is not the only thing the traversal order buys, and on a
+        // dict that only ever grows it is not the sharpest test of it: a cursor
+        // that counted its bucket bits in plain binary order would still reach
+        // every bucket, because a bucket that splits when the table doubles
+        // splits into one index the cursor has passed and one still ahead of
+        // it. What such a cursor loses is *termination*, and with it the whole
+        // point of handing the value back to a client: it advances one bucket
+        // per call, so a table that doubles faster than that outruns it and the
+        // cycle never ends.
+        //
+        // What makes the cycle finite is that a step is a fixed *fraction* of
+        // the keyspace rather than a fixed number of buckets: a step under mask
+        // `m` moves the cursor forward by exactly `1 / (m + 1)` of the whole,
+        // and doubling the table only makes later steps smaller. Read that
+        // position off the cursor — it is the cursor's bits in reverse — and
+        // demand it strictly increase. A cursor that moved through the keyspace
+        // in any other order fails on the second call instead of hanging.
+        let mut d = Dict::with_seed(seed());
+        for i in 0..64u32 {
+            d.insert(format!("stable-{i}").into_bytes(), vec![]);
+        }
+        let started_over = d.new.as_ref().map_or(d.old.len(), Vec::len);
+
+        let mut c = 0;
+        let mut position = 0u64;
+        let mut steps = 0usize;
+        let mut noise = 0u32;
+        loop {
+            c = d.scan(c, |_, _| {});
+            if c == 0 {
+                break;
+            }
+            let next = c.reverse_bits();
+            assert!(
+                next > position,
+                "the cursor moved backwards through the keyspace: \
+                 {position} then {next}"
+            );
+            position = next;
+
+            steps += 1;
+            // Monotone progress does not by itself say the cursor ever lands
+            // back on 0 — a cursor whose steps shrink faster than the table
+            // grows would advance forever without wrapping. Stop it here, so
+            // that failure is a failure and not a hung suite. A correct cycle
+            // takes a few hundred steps.
+            assert!(steps < 10_000, "the cycle never came back to cursor 0");
+
+            for _ in 0..8 {
+                d.insert(format!("noise-{noise}").into_bytes(), vec![]);
+                noise += 1;
+            }
+            d.rehash_step(1);
+        }
+
+        // Monotone progress alone would allow a cycle that crawls. Since every
+        // step is `1 / (m + 1)` of the keyspace and `m` only ever grows, a
+        // whole cycle costs no more steps than the table it ends on has
+        // buckets, however much the table grew along the way.
+        let ended_over = d.new.as_ref().map_or(d.old.len(), Vec::len);
+        assert!(ended_over > started_over, "the table never grew");
+        assert!(
+            steps <= ended_over,
+            "a cycle over {ended_over} buckets took {steps} steps"
+        );
+    }
+
+    #[test]
+    fn scan_hands_over_the_value_stored_under_each_key() {
+        use std::collections::BTreeMap;
+
+        let mut d = Dict::with_seed(seed());
+        for i in 0..50u32 {
+            d.insert(i.to_string().into_bytes(), format!("v{i}").into_bytes());
+        }
+        drain_rehash(&mut d);
+
+        let mut seen = BTreeMap::new();
+        let mut c = 0;
+        loop {
+            c = d.scan(c, |k, v| {
+                seen.insert(k.to_vec(), v.to_vec());
+            });
+            if c == 0 {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 50);
+        for i in 0..50u32 {
+            assert_eq!(
+                seen.get(i.to_string().as_bytes()).map(Vec::as_slice),
+                Some(format!("v{i}").as_bytes()),
+                "key {i} came back with the wrong value"
+            );
+        }
     }
 }
