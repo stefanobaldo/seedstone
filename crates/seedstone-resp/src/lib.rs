@@ -208,6 +208,17 @@ fn parse_i64(field: &[u8]) -> Result<i64, ParseError> {
     })
 }
 
+/// One of this module's length ceilings, in the width a declared length is
+/// parsed at.
+///
+/// A declared length is compared against the ceiling *before* it is narrowed to
+/// `usize`, so the comparison has to happen in `i64`. Both ceilings are small
+/// compile-time constants, so widening them is exact on every target — which is
+/// what makes the accept set independent of pointer width.
+fn ceiling(limit: usize) -> i64 {
+    i64::try_from(limit).expect("a length ceiling is a small constant")
+}
+
 /// Finds the first `\r\n` in `buf` at or after `start`.
 ///
 /// Returns `Some((line_end, after_crlf))` where `buf[start..line_end]` is
@@ -272,7 +283,7 @@ fn parse_frame(buf: &[u8], pos: usize, depth: usize) -> Result<Option<(Frame, us
             if len < -1 {
                 return Err(ParseError(format!("negative bulk length: {len}")));
             }
-            if len > MAX_BULK_LEN as i64 {
+            if len > ceiling(MAX_BULK_LEN) {
                 return Err(ParseError(format!(
                     "bulk length {len} exceeds the {MAX_BULK_LEN}-byte limit"
                 )));
@@ -318,7 +329,7 @@ fn parse_frame(buf: &[u8], pos: usize, depth: usize) -> Result<Option<(Frame, us
                     "array nesting exceeds the depth limit of {MAX_ARRAY_DEPTH}"
                 )));
             }
-            if count > MAX_ARRAY_LEN as i64 {
+            if count > ceiling(MAX_ARRAY_LEN) {
                 return Err(ParseError(format!(
                     "array length {count} exceeds the limit of {MAX_ARRAY_LEN}"
                 )));

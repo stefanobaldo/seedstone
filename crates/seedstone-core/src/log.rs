@@ -166,7 +166,7 @@ pub enum Decoded<'a> {
 fn crc32_iso_hdlc(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
-        crc ^= byte as u32;
+        crc ^= u32::from(byte);
         for _ in 0..8 {
             crc = if crc & 1 != 0 {
                 (crc >> 1) ^ 0xEDB8_8320
@@ -200,13 +200,20 @@ fn crc32_iso_hdlc(data: &[u8]) -> u32 {
 /// turns a violation into a panic in debug, test and simulator builds. In
 /// release the record is still written, with an exact length that
 /// [`decode_record`] will always classify as damage — a silently unreadable
-/// entry. Above 4 GiB the `as u32` narrowing of the length is a further silent
-/// truncation, producing a header that describes a different record than the
-/// bytes that follow.
+/// entry.
 ///
 /// It is a `debug_assert!` rather than a `Result` so the check costs nothing on
 /// the path every mutating command takes; the moment the command layer exists,
 /// the ceiling belongs there.
+///
+/// # Panics
+///
+/// If the body exceeds `u32::MAX` bytes, which the length field cannot
+/// describe. That is four thousand times the documented ceiling, so reaching it
+/// means the precondition above was violated by a wide margin. The narrowing is
+/// checked rather than truncating: a truncated length would produce a header
+/// describing a different record than the bytes that follow it, and a log that
+/// silently disagrees with itself is worse than one that stops.
 pub fn encode_record(rec: &Record<'_>, out: &mut Vec<u8>) {
     let body_len = BODY_FIXED_LEN + rec.payload.len();
     debug_assert!(
@@ -216,7 +223,9 @@ pub fn encode_record(rec: &Record<'_>, out: &mut Vec<u8>) {
 
     out.reserve(HEADER_LEN + body_len);
     out.push(MAGIC);
-    out.extend_from_slice(&(body_len as u32).to_le_bytes());
+    let declared = u32::try_from(body_len)
+        .expect("encode_record: a body length must fit the format's u32 field");
+    out.extend_from_slice(&declared.to_le_bytes());
 
     // The body's fields live in three places until they are written, so
     // reserve the checksum's slot, write the body, and fold the checksum over
@@ -458,12 +467,12 @@ mod tests {
     #[test]
     fn several_records_decode_back_to_back() {
         let mut buf = Vec::new();
-        for seq in 0..3u64 {
+        for seq in 0..3u8 {
             encode_record(
                 &Record {
                     shard: 5,
-                    seq,
-                    payload: &[seq as u8; 4],
+                    seq: u64::from(seq),
+                    payload: &[seq; 4],
                 },
                 &mut buf,
             );
@@ -549,7 +558,8 @@ mod tests {
         // A body too short to hold shard and seq, and a body larger than the
         // format will believe in, are both damage. Reporting NeedMore would
         // wedge the reader waiting for bytes that can never make sense.
-        for len in [0u32, 1, BODY_FIXED_LEN as u32 - 1] {
+        let fixed = u32::try_from(BODY_FIXED_LEN).expect("the fixed body length is a small const");
+        for len in [0u32, 1, fixed - 1] {
             let mut buf = vec![MAGIC];
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(&0u32.to_le_bytes());
@@ -557,9 +567,14 @@ mod tests {
         }
 
         let mut buf = vec![MAGIC];
-        buf.extend_from_slice(&(MAX_BODY_LEN as u32 + 1).to_le_bytes());
+        buf.extend_from_slice(&(max_body_len_u32() + 1).to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(decode_record(&buf), Decoded::Corrupt { skip: 1 });
+    }
+
+    /// [`MAX_BODY_LEN`] as the width the length field actually carries.
+    fn max_body_len_u32() -> u32 {
+        u32::try_from(MAX_BODY_LEN).expect("the ceiling is below 4 GiB by construction")
     }
 
     #[test]
@@ -568,7 +583,7 @@ mod tests {
         // claiming exactly MAX_BODY_LEN is plausible, so a buffer that has not
         // yet delivered that body is a short read.
         let mut buf = vec![MAGIC];
-        buf.extend_from_slice(&(MAX_BODY_LEN as u32).to_le_bytes());
+        buf.extend_from_slice(&max_body_len_u32().to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(decode_record(&buf), Decoded::NeedMore);
     }

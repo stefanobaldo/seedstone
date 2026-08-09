@@ -355,7 +355,8 @@ fn hash_key(seed: DictSeed, key: &[u8]) -> u64 {
 /// buys, and which also makes the old index the low bits of the new one when
 /// the table doubles.
 fn bucket_index(hash: u64, buckets: usize) -> usize {
-    (hash & (buckets as u64 - 1)) as usize
+    let masked = hash & (buckets as u64 - 1);
+    usize::try_from(masked).expect("a masked hash is below the bucket count, which is a usize")
 }
 
 /// The bucket-selecting mask of a table: its length minus one, which is a run
@@ -367,7 +368,9 @@ fn mask_of(table: &Table) -> u64 {
 
 /// Hands every entry of the bucket `cursor` selects in `table` to `visit`.
 fn visit_bucket<F: FnMut(&[u8], &[u8])>(table: &Table, cursor: u64, visit: &mut F) {
-    for (key, value) in &table[(cursor & mask_of(table)) as usize] {
+    let index = usize::try_from(cursor & mask_of(table))
+        .expect("a masked cursor is below the bucket count, which is a usize");
+    for (key, value) in &table[index] {
         visit(key, value);
     }
 }
@@ -458,7 +461,7 @@ mod tests {
 
         // And under the seed this module's tests use, including a key long
         // enough to take the multi-block path.
-        let ramp: Vec<u8> = (0..100u32).map(|i| (i % 256) as u8).collect();
+        let ramp: Vec<u8> = (0..100u8).collect();
         assert_eq!(hash_key(seed(), b""), 0xb8f9_c5c6_7c08_d736);
         assert_eq!(hash_key(seed(), b"key:1"), 0xa3e9_6ed8_b4a0_a1f7);
         assert_eq!(hash_key(seed(), &ramp), 0xbb82_314a_8b08_5307);
@@ -808,7 +811,7 @@ mod tests {
         let mut visited = Vec::new();
         let mut c = 0;
         loop {
-            visited.push((c & mask) as usize);
+            visited.push(usize::try_from(c & mask).expect("a masked cursor fits a bucket index"));
             c = d.scan(c, |_, _| {});
             if c == 0 {
                 break;

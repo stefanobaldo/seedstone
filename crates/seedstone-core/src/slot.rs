@@ -11,7 +11,7 @@
 pub fn crc16_xmodem(data: &[u8]) -> u16 {
     let mut crc: u16 = 0x0000;
     for &byte in data {
-        crc ^= (byte as u16) << 8;
+        crc ^= u16::from(byte) << 8;
         for _ in 0..8 {
             crc = if crc & 0x8000 != 0 {
                 (crc << 1) ^ 0x1021
@@ -52,7 +52,7 @@ mod tests {
         // from a from-definition reference implementation, not by printing
         // what this crate returns — do not "fix" a mismatch by pasting in
         // whatever shard_of currently returns.
-        let long_key: Vec<u8> = (0..100).map(|i: u32| (i % 256) as u8).collect();
+        let long_key: Vec<u8> = (0..100u8).collect();
         let vectors: [(&[u8], u16); 5] = [
             (b"foo", 918),
             (b"", 0),

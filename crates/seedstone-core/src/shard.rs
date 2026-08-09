@@ -228,9 +228,9 @@ impl ShardPool {
     }
 
     /// How many shards this pool spans.
+    #[must_use]
     pub fn shards(&self) -> u16 {
-        // The count came in as a `u16` in `spawn`, so it fits.
-        self.inboxes.len() as u16
+        u16::try_from(self.inboxes.len()).expect("the count came in as a u16 in spawn, so it fits")
     }
 }
 
