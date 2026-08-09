@@ -305,7 +305,10 @@ impl TraceSink for HashSink {
 
 /// Folds a byte string, length first so that concatenations cannot collide.
 fn fold_bytes(mut h: u64, bytes: &[u8]) -> u64 {
-    h = mix(h, bytes.len() as u64);
+    h = mix(
+        h,
+        u64::try_from(bytes.len()).expect("a slice length is a usize"),
+    );
     for &b in bytes {
         h = mix(h, u64::from(b));
     }
@@ -577,5 +580,34 @@ mod tests {
             a.trace_hash, c.trace_hash,
             "different sim seed, different schedule"
         );
+    }
+
+    #[test]
+    fn the_trace_hash_is_pinned_across_processes_and_builds() {
+        // The harness's product. Every other assertion about the trace compares
+        // two runs of the *same* build to each other, and stays green if the
+        // hash moves globally — a `cargo update` that reorders tokio's ready
+        // queue or changes `rand`'s sampling would silently retire every seed
+        // ever filed against this project, and nothing would say so.
+        //
+        // Unlike the SipHash and CRC vectors, this number has no external
+        // reference to be derived from: it is definitionally whatever this
+        // system computes. So it pins *stability*, not correctness, and that is
+        // the whole job. A mismatch here is not a bug report — it means the
+        // trace's meaning changed, and the question to answer is whether that
+        // was intended. When it was (a new command kind, a new folded field),
+        // update the constant in the same commit that caused it, and say so in
+        // the message. Never update it to make a red suite green.
+        const MINI_1_42: u64 = 0x2bbb_5d5f_3268_c6c6;
+
+        let outcome = run_sim(&SimConfig::mini(1, 42));
+        assert_eq!(
+            outcome.trace_hash, MINI_1_42,
+            "the recorded trace hash moved"
+        );
+        // The workload behind the hash, pinned separately: the two can drift
+        // apart, and a changed workload with a coincidentally equal hash is the
+        // one failure the assertion above cannot see.
+        assert_eq!(outcome.expected_sum, 99, "the recorded workload moved");
     }
 }
