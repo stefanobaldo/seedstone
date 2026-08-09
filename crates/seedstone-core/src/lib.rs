@@ -6,4 +6,5 @@
 //! into those commands lives here, at the crate's edge — the dependency
 //! belongs to that translation boundary, not to the core itself.
 
+pub mod dict;
 pub mod slot;
