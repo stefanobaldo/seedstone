@@ -12,9 +12,18 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Least privilege, in the tree rather than in a repository setting: a setting is
+# invisible to review and does not travel with a fork or a re-clone.
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   ci:
     runs-on: ubuntu-latest
+    # The most expensive step measures ~7 minutes. The default of six hours is
+    # what a hung simulation would burn before anyone noticed.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -31,8 +40,25 @@ jobs:
       # covers: neither subsumes the other, and both are load-bearing.
       - name: no simulator crate in the production dependency graph
         run: |
-          if cargo tree -p seedstone --edges normal,build | grep -q turmoil; then
-            echo "turmoil reached the production dependency graph" >&2; exit 1
+          set -euo pipefail
+          # Captured rather than piped straight into `grep`: in `if cmd | grep -q
+          # x`, only grep's status reaches the `if`, so a failing `cargo tree` —
+          # a renamed package, a bad flag, a broken lockfile — makes this step
+          # *pass*. A gate that succeeds when its own tooling breaks is not one.
+          tree=$(cargo tree -p seedstone --edges normal,build)
+          echo "$tree"
+          # The positive control. The negative assertion alone is vacuous if the
+          # graph is empty, and it would be: `seedstone` depends on
+          # `seedstone-core` only so this gate has something to search. Drop that
+          # dependency as an obvious cleanup and the grep below finds nothing
+          # forever, silently.
+          if ! grep -q seedstone-core <<<"$tree"; then
+            echo "the production graph does not even reach seedstone-core: this gate is asserting nothing" >&2
+            exit 1
+          fi
+          if grep -q turmoil <<<"$tree"; then
+            echo "turmoil reached the production dependency graph" >&2
+            exit 1
           fi
       # An allowlist of the irrelevant, not a denylist of the relevant: a path
       # counts as code unless *every* pattern excludes it, so anything nobody
@@ -48,7 +74,10 @@ jobs:
               - '!**/*.md'
               - '!LICENSE*'
               - '!.gitignore'
-              - '!docs/**'
+              # Markdown only, deliberately. `!docs/**` would also exclude a
+              # tracked `docs/examples/*.rs` the day one appears, and the sweep
+              # would stop running for it silently.
+              - '!docs/**/*.md'
       # Pushes to `main` always sweep; a pull request skips only when it
       # touched nothing but prose.
       # Calibrated against this workflow's own first run: 100 seeds took 546 s of
