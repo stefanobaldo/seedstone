@@ -12,3 +12,10 @@ unexpected_cfgs = { level = "warn", check-cfg = [] }
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "io-util"] }
+turmoil = "=0.7.2"
+siphasher = "1"
+rand = "0.9"
+rand_chacha = "0.9"
