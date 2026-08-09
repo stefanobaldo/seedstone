@@ -114,12 +114,48 @@ pub fn encode(frame: &Frame, out: &mut Vec<u8>) {
 #[derive(Debug, PartialEq)]
 pub struct ParseError(pub String);
 
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
 /// The maximum number of nested [`Frame::Array`] levels `parse` accepts.
 ///
 /// A top-level array is nesting level 1. Levels 1 through 64 are accepted;
 /// an array that would be the 65th level of nesting is rejected with a
 /// [`ParseError`] rather than recursed into.
 const MAX_ARRAY_DEPTH: usize = 64;
+
+/// The largest [`Frame::Bulk`] payload [`parse`] accepts, in bytes.
+///
+/// A declared length above this is a [`ParseError`] the moment the length
+/// line is read, before a single payload byte is buffered. The ceiling does
+/// three things at once:
+///
+/// - It bounds what a peer can make the reader hold. Without it, `$` plus a
+///   huge length is a standing instruction to buffer that many bytes, and the
+///   reader obeys until it dies.
+/// - It makes the protocol's accept set independent of pointer width. The
+///   length is parsed as `i64`, and converting it to `usize` succeeds on a
+///   64-bit target and fails on a 32-bit one — so `$4294967296` used to be a
+///   terminal error on one and "wait for more bytes, forever" on the other.
+///   Checked against a constant, both targets reject it identically.
+/// - It keeps a command within what the replication log can hold. A record
+///   body is capped at 64 MiB; two payloads at this ceiling plus framing sit
+///   well under that, so no accepted command can produce a record the log
+///   would refuse to write.
+pub const MAX_BULK_LEN: usize = 16 * 1024 * 1024;
+
+/// The largest [`Frame::Array`] element count [`parse`] accepts.
+///
+/// Same reasoning as [`MAX_BULK_LEN`], for the other length-prefixed frame:
+/// an unbounded count is an unbounded amount of work and buffering, and the
+/// `i64`-to-`usize` conversion splits behaviour by pointer width in exactly
+/// the same way.
+pub const MAX_ARRAY_LEN: usize = 1024 * 1024;
 
 /// Parses one RESP2 field holding a signed integer (a bulk/array length or an
 /// `Integer` frame's value) from `field`, which must not include the
@@ -218,6 +254,14 @@ fn parse_frame(buf: &[u8], pos: usize, depth: usize) -> Result<Option<(Frame, us
             if len < -1 {
                 return Err(ParseError(format!("negative bulk length: {len}")));
             }
+            if len > MAX_BULK_LEN as i64 {
+                return Err(ParseError(format!(
+                    "bulk length {len} exceeds the {MAX_BULK_LEN}-byte limit"
+                )));
+            }
+            // The ceiling above already puts this in range on any target with
+            // a 32-bit-or-wider `usize`; the conversion stays so the function
+            // has no panicking path at all.
             let len =
                 usize::try_from(len).map_err(|_| ParseError("bulk length too large".into()))?;
             let payload_start = next;
@@ -256,6 +300,13 @@ fn parse_frame(buf: &[u8], pos: usize, depth: usize) -> Result<Option<(Frame, us
                     "array nesting exceeds the depth limit of {MAX_ARRAY_DEPTH}"
                 )));
             }
+            if count > MAX_ARRAY_LEN as i64 {
+                return Err(ParseError(format!(
+                    "array length {count} exceeds the limit of {MAX_ARRAY_LEN}"
+                )));
+            }
+            // In range by the ceiling above; kept for the same reason as the
+            // bulk conversion.
             let count =
                 usize::try_from(count).map_err(|_| ParseError("array length too large".into()))?;
             let mut frames = Vec::new();
@@ -446,6 +497,42 @@ mod tests {
         let mut buf = Vec::new();
         encode(&too_deep, &mut buf);
         assert!(parse(&buf).is_err());
+    }
+
+    #[test]
+    fn parse_enforces_the_length_ceilings_at_the_header() {
+        // Rejected the moment the length line is read — no payload byte is
+        // ever buffered, which is the whole point of the ceiling.
+        let over = MAX_BULK_LEN + 1;
+        assert!(parse(format!("${over}\r\n").as_bytes()).is_err());
+        // The boundary itself is still accepted, and still reports "need
+        // more bytes" rather than an error.
+        assert_eq!(parse(format!("${MAX_BULK_LEN}\r\n").as_bytes()), Ok(None));
+
+        let over = MAX_ARRAY_LEN + 1;
+        assert!(parse(format!("*{over}\r\n").as_bytes()).is_err());
+        assert_eq!(parse(format!("*{MAX_ARRAY_LEN}\r\n").as_bytes()), Ok(None));
+    }
+
+    #[test]
+    fn a_length_beyond_a_32_bit_usize_is_rejected_the_same_way_everywhere() {
+        // The regression this pins: these lengths convert to `usize` on a
+        // 64-bit target and fail to on a 32-bit one, so before the ceilings
+        // the same bytes were a terminal error on one target and an
+        // indefinite "wait for more" on the other. Both are errors now, on
+        // every target, and the assertion holds wherever the suite runs.
+        for header in [&b"$4294967296\r\n"[..], b"*4294967296\r\n"] {
+            assert!(parse(header).is_err(), "{header:?}");
+        }
+    }
+
+    #[test]
+    fn parse_error_displays_its_message() {
+        let err = parse(b"!5\r\n").unwrap_err();
+        assert_eq!(err.to_string(), err.0);
+        assert!(err.to_string().contains("unknown RESP2 type byte"));
+        // And it is a real `std::error::Error`, so a caller can box it.
+        let _boxed: Box<dyn std::error::Error> = Box::new(err);
     }
 
     #[test]
