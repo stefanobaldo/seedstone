@@ -67,7 +67,22 @@ const QUOTE_LIMIT: usize = 32;
 /// well-formed RESP is answered with an error frame and the connection
 /// closes: the byte stream is desynchronised at that point and nothing after
 /// it can be trusted.
-pub async fn serve_connection<S, R>(mut stream: S, router: R)
+pub async fn serve_connection<S, R>(stream: S, router: R)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    R: Router,
+{
+    serve_connection_limited(stream, router, MAX_REQUEST_BYTES).await
+}
+
+/// [`serve_connection`] with the accumulation ceiling as a parameter.
+///
+/// The ceiling exists so that it can be exercised. Reaching 64 MiB through a
+/// pipe costs tens of seconds of pure scanning — the quadratic re-parse this
+/// limit bounds — so a test that used the real constant would either be
+/// skipped or be the slowest thing in the suite, and this layer's stated
+/// primary defence would go on having no coverage at all.
+async fn serve_connection_limited<S, R>(mut stream: S, router: R, max_request_bytes: usize)
 where
     S: AsyncRead + AsyncWrite + Unpin,
     R: Router,
@@ -105,9 +120,9 @@ where
         }
         buf.drain(..consumed);
 
-        if buf.len() > MAX_REQUEST_BYTES {
+        if buf.len() > max_request_bytes {
             let frame = safe_error(&format!(
-                "ERR request exceeds the {MAX_REQUEST_BYTES}-byte limit"
+                "ERR request exceeds the {max_request_bytes}-byte limit"
             ));
             write_frame(&mut stream, &frame, &mut out).await;
             return;
@@ -535,12 +550,21 @@ mod tests {
     fn safe_error_truncates_on_a_character_boundary() {
         // A multi-byte character straddling the limit must not be cut in
         // half — `String::truncate` panics if it is.
-        let long = "é".repeat(400);
-        let Frame::Error(text) = safe_error(&long) else {
-            panic!("expected an error frame");
-        };
-        assert!(text.len() <= 512);
-        assert!(long.starts_with(&text));
+        //
+        // The width matters, and a two-byte character does not test this at
+        // all: 512 is even, so it is always a boundary in a run of them, and
+        // a bare `text.truncate(512)` with the boundary search deleted passes.
+        // "€" is three bytes and 512 is not a multiple of three, so the cut
+        // lands mid-character and only the search saves it. Both widths are
+        // asserted so the cheap case cannot be the only cover.
+        for filler in ["é", "€"] {
+            let long = filler.repeat(400);
+            let Frame::Error(text) = safe_error(&long) else {
+                panic!("expected an error frame");
+            };
+            assert!(text.len() <= 512, "{filler}: {} bytes", text.len());
+            assert!(long.starts_with(&text), "{filler}: not a prefix");
+        }
     }
 
     #[test]
@@ -568,6 +592,48 @@ mod tests {
         // rejected as oversized despite every frame in it being legal.
         let largest_command_on_the_wire = 2 * MAX_BULK_LEN + 1024;
         assert!(MAX_REQUEST_BYTES > largest_command_on_the_wire);
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_never_ends_is_cut_off_at_the_ceiling() {
+        // The assertion above relates two constants; it never runs the code
+        // that enforces either. This does: a peer opens a bulk string and
+        // keeps feeding bytes without ever terminating it — the slow memory
+        // leak with a connection attached that the module doc names — and the
+        // server must answer and close rather than buffer forever.
+        const CEILING: usize = 64 * 1024;
+
+        let pool = ShardPool::spawn(4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(8 * 1024);
+        let task = tokio::spawn(serve_connection_limited(server, pool, CEILING));
+        let (mut r, mut w) = tokio::io::split(client);
+
+        let writer = tokio::spawn(async move {
+            // A well-formed, never-satisfied length prefix: every byte after
+            // it is a legal continuation, so the codec can only ask for more.
+            w.write_all(b"$1000000000\r\n").await?;
+            loop {
+                w.write_all(&[b'x'; 4096]).await?;
+            }
+            #[allow(unreachable_code)]
+            std::io::Result::Ok(())
+        });
+
+        let frames = read_frames(&mut r, 1).await;
+        let Frame::Error(text) = &frames[0] else {
+            panic!("expected an error frame, got {:?}", frames[0]);
+        };
+        assert!(text.contains("exceeds"), "unexpected refusal: {text}");
+
+        // The server closes rather than carrying on, and the writer stops
+        // because the pipe it is filling went away.
+        assert_eq!(
+            r.read(&mut [0u8; 64]).await.unwrap(),
+            0,
+            "stream stayed open"
+        );
+        writer.abort();
+        task.await.expect("the connection task must end cleanly");
     }
 
     // --- helpers ---
