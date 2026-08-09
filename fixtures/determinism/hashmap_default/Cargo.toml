@@ -1,0 +1,6 @@
+[workspace]
+
+[package]
+name = "fixture-hashmap-default"
+version = "0.0.0"
+edition = "2024"

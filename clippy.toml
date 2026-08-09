@@ -27,4 +27,8 @@ disallowed-types = [
   # Also covers the `rand::rngs::OsRng` re-export: both spellings resolve to
   # the same item.
   { path = "rand_core::OsRng", reason = "non-deterministic: use a seeded RNG" },
+  # Iteration order. The default hasher is seeded from the operating system, so
+  # two runs of the same program walk the same collection in different orders.
+  { path = "std::collections::HashMap", reason = "non-deterministic iteration order: use the keyspace dict or an explicitly seeded hasher" },
+  { path = "std::collections::HashSet", reason = "non-deterministic iteration order: use an explicitly seeded hasher" },
 ]

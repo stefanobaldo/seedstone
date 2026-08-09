@@ -21,6 +21,8 @@ const FIXTURES: &[&str] = &[
     "getrandom_u64",
     "thread_rng_type",
     "os_rng_type",
+    "hashmap_default",
+    "hashset_default",
 ];
 
 fn repo_root() -> PathBuf {
