@@ -256,6 +256,23 @@ async fn run_shard<T: TraceSink>(
 
     loop {
         tokio::select! {
+            // `biased` removes the runtime's RNG from this loop. Without it
+            // `select!` picks among ready arms at random, seeded from OS
+            // entropy — turmoil does seed tokio's runtime RNG, but only under
+            // `--cfg tokio_unstable`, which this workspace does not set. That
+            // is unseeded entropy inside the one crate whose whole premise is
+            // that a seed reproduces a run, and `clippy.toml`'s entropy
+            // prohibitions cannot see it: they match paths, not macro
+            // internals.
+            //
+            // It is unobservable today — the losing arm only advances a
+            // rehash, which reaches no reply and no trace field — and stops
+            // being unobservable the moment anything rehash-sensitive becomes
+            // visible, which a `SCAN` command would do. Draining the inbox
+            // first is also the right priority on its own merits: work the
+            // shard was asked for outranks housekeeping.
+            biased;
+
             envelope = inbox.recv() => {
                 let Some(Envelope { cmd, reply }) = envelope else {
                     break;
