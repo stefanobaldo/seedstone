@@ -620,7 +620,11 @@ mod tests {
             loop {
                 w.write_all(&[b'x'; 4096]).await?;
             }
-            #[allow(unreachable_code)]
+            #[allow(
+                unreachable_code,
+                reason = "the loop above only ends by returning its write error; \
+                          this line exists to give the block a Result type"
+            )]
             std::io::Result::Ok(())
         });
 

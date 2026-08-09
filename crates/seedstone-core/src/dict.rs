@@ -362,7 +362,8 @@ fn hash_key(seed: DictSeed, key: &[u8]) -> u64 {
 /// buys, and which also makes the old index the low bits of the new one when
 /// the table doubles.
 fn bucket_index(hash: u64, buckets: usize) -> usize {
-    let masked = hash & (buckets as u64 - 1);
+    let mask = u64::try_from(buckets).expect("a bucket count is a usize") - 1;
+    let masked = hash & mask;
     usize::try_from(masked).expect("a masked hash is below the bucket count, which is a usize")
 }
 
@@ -370,7 +371,7 @@ fn bucket_index(hash: u64, buckets: usize) -> usize {
 /// of low bits because the length is a power of two.
 fn mask_of(table: &Table) -> u64 {
     debug_assert!(!table.is_empty(), "mask_of: a table is never empty");
-    table.len() as u64 - 1
+    u64::try_from(table.len()).expect("a table length is a usize") - 1
 }
 
 /// Hands every entry of the bucket `cursor` selects in `table` to `visit`.
@@ -423,8 +424,8 @@ mod tests {
     /// Inserts ascending numeric keys until a rehash is in flight, and returns
     /// how many were inserted. Panics rather than looping forever if growth
     /// never triggers.
-    fn fill_until_rehashing(d: &mut Dict) -> u32 {
-        let mut count = 0u32;
+    fn fill_until_rehashing(d: &mut Dict) -> usize {
+        let mut count = 0usize;
         while !d.is_rehashing() {
             d.insert(
                 count.to_string().into_bytes(),
@@ -558,7 +559,7 @@ mod tests {
                 "key {i} went missing mid-rehash"
             );
         }
-        assert_eq!(d.len(), inserted as usize);
+        assert_eq!(d.len(), inserted);
         assert!(d.is_rehashing(), "a lookup must not advance the rehash");
     }
 
@@ -570,13 +571,13 @@ mod tests {
         // Key 0 predates the growth, so it can only be in the old table.
         assert_eq!(d.remove(b"0"), Some(b"0".to_vec()));
         assert_eq!(d.get(b"0"), None);
-        assert_eq!(d.len(), inserted as usize - 1);
+        assert_eq!(d.len(), inserted - 1);
 
         // And it stays gone once the rehash completes: the migration must not
         // resurrect it from a bucket it was never removed from.
         drain_rehash(&mut d);
         assert_eq!(d.get(b"0"), None);
-        assert_eq!(d.len(), inserted as usize - 1);
+        assert_eq!(d.len(), inserted - 1);
     }
 
     #[test]
@@ -587,11 +588,11 @@ mod tests {
         // Key 0 lives in the old table; the overwrite must update it in place
         // rather than leave a second copy in the new one.
         d.insert(b"0".to_vec(), b"overwritten".to_vec());
-        assert_eq!(d.len(), inserted as usize);
+        assert_eq!(d.len(), inserted);
         assert_eq!(d.get(b"0"), Some(&b"overwritten"[..]));
 
         drain_rehash(&mut d);
-        assert_eq!(d.len(), inserted as usize);
+        assert_eq!(d.len(), inserted);
         assert_eq!(d.get(b"0"), Some(&b"overwritten"[..]));
         // A duplicate would survive the first removal and still answer reads.
         assert_eq!(d.remove(b"0"), Some(b"overwritten".to_vec()));
@@ -609,7 +610,7 @@ mod tests {
             "the rehash was already over before it was driven"
         );
         assert!(!d.is_rehashing());
-        assert_eq!(d.len(), inserted as usize);
+        assert_eq!(d.len(), inserted);
         for i in 0..inserted {
             assert_eq!(
                 d.get(i.to_string().as_bytes()),
@@ -621,7 +622,7 @@ mod tests {
         // Stepping a dict that is not rehashing is a no-op, not a panic.
         d.rehash_step(64);
         assert!(!d.is_rehashing());
-        assert_eq!(d.len(), inserted as usize);
+        assert_eq!(d.len(), inserted);
     }
 
     /// Drives a rehash to completion one bucket at a time, returning how many
@@ -643,7 +644,7 @@ mod tests {
 
         d.rehash_step(usize::MAX);
         assert!(!d.is_rehashing());
-        assert_eq!(d.len(), inserted as usize);
+        assert_eq!(d.len(), inserted);
         for i in 0..inserted {
             assert_eq!(
                 d.get(i.to_string().as_bytes()),
@@ -814,7 +815,7 @@ mod tests {
         // buckets are empty, so a cursor that skipped or repeated a bucket
         // could still deliver every key. Read the buckets directly.
         let buckets = d.old.len();
-        let mask = buckets as u64 - 1;
+        let mask = u64::try_from(buckets).expect("a bucket count is a usize") - 1;
         let mut visited = Vec::new();
         let mut c = 0;
         loop {

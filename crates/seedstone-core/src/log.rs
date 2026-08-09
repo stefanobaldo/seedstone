@@ -187,14 +187,17 @@ fn crc32_iso_hdlc(data: &[u8]) -> u32 {
 ///
 /// The body — the ten fixed bytes plus the payload — must not exceed 64 MiB.
 ///
-/// **This is an obligation on the caller, and today nothing discharges it.**
-/// The precondition is reachable from untrusted input: the RESP codec bounds a
-/// bulk string only against negative lengths and buffer-offset overflow, with
-/// no `proto-max-bulk-len`-style ceiling anywhere, so a 100 MiB `SET` value
-/// parses cleanly and arrives here as an ordinary payload. Whoever builds the
-/// command layer between the codec and the shard must reject oversized values
-/// *before* this function sees them. Unlike `slot.rs`'s `shards > 0`, no
-/// argument that this is unreachable holds.
+/// Two things discharge that obligation today, neither of them here. The RESP
+/// codec caps a single payload at [`seedstone_resp::MAX_BULK_LEN`] (16 MiB),
+/// and the command layer's arity table caps a command at two payloads — so the
+/// largest record any accepted command can produce is about 32 MiB plus
+/// framing, comfortably under the 64 MiB ceiling.
+///
+/// **The second half of that is an assumption, not an enforcement.** It lives
+/// in the arity table, and a command carrying a third payload breaks the
+/// arithmetic without touching this file. [`seedstone_resp::MAX_BULK_LEN`]'s
+/// own documentation states the same assumption from the other side; whoever
+/// adds such a command owns re-deriving both.
 ///
 /// The `debug_assert!` below is a development tripwire, not that rejection: it
 /// turns a violation into a panic in debug, test and simulator builds. In
@@ -279,7 +282,13 @@ pub fn decode_record(buf: &[u8]) -> Decoded<'_> {
     // Plausibility before arrival: a length outside this range describes no
     // record any longer buffer could complete, so it is damage and not a
     // short read.
-    let body_len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    let declared = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
+    // On a target whose `usize` is narrower than the length field, a length
+    // this platform cannot even address is damage like any other — never a
+    // panic, because these four bytes are untrusted input.
+    let Ok(body_len) = usize::try_from(declared) else {
+        return Decoded::Corrupt { skip: 1 };
+    };
     if !(BODY_FIXED_LEN..=MAX_BODY_LEN).contains(&body_len) {
         return Decoded::Corrupt { skip: 1 };
     }
@@ -410,7 +419,9 @@ mod tests {
 
     #[test]
     fn records_round_trip() {
-        let long_payload: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let long_payload: Vec<u8> = (0..300u32)
+            .map(|i| u8::try_from(i % 251).expect("a remainder mod 251 fits a u8"))
+            .collect();
         let cases: &[Record<'_>] = &[
             Record {
                 shard: 0,
