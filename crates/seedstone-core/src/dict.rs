@@ -73,8 +73,9 @@ pub struct Dict {
 
 impl Dict {
     /// Creates an empty dict whose hashing is fixed by `seed`.
-    pub fn with_seed(seed: DictSeed) -> Dict {
-        Dict {
+    #[must_use]
+    pub fn with_seed(seed: DictSeed) -> Self {
+        Self {
             seed,
             old: empty_table(INITIAL_BUCKETS),
             new: None,
@@ -88,6 +89,7 @@ impl Dict {
     /// While a rehash is in flight the key may live in either table, so both
     /// are probed. A lookup never advances the rehash: reads are on the hot
     /// path and must not pay for a migration.
+    #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
         let hash = hash_key(self.seed, key);
         if let Some((_, value)) = find(&self.old, hash, key) {
@@ -159,17 +161,20 @@ impl Dict {
     }
 
     /// Number of entries, counting both tables while a rehash is in flight.
-    pub fn len(&self) -> usize {
+    #[must_use]
+    pub const fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the dict holds no entries.
-    pub fn is_empty(&self) -> bool {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Whether a rehash is in flight, i.e. the dict currently holds two tables.
-    pub fn is_rehashing(&self) -> bool {
+    #[must_use]
+    pub const fn is_rehashing(&self) -> bool {
         self.new.is_some()
     }
 
@@ -202,11 +207,13 @@ impl Dict {
         }
         self.rehash_index = end;
 
-        if self.rehash_index == self.old.len() {
-            self.old = self
-                .new
-                .take()
-                .expect("a rehash is in flight, so the new table exists");
+        // Taking `new` rather than unwrapping it is what keeps this path
+        // free of a panic the borrow checker would otherwise force: the
+        // table is known to be there, and `take` says so without asserting it.
+        if self.rehash_index == self.old.len()
+            && let Some(migrated) = self.new.take()
+        {
+            self.old = migrated;
             self.rehash_index = 0;
         }
     }
@@ -380,7 +387,7 @@ fn visit_bucket<F: FnMut(&[u8], &[u8])>(table: &Table, cursor: u64, visit: &mut 
 /// See [`Dict::scan`] for why the bits outside the mask are set first: the
 /// increment has to carry off the top of the reversed word so that a completed
 /// cycle lands back on exactly `0`.
-fn reverse_increment(cursor: u64, mask: u64) -> u64 {
+const fn reverse_increment(cursor: u64, mask: u64) -> u64 {
     let widened = cursor | !mask;
     widened.reverse_bits().wrapping_add(1).reverse_bits()
 }

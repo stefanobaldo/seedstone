@@ -264,6 +264,7 @@ pub fn encode_record(rec: &Record<'_>, out: &mut Vec<u8>) {
 /// can never make sense, which is exactly the wedge this format exists to
 /// avoid — so both are [`Decoded::Corrupt`], and the length is validated
 /// before the body's arrival is even considered.
+#[must_use]
 pub fn decode_record(buf: &[u8]) -> Decoded<'_> {
     match buf.first() {
         None => return Decoded::NeedMore,
@@ -325,9 +326,20 @@ pub trait ReplicationLog: Send + 'static {
     /// Durability is [`sync`](ReplicationLog::sync)'s job, and the two are
     /// separate because syncing every append is what makes torn writes
     /// unobservable — precisely the fault this format is built to survive.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying store reports. The mutation the record
+    /// describes must not proceed: a change applied without its record is the
+    /// one divergence recovery cannot detect.
     fn append(&mut self, rec: Record<'_>) -> std::io::Result<()>;
 
     /// Makes everything appended so far durable.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying store reports. Nothing appended since the last
+    /// successful sync may be assumed durable afterwards.
     fn sync(&mut self) -> std::io::Result<()>;
 }
 

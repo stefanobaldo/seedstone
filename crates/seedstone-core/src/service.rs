@@ -72,7 +72,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     R: Router,
 {
-    serve_connection_limited(stream, router, MAX_REQUEST_BYTES).await
+    serve_connection_limited(stream, router, MAX_REQUEST_BYTES).await;
 }
 
 /// [`serve_connection`] with the accumulation ceiling as a parameter.
@@ -199,13 +199,19 @@ fn protocol_error(error: &ParseError) -> String {
 /// readable and short rather than turning a binary blob into a wall of
 /// replacement characters.
 fn quote(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
     let mut rendered = String::new();
     for &byte in bytes.iter().take(QUOTE_LIMIT) {
         match byte {
             b'\\' => rendered.push_str("\\\\"),
             b'\'' => rendered.push_str("\\'"),
             0x20..=0x7e => rendered.push(byte as char),
-            other => rendered.push_str(&format!("\\x{other:02x}")),
+            // Written into the buffer rather than through a `format!` that
+            // allocates a two-character `String` per unprintable byte.
+            other => {
+                let _ = write!(rendered, "\\x{other:02x}");
+            }
         }
     }
     if bytes.len() > QUOTE_LIMIT {
@@ -255,13 +261,12 @@ fn frame_to_command(frame: Frame) -> Result<Command, String> {
             _ => Err(wrong_arity("del")),
         },
         b"INCRBY" => match args {
-            [key, delta] => match parse_i64(delta) {
-                Some(delta) => Ok(Command::IncrBy {
+            [key, delta] => parse_i64(delta)
+                .map(|delta| Command::IncrBy {
                     key: key.clone(),
                     delta,
-                }),
-                None => Err(NOT_AN_INTEGER.into()),
-            },
+                })
+                .ok_or_else(|| NOT_AN_INTEGER.to_owned()),
             _ => Err(wrong_arity("incrby")),
         },
         // The name is peer-supplied. It is quoted, not echoed.
