@@ -71,7 +71,7 @@ const SERVER: &str = "server";
 /// every client has finished, so a generous ceiling costs nothing. Overrunning
 /// it means a client is blocked forever, which is a finding rather than a
 /// tuning problem.
-const SIM_DURATION: Duration = Duration::from_secs(600);
+const SIM_DURATION: Duration = Duration::from_mins(10);
 
 /// How often the verifier client re-checks whether the workload has finished.
 const VERIFIER_POLL: Duration = Duration::from_millis(10);
@@ -129,8 +129,9 @@ pub struct SimConfig {
 impl SimConfig {
     /// The sweep configuration: the shape the DST spike proved
     /// schedule-sensitive.
-    pub fn standard(workload_seed: u64, sim_seed: u64) -> Self {
-        SimConfig {
+    #[must_use]
+    pub const fn standard(workload_seed: u64, sim_seed: u64) -> Self {
+        Self {
             shards: 1024,
             clients: 128,
             string_keys: 4096,
@@ -144,8 +145,9 @@ impl SimConfig {
 
     /// A smaller shape for tests: few enough client hosts to run in a unit
     /// test, enough operations per client to keep the counters contended.
-    pub fn mini(workload_seed: u64, sim_seed: u64) -> Self {
-        SimConfig {
+    #[must_use]
+    pub const fn mini(workload_seed: u64, sim_seed: u64) -> Self {
+        Self {
             shards: 1024,
             clients: 16,
             string_keys: 512,
@@ -176,7 +178,8 @@ impl SimOutcome {
     ///
     /// `INCRBY` is order-independent, so a schedule cannot legitimately move
     /// this: any difference is an acknowledged increment that did not survive.
-    pub fn invariant_holds(&self) -> bool {
+    #[must_use]
+    pub const fn invariant_holds(&self) -> bool {
         self.expected_sum == self.actual_sum
     }
 }
@@ -187,7 +190,8 @@ impl SimOutcome {
 /// output is explicitly not guaranteed stable across processes or Rust
 /// versions — defined entirely by this function. Cross-process stability is
 /// the product here, so the mixing function has to be ours.
-pub fn mix(h: u64, v: u64) -> u64 {
+#[must_use]
+pub const fn mix(h: u64, v: u64) -> u64 {
     (h.rotate_left(5) ^ v).wrapping_mul(TRACE_MULTIPLIER)
 }
 
@@ -199,6 +203,7 @@ pub fn mix(h: u64, v: u64) -> u64 {
 /// [`SIM_DURATION`] elapsing with a client still running. Both are harness
 /// bugs or deadlocks rather than findings about the system, and neither is
 /// something a sweep can carry on past.
+#[must_use]
 pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
     let mut sim = turmoil::Builder::new()
         .simulation_duration(SIM_DURATION)
@@ -515,8 +520,8 @@ struct Conn {
 
 impl Conn {
     /// Opens a connection to the simulated server.
-    async fn connect() -> turmoil::Result<Conn> {
-        Ok(Conn {
+    async fn connect() -> turmoil::Result<Self> {
+        Ok(Self {
             stream: turmoil::net::TcpStream::connect((SERVER, PORT)).await?,
             buf: Vec::new(),
             out: Vec::new(),

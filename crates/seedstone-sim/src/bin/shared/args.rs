@@ -41,8 +41,8 @@ impl Args {
     /// unparseable — an unknown flag is an error rather than something to
     /// ignore, since silently running a different configuration than the one
     /// asked for is exactly the failure this harness exists to rule out.
-    pub fn from_env() -> Result<Args, String> {
-        let mut args = Args {
+    pub fn from_env() -> Result<Self, String> {
+        let mut parsed = Self {
             sim_seed: None,
             seeds: None,
             workload_seed: DEFAULT_WORKLOAD_SEED,
@@ -53,20 +53,20 @@ impl Args {
         let mut argv = std::env::args().skip(1);
         while let Some(arg) = argv.next() {
             match arg.as_str() {
-                "--sim-seed" => args.sim_seed = Some(number(&arg, argv.next())?),
-                "--seeds" => args.seeds = Some(number(&arg, argv.next())?),
-                "--workload-seed" => args.workload_seed = number(&arg, argv.next())?,
-                "--mini" => args.mini = true,
-                "--plant" => args.plant = true,
+                "--sim-seed" => parsed.sim_seed = Some(number(&arg, argv.next())?),
+                "--seeds" => parsed.seeds = Some(number(&arg, argv.next())?),
+                "--workload-seed" => parsed.workload_seed = number(&arg, argv.next())?,
+                "--mini" => parsed.mini = true,
+                "--plant" => parsed.plant = true,
                 other => return Err(format!("unknown argument `{other}`")),
             }
         }
 
-        Ok(args)
+        Ok(parsed)
     }
 
     /// The configuration these arguments describe, at `sim_seed`.
-    pub fn config(&self, sim_seed: u64) -> SimConfig {
+    pub const fn config(&self, sim_seed: u64) -> SimConfig {
         let mut cfg = if self.mini {
             SimConfig::mini(self.workload_seed, sim_seed)
         } else {
