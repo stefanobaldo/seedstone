@@ -70,7 +70,7 @@ fn main() -> ExitCode {
 
 /// How the swept configuration is named in the summary, so a pasted line says
 /// which shape produced it.
-fn shape(args: &args::Args) -> &'static str {
+const fn shape(args: &args::Args) -> &'static str {
     if args.mini { "mini" } else { "standard" }
 }
 
