@@ -23,7 +23,7 @@
 //!   against that is a debug assertion, which is not there in release. This is
 //!   the enforcement point that is.
 
-use crate::shard::{Command, NOT_AN_INTEGER, Reply, Router, parse_i64};
+use crate::shard::{Command, Reply, ReplyError, Router, parse_i64};
 use seedstone_resp::{Frame, ParseError, encode, parse};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -157,9 +157,13 @@ fn reply_to_frame(reply: Reply) -> Frame {
         Reply::Bulk(Some(value)) => Frame::Bulk(value),
         Reply::Removed(removed) => Frame::Integer(i64::from(removed)),
         Reply::Integer(n) => Frame::Integer(n),
-        // A router's error text is server-authored, but this layer does not
-        // get to assume that about every router that will ever exist.
-        Reply::Error(message) => safe_error(&message),
+        // No `safe_error` here, and that is not an omission. A shard error is
+        // a [`ReplyError`] variant, so its text is a literal in `shard.rs`
+        // rather than anything a router composed — the type is what rules out
+        // a terminator, and `every_shard_error_is_frame_safe` checks the whole
+        // set. `safe_error` still guards the paths below, where the text is
+        // built from bytes a peer chose.
+        Reply::Error(error) => Frame::Error(error.wire_text().to_owned()),
     }
 }
 
@@ -266,7 +270,7 @@ fn frame_to_command(frame: Frame) -> Result<Command, String> {
                     key: key.clone(),
                     delta,
                 })
-                .ok_or_else(|| NOT_AN_INTEGER.to_owned()),
+                .ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned()),
             _ => Err(wrong_arity("incrby")),
         },
         // The name is peer-supplied. It is quoted, not echoed.
@@ -425,50 +429,52 @@ mod tests {
         );
     }
 
-    /// The same attack from the other side, where `safe_error` is the only
-    /// defence.
+    /// The same attack from the other side, made impossible rather than
+    /// caught.
     ///
-    /// Nothing sanitises a `Reply::Error` on its way out of a router — no
-    /// `quote` runs on this path — so if `serve_connection` passed the text
-    /// straight into `Frame::Error`, the router would be dictating frames.
-    /// Delete `safe_error` from `reply_to_frame` and this test fails; that is
-    /// what makes it worth having.
-    #[tokio::test]
-    async fn a_router_error_cannot_inject_frames_either() {
-        #[derive(Clone)]
-        struct SplittingRouter;
-
-        impl Router for SplittingRouter {
-            async fn dispatch(&self, _cmd: Command) -> Reply {
-                Reply::Error("ERR boom\r\n+INJECTED".into())
+    /// This used to be a `SplittingRouter` returning
+    /// `Reply::Error("ERR boom\r\n+INJECTED")`, proving that `safe_error`
+    /// neutralised it on the way out. That router can no longer be written:
+    /// [`ReplyError`] is a closed set of variants whose texts are literals in
+    /// `shard.rs`, so the defence moved from a runtime scrub to the type.
+    ///
+    /// What replaces it is stronger than what it replaces. The old test proved
+    /// one composed string was neutralised; this one holds every failure a
+    /// shard can report to the property the frame format actually needs, and a
+    /// new variant cannot be added without the match below forcing it into the
+    /// list.
+    #[test]
+    fn every_shard_error_is_frame_safe() {
+        let every = [
+            ReplyError::NotAnInteger,
+            ReplyError::WouldOverflow,
+            ReplyError::ShardUnavailable,
+            ReplyError::LogWriteFailed,
+        ];
+        for error in every {
+            // Exhaustiveness: adding a variant makes this match non-exhaustive
+            // and the crate stops compiling until it is named — and whoever
+            // names it here sees the array above.
+            match error {
+                ReplyError::NotAnInteger
+                | ReplyError::WouldOverflow
+                | ReplyError::ShardUnavailable
+                | ReplyError::LogWriteFailed => {}
             }
-        }
 
-        let (client, server) = tokio::io::duplex(4096);
-        tokio::spawn(serve_connection(server, SplittingRouter));
-        let (mut r, mut w) = tokio::io::split(client);
-
-        let mut out = Vec::new();
-        encode(&req(&["GET", "a"]), &mut out);
-        encode(&req(&["GET", "b"]), &mut out);
-        w.write_all(&out).await.unwrap();
-        w.flush().await.unwrap();
-
-        // Two commands, so two frames. Were the reply split, the second frame
-        // read here would be the injected `+INJECTED` rather than the reply
-        // to the second command.
-        let frames = read_frames(&mut r, 2).await;
-        for frame in &frames {
-            let Frame::Error(text) = frame else {
-                panic!("expected an error frame, got {frame:?}");
-            };
+            let text = error.wire_text();
             assert!(
-                !text.contains('\r') && !text.contains('\n'),
-                "error text still carries a terminator: {text:?}"
+                !text.contains(['\r', '\n']),
+                "{error:?} carries a frame terminator: {text:?}"
             );
+            assert!(!text.is_empty(), "{error:?} has no text");
+            // Redis error replies open with an uppercase code; clients match
+            // on it, and a lowercase or missing one is a protocol smell.
             assert!(
-                text.contains("INJECTED"),
-                "the terminator is neutralised, not the message dropped: {text:?}"
+                text.split(' ').next().is_some_and(|code| {
+                    !code.is_empty() && code.chars().all(|c| c.is_ascii_uppercase())
+                }),
+                "{error:?} does not open with an error code: {text:?}"
             );
         }
     }

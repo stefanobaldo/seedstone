@@ -46,32 +46,50 @@ const REHASH_TICK: Duration = Duration::from_millis(100);
 /// no-await rule actually constrains.
 const REHASH_BUCKETS_PER_TICK: usize = 1024;
 
-/// Reply text for a numeric operation on a value that is not an integer.
+/// Every way a shard can refuse a command.
 ///
-/// Byte-for-byte the message Redis returns, so existing clients that match on
-/// it keep working.
+/// A closed set, and that is the point. The wire text used to be a `String`
+/// carried inside the reply, with two of the constants `pub` so the
+/// simulator's planted router could answer exactly what the honest one
+/// answers — a shared constant discourages drift but does not prevent it,
+/// since any caller could still build a different string. Naming the failure
+/// instead of spelling it makes the planted router agree by construction.
 ///
-/// Public because it is a wire-visible contract, not an implementation
-/// detail: the simulator's planted router has to answer exactly what the
-/// honest one answers, or a planted trace differs for a reason other than the
-/// race it exists to plant. It kept a private copy of this string, and
-/// nothing linked the two.
-pub const NOT_AN_INTEGER: &str = "ERR value is not an integer or out of range";
+/// It also puts the frame-safety guarantee in the type: every text below is a
+/// literal in this file with no `\r` and no `\n`, so a shard error can never
+/// split a response frame. `every_shard_error_is_frame_safe` checks it over
+/// the whole set rather than over one example.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyError {
+    /// A numeric operation on a value that is not an integer.
+    NotAnInteger,
+    /// An `IncrBy` whose result would leave `i64`.
+    WouldOverflow,
+    /// The command's shard task is gone.
+    ///
+    /// Unreachable while a [`ShardPool`] is alive — it holds every sender, and
+    /// a shard task only stops when its inbox closes. It exists so the
+    /// dispatch path has no `unwrap`.
+    ShardUnavailable,
+    /// A mutation whose log record could not be written.
+    LogWriteFailed,
+}
 
-/// Reply text for an `IncrBy` whose result would leave `i64`.
-///
-/// Public for the same reason as [`NOT_AN_INTEGER`].
-pub const WOULD_OVERFLOW: &str = "ERR increment or decrement would overflow";
-
-/// Reply text for a command whose shard task is gone.
-///
-/// Unreachable while a [`ShardPool`] is alive — it holds every sender, and a
-/// shard task only stops when its inbox closes. It exists so the dispatch
-/// path has no `unwrap`.
-const SHARD_UNAVAILABLE: &str = "ERR shard is unavailable";
-
-/// Reply text for a mutation whose log record could not be written.
-const LOG_WRITE_FAILED: &str = "ERR replication log write failed";
+impl ReplyError {
+    /// The text this failure takes on the wire.
+    ///
+    /// Byte-for-byte what Redis returns where Redis has an equivalent, so
+    /// existing clients that match on the string keep working.
+    #[must_use]
+    pub const fn wire_text(self) -> &'static str {
+        match self {
+            Self::NotAnInteger => "ERR value is not an integer or out of range",
+            Self::WouldOverflow => "ERR increment or decrement would overflow",
+            Self::ShardUnavailable => "ERR shard is unavailable",
+            Self::LogWriteFailed => "ERR replication log write failed",
+        }
+    }
+}
 
 /// A command addressed to the shard that owns its key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,9 +163,9 @@ pub enum Reply {
     Removed(bool),
     /// An integer result.
     Integer(i64),
-    /// The command failed. The text is server-authored and contains no `\r`
-    /// or `\n`, so it is safe in a RESP error frame.
-    Error(String),
+    /// The command failed. See [`ReplyError`] — a closed set of
+    /// server-authored failures, none of whose texts can split a frame.
+    Error(ReplyError),
 }
 
 /// One unit of work for a shard: a command and where its reply goes.
@@ -274,10 +292,12 @@ impl Router for ShardPool {
             .is_ok();
         async move {
             if !sent {
-                return Reply::Error(SHARD_UNAVAILABLE.into());
+                return Reply::Error(ReplyError::ShardUnavailable);
             }
+            // `unwrap_or` rather than `unwrap_or_else`: building this reply no
+            // longer allocates, so there is nothing to defer.
             rx.await
-                .unwrap_or_else(|_| Reply::Error(SHARD_UNAVAILABLE.into()))
+                .unwrap_or(Reply::Error(ReplyError::ShardUnavailable))
         }
     }
 }
@@ -385,11 +405,11 @@ fn apply<L: ReplicationLog>(
                 None => 0,
                 Some(bytes) => match parse_i64(bytes) {
                     Some(n) => n,
-                    None => return Reply::Error(NOT_AN_INTEGER.into()),
+                    None => return Reply::Error(ReplyError::NotAnInteger),
                 },
             };
             let Some(next) = current.checked_add(*delta) else {
-                return Reply::Error(WOULD_OVERFLOW.into());
+                return Reply::Error(ReplyError::WouldOverflow);
             };
             if let Err(failed) = append(log, seq, shard) {
                 return failed;
@@ -416,7 +436,7 @@ fn append<L: ReplicationLog>(log: &mut L, seq: &mut u64, shard: u16) -> Result<(
             *seq += 1;
             Ok(())
         }
-        Err(_) => Err(Reply::Error(LOG_WRITE_FAILED.into())),
+        Err(_) => Err(Reply::Error(ReplyError::LogWriteFailed)),
     }
 }
 
@@ -489,7 +509,7 @@ mod tests {
                 delta: 1
             })
             .await,
-            Reply::Error("ERR value is not an integer or out of range".into())
+            Reply::Error(ReplyError::NotAnInteger)
         );
         assert_eq!(
             pool.dispatch(Command::Del { key: b"k".to_vec() }).await,
@@ -669,7 +689,7 @@ mod tests {
                 delta: 1
             })
             .await,
-            Reply::Error(WOULD_OVERFLOW.into())
+            Reply::Error(ReplyError::WouldOverflow)
         );
         // The value is untouched.
         assert_eq!(

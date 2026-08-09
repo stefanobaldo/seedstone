@@ -49,9 +49,7 @@ use seedstone_core::service::serve_connection;
 // indistinguishable from the honest one except in its atomicity, and these
 // strings enter the trace hash — a private copy that drifted would make a
 // planted trace differ for a reason unrelated to the race.
-use seedstone_core::shard::{
-    Command, NOT_AN_INTEGER, Reply, Router, ShardPool, TraceSink, WOULD_OVERFLOW, parse_i64,
-};
+use seedstone_core::shard::{Command, Reply, ReplyError, Router, ShardPool, TraceSink, parse_i64};
 use seedstone_resp::{Frame, encode, parse};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -326,7 +324,10 @@ fn fold_reply(h: u64, reply: &Reply) -> u64 {
         Reply::Ok => mix(h, 3),
         Reply::Removed(removed) => mix(mix(h, 4), u64::from(*removed)),
         Reply::Integer(n) => mix(mix(h, 5), n.cast_unsigned()),
-        Reply::Error(message) => fold_bytes(mix(h, 6), message.as_bytes()),
+        // Folds the wire text, not the variant tag: the recorded hashes
+        // predate the enum and must not move for a change that renamed
+        // nothing a client can see.
+        Reply::Error(error) => fold_bytes(mix(h, 6), error.wire_text().as_bytes()),
     }
 }
 
@@ -360,14 +361,14 @@ impl Router for PlantedRouter {
         let current = match self.0.dispatch(Command::Get { key: key.clone() }).await {
             Reply::Bulk(Some(value)) => match parse_i64(&value) {
                 Some(current) => current,
-                None => return Reply::Error(NOT_AN_INTEGER.into()),
+                None => return Reply::Error(ReplyError::NotAnInteger),
             },
             Reply::Bulk(None) => 0,
             // A shard that could not answer; pass its complaint on unchanged.
             other => return other,
         };
         let Some(updated) = current.checked_add(delta) else {
-            return Reply::Error(WOULD_OVERFLOW.into());
+            return Reply::Error(ReplyError::WouldOverflow);
         };
 
         // The window, widened deliberately. `current` was read at one moment
