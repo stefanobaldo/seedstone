@@ -14,4 +14,9 @@ jobs:
       - run: cargo build --workspace --locked
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `--workspace` unifies Cargo features across every crate in the build, so
+      # the features the simulator turns on leak into the production crates and
+      # hide what they would actually fail to compile on their own.
+      - name: production crates compile without simulator features
+        run: cargo clippy -p seedstone -p seedstone-core -p seedstone-resp --all-targets -- -D warnings
       - run: cargo test --workspace
