@@ -32,7 +32,14 @@ jobs:
       # a CI that can be made to lie is an attack on this project's central
       # claim, not just on its infrastructure. Dependabot maintains the pins;
       # without it they would simply rot.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      #
+      # Every action here runs on Node 24. Node 20 is deprecated on the
+      # runners, and an action still declaring it is force-run on 24 anyway —
+      # so the choice is between a version tested on the runtime it gets and
+      # one that is not. `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION` would only
+      # silence that by pinning to the deprecated runtime, which is the
+      # opposite of a fix.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --workspace --locked
       - run: cargo fmt --all --check
@@ -71,7 +78,7 @@ jobs:
       # counts as code unless *every* pattern excludes it, so anything nobody
       # anticipated still runs the sweep.
       - name: detect sweep-relevant changes
-        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: relevant
         if: github.event_name == 'pull_request'
         with:
