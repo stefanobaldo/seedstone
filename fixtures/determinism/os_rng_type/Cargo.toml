@@ -1,0 +1,9 @@
+[workspace]
+
+[package]
+name = "fixture-os-rng-type"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+rand_core = { version = "0.9", features = ["os_rng"] }

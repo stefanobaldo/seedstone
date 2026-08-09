@@ -1,0 +1,9 @@
+[workspace]
+
+[package]
+name = "fixture-getrandom-u64"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+getrandom = "0.3"

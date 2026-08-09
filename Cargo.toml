@@ -12,6 +12,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [] }
 
 [workspace.lints.clippy]
 disallowed_methods = "deny"
+disallowed_types = "deny"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "io-util"] }
