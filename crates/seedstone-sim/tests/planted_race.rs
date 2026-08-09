@@ -16,22 +16,23 @@ fn planted_race_is_caught_and_replays_across_processes() {
     for sim_seed in 1..=SEEDS {
         let mut cfg = SimConfig::mini(1, sim_seed);
         cfg.planted = true;
-        if !run_sim(&cfg).invariant_holds() {
-            failing = Some(sim_seed);
+        let outcome = run_sim(&cfg);
+        if !outcome.invariant_holds() {
+            failing = Some((sim_seed, outcome));
             break;
         }
     }
-    let seed = failing
+    let (seed, outcome) = failing
         .expect("no seed in 1..=64 surfaced the planted race — widen the sweep or the window");
 
-    let run = |_: u32| {
+    let run = || {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_replay"))
             .args(["--sim-seed", &seed.to_string(), "--mini", "--plant"])
             .output()
             .expect("replay spawn");
         String::from_utf8(out.stdout).unwrap()
     };
-    let (a, b) = (run(1), run(2));
+    let (a, b) = (run(), run());
     assert_eq!(
         a, b,
         "the same seed must replay to the same trace hash in separate processes"
@@ -39,6 +40,19 @@ fn planted_race_is_caught_and_replays_across_processes() {
     assert!(
         a.contains("invariant=violated"),
         "the replayed seed must reproduce the violation: {a}"
+    );
+    // Two subprocesses agreeing with each other is not enough: they agree by
+    // construction, since both build their config through the same code path.
+    // What a failure report promises is that *this* run reproduces, so the
+    // in-process hash is what the replayed line has to carry. Without this,
+    // `Args::config` could drift from the config the test built and the
+    // reproduction instructions a FAIL line prints would quietly go wrong
+    // while every assertion above still passed.
+    assert!(
+        a.contains(&format!("trace_hash=0x{:016x}", outcome.trace_hash)),
+        "replay must reproduce the trace hash the in-process run computed \
+         (0x{:016x}), got: {a}",
+        outcome.trace_hash
     );
 }
 
