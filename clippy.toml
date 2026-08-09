@@ -2,5 +2,29 @@ disallowed-methods = [
   { path = "std::time::Instant::now", reason = "non-deterministic: use the simulator clock" },
   { path = "std::time::SystemTime::now", reason = "non-deterministic: use the simulator clock" },
   { path = "std::thread::spawn", reason = "non-deterministic: the simulator owns scheduling" },
-  { path = "rand::rng", reason = "non-deterministic: use a seeded RNG", allow-invalid = true },
+  # Entropy. Every one of these draws from the operating system or from a
+  # thread-local generator seeded by it, so the run cannot be replayed.
+  { path = "rand::rng", reason = "non-deterministic: use a seeded RNG" },
+  { path = "rand::thread_rng", reason = "non-deterministic: use a seeded RNG" },
+  { path = "rand::random", reason = "non-deterministic: use a seeded RNG" },
+  { path = "rand::random_range", reason = "non-deterministic: use a seeded RNG" },
+  { path = "rand::random_bool", reason = "non-deterministic: use a seeded RNG" },
+  { path = "rand::random_ratio", reason = "non-deterministic: use a seeded RNG" },
+  { path = "rand::random_iter", reason = "non-deterministic: use a seeded RNG" },
+  { path = "rand::fill", reason = "non-deterministic: use a seeded RNG" },
+  { path = "rand_core::SeedableRng::from_os_rng", reason = "non-deterministic: use a seeded RNG" },
+  { path = "rand_core::SeedableRng::try_from_os_rng", reason = "non-deterministic: use a seeded RNG" },
+  { path = "getrandom::fill", reason = "non-deterministic: use a seeded RNG" },
+  { path = "getrandom::fill_uninit", reason = "non-deterministic: use a seeded RNG" },
+  { path = "getrandom::u32", reason = "non-deterministic: use a seeded RNG" },
+  { path = "getrandom::u64", reason = "non-deterministic: use a seeded RNG" },
+]
+
+# Entropy sources that are types rather than calls. `disallowed-methods` only
+# matches function and method paths, so a bare type needs this list.
+disallowed-types = [
+  { path = "rand::rngs::ThreadRng", reason = "non-deterministic: use a seeded RNG" },
+  # Also covers the `rand::rngs::OsRng` re-export: both spellings resolve to
+  # the same item.
+  { path = "rand_core::OsRng", reason = "non-deterministic: use a seeded RNG" },
 ]
