@@ -6,8 +6,17 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     /// Simple string: `+OK\r\n`
+    ///
+    /// The text must contain no `\r` and no `\n`: the `\r\n` that follows it
+    /// is the frame terminator, so either byte inside the text ends the frame
+    /// early and the remainder is read as further frames. See [`encode`].
     Simple(String),
     /// Error: `-ERR boom\r\n`
+    ///
+    /// The text must contain no `\r` and no `\n`, for the same reason as
+    /// [`Frame::Simple`]. This matters most here, because error messages are
+    /// the usual place where client-supplied text is quoted back. See
+    /// [`encode`].
     Error(String),
     /// Integer: `:-7\r\n`
     Integer(i64),
@@ -21,6 +30,24 @@ pub enum Frame {
 
 /// Encodes a RESP2 frame to its wire representation, appending bytes to `out`.
 ///
+/// # Precondition
+///
+/// The text of a [`Frame::Simple`] or a [`Frame::Error`] must contain no `\r`
+/// and no `\n`. Those two frames are terminated by the first `\r\n` after
+/// their type byte, so an embedded `\r` or `\n` ends the frame early and
+/// whatever follows it in the text is read by the peer as further frames of
+/// its own choosing. When such text is built from client-supplied input — an
+/// error message quoting a command name, say — that is response splitting:
+/// the client dictates frames the server never meant to send.
+///
+/// They are the only two variants with this restriction. [`Frame::Bulk`] is
+/// length-prefixed, so it carries arbitrary bytes, `\r\n` and NUL included,
+/// without ambiguity; prefer it for anything derived from input.
+///
+/// Encoding stays infallible: callers construct these frames from text they
+/// control, and the precondition is checked by a debug assertion rather than
+/// enforced by escaping or a `Result`.
+///
 /// # Example
 ///
 /// ```
@@ -33,11 +60,21 @@ pub enum Frame {
 pub fn encode(frame: &Frame, out: &mut Vec<u8>) {
     match frame {
         Frame::Simple(s) => {
+            debug_assert!(
+                !s.as_bytes().contains(&b'\r') && !s.as_bytes().contains(&b'\n'),
+                "simple string must not contain CR or LF: an embedded terminator \
+                 splits the frame and lets the text inject frames of its own"
+            );
             out.push(b'+');
             out.extend_from_slice(s.as_bytes());
             out.extend_from_slice(b"\r\n");
         }
         Frame::Error(e) => {
+            debug_assert!(
+                !e.as_bytes().contains(&b'\r') && !e.as_bytes().contains(&b'\n'),
+                "error string must not contain CR or LF: an embedded terminator \
+                 splits the frame and lets the text inject frames of its own"
+            );
             out.push(b'-');
             out.extend_from_slice(e.as_bytes());
             out.extend_from_slice(b"\r\n");
@@ -313,6 +350,39 @@ mod tests {
             assert_eq!(&parsed, frame);
             assert_eq!(consumed, out.len());
         }
+    }
+
+    #[test]
+    fn bulk_strings_carry_arbitrary_bytes() {
+        // The length prefix is what makes a bulk string binary-safe: a payload
+        // holding the terminator itself, a NUL and a non-UTF-8 byte must come
+        // back byte for byte.
+        let frame = Frame::Bulk(b"a\r\nb\x00c\xffd".to_vec());
+        let mut out = Vec::new();
+        encode(&frame, &mut out);
+        let (parsed, consumed) = parse(&out).unwrap().unwrap();
+        assert_eq!(parsed, frame);
+        assert_eq!(consumed, out.len());
+    }
+
+    #[test]
+    fn integers_round_trip_at_the_extremes_of_i64() {
+        for value in [i64::MIN, i64::MAX] {
+            let frame = Frame::Integer(value);
+            let mut out = Vec::new();
+            encode(&frame, &mut out);
+            let (parsed, consumed) = parse(&out).unwrap().unwrap();
+            assert_eq!(parsed, frame, "{value}");
+            assert_eq!(consumed, out.len(), "{value}");
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "must not contain CR or LF")]
+    fn encoding_a_simple_string_holding_a_terminator_trips_the_debug_assertion() {
+        let mut out = Vec::new();
+        encode(&Frame::Simple("OK\r\n+INJECTED".into()), &mut out);
     }
 
     #[test]
