@@ -32,3 +32,15 @@ disallowed-types = [
   { path = "std::collections::HashMap", reason = "non-deterministic iteration order: use the keyspace dict or an explicitly seeded hasher" },
   { path = "std::collections::HashSet", reason = "non-deterministic iteration order: use an explicitly seeded hasher" },
 ]
+
+# Proper nouns `doc_markdown` would otherwise demand backticks around. Every
+# one of these is a name in prose — a product, a hash function — and not a Rust
+# item, so backticking them would make the documentation wrong to be tidy.
+# `..` keeps clippy's own default list.
+doc-valid-idents = ["SeedStone", "SipHash", "FxHash", ".."]
+
+# Complexity ceilings. Explicit even where they match the current defaults:
+# a ceiling is policy, and policy that lives in a default is invisible.
+cognitive-complexity-threshold = 25
+too-many-lines-threshold = 100
+too-many-arguments-threshold = 7
