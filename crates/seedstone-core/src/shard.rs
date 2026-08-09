@@ -105,12 +105,13 @@ pub enum Command {
 
 impl Command {
     /// The key this command addresses — what [`shard_of`] routes on.
+    #[must_use]
     pub fn key(&self) -> &[u8] {
         match self {
-            Command::Get { key }
-            | Command::Set { key, .. }
-            | Command::Del { key }
-            | Command::IncrBy { key, .. } => key,
+            Self::Get { key }
+            | Self::Set { key, .. }
+            | Self::Del { key }
+            | Self::IncrBy { key, .. } => key,
         }
     }
 
@@ -119,12 +120,13 @@ impl Command {
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4. These values are folded
     /// into the simulator's trace hash, so they are part of what a replay
     /// compares: changing one changes every recorded hash.
-    pub fn kind(&self) -> u8 {
+    #[must_use]
+    pub const fn kind(&self) -> u8 {
         match self {
-            Command::Get { .. } => 1,
-            Command::Set { .. } => 2,
-            Command::Del { .. } => 3,
-            Command::IncrBy { .. } => 4,
+            Self::Get { .. } => 1,
+            Self::Set { .. } => 2,
+            Self::Del { .. } => 3,
+            Self::IncrBy { .. } => 4,
         }
     }
 }
@@ -195,6 +197,14 @@ pub trait Router: Clone + Send + Sync + 'static {
 #[derive(Clone)]
 pub struct ShardPool {
     inboxes: Arc<Vec<mpsc::UnboundedSender<Envelope>>>,
+    /// The inbox count, kept in the width it arrived in.
+    ///
+    /// Redundant with `inboxes.len()`, and deliberately so: the count is a
+    /// `u16` at every point that matters — [`spawn`](ShardPool::spawn) takes
+    /// one, [`shard_of`] wants one — and narrowing the `Vec`'s length back
+    /// down on every dispatch would be a fallible conversion standing where an
+    /// invariant already holds. Two bytes buy its absence.
+    shards: u16,
 }
 
 impl ShardPool {
@@ -207,7 +217,13 @@ impl ShardPool {
     /// # Panics
     ///
     /// If `shards` is zero: there would be nowhere to route a key.
-    pub fn spawn<T: TraceSink>(shards: u16, seed: DictSeed, trace: T) -> ShardPool {
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "every shard gets a clone and the original is dropped, but taking \
+                  the sink by value is what lets a caller move one in rather than \
+                  keep it alive alongside the pool"
+    )]
+    pub fn spawn<T: TraceSink>(shards: u16, seed: DictSeed, trace: T) -> Self {
         assert!(
             shards > 0,
             "ShardPool::spawn: shards must be greater than zero"
@@ -222,15 +238,16 @@ impl ShardPool {
             };
             tokio::spawn(run_shard(shard, shard_seed, trace.clone(), rx));
         }
-        ShardPool {
+        Self {
             inboxes: Arc::new(inboxes),
+            shards,
         }
     }
 
     /// How many shards this pool spans.
     #[must_use]
-    pub fn shards(&self) -> u16 {
-        u16::try_from(self.inboxes.len()).expect("the count came in as a u16 in spawn, so it fits")
+    pub const fn shards(&self) -> u16 {
+        self.shards
     }
 }
 

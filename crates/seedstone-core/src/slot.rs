@@ -8,6 +8,7 @@
 ///
 /// Polynomial `0x1021`, initial value `0x0000`, no reflection of input or
 /// output, no final XOR.
+#[must_use]
 pub fn crc16_xmodem(data: &[u8]) -> u16 {
     let mut crc: u16 = 0x0000;
     for &byte in data {
@@ -31,6 +32,7 @@ pub fn crc16_xmodem(data: &[u8]) -> u16 {
 /// error: it panics, with the assert's message in debug builds or with
 /// Rust's remainder-by-zero panic in release builds. It is checked with a
 /// `debug_assert!` rather than propagated as a `Result` or `Option`.
+#[must_use]
 pub fn shard_of(key: &[u8], shards: u16) -> u16 {
     debug_assert!(shards > 0, "shard_of: shards must be greater than zero");
     crc16_xmodem(key) % shards
