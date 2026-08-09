@@ -187,6 +187,18 @@ impl TraceSink for NoTrace {
 /// connection code knowing.
 pub trait Router: Clone + Send + Sync + 'static {
     /// Routes `cmd` to whatever owns its key and resolves to the reply.
+    ///
+    /// # Cancellation
+    ///
+    /// **An implementation may have routed the command before the returned
+    /// future is polled, and dropping that future does not un-route it.**
+    /// [`ShardPool`] sends at call time; the simulator's `async fn` routers do
+    /// not. So a caller that abandons a dispatch — a timeout, a `select!`, a
+    /// shutdown — must treat the command as possibly applied.
+    ///
+    /// The per-key atomicity the shard guarantees stops at this boundary: a
+    /// command either has not started or has finished, but the caller does not
+    /// always get to learn which.
     fn dispatch(&self, cmd: Command) -> impl Future<Output = Reply> + Send;
 }
 
