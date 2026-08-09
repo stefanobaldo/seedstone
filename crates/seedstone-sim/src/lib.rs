@@ -32,12 +32,20 @@
 //! and sums what is actually there. The two differ **iff** an update was
 //! lost. The remaining keys take `GET`/`SET`/`DEL` for coverage and carry no
 //! sum invariant — `SET` overwrites, so it has no order-independent total.
+//!
+//! # The planted race
+//!
+//! [`SimConfig::planted`] swaps the honest router for [`PlantedRouter`], which
+//! serves `INCRBY` as a read-modify-write pair instead of one atomic message.
+//! That is the harness testing itself: a simulation that has never failed has
+//! not been shown capable of failing, and `planted_race.rs` requires the sweep
+//! to catch this one and a separate process to replay it byte for byte.
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use seedstone_core::dict::DictSeed;
 use seedstone_core::service::serve_connection;
-use seedstone_core::shard::{Command, Reply, ShardPool, TraceSink, parse_i64};
+use seedstone_core::shard::{Command, Reply, Router, ShardPool, TraceSink, parse_i64};
 use seedstone_resp::{Frame, encode, parse};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -186,11 +194,6 @@ pub fn mix(h: u64, v: u64) -> u64 {
 /// bugs or deadlocks rather than findings about the system, and neither is
 /// something a sweep can carry on past.
 pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
-    // Task 13 selects a deliberately racy router on this flag. Until then both
-    // arms are the pool itself, and the field is carried so the binaries,
-    // their arguments and the config shape do not have to change later.
-    let _ = cfg.planted;
-
     let mut sim = turmoil::Builder::new()
         .simulation_duration(SIM_DURATION)
         .rng_seed(cfg.sim_seed)
@@ -212,13 +215,14 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
     };
     let sink = HashSink(Arc::clone(&trace));
     let shards = cfg.shards;
+    let planted = cfg.planted;
 
     sim.host(SERVER, move || {
         // Cloned per invocation: turmoil may restart a host, and each start
         // needs its own future. The sink is shared on purpose — a restart
         // continues the same trace.
         let sink = sink.clone();
-        server(shards, dict_seed, sink)
+        server(shards, dict_seed, sink, planted)
     });
 
     for id in 0..cfg.clients {
@@ -312,18 +316,90 @@ fn fold_reply(h: u64, reply: &Reply) -> u64 {
     }
 }
 
+/// A router that turns the atomic `INCRBY` into a read-modify-write race.
+///
+/// This is the harness's self-test: a simulator that never fails proves
+/// nothing, so the branch ships a bug the sweep is required to find. The bug
+/// is deliberately *above* the shard, which is where a real one would live —
+/// the shard's handler is a plain `fn` and cannot await, so no lost update can
+/// be planted inside it. Here `INCRBY` becomes `GET`, compute, `SET`: two
+/// shard round-trips with an await between them, so another connection's
+/// increment can land in the window and be overwritten.
+///
+/// Every other command passes straight through, so the only thing that differs
+/// from an honest run is the atomicity of the one command carrying the
+/// invariant.
+#[derive(Clone)]
+pub struct PlantedRouter(pub ShardPool);
+
+/// The reply text the shard gives a non-numeric `INCRBY` target.
+///
+/// Duplicated from `seedstone-core` (where it is private) rather than
+/// approximated: the planted router must be indistinguishable from the honest
+/// one except in its atomicity, and these strings enter the trace hash.
+const NOT_AN_INTEGER: &str = "ERR value is not an integer or out of range";
+
+/// The reply text the shard gives an `INCRBY` that would leave `i64`.
+const WOULD_OVERFLOW: &str = "ERR increment or decrement would overflow";
+
+impl Router for PlantedRouter {
+    // Spelled `async fn` rather than the trait's desugared `-> impl Future`:
+    // with a bare `async` block as the body clippy's `manual_async_fn` fires,
+    // and the gate is `-D warnings`. `ShardPool`'s own impl keeps the
+    // desugared form for a reason that does not apply here — it sends on the
+    // inbox before the future is awaited.
+    async fn dispatch(&self, cmd: Command) -> Reply {
+        let Command::IncrBy { key, delta } = cmd else {
+            return self.0.dispatch(cmd).await;
+        };
+
+        let current = match self.0.dispatch(Command::Get { key: key.clone() }).await {
+            Reply::Bulk(Some(value)) => match parse_i64(&value) {
+                Some(current) => current,
+                None => return Reply::Error(NOT_AN_INTEGER.into()),
+            },
+            Reply::Bulk(None) => 0,
+            // A shard that could not answer; pass its complaint on unchanged.
+            other => return other,
+        };
+        let Some(updated) = current.checked_add(delta) else {
+            return Reply::Error(WOULD_OVERFLOW.into());
+        };
+
+        // The window: `current` was read at one moment and is written back at
+        // a later one, and nothing holds the key still in between.
+        match self
+            .0
+            .dispatch(Command::Set {
+                key,
+                value: updated.to_string().into_bytes(),
+            })
+            .await
+        {
+            Reply::Ok => Reply::Integer(updated),
+            other => other,
+        }
+    }
+}
+
 /// The server host: the real stack, on a simulated listener.
 ///
 /// The pool is spawned *here*, inside the host, rather than around
 /// [`run_sim`]: [`ShardPool::spawn`] spawns onto the ambient tokio runtime,
 /// and under turmoil each host has its own. Spawned outside, the shards would
 /// land on whatever runtime happened to be current — or on none at all.
-async fn server(shards: u16, seed: DictSeed, sink: HashSink) -> turmoil::Result {
+async fn server(shards: u16, seed: DictSeed, sink: HashSink, planted: bool) -> turmoil::Result {
     let pool = ShardPool::spawn(shards, seed, sink);
     let listener = turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await?;
     loop {
         let (stream, _peer) = listener.accept().await?;
-        tokio::spawn(serve_connection(stream, pool.clone()));
+        // The choice is per connection only because that is where the router
+        // is handed over; it is the same choice every time.
+        if planted {
+            tokio::spawn(serve_connection(stream, PlantedRouter(pool.clone())));
+        } else {
+            tokio::spawn(serve_connection(stream, pool.clone()));
+        }
     }
 }
 
