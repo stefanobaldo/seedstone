@@ -15,20 +15,21 @@ What exists, across four crates:
   with the wire-level length and depth limits a server needs at its edge.
 - `seedstone-core` — the deterministic core: a keyspace dict with seeded
   hashing and incremental rehashing, a scan cursor stable across table
-  growth, a replication-log record format that tolerates holes, and a shard
-  runtime of up to 1024 message-passing shards whose command handlers cannot
-  await. On top of those, a RESP service layer generic over its transport.
+  growth, a replication-log record format that tolerates holes, and a runtime
+  of message-passing shards whose command handlers cannot await. On top of
+  those, a RESP service layer generic over its transport.
 - `seedstone-sim` — a deterministic simulation harness: the real server and
   real clients over a simulated network and clock, folding every completed
   command into a trace hash that is a function of two seeds and nothing else.
-- `seedstone` — the binary crate, still a placeholder.
+  It runs the core at 1024 shards.
+- `seedstone` — the crate the server will live in; today an empty library.
 
 The project is built around deterministic simulation testing, so any
 concurrency bug is meant to be reproducible from a seed. CI sweeps a range of
-simulator seeds on every change and enforces the determinism rules that make
-that reproducibility possible — including a self-test that plants a genuine
-lost-update race and requires the sweep to find it and a second process to
-replay it byte for byte.
+simulator seeds on every change that touches code, and enforces the
+determinism rules that make that reproducibility possible — including a
+self-test that plants a genuine lost-update race and requires the sweep to
+find it and a second process to replay it byte for byte.
 
 There is no server to connect to yet, no persistence, and no benchmarks. The
 README will grow as the code does.
