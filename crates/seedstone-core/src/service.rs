@@ -23,7 +23,7 @@
 //!   against that is a debug assertion, which is not there in release. This is
 //!   the enforcement point that is.
 
-use crate::shard::{Command, Reply, Router, parse_i64};
+use crate::shard::{Command, NOT_AN_INTEGER, Reply, Router, parse_i64};
 use seedstone_resp::{Frame, ParseError, encode, parse};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -245,7 +245,7 @@ fn frame_to_command(frame: Frame) -> Result<Command, String> {
                     key: key.clone(),
                     delta,
                 }),
-                None => Err("ERR value is not an integer or out of range".into()),
+                None => Err(NOT_AN_INTEGER.into()),
             },
             _ => Err(wrong_arity("incrby")),
         },

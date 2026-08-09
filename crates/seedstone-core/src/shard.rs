@@ -50,10 +50,18 @@ const REHASH_BUCKETS_PER_TICK: usize = 1024;
 ///
 /// Byte-for-byte the message Redis returns, so existing clients that match on
 /// it keep working.
-const NOT_AN_INTEGER: &str = "ERR value is not an integer or out of range";
+///
+/// Public because it is a wire-visible contract, not an implementation
+/// detail: the simulator's planted router has to answer exactly what the
+/// honest one answers, or a planted trace differs for a reason other than the
+/// race it exists to plant. It kept a private copy of this string, and
+/// nothing linked the two.
+pub const NOT_AN_INTEGER: &str = "ERR value is not an integer or out of range";
 
 /// Reply text for an `IncrBy` whose result would leave `i64`.
-const WOULD_OVERFLOW: &str = "ERR increment or decrement would overflow";
+///
+/// Public for the same reason as [`NOT_AN_INTEGER`].
+pub const WOULD_OVERFLOW: &str = "ERR increment or decrement would overflow";
 
 /// Reply text for a command whose shard task is gone.
 ///
