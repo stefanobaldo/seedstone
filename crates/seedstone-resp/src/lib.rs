@@ -48,6 +48,16 @@ pub enum Frame {
 /// control, and the precondition is checked by a debug assertion rather than
 /// enforced by escaping or a `Result`.
 ///
+/// # Depth
+///
+/// Unlike [`parse`], which refuses nesting deeper than [`MAX_ARRAY_DEPTH`],
+/// this function recurses on [`Frame::Array`] without a limit and will
+/// overflow the stack — an abort, not a panic — on a deeply enough nested
+/// frame. Nothing reachable today builds one: a parsed frame is already
+/// depth-capped, and the frames this workspace constructs are flat. The
+/// asymmetry is safe only while that stays true, so a caller that ever
+/// encodes a frame derived from input owes a depth check first.
+///
 /// # Example
 ///
 /// ```
@@ -147,6 +157,14 @@ const MAX_ARRAY_DEPTH: usize = 64;
 ///   body is capped at 64 MiB; two payloads at this ceiling plus framing sit
 ///   well under that, so no accepted command can produce a record the log
 ///   would refuse to write.
+///
+///   **That last point rests on an assumption this crate does not enforce:
+///   that no command carries more than two payloads.** It is the command
+///   layer's arity table that holds it up, not the codec — `parse` alone will
+///   happily hand back an array of [`MAX_ARRAY_LEN`] bulks of this size. A
+///   third bulk argument (`MSET`, `SET … EX`, a multi-key `DEL`) puts four
+///   payloads in one record and breaks the arithmetic, so whoever adds one
+///   owns re-checking it against the log's ceiling.
 pub const MAX_BULK_LEN: usize = 16 * 1024 * 1024;
 
 /// The largest [`Frame::Array`] element count [`parse`] accepts.
