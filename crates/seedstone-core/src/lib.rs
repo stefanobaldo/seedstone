@@ -7,4 +7,5 @@
 //! belongs to that translation boundary, not to the core itself.
 
 pub mod dict;
+pub mod log;
 pub mod slot;
