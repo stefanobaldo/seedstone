@@ -244,16 +244,45 @@ impl ShardPool {
     /// the shard index — so one root seed fixes the whole node's placement
     /// while no two shards share a bucket layout.
     ///
+    /// Every shard logs to a [`NoopLog`]. See
+    /// [`spawn_with_log`](ShardPool::spawn_with_log) to supply a real one.
+    ///
+    /// # Panics
+    ///
+    /// If `shards` is zero: there would be nowhere to route a key.
+    pub fn spawn<T: TraceSink>(shards: u16, seed: DictSeed, trace: T) -> Self {
+        Self::spawn_with_log(shards, seed, trace, |_shard| NoopLog)
+    }
+
+    /// [`spawn`](ShardPool::spawn) with the replication log supplied per shard.
+    ///
+    /// `make_log` is called once per shard, with that shard's index, and the
+    /// log it returns is owned by that shard task for its lifetime. A single
+    /// writer shared by every shard is expressible too — return clones of one
+    /// handle — which is what a group-commit implementation would do.
+    ///
+    /// This constructor is the reason the log seam is real rather than
+    /// aspirational: with it, replacing [`NoopLog`] changes an argument at one
+    /// call site and nothing else. Without it, `run_shard` would have to grow a
+    /// type parameter and every caller would have to be revisited on the day a
+    /// log first writes bytes — which is exactly the retrofit the seam exists
+    /// to avoid.
+    ///
     /// # Panics
     ///
     /// If `shards` is zero: there would be nowhere to route a key.
     #[allow(
         clippy::needless_pass_by_value,
-        reason = "every shard gets a clone and the original is dropped, but taking \
-                  the sink by value is what lets a caller move one in rather than \
-                  keep it alive alongside the pool"
+        reason = "every shard gets a clone of the sink and the original is dropped, \
+                  but taking both it and the log factory by value is what lets a \
+                  caller move them in rather than keep them alive alongside the pool"
     )]
-    pub fn spawn<T: TraceSink>(shards: u16, seed: DictSeed, trace: T) -> Self {
+    pub fn spawn_with_log<T, L, F>(shards: u16, seed: DictSeed, trace: T, make_log: F) -> Self
+    where
+        T: TraceSink,
+        L: ReplicationLog,
+        F: Fn(u16) -> L,
+    {
         assert!(
             shards > 0,
             "ShardPool::spawn: shards must be greater than zero"
@@ -266,7 +295,13 @@ impl ShardPool {
                 k0: seed.k0 ^ u64::from(shard),
                 k1: seed.k1,
             };
-            tokio::spawn(run_shard(shard, shard_seed, trace.clone(), rx));
+            tokio::spawn(run_shard(
+                shard,
+                shard_seed,
+                trace.clone(),
+                make_log(shard),
+                rx,
+            ));
         }
         Self {
             inboxes: Arc::new(inboxes),
@@ -306,14 +341,14 @@ impl Router for ShardPool {
 ///
 /// Returns when the inbox closes, which happens once the last [`ShardPool`]
 /// handle is dropped.
-async fn run_shard<T: TraceSink>(
+async fn run_shard<T: TraceSink, L: ReplicationLog>(
     shard: u16,
     seed: DictSeed,
     trace: T,
+    mut log: L,
     mut inbox: mpsc::UnboundedReceiver<Envelope>,
 ) {
     let mut dict = Dict::with_seed(seed);
-    let mut log = NoopLog;
     let mut seq: u64 = 0;
 
     let mut tick = tokio::time::interval(REHASH_TICK);
@@ -352,6 +387,18 @@ async fn run_shard<T: TraceSink>(
             }
             _ = tick.tick() => {
                 dict.rehash_step(REHASH_BUCKETS_PER_TICK);
+                // The durability point, and the only place in a shard that can
+                // afford to be one: `append` runs inside a handler that cannot
+                // `await`, so it must stay cheap, while this arm is already
+                // async and may block. That split is why the trait has two
+                // methods rather than one.
+                //
+                // The cadence is the tick's, which is a starting shape rather
+                // than a policy — a real log picks its own, and may want group
+                // commit across shards instead. The error has nowhere to go
+                // until this project has somewhere to report to; a log that
+                // cannot sync is a Phase 3 problem with a Phase 3 answer.
+                let _ = log.sync();
             }
         }
     }
@@ -812,6 +859,102 @@ mod tests {
                 // The delete found nothing, so it did not consume position 2.
                 (0, 2, 3, Reply::Removed(false)),
             ]
+        );
+    }
+
+    /// The seam, exercised rather than asserted.
+    ///
+    /// A log that is not [`NoopLog`] reaches a shard and sees every mutation at
+    /// its replication position. Until the pool took a log factory this test
+    /// could not be written at all, which is what made "the seam exists from
+    /// day one" a claim about intent rather than about the code.
+    #[tokio::test]
+    async fn a_supplied_log_receives_every_mutation() {
+        #[derive(Clone, Default)]
+        struct Recording(Arc<Mutex<Vec<(u16, u64)>>>);
+
+        impl ReplicationLog for Recording {
+            fn append(&mut self, rec: Record<'_>) -> std::io::Result<()> {
+                self.0.lock().expect("log mutex").push((rec.shard, rec.seq));
+                Ok(())
+            }
+            fn sync(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log = Recording::default();
+        let pool = ShardPool::spawn_with_log(1, DictSeed { k0: 1, k1: 2 }, NoTrace, {
+            let log = log.clone();
+            move |_shard| log.clone()
+        });
+
+        pool.dispatch(Command::Set {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        })
+        .await;
+        pool.dispatch(Command::Get { key: b"k".to_vec() }).await;
+        pool.dispatch(Command::Del {
+            key: b"absent".to_vec(),
+        })
+        .await;
+        pool.dispatch(Command::IncrBy {
+            key: b"n".to_vec(),
+            delta: 1,
+        })
+        .await;
+
+        // The read and the delete-that-removed-nothing append nothing, so the
+        // positions are gapless — the same property `seq` is asserted to have.
+        assert_eq!(*log.0.lock().expect("log mutex"), vec![(0, 0), (0, 1)]);
+    }
+
+    /// A mutation whose record cannot be written must not happen.
+    ///
+    /// `apply`'s documentation says the record is appended *before* the dict is
+    /// touched, so a record can never describe a change that was not made and a
+    /// change can never outrun its record. With only [`NoopLog`] reachable,
+    /// nothing could fail an append and that ordering had no coverage at all.
+    #[tokio::test]
+    async fn a_log_that_cannot_write_refuses_the_mutation() {
+        struct Failing;
+
+        impl ReplicationLog for Failing {
+            fn append(&mut self, _rec: Record<'_>) -> std::io::Result<()> {
+                Err(std::io::Error::other("the disk went away"))
+            }
+            fn sync(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let pool =
+            ShardPool::spawn_with_log(1, DictSeed { k0: 1, k1: 2 }, NoTrace, |_shard| Failing);
+
+        assert_eq!(
+            pool.dispatch(Command::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            })
+            .await,
+            Reply::Error(ReplyError::LogWriteFailed)
+        );
+        // And the write did not land: the refusal is not cosmetic.
+        assert_eq!(
+            pool.dispatch(Command::Get { key: b"k".to_vec() }).await,
+            Reply::Bulk(None),
+            "the value was stored despite its record failing"
+        );
+        // An unloggable IncrBy is refused for the same reason, rather than
+        // incrementing and reporting a number nothing recorded.
+        assert_eq!(
+            pool.dispatch(Command::IncrBy {
+                key: b"n".to_vec(),
+                delta: 5
+            })
+            .await,
+            Reply::Error(ReplyError::LogWriteFailed)
         );
     }
 
