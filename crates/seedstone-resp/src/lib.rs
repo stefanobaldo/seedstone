@@ -363,6 +363,12 @@ mod tests {
             (Frame::Error("ERR boom".into()), b"-ERR boom\r\n"),
             (Frame::Integer(-7), b":-7\r\n"),
             (Frame::Bulk(b"hi".to_vec()), b"$2\r\nhi\r\n"),
+            // The empty bulk is the one length-prefixed frame whose payload
+            // and terminator are adjacent, so it is exactly where an
+            // off-by-one in the encoder would hide. It is also not `Null`:
+            // "a value that is zero bytes long" and "no value" are different
+            // frames, and the pair is here so nobody collapses them.
+            (Frame::Bulk(Vec::new()), b"$0\r\n\r\n"),
             (Frame::Null, b"$-1\r\n"),
             (
                 Frame::Array(vec![
