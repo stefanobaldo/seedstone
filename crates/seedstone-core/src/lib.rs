@@ -8,4 +8,5 @@
 
 pub mod dict;
 pub mod log;
+pub mod shard;
 pub mod slot;
