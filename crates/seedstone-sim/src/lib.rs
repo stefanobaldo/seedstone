@@ -362,8 +362,19 @@ impl Router for PlantedRouter {
             return Reply::Error(WOULD_OVERFLOW.into());
         };
 
-        // The window: `current` was read at one moment and is written back at
-        // a later one, and nothing holds the key still in between.
+        // The window, widened deliberately. `current` was read at one moment
+        // and is written back at a later one, and nothing holds the key still
+        // in between; this hands the scheduler an explicit chance to run
+        // another connection there. Without it the window is one scheduler
+        // round and the race surfaced in 2 seeds of 64 — evidence far weaker
+        // than the claim the self-test makes. With it, 26 of 64.
+        //
+        // It is not a cheat: a genuine read-modify-write across an await is
+        // exactly this shape, and the suspension point is honest rather than
+        // simulated. It is also free — the honest router is untouched, and no
+        // hash of a planted run is pinned anywhere, so no recorded trace moves.
+        tokio::task::yield_now().await;
+
         match self
             .0
             .dispatch(Command::Set {
