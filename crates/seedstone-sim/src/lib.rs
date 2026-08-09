@@ -317,7 +317,7 @@ fn fold_reply(h: u64, reply: &Reply) -> u64 {
         Reply::Bulk(Some(value)) => fold_bytes(mix(h, 2), value),
         Reply::Ok => mix(h, 3),
         Reply::Removed(removed) => mix(mix(h, 4), u64::from(*removed)),
-        Reply::Integer(n) => mix(mix(h, 5), *n as u64),
+        Reply::Integer(n) => mix(mix(h, 5), n.cast_unsigned()),
         Reply::Error(message) => fold_bytes(mix(h, 6), message.as_bytes()),
     }
 }
