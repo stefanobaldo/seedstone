@@ -1,18 +1,30 @@
-//! The shard runtime: N keyspaces, each owned by one task behind an inbox.
+//! The shard runtime: N keyspaces, hosted by a smaller number of executor
+//! tasks, each behind an unbounded inbox.
 //!
-//! A shard is a task, a [`Dict`] nothing else can reach, and an unbounded
-//! inbox. Work arrives as an [`Envelope`] — a [`Command`] plus the one-shot
-//! channel its [`Reply`] goes back on — and the shard answers messages one at
-//! a time, in arrival order. Nothing is shared, so nothing is locked.
+//! A virtual shard is a [`Dict`] nothing else can reach, its replication
+//! position, and its log. It is the unit of *keyspace ownership*, not of
+//! scheduling: an executor task owns a contiguous range of shards and is the
+//! only thing that touches their state. Work arrives as an [`Envelope`] — a
+//! batch of `(shard, command)` pairs plus the one-shot channel its replies go
+//! back on — and an executor answers envelopes one at a time, in arrival
+//! order, applying each batch's commands in order. Nothing is shared, so
+//! nothing is locked.
+//!
+//! Splitting the two lets the shard count stay a placement decision, fixed by
+//! the deployment format, while the executor count follows the machine. A key
+//! never moves between shards, and a shard's whole history stays inside one
+//! task.
 //!
 //! # Why a handler is a plain `fn`
 //!
 //! [`apply`] takes `&mut Dict` and returns a `Reply`. It is not `async`, and
-//! that is the point: a handler that cannot `await` cannot yield the shard
+//! that is the point: a handler that cannot `await` cannot yield the executor
 //! mid-command, so a command either has not started or has finished, and two
 //! commands on one key can never interleave. The rule is enforced by the
-//! signature rather than by review — the only `await`s in a shard task are
-//! the `select!` arms of [`run_shard`].
+//! signature rather than by review — the only `await`s in an executor task are
+//! the `select!` arms of [`run_executor`]. A batch inherits the property: no
+//! `await` separates its commands either, so nothing from another connection
+//! can land inside one.
 //!
 //! That is also why the interesting concurrency bugs of this system live
 //! *above* the shard, in code that sends two messages with an `await` between
@@ -20,7 +32,7 @@
 
 use crate::dict::{Dict, DictSeed};
 use crate::log::{NoopLog, Record, ReplicationLog};
-use crate::slot::shard_of;
+use crate::slot::{executor_of, shard_of};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,10 +77,10 @@ pub enum ReplyError {
     NotAnInteger,
     /// An `IncrBy` whose result would leave `i64`.
     WouldOverflow,
-    /// The command's shard task is gone.
+    /// The executor hosting the command's shard is gone.
     ///
     /// Unreachable while a [`ShardPool`] is alive — it holds every sender, and
-    /// a shard task only stops when its inbox closes. It exists so the
+    /// an executor task only stops when its inbox closes. It exists so the
     /// dispatch path has no `unwrap`.
     ShardUnavailable,
     /// A mutation whose log record could not be written.
@@ -168,12 +180,17 @@ pub enum Reply {
     Error(ReplyError),
 }
 
-/// One unit of work for a shard: a command and where its reply goes.
+/// One unit of work for an executor: a batch of commands and where its
+/// replies go.
 pub struct Envelope {
-    /// The command to run.
-    pub cmd: Command,
-    /// The channel the shard sends the reply back on.
-    pub reply: oneshot::Sender<Reply>,
+    /// `(shard, command)` pairs, applied in order.
+    ///
+    /// The shard id is computed once, at routing time; carrying it is what
+    /// keeps the executor from hashing every key a second time. Every pair's
+    /// shard must be one the receiving executor owns.
+    pub cmds: Vec<(u16, Command)>,
+    /// Answered once, with one reply per command, in the same order.
+    pub reply: oneshot::Sender<Vec<Reply>>,
 }
 
 /// An observer of every command a shard completes.
@@ -220,38 +237,46 @@ pub trait Router: Clone + Send + Sync + 'static {
     fn dispatch(&self, cmd: Command) -> impl Future<Output = Reply> + Send;
 }
 
-/// A set of shard tasks and the inboxes that reach them.
+/// A set of executor tasks, the virtual shards they host, and the inboxes
+/// that reach them.
 ///
 /// Cloning is cheap and shares the same shards: every clone is a handle to
 /// one pool, not a copy of it.
 #[derive(Clone)]
 pub struct ShardPool {
+    /// One inbox per executor, indexed by executor id.
     inboxes: Arc<Vec<mpsc::UnboundedSender<Envelope>>>,
-    /// The inbox count, kept in the width it arrived in.
+    /// How many virtual shards the keyspace is divided into.
     ///
-    /// Redundant with `inboxes.len()`, and deliberately so: the count is a
-    /// `u16` at every point that matters — [`spawn`](ShardPool::spawn) takes
-    /// one, [`shard_of`] wants one — and narrowing the `Vec`'s length back
-    /// down on every dispatch would be a fallible conversion standing where an
-    /// invariant already holds. Two bytes buy its absence.
+    /// Kept in the width it arrived in: the count is a `u16` at every point
+    /// that matters — [`spawn`](ShardPool::spawn) takes one, [`shard_of`]
+    /// wants one — and narrowing a `Vec`'s length back down on every dispatch
+    /// would be a fallible conversion standing where an invariant already
+    /// holds. Two bytes buy its absence.
     shards: u16,
+    /// How many executor tasks host those shards. Redundant with
+    /// `inboxes.len()`, for the reason `shards` states.
+    executors: u16,
 }
 
 impl ShardPool {
-    /// Spawns `shards` shard tasks on the current tokio runtime.
+    /// Spawns `executors` executor tasks on the current tokio runtime,
+    /// hosting `shards` virtual shards between them.
     ///
-    /// Each shard hashes with a seed derived from `seed` — `k0` xored with
-    /// the shard index — so one root seed fixes the whole node's placement
-    /// while no two shards share a bucket layout.
+    /// The shards are partitioned into contiguous ranges by
+    /// [`executor_of`]. Each shard hashes with a seed derived from `seed` —
+    /// `k0` xored with the shard index — so one root seed fixes the whole
+    /// node's placement while no two shards share a bucket layout.
     ///
     /// Every shard logs to a [`NoopLog`]. See
     /// [`spawn_with_log`](ShardPool::spawn_with_log) to supply a real one.
     ///
     /// # Panics
     ///
-    /// If `shards` is zero: there would be nowhere to route a key.
-    pub fn spawn<T: TraceSink>(shards: u16, seed: DictSeed, trace: T) -> Self {
-        Self::spawn_with_log(shards, seed, trace, |_shard| NoopLog)
+    /// If `shards` is zero — there would be nowhere to route a key — or if
+    /// `executors` is not in `1..=shards`.
+    pub fn spawn<T: TraceSink>(shards: u16, executors: u16, seed: DictSeed, trace: T) -> Self {
+        Self::spawn_with_log(shards, executors, seed, trace, |_shard| NoopLog)
     }
 
     /// [`spawn`](ShardPool::spawn) with the replication log supplied per shard.
@@ -263,21 +288,28 @@ impl ShardPool {
     ///
     /// This constructor is the reason the log seam is real rather than
     /// aspirational: with it, replacing [`NoopLog`] changes an argument at one
-    /// call site and nothing else. Without it, `run_shard` would have to grow a
-    /// type parameter and every caller would have to be revisited on the day a
+    /// call site and nothing else. Without it, `run_executor` would have to grow
+    /// a type parameter and every caller would have to be revisited on the day a
     /// log first writes bytes — which is exactly the retrofit the seam exists
     /// to avoid.
     ///
     /// # Panics
     ///
-    /// If `shards` is zero: there would be nowhere to route a key.
+    /// If `shards` is zero — there would be nowhere to route a key — or if
+    /// `executors` is not in `1..=shards`.
     #[allow(
         clippy::needless_pass_by_value,
-        reason = "every shard gets a clone of the sink and the original is dropped, \
+        reason = "every executor gets a clone of the sink and the original is dropped, \
                   but taking both it and the log factory by value is what lets a \
                   caller move them in rather than keep them alive alongside the pool"
     )]
-    pub fn spawn_with_log<T, L, F>(shards: u16, seed: DictSeed, trace: T, make_log: F) -> Self
+    pub fn spawn_with_log<T, L, F>(
+        shards: u16,
+        executors: u16,
+        seed: DictSeed,
+        trace: T,
+        make_log: F,
+    ) -> Self
     where
         T: TraceSink,
         L: ReplicationLog,
@@ -287,70 +319,124 @@ impl ShardPool {
             shards > 0,
             "ShardPool::spawn: shards must be greater than zero"
         );
-        let mut inboxes = Vec::with_capacity(usize::from(shards));
+        assert!(
+            executors > 0 && executors <= shards,
+            "ShardPool::spawn: executors must be in 1..=shards"
+        );
+
+        // Built by walking the shards once in order: `executor_of` is monotone,
+        // so each executor's states arrive contiguously and in ascending shard
+        // order, which is what makes `first_shard` plus an offset enough to
+        // address them.
+        let mut inboxes = Vec::with_capacity(usize::from(executors));
+        let mut pending: Option<(u16, Vec<ShardState<L>>)> = None;
         for shard in 0..shards {
-            let (tx, rx) = mpsc::unbounded_channel();
-            inboxes.push(tx);
-            let shard_seed = DictSeed {
-                k0: seed.k0 ^ u64::from(shard),
-                k1: seed.k1,
+            let state = ShardState {
+                dict: Dict::with_seed(DictSeed {
+                    k0: seed.k0 ^ u64::from(shard),
+                    k1: seed.k1,
+                }),
+                seq: 0,
+                log: make_log(shard),
             };
-            tokio::spawn(run_shard(
-                shard,
-                shard_seed,
-                trace.clone(),
-                make_log(shard),
-                rx,
-            ));
+            match &mut pending {
+                Some((first_shard, states))
+                    if executor_of(shard, shards, executors)
+                        == executor_of(*first_shard, shards, executors) =>
+                {
+                    states.push(state);
+                }
+                _ => {
+                    if let Some((first_shard, states)) = pending.take() {
+                        inboxes.push(spawn_executor(first_shard, states, trace.clone()));
+                    }
+                    pending = Some((shard, vec![state]));
+                }
+            }
         }
+        if let Some((first_shard, states)) = pending {
+            inboxes.push(spawn_executor(first_shard, states, trace));
+        }
+
         Self {
             inboxes: Arc::new(inboxes),
             shards,
+            executors,
         }
     }
 
-    /// How many shards this pool spans.
+    /// How many virtual shards this pool spans.
     #[must_use]
     pub const fn shards(&self) -> u16 {
         self.shards
     }
+
+    /// How many executor tasks host those shards.
+    #[must_use]
+    pub const fn executors(&self) -> u16 {
+        self.executors
+    }
+}
+
+/// Spawns one executor task and returns the inbox that reaches it.
+fn spawn_executor<T: TraceSink, L: ReplicationLog>(
+    first_shard: u16,
+    states: Vec<ShardState<L>>,
+    trace: T,
+) -> mpsc::UnboundedSender<Envelope> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(run_executor(first_shard, states, trace, rx));
+    tx
 }
 
 impl Router for ShardPool {
     fn dispatch(&self, cmd: Command) -> impl Future<Output = Reply> + Send {
-        let index = usize::from(shard_of(cmd.key(), self.shards()));
+        let shard = shard_of(cmd.key(), self.shards);
+        let executor = usize::from(executor_of(shard, self.shards, self.executors));
         let (tx, rx) = oneshot::channel();
         // Send before the future is awaited: the inbox is unbounded, so this
         // never blocks and the caller cannot deadlock by holding the future.
-        let sent = self.inboxes[index]
-            .send(Envelope { cmd, reply: tx })
+        let sent = self.inboxes[executor]
+            .send(Envelope {
+                cmds: vec![(shard, cmd)],
+                reply: tx,
+            })
             .is_ok();
         async move {
             if !sent {
                 return Reply::Error(ReplyError::ShardUnavailable);
             }
-            // `unwrap_or` rather than `unwrap_or_else`: building this reply no
-            // longer allocates, so there is nothing to defer.
-            rx.await
-                .unwrap_or(Reply::Error(ReplyError::ShardUnavailable))
+            match rx.await {
+                // A one-command batch is answered with one reply; anything
+                // else means the executor did not answer this envelope.
+                Ok(mut replies) if replies.len() == 1 => replies.pop().expect("checked non-empty"),
+                _ => Reply::Error(ReplyError::ShardUnavailable),
+            }
         }
     }
 }
 
-/// One shard task: own a dict, answer the inbox, keep any rehash moving.
+/// One virtual shard's state: what used to be one task's locals.
+struct ShardState<L> {
+    dict: Dict,
+    seq: u64,
+    log: L,
+}
+
+/// One executor task: own a contiguous range of shards, answer the inbox,
+/// keep every owned rehash moving.
+///
+/// `states` holds the range's shards in ascending order starting at
+/// `first_shard`, so a command's shard id indexes it by subtraction.
 ///
 /// Returns when the inbox closes, which happens once the last [`ShardPool`]
 /// handle is dropped.
-async fn run_shard<T: TraceSink, L: ReplicationLog>(
-    shard: u16,
-    seed: DictSeed,
+async fn run_executor<T: TraceSink, L: ReplicationLog>(
+    first_shard: u16,
+    mut states: Vec<ShardState<L>>,
     trace: T,
-    mut log: L,
     mut inbox: mpsc::UnboundedReceiver<Envelope>,
 ) {
-    let mut dict = Dict::with_seed(seed);
-    let mut seq: u64 = 0;
-
     let mut tick = tokio::time::interval(REHASH_TICK);
     // `interval` yields its first tick immediately; consume it so the first
     // real tick is one period away.
@@ -376,29 +462,43 @@ async fn run_shard<T: TraceSink, L: ReplicationLog>(
             biased;
 
             envelope = inbox.recv() => {
-                let Some(Envelope { cmd, reply }) = envelope else {
+                let Some(Envelope { cmds, reply }) = envelope else {
                     break;
                 };
-                let at = seq;
-                let answer = apply(&mut dict, &mut log, &mut seq, shard, &cmd);
-                trace.record(shard, at, &cmd, &answer);
-                // The caller may have gone away; its reply is simply dropped.
-                let _ = reply.send(answer);
+                // No `await` inside this loop, so a batch is applied as a unit:
+                // nothing from another connection lands between its commands.
+                let mut replies = Vec::with_capacity(cmds.len());
+                for (shard, cmd) in &cmds {
+                    let state = &mut states[usize::from(shard - first_shard)];
+                    let at = state.seq;
+                    let answer =
+                        apply(&mut state.dict, &mut state.log, &mut state.seq, *shard, cmd);
+                    trace.record(*shard, at, cmd, &answer);
+                    replies.push(answer);
+                }
+                // The caller may have gone away; its replies are simply dropped.
+                let _ = reply.send(replies);
             }
+            // One ticker per executor rather than one per shard, advancing
+            // every owned dict by the same budget: the same per-dict drain
+            // rate, and the same aggregate work, as independent tickers.
             _ = tick.tick() => {
-                dict.rehash_step(REHASH_BUCKETS_PER_TICK);
-                // The durability point, and the only place in a shard that can
-                // afford to be one: `append` runs inside a handler that cannot
-                // `await`, so it must stay cheap, while this arm is already
-                // async and may block. That split is why the trait has two
-                // methods rather than one.
-                //
-                // The cadence is the tick's, which is a starting shape rather
-                // than a policy — a real log picks its own, and may want group
-                // commit across shards instead. The error has nowhere to go
-                // until this project has somewhere to report to; a log that
-                // cannot sync is a Phase 3 problem with a Phase 3 answer.
-                let _ = log.sync();
+                for state in &mut states {
+                    state.dict.rehash_step(REHASH_BUCKETS_PER_TICK);
+                    // The durability point, and the only place in a shard that
+                    // can afford to be one: `append` runs inside a handler that
+                    // cannot `await`, so it must stay cheap, while this arm is
+                    // already async and may block. That split is why the trait
+                    // has two methods rather than one.
+                    //
+                    // The cadence is the tick's, which is a starting shape
+                    // rather than a policy — a real log picks its own, and may
+                    // want group commit across shards instead. The error has
+                    // nowhere to go until this project has somewhere to report
+                    // to; a log that cannot sync is a Phase 3 problem with a
+                    // Phase 3 answer.
+                    let _ = state.log.sync();
+                }
             }
         }
     }
@@ -521,7 +621,7 @@ mod tests {
 
     #[tokio::test]
     async fn commands_round_trip_through_the_pool() {
-        let pool = ShardPool::spawn(16, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let pool = ShardPool::spawn(16, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         assert_eq!(
             pool.dispatch(Command::Set {
                 key: b"k".to_vec(),
@@ -721,7 +821,7 @@ mod tests {
 
     #[tokio::test]
     async fn incr_by_reports_overflow_instead_of_panicking() {
-        let pool = ShardPool::spawn(4, DictSeed { k0: 3, k1: 4 }, NoTrace);
+        let pool = ShardPool::spawn(4, 4, DictSeed { k0: 3, k1: 4 }, NoTrace);
         assert_eq!(
             pool.dispatch(Command::Set {
                 key: b"c".to_vec(),
@@ -747,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_counter_starts_at_zero_and_set_overwrites() {
-        let pool = ShardPool::spawn(8, DictSeed { k0: 5, k1: 6 }, NoTrace);
+        let pool = ShardPool::spawn(8, 4, DictSeed { k0: 5, k1: 6 }, NoTrace);
         assert_eq!(
             pool.dispatch(Command::IncrBy {
                 key: b"fresh".to_vec(),
@@ -778,7 +878,7 @@ mod tests {
     async fn keys_spread_over_shards_and_every_one_survives_growth() {
         // 16 shards, enough keys that several dicts outgrow their initial
         // eight buckets and rehash while the writes keep coming.
-        let pool = ShardPool::spawn(16, DictSeed { k0: 11, k1: 13 }, NoTrace);
+        let pool = ShardPool::spawn(16, 4, DictSeed { k0: 11, k1: 13 }, NoTrace);
         let keys: Vec<Vec<u8>> = (0..600u32)
             .map(|i| format!("key:{i}").into_bytes())
             .collect();
@@ -830,7 +930,7 @@ mod tests {
         let sink = Recorder::default();
         // One shard, so every command shares a `seq` counter and the observed
         // positions are a single sequence rather than an interleaving.
-        let pool = ShardPool::spawn(1, DictSeed { k0: 2, k1: 3 }, sink.clone());
+        let pool = ShardPool::spawn(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone());
 
         pool.dispatch(Command::Get { key: b"k".to_vec() }).await;
         pool.dispatch(Command::Set {
@@ -862,6 +962,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shards_sharing_an_executor_keep_independent_replication_positions() {
+        let sink = Recorder::default();
+        // Four shards on one executor: every shard's state lives in one task, and
+        // the positions must still be per shard, not per executor.
+        let pool = ShardPool::spawn(4, 1, DictSeed { k0: 2, k1: 3 }, sink.clone());
+
+        // Two keys on two different shards (probe until found).
+        let keys: Vec<Vec<u8>> = (0..32u32).map(|i| format!("k{i}").into_bytes()).collect();
+        let a = keys
+            .iter()
+            .find(|k| shard_of(k, 4) == 0)
+            .expect("a key on shard 0")
+            .clone();
+        let b = keys
+            .iter()
+            .find(|k| shard_of(k, 4) == 1)
+            .expect("a key on shard 1")
+            .clone();
+
+        for key in [&a, &b, &a, &b] {
+            pool.dispatch(Command::Set {
+                key: key.clone(),
+                value: b"v".to_vec(),
+            })
+            .await;
+        }
+        let seen = sink.0.lock().expect("recorder mutex").clone();
+        let positions: Vec<(u16, u64)> = seen
+            .iter()
+            .map(|(shard, seq, _, _)| (*shard, *seq))
+            .collect();
+        assert_eq!(positions, vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
+    }
+
     /// The seam, exercised rather than asserted.
     ///
     /// A log that is not [`NoopLog`] reaches a shard and sees every mutation at
@@ -884,7 +1019,7 @@ mod tests {
         }
 
         let log = Recording::default();
-        let pool = ShardPool::spawn_with_log(1, DictSeed { k0: 1, k1: 2 }, NoTrace, {
+        let pool = ShardPool::spawn_with_log(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace, {
             let log = log.clone();
             move |_shard| log.clone()
         });
@@ -930,7 +1065,7 @@ mod tests {
         }
 
         let pool =
-            ShardPool::spawn_with_log(1, DictSeed { k0: 1, k1: 2 }, NoTrace, |_shard| Failing);
+            ShardPool::spawn_with_log(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace, |_shard| Failing);
 
         assert_eq!(
             pool.dispatch(Command::Set {
@@ -961,6 +1096,20 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "shards must be greater than zero")]
     async fn a_pool_of_no_shards_is_a_programming_error() {
-        ShardPool::spawn(0, DictSeed { k0: 0, k1: 0 }, NoTrace);
+        ShardPool::spawn(0, 1, DictSeed { k0: 0, k1: 0 }, NoTrace);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "executors must be in 1..=shards")]
+    async fn a_pool_of_no_executors_is_a_programming_error() {
+        ShardPool::spawn(4, 0, DictSeed { k0: 0, k1: 0 }, NoTrace);
+    }
+
+    /// More executors than shards would leave one owning nothing, which the
+    /// partition function has no way to express and no caller has a use for.
+    #[tokio::test]
+    #[should_panic(expected = "executors must be in 1..=shards")]
+    async fn a_pool_with_more_executors_than_shards_is_a_programming_error() {
+        ShardPool::spawn(4, 5, DictSeed { k0: 0, k1: 0 }, NoTrace);
     }
 }

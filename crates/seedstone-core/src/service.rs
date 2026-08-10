@@ -658,7 +658,7 @@ mod tests {
 
     #[tokio::test]
     async fn serves_resp_over_a_duplex_stream() {
-        let pool = ShardPool::spawn(16, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let pool = ShardPool::spawn(16, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(4096);
         tokio::spawn(serve_connection(server, pool));
         let (mut r, mut w) = tokio::io::split(client);
@@ -881,7 +881,7 @@ mod tests {
         const VALUE: usize = 64 * 1024;
         const READS: usize = 8;
 
-        let pool = ShardPool::spawn(16, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let pool = ShardPool::spawn(16, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
         let flushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_write = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1192,7 +1192,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_disconnect_ends_the_connection_task() {
-        let pool = ShardPool::spawn(4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let pool = ShardPool::spawn(4, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(serve_connection(server, pool));
         drop(client);
@@ -1293,7 +1293,7 @@ mod tests {
     async fn a_frame_that_never_ends_is_cut_off_at_the_ceiling() {
         const CEILING: usize = 64 * 1024;
 
-        let pool = ShardPool::spawn(4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let pool = ShardPool::spawn(4, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(8 * 1024);
         let task = tokio::spawn(serve_connection_limited(server, pool, CEILING));
         let (mut r, mut w) = tokio::io::split(client);
@@ -1347,7 +1347,7 @@ mod tests {
     async fn an_array_too_large_to_hold_is_refused_at_its_header() {
         const CEILING: usize = 64 * 1024;
 
-        let pool = ShardPool::spawn(4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let pool = ShardPool::spawn(4, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(serve_connection_limited(server, pool, CEILING));
         let (mut r, mut w) = tokio::io::split(client);
@@ -1394,7 +1394,7 @@ mod tests {
     async fn a_bulk_too_large_to_hold_is_refused_at_its_header() {
         const CEILING: usize = 64 * 1024;
 
-        let pool = ShardPool::spawn(4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let pool = ShardPool::spawn(4, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(serve_connection_limited(server, pool, CEILING));
         let (mut r, mut w) = tokio::io::split(client);
@@ -1674,7 +1674,7 @@ mod tests {
         tokio::io::WriteHalf<tokio::io::DuplexStream>,
         ShardPool,
     ) {
-        let pool = ShardPool::spawn(shards, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let pool = ShardPool::spawn(shards, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(64 * 1024);
         tokio::spawn(serve_connection(server, pool.clone()));
         let (r, w) = tokio::io::split(client);
