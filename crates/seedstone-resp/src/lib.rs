@@ -160,11 +160,13 @@ const MAX_ARRAY_DEPTH: usize = 64;
 ///
 ///   **That last point rests on an assumption this crate does not enforce:
 ///   that no command carries more than two payloads.** It is the command
-///   layer's arity table that holds it up, not the codec — `parse` alone will
-///   happily hand back an array of [`MAX_ARRAY_LEN`] bulks of this size. A
-///   third bulk argument (`MSET`, `SET … EX`, a multi-key `DEL`) puts four
-///   payloads in one record and breaks the arithmetic, so whoever adds one
-///   owns re-checking it against the log's ceiling.
+///   layer's arity table that holds it up, not the codec — nothing here ties
+///   the number of bulks in an array to the number a command expects, and
+///   [`DecoderLimits::max_in_memory`] bounds only the total, which is the log
+///   record's ceiling and not the arity rule. A third bulk argument (`MSET`,
+///   `SET … EX`, a multi-key `DEL`) puts four payloads in one record and
+///   breaks the arithmetic, so whoever adds one owns re-checking it against
+///   the log's ceiling.
 pub const MAX_BULK_LEN: usize = 16 * 1024 * 1024;
 
 /// The largest [`Frame::Array`] element count [`parse`] accepts.
@@ -219,154 +221,513 @@ fn ceiling(limit: usize) -> i64 {
     i64::try_from(limit).expect("a length ceiling is a small constant")
 }
 
-/// Finds the first `\r\n` in `buf` at or after `start`.
+/// The bounds a [`Decoder`] enforces on top of the per-frame ceilings.
 ///
-/// Returns `Some((line_end, after_crlf))` where `buf[start..line_end]` is
-/// the line's content and `after_crlf` is the offset just past the `\r\n`.
-/// Returns `None` when no `\r\n` is present yet — including when `buf` ends
-/// with a lone `\r` — which means "wait for more bytes", not "malformed".
-fn read_line(buf: &[u8], start: usize) -> Option<(usize, usize)> {
-    let mut i = start;
-    while i + 1 < buf.len() {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
-            return Some((i, i + 2));
-        }
-        i += 1;
-    }
-    None
+/// [`MAX_BULK_LEN`] and [`MAX_ARRAY_LEN`] cap what any *one* length prefix may
+/// declare, and they are not configurable: they are part of the protocol's
+/// accept set, identical on every target. These two are the other half — what
+/// a peer may make the decoder *hold* while a frame is still arriving — and a
+/// caller sets them to whatever its own budget is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecoderLimits {
+    /// The most undecoded wire bytes one frame may occupy.
+    ///
+    /// Checked when the decoder runs out of input, so it bounds the buffer a
+    /// dribbled frame can grow: a peer that opens a frame and never closes it
+    /// is cut off here rather than fed forever.
+    pub max_frame_bytes: usize,
+    /// The most memory the *parsed* form of one frame may occupy.
+    ///
+    /// The wire form does not reveal this. An `Integer` element is four bytes
+    /// on the wire and a whole [`Frame`] once parsed, so an array of them
+    /// amplifies by roughly eight; a bound on bytes read cannot see that, and
+    /// this one is what stops it.
+    pub max_in_memory: usize,
 }
 
-/// Parses one RESP2 frame starting at `buf[pos..]`.
-///
-/// `depth` is the array-nesting level of the frame at `pos` itself (0 for a
-/// frame that is not inside any array). Returns `Ok(Some((frame,
-/// after_frame)))` on success, `Ok(None)` if `buf[pos..]` is a proper prefix
-/// of a valid frame, or `Err` if it can never be valid.
-fn parse_frame(buf: &[u8], pos: usize, depth: usize) -> Result<Option<(Frame, usize)>, ParseError> {
-    let Some(&type_byte) = buf.get(pos) else {
-        return Ok(None);
-    };
-    let content_start = pos + 1;
+impl DecoderLimits {
+    /// The buffer capacity a drained decoder shrinks back to.
+    ///
+    /// A connection that once carried a large frame otherwise keeps that
+    /// allocation for its whole life, and idle connections outnumber busy
+    /// ones. Below this, shrinking would cost more churn than it saves.
+    pub const SHED: usize = 256 * 1024;
 
-    match type_byte {
-        b'+' => {
-            let Some((line_end, next)) = read_line(buf, content_start) else {
-                return Ok(None);
-            };
-            let s = String::from_utf8(buf[content_start..line_end].to_vec())
-                .map_err(|_| ParseError("simple string is not valid UTF-8".into()))?;
-            Ok(Some((Frame::Simple(s), next)))
+    /// Default for [`DecoderLimits::max_frame_bytes`], 64 MiB.
+    ///
+    /// Coherent with the connection layer's own request ceiling: the decoder
+    /// refuses at the same point the reader above it would.
+    pub const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+    /// Default for [`DecoderLimits::max_in_memory`], 64 MiB.
+    pub const DEFAULT_MAX_IN_MEMORY: usize = 64 * 1024 * 1024;
+}
+
+impl Default for DecoderLimits {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: Self::DEFAULT_MAX_FRAME_BYTES,
+            max_in_memory: Self::DEFAULT_MAX_IN_MEMORY,
         }
-        b'-' => {
-            let Some((line_end, next)) = read_line(buf, content_start) else {
-                return Ok(None);
-            };
-            let s = String::from_utf8(buf[content_start..line_end].to_vec())
-                .map_err(|_| ParseError("error string is not valid UTF-8".into()))?;
-            Ok(Some((Frame::Error(s), next)))
-        }
-        b':' => {
-            let Some((line_end, next)) = read_line(buf, content_start) else {
-                return Ok(None);
-            };
-            let n = parse_i64(&buf[content_start..line_end])?;
-            Ok(Some((Frame::Integer(n), next)))
-        }
-        b'$' => parse_bulk(buf, content_start),
-        b'*' => parse_array(buf, content_start, depth),
-        other => Err(ParseError(format!("unknown RESP2 type byte: {other:#04x}"))),
     }
 }
 
-/// Parses the body of a `$` frame, whose length line starts at `content_start`.
-///
-/// Both null (`$-1`) and ordinary bulk strings come through here; the caller
-/// has consumed only the type byte.
-fn parse_bulk(buf: &[u8], content_start: usize) -> Result<Option<(Frame, usize)>, ParseError> {
-    let Some((line_end, next)) = read_line(buf, content_start) else {
-        return Ok(None);
-    };
-    let len = parse_i64(&buf[content_start..line_end])?;
-    if len == -1 {
-        return Ok(Some((Frame::Null, next)));
-    }
-    if len < -1 {
-        return Err(ParseError(format!("negative bulk length: {len}")));
-    }
-    if len > ceiling(MAX_BULK_LEN) {
-        return Err(ParseError(format!(
-            "bulk length {len} exceeds the {MAX_BULK_LEN}-byte limit"
-        )));
-    }
-    // The ceiling above already puts this in range on any target with a
-    // 32-bit-or-wider `usize`; the conversion stays so the function has no
-    // panicking path at all.
-    let len = usize::try_from(len).map_err(|_| ParseError("bulk length too large".into()))?;
-    let payload_start = next;
-    let payload_end = payload_start
-        .checked_add(len)
-        .ok_or_else(|| ParseError("bulk length overflows buffer offset".into()))?;
-    let term_end = payload_end
-        .checked_add(2)
-        .ok_or_else(|| ParseError("bulk length overflows buffer offset".into()))?;
-    if term_end > buf.len() {
-        return Ok(None);
-    }
-    if &buf[payload_end..term_end] != b"\r\n" {
-        return Err(ParseError("bulk payload missing CRLF terminator".into()));
-    }
-    Ok(Some((
-        Frame::Bulk(buf[payload_start..payload_end].to_vec()),
-        term_end,
-    )))
+/// An array whose header has been read and whose elements are still arriving.
+#[derive(Debug)]
+struct PendingArray {
+    /// Elements still to come before the array is complete.
+    remaining: usize,
+    /// Elements already parsed, in order.
+    elements: Vec<Frame>,
 }
 
-/// Parses the body of a `*` frame, whose count line starts at `content_start`.
+/// One completed unit of input: a value, or the header of an array whose
+/// elements are still to come.
+#[derive(Debug)]
+enum Element {
+    Value(Frame),
+    ArrayHeader(usize),
+}
+
+/// How far into the current element the reader has got.
 ///
-/// `depth` is the nesting level of the array's *parent*, so the array itself
-/// sits one level deeper — which is what [`MAX_ARRAY_DEPTH`] is checked against.
-fn parse_array(
-    buf: &[u8],
-    content_start: usize,
-    depth: usize,
-) -> Result<Option<(Frame, usize)>, ParseError> {
-    let Some((line_end, next)) = read_line(buf, content_start) else {
-        return Ok(None);
-    };
-    let count = parse_i64(&buf[content_start..line_end])?;
-    if count < 0 {
-        // `*-1\r\n` (the null array) is not supported; every negative count,
-        // including -1, is rejected.
-        return Err(ParseError(format!(
-            "negative array length is not supported: {count}"
-        )));
+/// This enum is the whole point of the rework: nothing already understood is
+/// understood twice. A resumed decode picks up from the recorded position
+/// instead of re-reading the element from its type byte, which is what turns
+/// a dribbled frame from quadratic work into linear.
+#[derive(Debug, Clone, Copy)]
+enum Partial {
+    /// At the element's type byte; none of it has been read.
+    Start,
+    /// Inside a CRLF-terminated line. `scanned` is the offset of the first
+    /// byte not yet tested as the start of a `\r\n`, so a resumed scan skips
+    /// everything already searched.
+    Line { scanned: usize },
+    /// A `$` header has been read and validated. The payload starts `header`
+    /// bytes past the element's first byte and runs for `len`, so waiting for
+    /// it is a comparison of two numbers — the payload is never scanned.
+    BulkBody { header: usize, len: usize },
+}
+
+/// The resumable half of the decoder: everything except the byte buffer.
+///
+/// Split out from [`Decoder`] so [`parse`] can run the same state machine
+/// over a slice it does not own, and so the one-shot and streaming entry
+/// points cannot drift apart.
+#[derive(Debug)]
+struct Decoding {
+    /// First byte not yet consumed by a *completed* element.
+    scan: usize,
+    /// Position inside the element at `scan`.
+    partial: Partial,
+    /// Arrays still being filled, outermost first. Flat, so no input can
+    /// recurse this into the call stack.
+    stack: Vec<PendingArray>,
+    /// Accounted size of everything held in `stack`, plus the frame about to
+    /// leave it.
+    in_memory: usize,
+    /// Bytes the state machine has looked at or copied.
+    ///
+    /// Only [`Decoder::bytes_examined`] reads it, and only under `cfg(test)`;
+    /// it exists so the linearity property is a test assertion rather than a
+    /// claim. Counting is a handful of additions per element, not one per
+    /// byte, so it stays in ordinary builds rather than behind a feature that
+    /// would have to be unified across the workspace.
+    examined: usize,
+}
+
+impl Decoding {
+    /// A decoder positioned at the start of a frame, holding nothing.
+    const fn new() -> Self {
+        Self {
+            scan: 0,
+            partial: Partial::Start,
+            stack: Vec::new(),
+            in_memory: 0,
+            examined: 0,
+        }
     }
-    let depth = depth + 1;
-    if depth > MAX_ARRAY_DEPTH {
-        return Err(ParseError(format!(
-            "array nesting exceeds the depth limit of {MAX_ARRAY_DEPTH}"
-        )));
+
+    /// Returns to the start-of-frame position, keeping the work counter.
+    ///
+    /// Called once a top-level frame has been delivered and its bytes drained,
+    /// which is the only moment `scan` may go backwards: [`Partial::Line`] and
+    /// [`Partial::BulkBody`] hold offsets into the buffer, and both are
+    /// [`Partial::Start`] here by construction.
+    fn restart(&mut self) {
+        debug_assert!(self.stack.is_empty(), "a delivered frame leaves no arrays");
+        self.scan = 0;
+        self.partial = Partial::Start;
+        self.in_memory = 0;
     }
-    if count > ceiling(MAX_ARRAY_LEN) {
-        return Err(ParseError(format!(
-            "array length {count} exceeds the limit of {MAX_ARRAY_LEN}"
-        )));
-    }
-    // In range by the ceiling above; kept for the same reason as the bulk
-    // conversion.
-    let count = usize::try_from(count).map_err(|_| ParseError("array length too large".into()))?;
-    let mut frames = Vec::new();
-    let mut cursor = next;
-    for _ in 0..count {
-        match parse_frame(buf, cursor, depth)? {
-            None => return Ok(None),
-            Some((frame, after_frame)) => {
-                frames.push(frame);
-                cursor = after_frame;
+
+    /// Reads elements from `buf` until one completes a top-level frame.
+    ///
+    /// `Ok(None)` means the input ran out mid-frame; every element completed
+    /// so far is retained, and the next call resumes rather than restarts.
+    fn step(&mut self, buf: &[u8], limits: &DecoderLimits) -> Result<Option<Frame>, ParseError> {
+        loop {
+            let Some(element) = self.read_element(buf, limits)? else {
+                // Everything in `buf` belongs to the frame still being read:
+                // a decoder drains its buffer the moment one completes, and a
+                // one-shot `parse` only reaches here when the first frame is
+                // incomplete. So this is that frame's wire size so far.
+                if buf.len() > limits.max_frame_bytes {
+                    return Err(ParseError(format!(
+                        "frame exceeds the {}-byte buffering limit",
+                        limits.max_frame_bytes
+                    )));
+                }
+                return Ok(None);
+            };
+            if let Some(frame) = self.place(element, limits)? {
+                return Ok(Some(frame));
             }
         }
     }
-    Ok(Some((Frame::Array(frames), cursor)))
+
+    /// Reads the single element at `scan`, advancing `scan` past it.
+    ///
+    /// `Ok(None)` means the element is incomplete; `partial` then records how
+    /// far it got, so the next attempt does not start over.
+    fn read_element(
+        &mut self,
+        buf: &[u8],
+        limits: &DecoderLimits,
+    ) -> Result<Option<Element>, ParseError> {
+        // A bulk whose header is already parsed needs no scanning at all.
+        if let Partial::BulkBody { header, len } = self.partial {
+            return Ok(self.finish_bulk(buf, header, len)?.map(Element::Value));
+        }
+
+        let Some(&type_byte) = buf.get(self.scan) else {
+            return Ok(None);
+        };
+        self.examined += 1;
+        let content = self.scan + 1;
+        let Some((line_end, next)) = self.find_crlf(buf, content) else {
+            return Ok(None);
+        };
+        let field = &buf[content..line_end];
+
+        let element = match type_byte {
+            b'+' => Element::Value(Frame::Simple(
+                String::from_utf8(field.to_vec())
+                    .map_err(|_| ParseError("simple string is not valid UTF-8".into()))?,
+            )),
+            b'-' => Element::Value(Frame::Error(
+                String::from_utf8(field.to_vec())
+                    .map_err(|_| ParseError("error string is not valid UTF-8".into()))?,
+            )),
+            b':' => Element::Value(Frame::Integer(parse_i64(field)?)),
+            b'$' => {
+                let len = parse_i64(field)?;
+                if len == -1 {
+                    self.scan = next;
+                    return Ok(Some(Element::Value(Frame::Null)));
+                }
+                if len < -1 {
+                    return Err(ParseError(format!("negative bulk length: {len}")));
+                }
+                if len > ceiling(MAX_BULK_LEN) {
+                    return Err(ParseError(format!(
+                        "bulk length {len} exceeds the {MAX_BULK_LEN}-byte limit"
+                    )));
+                }
+                // The ceiling above already puts this in range on any target
+                // with a 32-bit-or-wider `usize`; the conversion stays so this
+                // function has no panicking path at all.
+                let len =
+                    usize::try_from(len).map_err(|_| ParseError("bulk length too large".into()))?;
+                let header = next - self.scan;
+                self.partial = Partial::BulkBody { header, len };
+                return Ok(self.finish_bulk(buf, header, len)?.map(Element::Value));
+            }
+            b'*' => Element::ArrayHeader(self.array_header(field, limits)?),
+            other => return Err(ParseError(format!("unknown RESP2 type byte: {other:#04x}"))),
+        };
+        self.scan = next;
+        Ok(Some(element))
+    }
+
+    /// Validates a `*` count line and returns the element count it declares.
+    ///
+    /// The depth check lives here rather than where the array is pushed, so
+    /// the order the three rejections are tried in matches what a reader of
+    /// the protocol expects: sign, then depth, then ceiling.
+    fn array_header(&self, field: &[u8], limits: &DecoderLimits) -> Result<usize, ParseError> {
+        let count = parse_i64(field)?;
+        if count < 0 {
+            // `*-1\r\n` (the null array) is not supported; every negative
+            // count, including -1, is rejected.
+            return Err(ParseError(format!(
+                "negative array length is not supported: {count}"
+            )));
+        }
+        if self.stack.len() + 1 > MAX_ARRAY_DEPTH {
+            return Err(ParseError(format!(
+                "array nesting exceeds the depth limit of {MAX_ARRAY_DEPTH}"
+            )));
+        }
+        if count > ceiling(MAX_ARRAY_LEN) {
+            return Err(ParseError(format!(
+                "array length {count} exceeds the limit of {MAX_ARRAY_LEN}"
+            )));
+        }
+        // In range by the ceiling above; kept for the same reason as the bulk
+        // conversion.
+        let count =
+            usize::try_from(count).map_err(|_| ParseError("array length too large".into()))?;
+        // An array that cannot fit even as empty `Frame`s is refused at its
+        // header, before one element is read — the count is a promise about
+        // memory, and this is the only moment the promise is cheap to refuse.
+        if count.saturating_mul(size_of::<Frame>()) > limits.max_in_memory {
+            return Err(ParseError(format!(
+                "array of {count} elements exceeds the {}-byte in-memory limit",
+                limits.max_in_memory
+            )));
+        }
+        Ok(count)
+    }
+
+    /// Completes a `$` element whose header has already been read.
+    ///
+    /// The declared length short-circuits the wait: while the payload is still
+    /// arriving this compares two numbers and looks at no bytes at all, which
+    /// is what keeps a 16 MiB bulk delivered in 1 KiB reads linear.
+    fn finish_bulk(
+        &mut self,
+        buf: &[u8],
+        header: usize,
+        len: usize,
+    ) -> Result<Option<Frame>, ParseError> {
+        let overflow = || ParseError("bulk length overflows buffer offset".into());
+        let end = header
+            .checked_add(len)
+            .and_then(|n| n.checked_add(2))
+            .and_then(|n| self.scan.checked_add(n))
+            .ok_or_else(overflow)?;
+        if end > buf.len() {
+            return Ok(None);
+        }
+        let payload_start = self.scan + header;
+        let payload_end = payload_start + len;
+        if &buf[payload_end..end] != b"\r\n" {
+            return Err(ParseError("bulk payload missing CRLF terminator".into()));
+        }
+        self.examined += len;
+        let payload = buf[payload_start..payload_end].to_vec();
+        self.scan = end;
+        self.partial = Partial::Start;
+        Ok(Some(Frame::Bulk(payload)))
+    }
+
+    /// Finds the first `\r\n` at or after `start`, resuming a scan an earlier
+    /// call left unfinished.
+    ///
+    /// Returns `Some((line_end, after_crlf))` where `buf[start..line_end]` is
+    /// the line's content and `after_crlf` is the offset just past the `\r\n`.
+    /// `None` means "wait for more bytes" — including when `buf` ends with a
+    /// lone `\r` — and records how far the search reached, so a line arriving
+    /// one byte at a time is scanned once rather than once per byte.
+    fn find_crlf(&mut self, buf: &[u8], start: usize) -> Option<(usize, usize)> {
+        let resume = match self.partial {
+            Partial::Line { scanned } if scanned > start => scanned,
+            _ => start,
+        };
+        let mut i = resume;
+        while i + 1 < buf.len() {
+            if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+                self.examined += i + 2 - resume;
+                self.partial = Partial::Start;
+                return Some((i, i + 2));
+            }
+            i += 1;
+        }
+        // The loop never inspects the final byte, which may yet turn out to be
+        // the `\r` of a terminator, so resuming from it is safe.
+        self.examined += i - resume;
+        self.partial = Partial::Line { scanned: i };
+        None
+    }
+
+    /// Attaches a completed element to the innermost pending array, cascading
+    /// through every array the attachment fills.
+    ///
+    /// Returns the frame once one completes at top level, `None` while the
+    /// decoder still owes elements to some array.
+    fn place(
+        &mut self,
+        element: Element,
+        limits: &DecoderLimits,
+    ) -> Result<Option<Frame>, ParseError> {
+        let mut value = match element {
+            Element::ArrayHeader(count) => {
+                // Depth is checked in `array_header`, before the count is
+                // even converted; this push cannot exceed it.
+                self.stack.push(PendingArray {
+                    remaining: count,
+                    elements: Vec::new(),
+                });
+                // Only a zero-element array can already be complete.
+                match self.pop_filled() {
+                    Some(frame) => frame,
+                    None => return Ok(None),
+                }
+            }
+            Element::Value(frame) => frame,
+        };
+        loop {
+            self.charge(&value, limits)?;
+            if self.stack.is_empty() {
+                self.in_memory = 0;
+                return Ok(Some(value));
+            }
+            let top = self.stack.last_mut().expect("the stack is not empty");
+            top.elements.push(value);
+            top.remaining -= 1;
+            match self.pop_filled() {
+                Some(frame) => value = frame,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Pops the innermost pending array if it has all its elements.
+    fn pop_filled(&mut self) -> Option<Frame> {
+        self.stack
+            .pop_if(|array| array.remaining == 0)
+            .map(|filled| Frame::Array(filled.elements))
+    }
+
+    /// Accounts for one frame against [`DecoderLimits::max_in_memory`].
+    ///
+    /// Charged *before* the frame is pushed, so the limit stops the array from
+    /// growing rather than discovering afterwards that it did.
+    fn charge(&mut self, frame: &Frame, limits: &DecoderLimits) -> Result<(), ParseError> {
+        let cost = size_of::<Frame>().saturating_add(payload_bytes(frame));
+        self.in_memory = self.in_memory.saturating_add(cost);
+        if self.in_memory > limits.max_in_memory {
+            return Err(ParseError(format!(
+                "decoded frame exceeds the {}-byte in-memory limit",
+                limits.max_in_memory
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The heap bytes a frame owns beyond the [`Frame`] itself.
+///
+/// An array's children are charged as each one is attached, so the array node
+/// contributes only its own size and nothing is counted twice.
+const fn payload_bytes(frame: &Frame) -> usize {
+    match frame {
+        Frame::Simple(text) | Frame::Error(text) => text.len(),
+        Frame::Bulk(payload) => payload.len(),
+        Frame::Integer(_) | Frame::Null | Frame::Array(_) => 0,
+    }
+}
+
+/// A resumable RESP2 decoder: wire bytes in, frames out.
+///
+/// The difference from calling [`parse`] on a growing buffer is where the work
+/// goes. `parse` starts at offset zero every time, so a request that arrives
+/// in `n` chunks re-parses every already-complete element `n` times and
+/// re-allocates its payload each time; an array of a million tiny bulks is
+/// megabytes of input and order 10⁸ allocations. A `Decoder` keeps the
+/// elements it has already understood, so the same input is parsed once.
+///
+/// It is also non-recursive. Nesting is held in a heap [`Vec`], not in the
+/// call stack, so [`MAX_ARRAY_DEPTH`] is a policy about what the protocol
+/// accepts rather than the only thing standing between a hostile frame and a
+/// stack overflow.
+///
+/// # Example
+///
+/// ```
+/// use seedstone_resp::{Decoder, DecoderLimits, Frame};
+///
+/// let mut decoder = Decoder::new(DecoderLimits::default());
+/// decoder.feed(b"*1\r\n$3\r\nGET");
+/// assert_eq!(decoder.try_next(), Ok(None)); // still arriving
+/// decoder.feed(b"\r\n");
+/// assert_eq!(
+///     decoder.try_next(),
+///     Ok(Some(Frame::Array(vec![Frame::Bulk(b"GET".to_vec())]))),
+/// );
+/// assert_eq!(decoder.buffered(), 0);
+/// ```
+#[derive(Debug)]
+pub struct Decoder {
+    /// Wire bytes fed but not yet consumed by a delivered frame.
+    buf: Vec<u8>,
+    state: Decoding,
+    limits: DecoderLimits,
+}
+
+impl Decoder {
+    /// A decoder holding nothing, bounded by `limits`.
+    #[must_use]
+    pub const fn new(limits: DecoderLimits) -> Self {
+        Self {
+            buf: Vec::new(),
+            state: Decoding::new(),
+            limits,
+        }
+    }
+
+    /// Appends freshly read wire bytes.
+    ///
+    /// Chunk boundaries carry no meaning: the same bytes produce the same
+    /// frames however they are split.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Takes the next complete frame, if the bytes fed so far hold one.
+    ///
+    /// `Ok(None)` means "read more and call again" and costs nothing to
+    /// repeat: no element already parsed is parsed a second time. Call it in a
+    /// loop after each [`Decoder::feed`] — one read can carry several frames.
+    ///
+    /// # Errors
+    ///
+    /// When the bytes can never form a valid frame — the same conditions
+    /// [`parse`] rejects — or when the frame in flight exceeds
+    /// [`DecoderLimits::max_frame_bytes`] on the wire or
+    /// [`DecoderLimits::max_in_memory`] once parsed. Every one of these is
+    /// terminal: the decoder holds a half-read frame it cannot resynchronise
+    /// from, so the connection is the thing to drop, not the error.
+    pub fn try_next(&mut self) -> Result<Option<Frame>, ParseError> {
+        let Some(frame) = self.state.step(&self.buf, &self.limits)? else {
+            return Ok(None);
+        };
+        self.buf.drain(..self.state.scan);
+        self.state.restart();
+        if self.buf.capacity() > DecoderLimits::SHED {
+            // A connection that carried one large frame otherwise holds that
+            // buffer for the rest of its life.
+            self.buf.shrink_to(DecoderLimits::SHED);
+        }
+        Ok(Some(frame))
+    }
+
+    /// Bytes fed but not yet consumed by a delivered frame.
+    #[must_use]
+    pub const fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Bytes the state machine has looked at or copied since construction.
+    ///
+    /// The linearity property this type exists for is only meaningful if it
+    /// can be measured, so the counter is asserted on in this crate's tests.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn bytes_examined(&self) -> usize {
+        self.state.examined
+    }
 }
 
 /// Parses one RESP2 frame from the start of `buf`.
@@ -381,6 +742,11 @@ fn parse_array(
 ///   from the connection and call `parse` again.
 /// - `Err(ParseError)` — `buf` can never be a valid frame. This is terminal
 ///   for the connection; do not retry.
+///
+/// A caller that reads from a socket wants [`Decoder`] instead. This function
+/// starts from offset zero on every call, so feeding it a growing buffer
+/// re-parses — and re-allocates — every element that was already complete;
+/// `Decoder` runs the same state machine and keeps what it has understood.
 ///
 /// # Errors
 ///
@@ -399,7 +765,12 @@ fn parse_array(
 /// assert_eq!(parse(&buf), Ok(Some((Frame::Integer(42), buf.len()))));
 /// ```
 pub fn parse(buf: &[u8]) -> Result<Option<(Frame, usize)>, ParseError> {
-    parse_frame(buf, 0, 0)
+    let mut state = Decoding::new();
+    // `scan` stops at the end of the frame that completed, which is exactly
+    // the byte count this function's contract reports.
+    Ok(state
+        .step(buf, &DecoderLimits::default())?
+        .map(|frame| (frame, state.scan)))
 }
 
 #[cfg(test)]
@@ -599,5 +970,200 @@ mod tests {
         encode(&Frame::Integer(2), &mut out);
         let (f, used) = parse(&out).unwrap().unwrap();
         assert_eq!((f, used), (Frame::Integer(1), split));
+    }
+
+    /// The frames every decoder test streams. Same shapes as
+    /// `parse_round_trips_every_frame_type`, plus the two that only a
+    /// resumable decoder makes interesting: a bulk long enough to straddle
+    /// several chunks, and an array whose elements are individually tiny.
+    fn streaming_cases() -> Vec<Frame> {
+        vec![
+            Frame::Simple("OK".into()),
+            Frame::Error("ERR boom".into()),
+            Frame::Integer(-7),
+            Frame::Bulk(b"hi".to_vec()),
+            Frame::Bulk(Vec::new()),
+            Frame::Bulk(b"a\r\nb\x00c\xffd".to_vec()),
+            Frame::Null,
+            Frame::Array(vec![
+                Frame::Bulk(b"GET".to_vec()),
+                Frame::Bulk(b"k".to_vec()),
+            ]),
+            Frame::Array(vec![]),
+            Frame::Array(vec![Frame::Array(vec![Frame::Integer(1)])]),
+            Frame::Array(vec![
+                Frame::Simple("nested".into()),
+                Frame::Array(vec![Frame::Null, Frame::Array(vec![])]),
+                Frame::Integer(i64::MIN),
+            ]),
+            Frame::Bulk(vec![b'q'; 5000]),
+        ]
+    }
+
+    /// Feeds `wire` to a fresh decoder in `chunk`-sized pieces, draining every
+    /// frame that becomes available after each piece.
+    fn drain_in_chunks(wire: &[u8], chunk: usize) -> Result<Vec<Frame>, ParseError> {
+        let mut decoder = Decoder::new(DecoderLimits::default());
+        let mut frames = Vec::new();
+        for piece in wire.chunks(chunk) {
+            decoder.feed(piece);
+            while let Some(frame) = decoder.try_next()? {
+                frames.push(frame);
+            }
+        }
+        assert_eq!(decoder.buffered(), 0, "wire fully consumed");
+        Ok(frames)
+    }
+
+    #[test]
+    fn decoder_equals_parse_under_every_chunking() {
+        for frame in streaming_cases() {
+            let mut wire = Vec::new();
+            encode(&frame, &mut wire);
+            let one_shot = parse(&wire).unwrap().unwrap();
+            assert_eq!(one_shot, (frame.clone(), wire.len()));
+
+            for chunk in [1, 2, 3, 7, wire.len()] {
+                let frames = drain_in_chunks(&wire, chunk).unwrap();
+                assert_eq!(frames, vec![frame.clone()], "chunk size {chunk}");
+            }
+        }
+
+        // The same property for a pipeline: one stream carrying every case
+        // back to back, which is what a real connection delivers.
+        let cases = streaming_cases();
+        let mut wire = Vec::new();
+        for frame in &cases {
+            encode(frame, &mut wire);
+        }
+        for chunk in [1, 2, 3, 7, wire.len()] {
+            let frames = drain_in_chunks(&wire, chunk).unwrap();
+            assert_eq!(frames, cases, "chunk size {chunk}");
+        }
+    }
+
+    #[test]
+    fn decoder_work_is_linear_in_input() {
+        // The property the rework exists for. `bytes_examined` counts every
+        // byte the state machine looks at or copies, so re-parsing a
+        // completed element from the start of the buffer shows up in it.
+
+        // One large bulk, dribbled a byte at a time. Parsing from offset zero
+        // on every chunk re-reads the length line a million times.
+        let mut wire = Vec::new();
+        encode(&Frame::Bulk(vec![b'x'; 1024 * 1024]), &mut wire);
+        let mut decoder = Decoder::new(DecoderLimits::default());
+        for byte in &wire {
+            decoder.feed(std::slice::from_ref(byte));
+            if let Some(frame) = decoder.try_next().unwrap() {
+                assert_eq!(frame, Frame::Bulk(vec![b'x'; 1024 * 1024]));
+            }
+        }
+        assert!(
+            decoder.bytes_examined() <= 4 * wire.len(),
+            "one bulk: examined {} for {} wire bytes",
+            decoder.bytes_examined(),
+            wire.len()
+        );
+
+        // Many tiny elements in one array — the adversarial shape, where
+        // re-parsing from offset zero also re-allocates every completed
+        // element and the total work is quadratic.
+        let elements: Vec<Frame> = (0..20_000).map(|_| Frame::Bulk(b"k".to_vec())).collect();
+        let array = Frame::Array(elements);
+        let mut wire = Vec::new();
+        encode(&array, &mut wire);
+        let mut decoder = Decoder::new(DecoderLimits::default());
+        let mut seen = 0;
+        for byte in &wire {
+            decoder.feed(std::slice::from_ref(byte));
+            if let Some(frame) = decoder.try_next().unwrap() {
+                assert_eq!(frame, array);
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 1);
+        assert!(
+            decoder.bytes_examined() <= 4 * wire.len(),
+            "tiny elements: examined {} for {} wire bytes",
+            decoder.bytes_examined(),
+            wire.len()
+        );
+    }
+
+    #[test]
+    fn decoder_bounds_the_parsed_representation() {
+        // Tiny on the wire, fat in memory: an integer element is 4 wire bytes
+        // and a whole `Frame` once parsed, so an array of them amplifies by
+        // eight. A bound on bytes read cannot see that; this one is on the
+        // parsed representation, and there are two places it bites.
+        let budget = 1024 * 1024;
+        let limits = DecoderLimits {
+            max_in_memory: budget,
+            ..DecoderLimits::default()
+        };
+        let affordable = budget / size_of::<Frame>();
+
+        // One: a count the decoder could never afford is refused at the
+        // header, before a single element byte is read. `MAX_ARRAY_LEN`
+        // empty `Frame`s are 32 MiB, and the budget here is 1 MiB.
+        let mut decoder = Decoder::new(limits);
+        decoder.feed(format!("*{MAX_ARRAY_LEN}\r\n").as_bytes());
+        decoder.feed(&b":1\r\n".repeat(10));
+        let err = decoder.try_next().unwrap_err();
+        assert!(
+            err.to_string().contains("in-memory"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            decoder.state.stack.is_empty(),
+            "the array was never started"
+        );
+
+        // Two: a count that fits, filled with elements that do not. The wire
+        // says nothing about the payload sizes to come, so this can only be
+        // caught while the array fills — and it is caught as it fills, never
+        // after the fact.
+        let payload = 64 * 1024;
+        let count = 100;
+        assert!(count * size_of::<Frame>() < budget, "the header is payable");
+        let element = Frame::Bulk(vec![b'p'; payload]);
+        let mut wire = format!("*{count}\r\n").into_bytes();
+        for _ in 0..count {
+            encode(&element, &mut wire);
+        }
+        let mut decoder = Decoder::new(limits);
+        decoder.feed(&wire);
+        let err = decoder.try_next().unwrap_err();
+        assert!(
+            err.to_string().contains("in-memory"),
+            "unexpected error: {err}"
+        );
+
+        let held = decoder.state.stack.last().map_or(0, |a| a.elements.len());
+        assert!(held > 0, "elements were accepted up to the bound");
+        assert!(
+            held <= budget / payload,
+            "held {held} elements of {payload} bytes on a {budget}-byte budget"
+        );
+        assert!(held < affordable, "stopped well short of the count");
+    }
+
+    #[test]
+    fn decoder_sheds_capacity_after_a_large_frame() {
+        let mut wire = Vec::new();
+        encode(&Frame::Bulk(vec![b'z'; 4 * 1024 * 1024]), &mut wire);
+        let mut decoder = Decoder::new(DecoderLimits::default());
+        decoder.feed(&wire);
+        assert!(decoder.buf.capacity() > DecoderLimits::SHED);
+
+        let frame = decoder.try_next().unwrap().unwrap();
+        assert_eq!(frame, Frame::Bulk(vec![b'z'; 4 * 1024 * 1024]));
+        assert_eq!(decoder.buffered(), 0);
+        assert!(
+            decoder.buf.capacity() <= DecoderLimits::SHED,
+            "capacity {} still held after draining a 4 MiB frame",
+            decoder.buf.capacity()
+        );
     }
 }
