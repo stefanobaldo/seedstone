@@ -55,8 +55,14 @@ pub enum Frame {
 /// is a stronger guarantee than [`MAX_ARRAY_DEPTH`] gives on the way in: the
 /// depth limit says which frames [`parse`] will *produce*, and says nothing
 /// about a frame a caller built itself. Encoding one of those used to be an
-/// abort waiting for the first caller careless enough to construct it; now it
-/// is simply slow in proportion to its size.
+/// abort waiting for the first caller careless enough to construct it.
+///
+/// What the change buys is that the cost is now memory rather than a crash,
+/// not that the cost went away. The work stack holds every element of an
+/// array the moment that array's header is emitted, so it grows with the
+/// widest level as well as the deepest — a heap allocation proportional to
+/// the frame, which fails as an allocation failure rather than as an abort
+/// halfway down the call stack.
 ///
 /// # Example
 ///
@@ -238,7 +244,7 @@ fn ceiling(limit: usize) -> i64 {
 /// accept set, identical on every target. These two are the other half — what
 /// a peer may make the decoder *hold* while a frame is still arriving — and a
 /// caller sets them to whatever its own budget is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct DecoderLimits {
     /// The most undecoded wire bytes one frame may occupy.
     ///
@@ -262,22 +268,15 @@ impl DecoderLimits {
     /// allocation for its whole life, and idle connections outnumber busy
     /// ones. Below this, shrinking would cost more churn than it saves.
     pub const SHED: usize = 256 * 1024;
-
-    /// Default for [`DecoderLimits::max_frame_bytes`], 64 MiB.
-    ///
-    /// Coherent with the connection layer's own request ceiling: the decoder
-    /// refuses at the same point the reader above it would.
-    pub const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-
-    /// Default for [`DecoderLimits::max_in_memory`], 64 MiB.
-    pub const DEFAULT_MAX_IN_MEMORY: usize = 64 * 1024 * 1024;
 }
 
 impl Default for DecoderLimits {
+    /// 64 MiB each, coherent with the connection layer's own request ceiling:
+    /// the decoder refuses at the same point the reader above it would.
     fn default() -> Self {
         Self {
-            max_frame_bytes: Self::DEFAULT_MAX_FRAME_BYTES,
-            max_in_memory: Self::DEFAULT_MAX_IN_MEMORY,
+            max_frame_bytes: 64 * 1024 * 1024,
+            max_in_memory: 64 * 1024 * 1024,
         }
     }
 }
@@ -813,6 +812,21 @@ impl Decoder {
 /// length, a bulk payload whose terminator is not `\r\n`, a length above
 /// [`MAX_BULK_LEN`] or [`MAX_ARRAY_LEN`], or nesting past the depth limit.
 ///
+/// And, because this function runs on [`DecoderLimits::default`], in two
+/// cases that are about resources rather than about the bytes being wrong:
+///
+/// - **An incomplete frame already past
+///   [`DecoderLimits::max_frame_bytes`]**, 64 MiB. This is an `Err` where
+///   every shorter prefix of the same frame is `Ok(None)`: a peer that opens
+///   a frame and never closes it is cut off rather than waited on forever.
+/// - **A complete, well-formed frame whose *parsed* form exceeds
+///   [`DecoderLimits::max_in_memory`]**, also 64 MiB. Nothing in such a frame
+///   breaks a per-frame ceiling — every bulk is within [`MAX_BULK_LEN`] and
+///   every array within [`MAX_ARRAY_LEN`] — but their sum is not something
+///   the caller agreed to hold. Two nested arrays of a million integers are
+///   8 MiB on the wire and 64 MiB once parsed, and that ratio is exactly what
+///   a bound on bytes read cannot see.
+///
 /// # Example
 ///
 /// ```
@@ -1133,6 +1147,67 @@ mod tests {
     }
 
     #[test]
+    fn parse_refuses_an_incomplete_frame_past_the_buffering_limit() {
+        // `parse` runs on `DecoderLimits::default()`, so the one-shot path
+        // carries the same ceilings the streaming one does. This is new
+        // behaviour and the boundary is worth pinning: every shorter prefix
+        // of this frame is `Ok(None)`, and one byte more is terminal.
+        let limit = DecoderLimits::default().max_frame_bytes;
+        let mut buf = vec![b'x'; limit];
+        buf[0] = b'+'; // a simple string whose terminator never comes
+        assert_eq!(parse(&buf), Ok(None), "at the ceiling: still waiting");
+
+        buf.push(b'x');
+        let err = parse(&buf).unwrap_err();
+        assert!(
+            err.to_string().starts_with("frame exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_refuses_a_complete_frame_whose_parsed_form_is_too_large() {
+        // Distinct from the ceiling above, and the easier one to miss: these
+        // bytes are a complete, well-formed frame. No bulk breaks
+        // `MAX_BULK_LEN`, no array breaks `MAX_ARRAY_LEN`, and nesting is two
+        // deep. Only the sum is too much — which is the whole point of
+        // bounding the parsed form rather than the bytes read.
+        let budget = DecoderLimits::default().max_in_memory;
+        let per_array = budget / (2 * size_of::<Frame>());
+        assert!(per_array <= MAX_ARRAY_LEN, "each array is a legal length");
+
+        // Integers are the cheapest way to reach the budget: 4 bytes on the
+        // wire, a whole `Frame` in memory. Two arrays of `per_array` of them
+        // is ~8 MiB of input and ~64 MiB parsed.
+        let mut wire = b"*2\r\n".to_vec();
+        for _ in 0..2 {
+            wire.extend_from_slice(format!("*{per_array}\r\n").as_bytes());
+            wire.extend_from_slice(&b":1\r\n".repeat(per_array));
+        }
+        let err = parse(&wire).unwrap_err();
+        assert!(
+            err.to_string().starts_with("decoded frame exceeds"),
+            "unexpected error: {err}"
+        );
+
+        // The neighbouring accepting case, so the assertion above cannot be
+        // satisfied by a limit that rejects everything: four elements fewer
+        // leaves room for the three array nodes and parses.
+        let per_array = per_array - 4;
+        let mut wire = b"*2\r\n".to_vec();
+        for _ in 0..2 {
+            wire.extend_from_slice(format!("*{per_array}\r\n").as_bytes());
+            wire.extend_from_slice(&b":1\r\n".repeat(per_array));
+        }
+        let (frame, consumed) = parse(&wire).unwrap().unwrap();
+        assert_eq!(consumed, wire.len());
+        let Frame::Array(outer) = frame else {
+            panic!("expected an array")
+        };
+        assert_eq!(outer.len(), 2);
+    }
+
+    #[test]
     fn decoder_work_is_linear_in_input() {
         // The property the rework exists for. `bytes_examined` counts every
         // byte the state machine looks at or copies, so re-parsing a
@@ -1179,6 +1254,33 @@ mod tests {
             decoder.bytes_examined(),
             wire.len()
         );
+
+        // One enormous *line*, which is the only shape that exercises the
+        // resumable CRLF search. The two rows above have length lines of nine
+        // bytes and payloads reached by arithmetic, so they pass even with the
+        // resume deleted; here the terminator is a megabyte away and a search
+        // that restarted at the line's first byte on every chunk would be
+        // quadratic — half a trillion byte comparisons against this budget.
+        let text = "x".repeat(1024 * 1024);
+        let simple = Frame::Simple(text);
+        let mut wire = Vec::new();
+        encode(&simple, &mut wire);
+        let mut decoder = Decoder::new(DecoderLimits::default());
+        let mut seen = 0;
+        for byte in &wire {
+            decoder.feed(std::slice::from_ref(byte));
+            if let Some(frame) = decoder.try_next().unwrap() {
+                assert_eq!(frame, simple);
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 1);
+        assert!(
+            decoder.bytes_examined() <= 4 * wire.len(),
+            "one long line: examined {} for {} wire bytes",
+            decoder.bytes_examined(),
+            wire.len()
+        );
     }
 
     #[test]
@@ -1201,8 +1303,12 @@ mod tests {
         decoder.feed(format!("*{MAX_ARRAY_LEN}\r\n").as_bytes());
         decoder.feed(&b":1\r\n".repeat(10));
         let err = decoder.try_next().unwrap_err();
+        // Matched on the header refusal's own wording, not on the word the
+        // two refusals share: otherwise deleting the header check would leave
+        // this green, caught instead by the per-element charge below.
         assert!(
-            err.to_string().contains("in-memory"),
+            err.to_string()
+                .starts_with(&format!("array of {MAX_ARRAY_LEN} elements")),
             "unexpected error: {err}"
         );
         assert!(
@@ -1256,7 +1362,7 @@ mod tests {
         decoder.feed(&wire);
         let err = decoder.try_next().unwrap_err();
         assert!(
-            err.to_string().contains("in-memory"),
+            err.to_string().starts_with("decoded frame exceeds"),
             "unexpected error: {err}"
         );
 
