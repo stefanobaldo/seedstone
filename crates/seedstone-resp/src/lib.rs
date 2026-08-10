@@ -50,13 +50,13 @@ pub enum Frame {
 ///
 /// # Depth
 ///
-/// Unlike [`parse`], which refuses nesting deeper than [`MAX_ARRAY_DEPTH`],
-/// this function recurses on [`Frame::Array`] without a limit and will
-/// overflow the stack — an abort, not a panic — on a deeply enough nested
-/// frame. Nothing reachable today builds one: a parsed frame is already
-/// depth-capped, and the frames this workspace constructs are flat. The
-/// asymmetry is safe only while that stays true, so a caller that ever
-/// encodes a frame derived from input owes a depth check first.
+/// Encoding does not recurse. Nesting is walked with an explicit stack on the
+/// heap, so no frame — however deep — can overflow the call stack here. That
+/// is a stronger guarantee than [`MAX_ARRAY_DEPTH`] gives on the way in: the
+/// depth limit says which frames [`parse`] will *produce*, and says nothing
+/// about a frame a caller built itself. Encoding one of those used to be an
+/// abort waiting for the first caller careless enough to construct it; now it
+/// is simply slow in proportion to its size.
 ///
 /// # Example
 ///
@@ -68,6 +68,18 @@ pub enum Frame {
 /// assert_eq!(out, b"+OK\r\n");
 /// ```
 pub fn encode(frame: &Frame, out: &mut Vec<u8>) {
+    // An array contributes only its header: RESP2 has no closing delimiter,
+    // so its elements follow in order and nothing has to be emitted after
+    // them. That is what lets one flat stack replace the recursion — pushing
+    // the children in reverse is the whole of the bookkeeping.
+    let mut pending = vec![frame];
+    while let Some(frame) = pending.pop() {
+        encode_one(frame, out, &mut pending);
+    }
+}
+
+/// Emits one frame's own bytes, pushing an array's elements onto `pending`.
+fn encode_one<'a>(frame: &'a Frame, out: &mut Vec<u8>, pending: &mut Vec<&'a Frame>) {
     match frame {
         Frame::Simple(s) => {
             debug_assert!(
@@ -108,9 +120,7 @@ pub fn encode(frame: &Frame, out: &mut Vec<u8>) {
             out.push(b'*');
             out.extend_from_slice(frames.len().to_string().as_bytes());
             out.extend_from_slice(b"\r\n");
-            for f in frames {
-                encode(f, out);
-            }
+            pending.extend(frames.iter().rev());
         }
     }
 }
@@ -1165,5 +1175,48 @@ mod tests {
             "capacity {} still held after draining a 4 MiB frame",
             decoder.buf.capacity()
         );
+    }
+
+    /// Takes a [`Frame`] apart with an explicit stack.
+    ///
+    /// `Frame`'s derived `Drop` recurses once per nesting level, so letting a
+    /// deeply nested value fall out of scope runs the drop glue that many
+    /// frames deep and can overflow the test thread's stack — a failure with
+    /// nothing to do with the code under test. `Debug` and `PartialEq` are
+    /// recursive for the same reason, which is why the caller neither formats
+    /// nor compares the value.
+    fn dismantle(frame: Frame) {
+        let mut stack = vec![frame];
+        while let Some(frame) = stack.pop() {
+            if let Frame::Array(children) = frame {
+                stack.extend(children);
+            }
+        }
+    }
+
+    #[test]
+    fn encoding_a_deeply_nested_frame_cannot_overflow_the_stack() {
+        // 10_000 levels: far past what the parser accepts, and far past what
+        // a recursive encoder survives.
+        let mut frame = Frame::Integer(1);
+        for _ in 0..10_000 {
+            frame = Frame::Array(vec![frame]);
+        }
+
+        let mut wire = Vec::new();
+        encode(&frame, &mut wire);
+        // Encoding returned at all — that is the first property. The length
+        // is the arithmetic check that it encoded the whole structure.
+        assert_eq!(wire.len(), 10_000 * b"*1\r\n".len() + b":1\r\n".len());
+
+        // And the second: the decoder refuses those bytes at the depth limit,
+        // so the asymmetry is safe in the only direction that matters.
+        let err = parse(&wire).unwrap_err();
+        assert!(err.to_string().contains("depth limit"), "{err}");
+        let mut decoder = Decoder::new(DecoderLimits::default());
+        decoder.feed(&wire);
+        assert!(decoder.try_next().is_err());
+
+        dismantle(frame);
     }
 }
