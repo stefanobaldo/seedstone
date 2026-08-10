@@ -339,6 +339,13 @@ enum Partial {
 /// points cannot drift apart.
 #[derive(Debug)]
 struct Decoding {
+    /// Where in the buffer the frame currently being read begins.
+    ///
+    /// Everything before it belongs to frames already delivered and is dead
+    /// weight the buffer will drop at its next compaction. Keeping it as an
+    /// offset rather than compacting on the spot is what makes a pipelined
+    /// read batch cost one move instead of one per frame.
+    frame_start: usize,
     /// First byte not yet consumed by a *completed* element.
     scan: usize,
     /// Position inside the element at `scan`.
@@ -363,6 +370,7 @@ impl Decoding {
     /// A decoder positioned at the start of a frame, holding nothing.
     const fn new() -> Self {
         Self {
+            frame_start: 0,
             scan: 0,
             partial: Partial::Start,
             stack: Vec::new(),
@@ -371,17 +379,30 @@ impl Decoding {
         }
     }
 
-    /// Returns to the start-of-frame position, keeping the work counter.
+    /// Records that the frame that just completed is no longer being read.
     ///
-    /// Called once a top-level frame has been delivered and its bytes drained,
-    /// which is the only moment `scan` may go backwards: [`Partial::Line`] and
-    /// [`Partial::BulkBody`] hold offsets into the buffer, and both are
-    /// [`Partial::Start`] here by construction.
-    fn restart(&mut self) {
+    /// Its bytes stay in the buffer — dropping them here would be a move per
+    /// frame — and the next frame starts where this one ended.
+    fn finish_frame(&mut self) {
         debug_assert!(self.stack.is_empty(), "a delivered frame leaves no arrays");
-        self.scan = 0;
+        self.frame_start = self.scan;
         self.partial = Partial::Start;
         self.in_memory = 0;
+    }
+
+    /// Rebases every offset after `cut` bytes were removed from the buffer's
+    /// front.
+    ///
+    /// `cut` is always `frame_start`, so what is discarded is exactly the
+    /// frames already delivered. [`Partial::BulkBody`] needs no adjustment:
+    /// its two fields are measured from `scan`, not from the buffer.
+    fn shift_back(&mut self, cut: usize) {
+        debug_assert!(cut <= self.scan, "a cut may never pass the read cursor");
+        self.frame_start -= cut;
+        self.scan -= cut;
+        if let Partial::Line { scanned } = &mut self.partial {
+            *scanned -= cut;
+        }
     }
 
     /// Reads elements from `buf` until one completes a top-level frame.
@@ -391,11 +412,9 @@ impl Decoding {
     fn step(&mut self, buf: &[u8], limits: &DecoderLimits) -> Result<Option<Frame>, ParseError> {
         loop {
             let Some(element) = self.read_element(buf, limits)? else {
-                // Everything in `buf` belongs to the frame still being read:
-                // a decoder drains its buffer the moment one completes, and a
-                // one-shot `parse` only reaches here when the first frame is
-                // incomplete. So this is that frame's wire size so far.
-                if buf.len() > limits.max_frame_bytes {
+                // Nothing can follow an unfinished frame, so every byte from
+                // `frame_start` on belongs to it: this is its wire size so far.
+                if buf.len() - self.frame_start > limits.max_frame_bytes {
                     return Err(ParseError(format!(
                         "frame exceeds the {}-byte buffering limit",
                         limits.max_frame_bytes
@@ -739,6 +758,7 @@ impl Decoder {
     /// Chunk boundaries carry no meaning: the same bytes produce the same
     /// frames however they are split.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.compact();
         self.buf.extend_from_slice(bytes);
     }
 
@@ -747,6 +767,9 @@ impl Decoder {
     /// `Ok(None)` means "read more and call again" and costs nothing to
     /// repeat: no element already parsed is parsed a second time. Call it in a
     /// loop after each [`Decoder::feed`] — one read can carry several frames.
+    /// That loop is the intended shape, and the buffer is reclaimed on the
+    /// call that ends it rather than on each frame, so draining ten frames
+    /// from one read moves their bytes once.
     ///
     /// # Errors
     ///
@@ -758,22 +781,49 @@ impl Decoder {
     /// from, so the connection is the thing to drop, not the error.
     pub fn try_next(&mut self) -> Result<Option<Frame>, ParseError> {
         let Some(frame) = self.state.step(&self.buf, &self.limits)? else {
+            // Out of input: the caller is about to go and read more, so this
+            // is the moment to hand back what the frames just delivered were
+            // occupying. Once per read batch, not once per frame.
+            self.compact();
             return Ok(None);
         };
-        self.buf.drain(..self.state.scan);
-        self.state.restart();
+        self.state.finish_frame();
+        Ok(Some(frame))
+    }
+
+    /// Drops the bytes of frames already delivered, and sheds the capacity a
+    /// large frame left behind.
+    ///
+    /// Every removal from the front of a `Vec` moves everything after it, so
+    /// doing this per frame makes a pipelined read batch quadratic in the
+    /// frames it carries: `k` frames in `S` bytes move about `S·k/2` bytes
+    /// instead of `S`. Deferring it to the batch boundary is the whole reason
+    /// [`Decoding::frame_start`] exists.
+    ///
+    /// Safe at any point, not only between frames: what it discards is bounded
+    /// by `frame_start`, and the offsets that survive are rebased.
+    fn compact(&mut self) {
+        let cut = self.state.frame_start;
+        if cut == 0 {
+            return;
+        }
+        self.buf.drain(..cut);
+        self.state.shift_back(cut);
         if self.buf.capacity() > DecoderLimits::SHED {
             // A connection that carried one large frame otherwise holds that
             // buffer for the rest of its life.
             self.buf.shrink_to(DecoderLimits::SHED);
         }
-        Ok(Some(frame))
     }
 
     /// Bytes fed but not yet consumed by a delivered frame.
+    ///
+    /// Bytes of delivered frames may still be sitting in the buffer, waiting
+    /// for the next compaction; they are not counted, because the caller has
+    /// already been given what they were worth.
     #[must_use]
     pub const fn buffered(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.state.frame_start
     }
 
     /// Bytes the state machine has looked at or copied since construction.
@@ -1386,10 +1436,71 @@ mod tests {
         let frame = decoder.try_next().unwrap().unwrap();
         assert_eq!(frame, Frame::Bulk(vec![b'z'; 4 * 1024 * 1024]));
         assert_eq!(decoder.buffered(), 0);
+
+        // The shed happens when the decoder runs out of input, not when the
+        // frame leaves — the same point the buffer is compacted at, and for
+        // the same reason: a caller draining a pipelined batch must not pay a
+        // reallocation between one frame and the next. Every caller reaches it
+        // on the call that tells it to go and read more.
+        assert_eq!(decoder.try_next(), Ok(None));
         assert!(
             decoder.buf.capacity() <= DecoderLimits::SHED,
             "capacity {} still held after draining a 4 MiB frame",
             decoder.buf.capacity()
+        );
+    }
+
+    #[test]
+    fn decoder_compacts_once_per_batch_not_once_per_frame() {
+        // The regression this pins is not a wrong answer, it is a quadratic:
+        // every removal from the front of the buffer moves everything after
+        // it, so compacting per frame makes draining a pipelined read cost
+        // about `bytes × frames / 2` in memory traffic instead of `bytes`.
+        let mut one = Vec::new();
+        encode(&Frame::Array(vec![Frame::Bulk(b"PING".to_vec())]), &mut one);
+        let count = 64;
+        let batch = one.repeat(count);
+
+        let mut decoder = Decoder::new(DecoderLimits::default());
+        decoder.feed(&batch);
+        for taken in 1..=count {
+            let frame = decoder.try_next().unwrap().expect("a frame per repeat");
+            assert_eq!(frame, Frame::Array(vec![Frame::Bulk(b"PING".to_vec())]));
+            // Nothing has been moved yet: the delivered frames' bytes are
+            // still sitting in front of the cursor.
+            assert_eq!(
+                decoder.buf.len(),
+                batch.len(),
+                "the buffer was compacted after frame {taken}"
+            );
+            // And the count of what is still owed is right anyway.
+            assert_eq!(decoder.buffered(), batch.len() - taken * one.len());
+        }
+
+        // The batch is spent, so the call that reports it also reclaims it.
+        assert_eq!(decoder.try_next(), Ok(None));
+        assert_eq!(decoder.buf.len(), 0);
+        assert_eq!(decoder.buffered(), 0);
+
+        // A partial frame trailing the batch is compacted just the same: what
+        // is dropped is bounded by where the unfinished frame starts, not by
+        // whether one is in flight. Otherwise a peer that always leaves a few
+        // bytes over would keep every delivered frame's bytes alive with it.
+        let mut decoder = Decoder::new(DecoderLimits::default());
+        decoder.feed(&batch);
+        decoder.feed(&one[..3]);
+        for _ in 0..count {
+            assert!(decoder.try_next().unwrap().is_some());
+        }
+        assert_eq!(decoder.try_next(), Ok(None));
+        assert_eq!(decoder.buf.len(), 3, "only the partial frame is left");
+        assert_eq!(decoder.buffered(), 3);
+
+        // ...and it still completes, from the rebased offsets.
+        decoder.feed(&one[3..]);
+        assert_eq!(
+            decoder.try_next(),
+            Ok(Some(Frame::Array(vec![Frame::Bulk(b"PING".to_vec())])))
         );
     }
 
