@@ -188,14 +188,6 @@ impl Server {
                         Ok(permit) => {
                             let router = self.pool.clone();
                             tokio::spawn(async move {
-                                #[allow(
-                                    clippy::large_futures,
-                                    reason = "the 16 KiB is the connection's read chunk, and \
-                                              this future is the whole body of a spawned task: \
-                                              tokio already heap-allocates it, so boxing would \
-                                              buy a second allocation and a pointer chase per \
-                                              read without removing a byte"
-                                )]
                                 serve_connection(stream, router).await;
                                 drop(permit);
                             });
