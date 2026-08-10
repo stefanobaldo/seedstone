@@ -49,13 +49,23 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// may occupy — and [`DecoderLimits::max_in_memory`] — what that frame costs
 /// once parsed, which the wire form does not reveal. That is deliberate and
 /// it is a choice, because this layer could just as well have counted the
-/// bytes it read: the decoder is the thing that *holds* them, it is the only
-/// one of the two that can see the parsed size at all, and it checks both
-/// before the memory is spent rather than after. A peer over the ceiling is
-/// therefore answered with the codec's own `frame exceeds the …-byte
-/// buffering limit` (or `decoded frame exceeds …`), not with a second message
-/// this layer would have to keep in step with it. One ceiling, one
+/// bytes it read: the decoder is the thing that *holds* them, and it is the
+/// only one of the two that can see the parsed size at all. A peer over the
+/// ceiling is therefore answered with the codec's own `frame exceeds the
+/// …-byte buffering limit` (or `decoded frame exceeds …`), not with a second
+/// message this layer would have to keep in step with it. One ceiling, one
 /// enforcement point, one wording.
+///
+/// The two halves are not enforced with the same sharpness, and the
+/// difference is worth knowing. `max_in_memory` is checked *before* the
+/// memory is spent — a bulk payload is priced from its declared length ahead
+/// of the copy, an array from its count ahead of its first element — so the
+/// refusal costs nothing but the header. `max_frame_bytes` is checked after
+/// the bytes have already landed in the decoder's buffer, which is the same
+/// after-the-fact shape the count deleted from this loop had, and it overruns
+/// by at most one read ([`READ_CEILING`]). Moving it earlier would mean the
+/// decoder telling the reader how much to ask for, which is a wider contract
+/// than either half needs.
 ///
 /// # Known cost
 ///
@@ -951,6 +961,16 @@ mod tests {
         // rejected as oversized despite every frame in it being legal.
         let largest_command_on_the_wire = 2 * MAX_BULK_LEN + 1024;
         assert!(MAX_REQUEST_BYTES > largest_command_on_the_wire);
+
+        // The same claim in the other direction, which binding this constant
+        // to `max_in_memory` created a second way to break. An array of
+        // `MAX_ARRAY_LEN` elements is a length the codec accepts, and its
+        // empty `Frame`s alone must fit — otherwise `*1048576\r\n` starts
+        // being refused at its header with nothing here to say so. The margin
+        // today is 32 MiB against 64 MiB, and neither `size_of::<Frame>()` nor
+        // `MAX_ARRAY_LEN` is a contract: one wider variant, or one doubling,
+        // closes it.
+        assert!(MAX_ARRAY_LEN.saturating_mul(size_of::<Frame>()) < MAX_REQUEST_BYTES);
     }
 
     /// A peer opens a frame and keeps feeding bytes without ever terminating
@@ -1016,12 +1036,13 @@ mod tests {
 
     /// The other half of the ceiling: what a frame costs once parsed.
     ///
-    /// The wire form does not reveal it — the four bytes below promise an
-    /// array whose empty `Frame`s alone are two orders of magnitude past the
-    /// budget — so a limit counting only bytes read cannot refuse this, and
-    /// the connection would spend the memory before discovering it could not
-    /// afford it. Passing `max_request_bytes` as `max_in_memory` too is what
-    /// makes the refusal land at the header; this test is what says so.
+    /// The wire form does not reveal it. The array header below is nine bytes
+    /// and promises elements whose empty `Frame`s alone are two orders of
+    /// magnitude past the budget, so a limit counting only bytes read cannot
+    /// refuse this and the connection would spend the memory before
+    /// discovering it could not afford it. Passing `max_request_bytes` as
+    /// `max_in_memory` too is what makes the refusal land at the header; this
+    /// test is what says so.
     #[tokio::test]
     async fn an_array_too_large_to_hold_is_refused_at_its_header() {
         const CEILING: usize = 64 * 1024;
@@ -1047,8 +1068,14 @@ mod tests {
         let Frame::Error(text) = &frames[0] else {
             panic!("expected an error frame, got {:?}", frames[0]);
         };
+        // The header refusal's own wording, not the phrase it shares with the
+        // per-element charge: the setup makes `array_header` the only possible
+        // source, but matching the fuller text is what checks that rather than
+        // leaving it to be inferred from the setup.
         assert!(
-            text.contains(&format!("exceeds the {CEILING}-byte in-memory limit")),
+            text.contains(&format!(
+                "array of {count} elements exceeds the {CEILING}-byte in-memory limit"
+            )),
             "unexpected refusal: {text}"
         );
         task.await.expect("the connection task must end cleanly");
