@@ -20,7 +20,9 @@
 //!   enforces ([`seedstone_resp::MAX_BULK_LEN`],
 //!   [`seedstone_resp::MAX_ARRAY_LEN`]). Without a cap, a peer
 //!   that opens a frame and never finishes it is a slow memory leak with a
-//!   connection attached.
+//!   connection attached. The cap is *set* here and *enforced* by the
+//!   [`Decoder`] this layer hands it to — see [`MAX_REQUEST_BYTES`] for why
+//!   the two are not the same place.
 //! - **No response splitting.** Every error frame this module emits passes
 //!   through [`safe_error`] first. A `Frame::Error` is terminated by the first
 //!   `\r\n` after its type byte, so text carrying either byte would let a peer
@@ -29,7 +31,7 @@
 //!   the enforcement point that is.
 
 use crate::shard::{Command, Reply, ReplyError, Router, parse_i64};
-use seedstone_resp::{Frame, ParseError, encode, parse};
+use seedstone_resp::{Decoder, DecoderLimits, Frame, ParseError, encode};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// How many bytes one connection may hold while a frame is still incomplete.
@@ -40,18 +42,51 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// [`seedstone_resp::MAX_BULK_LEN`] payloads is about 32 MiB on the wire — or
 /// a legitimate command would be refused as oversized.
 ///
+/// # Where it is enforced
+///
+/// Not here. It is handed to the [`Decoder`] as both
+/// [`DecoderLimits::max_frame_bytes`] — the wire bytes one unfinished frame
+/// may occupy — and [`DecoderLimits::max_in_memory`] — what that frame costs
+/// once parsed, which the wire form does not reveal. That is deliberate and
+/// it is a choice, because this layer could just as well have counted the
+/// bytes it read: the decoder is the thing that *holds* them, it is the only
+/// one of the two that can see the parsed size at all, and it checks both
+/// before the memory is spent rather than after. A peer over the ceiling is
+/// therefore answered with the codec's own `frame exceeds the …-byte
+/// buffering limit` (or `decoded frame exceeds …`), not with a second message
+/// this layer would have to keep in step with it. One ceiling, one
+/// enforcement point, one wording.
+///
 /// # Known cost
 ///
-/// The codec re-parses an incomplete frame from its start on every arriving
-/// chunk, so filling this buffer is quadratic in the bytes read. The ceiling
-/// bounds it — it cannot run away — but the bound is generous, and a peer
-/// that dribbles a 64 MiB frame in makes the server do far more scanning than
-/// reading. Closing it properly needs a resumable parser, which is a change
-/// to the codec's contract, not to this constant.
+/// Filling this buffer is linear in the bytes read — the decoder resumes
+/// where it stopped instead of re-parsing the frame from its first byte — so
+/// a dribbled frame costs what it weighs and no more. What remains is the
+/// weight itself: this is a *per connection* ceiling, and the product of it
+/// and the connection limit is not a number the machine has. It is a bound on
+/// the worst case one peer can impose, not a memory budget for all of them.
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
-/// Bytes read from the transport per `read` call.
-const READ_CHUNK: usize = 16 * 1024;
+/// Bytes a connection's read buffer starts at, and sheds back to.
+///
+/// A request is typically tens of bytes, and idle connections outnumber busy
+/// ones: at the connection limit's default of 10 000, every kilobyte reserved
+/// here is 10 MiB of resident memory bought before anyone has spoken.
+const READ_FLOOR: usize = 2 * 1024;
+
+/// The largest single `read` a connection grows to.
+///
+/// Reached by doubling, one filling read at a time, so a peer that is
+/// streaming gets fewer and larger syscalls while one that sends a command
+/// and waits never pays for the capacity.
+const READ_CEILING: usize = 64 * 1024;
+
+/// The reply buffer capacity a connection sheds back to after each write.
+///
+/// Same reasoning as [`DecoderLimits::SHED`] on the read side, and the same
+/// number: one large reply otherwise leaves its allocation attached to the
+/// connection for the rest of that connection's life.
+const REPLY_SHED: usize = 256 * 1024;
 
 /// How much of a peer-supplied byte string an error message may quote.
 const QUOTE_LIMIT: usize = 32;
@@ -112,40 +147,44 @@ where
 /// [`serve_connection`] with the accumulation ceiling as a parameter.
 ///
 /// The ceiling exists so that it can be exercised. Reaching 64 MiB through a
-/// pipe costs tens of seconds of pure scanning — the quadratic re-parse this
-/// limit bounds — so a test that used the real constant would either be
-/// skipped or be the slowest thing in the suite, and this layer's stated
-/// primary defence would go on having no coverage at all.
+/// pipe is linear work now rather than quadratic, but it is still 64 MiB
+/// written, copied and held, for a property a 64 KiB ceiling demonstrates
+/// identically — so a test on the real constant would be the slowest thing in
+/// the suite by a wide margin, and this layer's stated primary defence would
+/// go on having no coverage at all.
 async fn serve_connection_limited<S, R>(mut stream: S, router: R, max_request_bytes: usize)
 where
     S: AsyncRead + AsyncWrite + Unpin,
     R: Router,
 {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; READ_CHUNK];
+    let mut decoder = Decoder::new(DecoderLimits {
+        max_frame_bytes: max_request_bytes,
+        max_in_memory: max_request_bytes,
+    });
+    // On the heap, not in this future. A fixed array here is capacity every
+    // spawned connection task reserves whether or not its peer ever speaks,
+    // and it is the whole of what made this future large enough for clippy to
+    // complain about.
+    let mut read_buf = vec![0u8; READ_FLOOR];
     let mut out: Vec<u8> = Vec::new();
 
     loop {
-        // Drain every complete frame the buffer already holds before asking
+        // Drain every complete frame the decoder already holds before asking
         // the transport for more.
-        let mut consumed = 0;
         loop {
-            let (reply, hang_up) = match parse(&buf[consumed..]) {
-                Ok(Some((frame, used))) => {
-                    consumed += used;
-                    match frame_to_action(frame) {
-                        Action::Dispatch(cmd) => {
-                            (reply_to_frame(router.dispatch(cmd).await), false)
-                        }
-                        Action::Reply(frame) => (frame, false),
-                        Action::ReplyThenClose(frame) => (frame, true),
-                    }
-                }
+            let (reply, hang_up) = match decoder.try_next() {
+                Ok(Some(frame)) => match frame_to_action(frame) {
+                    Action::Dispatch(cmd) => (reply_to_frame(router.dispatch(cmd).await), false),
+                    Action::Reply(frame) => (frame, false),
+                    Action::ReplyThenClose(frame) => (frame, true),
+                },
                 // A proper prefix of a valid frame: read more.
                 Ok(None) => break,
                 Err(error) => {
-                    // Terminal. Report it and go, without draining: the
-                    // stream is desynchronised and there is no resync point.
+                    // Terminal, and that now covers the accumulation ceiling
+                    // as well as malformed bytes: either way the decoder holds
+                    // a half-read frame with no resync point. Report it and
+                    // go, without draining.
                     let frame = safe_error(&protocol_error(&error));
                     write_frame(&mut stream, &frame, &mut out).await;
                     return;
@@ -155,22 +194,34 @@ where
                 return;
             }
         }
-        buf.drain(..consumed);
 
-        if buf.len() > max_request_bytes {
-            let frame = safe_error(&format!(
-                "ERR request exceeds the {max_request_bytes}-byte limit"
-            ));
-            write_frame(&mut stream, &frame, &mut out).await;
-            return;
-        }
-
-        match stream.read(&mut chunk).await {
+        match stream.read(&mut read_buf).await {
             // EOF, or a transport that failed. Either way the connection is
             // over and there is nobody left to tell.
             Ok(0) | Err(_) => return,
-            Ok(got) => buf.extend_from_slice(&chunk[..got]),
+            Ok(got) => {
+                decoder.feed(&read_buf[..got]);
+                resize_read_buffer(&mut read_buf, got);
+            }
         }
+    }
+}
+
+/// Sizes the read buffer to what this connection is actually reading.
+///
+/// A read that filled the buffer says the peer had more waiting, so the next
+/// one asks for twice as much; a read that used a quarter of it or less says
+/// the peer is done, so the capacity goes back to the floor rather than
+/// staying attached to an idle connection. The two thresholds are deliberately
+/// far apart — a connection reading steadily at half its buffer neither grows
+/// nor sheds, which is the case that would otherwise reallocate on every read.
+fn resize_read_buffer(read_buf: &mut Vec<u8>, got: usize) {
+    if got == read_buf.len() {
+        let grown = read_buf.len().saturating_mul(2).min(READ_CEILING);
+        read_buf.resize(grown, 0);
+    } else if read_buf.len() > READ_FLOOR && got.saturating_mul(4) <= read_buf.len() {
+        read_buf.truncate(READ_FLOOR);
+        read_buf.shrink_to(READ_FLOOR);
     }
 }
 
@@ -183,7 +234,11 @@ where
 {
     out.clear();
     encode(frame, out);
-    stream.write_all(out).await.is_ok() && stream.flush().await.is_ok()
+    let delivered = stream.write_all(out).await.is_ok() && stream.flush().await.is_ok();
+    if out.capacity() > REPLY_SHED {
+        out.shrink_to(REPLY_SHED);
+    }
+    delivered
 }
 
 /// Translates a shard's [`Reply`] into the frame that carries it.
@@ -418,7 +473,7 @@ mod tests {
     use super::*;
     use crate::dict::DictSeed;
     use crate::shard::{NoTrace, ShardPool};
-    use seedstone_resp::{MAX_ARRAY_LEN, MAX_BULK_LEN};
+    use seedstone_resp::{MAX_ARRAY_LEN, MAX_BULK_LEN, parse};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -860,24 +915,36 @@ mod tests {
         assert!(MAX_REQUEST_BYTES > largest_command_on_the_wire);
     }
 
+    /// A peer opens a frame and keeps feeding bytes without ever terminating
+    /// it — the slow memory leak with a connection attached that the module
+    /// doc names — and the server must answer and close rather than buffer
+    /// forever.
+    ///
+    /// The declared length matters, and it used to be wrong. This test opened
+    /// with `$1000000000\r\n`, which is far above [`MAX_BULK_LEN`]: the codec
+    /// refused that header on sight, so the refusal came from the *per-frame*
+    /// bulk ceiling and the accumulation ceiling was never reached at all.
+    /// The old assertion only looked for the word "exceeds", which both
+    /// messages carry, so deleting this layer's limit outright would have left
+    /// it green. The length below is one the codec accepts, which leaves the
+    /// ceiling as the only thing that can ever stop the dribble, and the
+    /// assertion names that ceiling's own number.
     #[tokio::test]
     async fn a_frame_that_never_ends_is_cut_off_at_the_ceiling() {
-        // The assertion above relates two constants; it never runs the code
-        // that enforces either. This does: a peer opens a bulk string and
-        // keeps feeding bytes without ever terminating it — the slow memory
-        // leak with a connection attached that the module doc names — and the
-        // server must answer and close rather than buffer forever.
         const CEILING: usize = 64 * 1024;
+        const { assert!(MAX_BULK_LEN > CEILING, "the promise must outlast it") };
 
         let pool = ShardPool::spawn(4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(8 * 1024);
         let task = tokio::spawn(serve_connection_limited(server, pool, CEILING));
         let (mut r, mut w) = tokio::io::split(client);
 
+        let header = format!("${MAX_BULK_LEN}\r\n");
         let writer = tokio::spawn(async move {
-            // A well-formed, never-satisfied length prefix: every byte after
-            // it is a legal continuation, so the codec can only ask for more.
-            w.write_all(b"$1000000000\r\n").await?;
+            // A legal, never-satisfied length prefix: the codec accepts the
+            // header, so every byte after it is a payload byte it is still
+            // waiting for and nothing but the ceiling ever says stop.
+            w.write_all(header.as_bytes()).await?;
             loop {
                 w.write_all(&[b'x'; 4096]).await?;
             }
@@ -893,7 +960,10 @@ mod tests {
         let Frame::Error(text) = &frames[0] else {
             panic!("expected an error frame, got {:?}", frames[0]);
         };
-        assert!(text.contains("exceeds"), "unexpected refusal: {text}");
+        assert!(
+            text.contains(&format!("exceeds the {CEILING}-byte buffering limit")),
+            "unexpected refusal: {text}"
+        );
 
         // The server closes rather than carrying on, and the writer stops
         // because the pipe it is filling went away.
@@ -904,6 +974,102 @@ mod tests {
         );
         writer.abort();
         task.await.expect("the connection task must end cleanly");
+    }
+
+    /// The other half of the ceiling: what a frame costs once parsed.
+    ///
+    /// The wire form does not reveal it — the four bytes below promise an
+    /// array whose empty `Frame`s alone are two orders of magnitude past the
+    /// budget — so a limit counting only bytes read cannot refuse this, and
+    /// the connection would spend the memory before discovering it could not
+    /// afford it. Passing `max_request_bytes` as `max_in_memory` too is what
+    /// makes the refusal land at the header; this test is what says so.
+    #[tokio::test]
+    async fn an_array_too_large_to_hold_is_refused_at_its_header() {
+        const CEILING: usize = 64 * 1024;
+
+        let pool = ShardPool::spawn(4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(serve_connection_limited(server, pool, CEILING));
+        let (mut r, mut w) = tokio::io::split(client);
+
+        // A legal count — well under `MAX_ARRAY_LEN` — that this connection's
+        // budget still cannot hold.
+        let count = MAX_ARRAY_LEN / 2;
+        assert!(count * size_of::<Frame>() > CEILING, "the count is payable");
+        w.write_all(format!("*{count}\r\n").as_bytes())
+            .await
+            .unwrap();
+        // Nothing follows, and the peer says so. Without the shutdown a
+        // decoder that accepted the header would sit waiting for elements that
+        // never come, and this test would hang instead of failing.
+        w.shutdown().await.unwrap();
+
+        let frames = read_frames(&mut r, 1).await;
+        let Frame::Error(text) = &frames[0] else {
+            panic!("expected an error frame, got {:?}", frames[0]);
+        };
+        assert!(
+            text.contains(&format!("exceeds the {CEILING}-byte in-memory limit")),
+            "unexpected refusal: {text}"
+        );
+        task.await.expect("the connection task must end cleanly");
+    }
+
+    /// A request larger than one read is reassembled, not re-parsed.
+    ///
+    /// The adaptive read buffer starts at [`READ_FLOOR`], so a command past
+    /// that size crosses several reads and several `feed`s — the case where a
+    /// decoder that restarted at offset zero and one that resumes differ, and
+    /// the case a buffer sized by a constant nobody tested against would have
+    /// hidden.
+    #[tokio::test]
+    async fn a_request_spanning_many_reads_arrives_whole() {
+        let (mut r, mut w, _pool) = connected(4);
+        let value = vec![b'v'; 8 * READ_FLOOR];
+        let mut out = Vec::new();
+        encode(
+            &Frame::Array(vec![
+                Frame::Bulk(b"SET".to_vec()),
+                Frame::Bulk(b"k".to_vec()),
+                Frame::Bulk(value.clone()),
+            ]),
+            &mut out,
+        );
+        encode(&req(&["GET", "k"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 2).await;
+        assert_eq!(frames[0], Frame::Simple("OK".into()));
+        assert_eq!(frames[1], Frame::Bulk(value));
+    }
+
+    #[test]
+    fn the_read_buffer_grows_while_it_fills_and_sheds_when_it_stops() {
+        let mut read_buf = vec![0u8; READ_FLOOR];
+
+        // Filling reads double it, up to the ceiling and no further.
+        for _ in 0..32 {
+            let got = read_buf.len();
+            resize_read_buffer(&mut read_buf, got);
+        }
+        assert_eq!(read_buf.len(), READ_CEILING);
+
+        // A read that used more than a quarter holds the size: this is the
+        // steady state, and reallocating through it would cost more than the
+        // capacity does.
+        resize_read_buffer(&mut read_buf, READ_CEILING / 2);
+        assert_eq!(read_buf.len(), READ_CEILING);
+
+        // A read that used a quarter or less gives the capacity back.
+        resize_read_buffer(&mut read_buf, READ_CEILING / 4);
+        assert_eq!(read_buf.len(), READ_FLOOR);
+        assert!(read_buf.capacity() <= READ_FLOOR * 2);
+
+        // And the floor is a floor: a tiny read at it changes nothing.
+        resize_read_buffer(&mut read_buf, 1);
+        assert_eq!(read_buf.len(), READ_FLOOR);
     }
 
     // --- helpers ---
