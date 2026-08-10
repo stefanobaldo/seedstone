@@ -235,6 +235,13 @@ where
     out.clear();
     encode(frame, out);
     let delivered = stream.write_all(out).await.is_ok() && stream.flush().await.is_ok();
+    // Cleared *before* the shed, not after the next `encode`. `Vec::shrink_to`
+    // never shrinks below the length, so clearing at the top of the call only
+    // would make this a no-op on precisely the write that just grew the
+    // buffer — the large reply would keep its allocation until a second reply
+    // happened to follow it, and a client that reads one big value and then
+    // goes quiet would never send that second one.
+    out.clear();
     if out.capacity() > REPLY_SHED {
         out.shrink_to(REPLY_SHED);
     }
@@ -1043,6 +1050,37 @@ mod tests {
         let frames = read_frames(&mut r, 2).await;
         assert_eq!(frames[0], Frame::Simple("OK".into()));
         assert_eq!(frames[1], Frame::Bulk(value));
+    }
+
+    /// A large reply must not leave its allocation attached to the connection.
+    ///
+    /// [`write_frame`] clears `out` twice, and the second clear is the load-
+    /// bearing one: `Vec::shrink_to` never shrinks below the length, so
+    /// shedding while the reply is still in the buffer is a no-op on exactly
+    /// the write that grew it. The bug that shape produces is invisible in a
+    /// pipeline — the next reply clears the buffer anyway — and shows up only
+    /// for the client that reads one big value and then goes quiet, which is
+    /// why it is asserted directly on the function rather than through a
+    /// connection.
+    #[tokio::test]
+    async fn a_large_reply_sheds_its_buffer_before_the_next_one() {
+        let mut sink: Vec<u8> = Vec::new();
+        let mut out: Vec<u8> = Vec::new();
+
+        let big = Frame::Bulk(vec![b'v'; 4 * REPLY_SHED]);
+        assert!(write_frame(&mut sink, &big, &mut out).await);
+        assert!(sink.len() > 4 * REPLY_SHED, "the reply was truncated");
+        assert!(
+            out.capacity() <= REPLY_SHED,
+            "capacity {} still held after the reply that grew it",
+            out.capacity()
+        );
+
+        // Shedding cost nothing: the next reply is still encoded correctly
+        // into the shrunken buffer.
+        sink.clear();
+        assert!(write_frame(&mut sink, &Frame::Simple("OK".into()), &mut out).await);
+        assert_eq!(sink, b"+OK\r\n");
     }
 
     #[test]
