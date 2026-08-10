@@ -385,6 +385,16 @@ struct Decoding {
     /// claim. Counting is a handful of additions per element, not one per
     /// byte, so it stays in ordinary builds rather than behind a feature that
     /// would have to be unified across the workspace.
+    ///
+    /// Every increment saturates. It is compiled into release builds and
+    /// never reset, so on a target with a 32-bit `usize` a long-lived
+    /// connection reaches the wrap in four gigabytes — and a debug build
+    /// would answer that with an arithmetic panic, in the hot path of a crate
+    /// whose integer parsing goes out of its way to have no panicking path at
+    /// all. Resetting it per frame would be the other fix and is the wrong
+    /// one: the tests read it after frames complete, so a per-frame reset
+    /// would leave them asserting on a counter near zero however quadratic
+    /// the decoder became.
     examined: usize,
 }
 
@@ -471,7 +481,7 @@ impl Decoding {
         let Some(&type_byte) = buf.get(self.scan) else {
             return Ok(None);
         };
-        self.examined += 1;
+        self.examined = self.examined.saturating_add(1);
         // The type byte is decided on before anything is spent looking for a
         // terminator. No continuation can rescue an unknown one, so waiting
         // for a `\r\n` that may never come would turn one junk byte into a
@@ -631,7 +641,7 @@ impl Decoding {
         let mut i = resume;
         while i + 1 < buf.len() {
             if buf[i] == b'\r' && buf[i + 1] == b'\n' {
-                self.examined += i + 2 - resume;
+                self.examined = self.examined.saturating_add(i + 2 - resume);
                 self.partial = Partial::Start;
                 return Some((i, i + 2));
             }
@@ -639,7 +649,7 @@ impl Decoding {
         }
         // The loop never inspects the final byte, which may yet turn out to be
         // the `\r` of a terminator, so resuming from it is safe.
-        self.examined += i - resume;
+        self.examined = self.examined.saturating_add(i - resume);
         self.partial = Partial::Line { scanned: i };
         None
     }
