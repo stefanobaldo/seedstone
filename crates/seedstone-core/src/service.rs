@@ -146,6 +146,27 @@ const READ_QUIET_READS: u32 = 4;
 /// — see [`resize_connection_buffers`].
 const REPLY_SHED: usize = DecoderLimits::SHED;
 
+/// How much one drain may accumulate before it writes.
+///
+/// Flushing at the drain boundary is what turns a pipelined batch into one
+/// syscall pair instead of one per reply. But a drain ends only when the
+/// decoder holds no complete frame, and the decoder holds whatever a full
+/// [`READ_CEILING`] of pipelined requests decodes to — so without a mark, one
+/// drain buffers *every* reply that batch earns, where the per-reply flush it
+/// replaced buffered one. This is the point at which the replies already
+/// accumulated are worth a write on their own.
+///
+/// The number is [`REPLY_SHED`] — the capacity a working connection is already
+/// allowed to keep between writes — taken from it rather than restated. The
+/// mark and the shed floor agreeing is what keeps a connection at steady state
+/// from both growing past it and reallocating below it: every write at the
+/// mark is followed by a shed to the same size, which is a no-op.
+///
+/// **A single reply larger than the mark still goes out whole.** The check is
+/// made after appending, never before, because a frame is not splittable: half
+/// a bulk string on the wire is a protocol violation, not a partial write.
+const REPLY_HIGH_WATER: usize = REPLY_SHED;
+
 /// How much of a peer-supplied byte string an error message may quote.
 const QUOTE_LIMIT: usize = 32;
 
@@ -187,6 +208,12 @@ enum Action {
 /// waits for bytes while a reply sits unflushed; batching within one drain
 /// preserves it, because a drain only ends when the decoder has no complete
 /// frame left.
+///
+/// Accumulation is bounded rather than open-ended: a drain that reaches
+/// [`REPLY_HIGH_WATER`] writes there and carries on into the same buffer, so
+/// what one connection can hold does not scale with how much its peer chose
+/// to pipeline. Writing earlier can never violate the invariant above — it
+/// only shortens the time a reply spends buffered.
 ///
 /// A frame that is well-formed RESP but not a command this server knows —
 /// wrong arity, unknown name — is answered with an error frame and the
@@ -239,16 +266,29 @@ where
         let mut drained = false;
         while !drained && !hang_up {
             match decoder.try_next() {
-                Ok(Some(frame)) => match frame_to_action(frame) {
-                    Action::Dispatch(cmd) => {
-                        append_frame(&mut out, &reply_to_frame(router.dispatch(cmd).await));
+                Ok(Some(frame)) => {
+                    match frame_to_action(frame) {
+                        Action::Dispatch(cmd) => {
+                            append_frame(&mut out, &reply_to_frame(router.dispatch(cmd).await));
+                        }
+                        Action::Reply(frame) => append_frame(&mut out, &frame),
+                        Action::ReplyThenClose(frame) => {
+                            append_frame(&mut out, &frame);
+                            hang_up = true;
+                        }
                     }
-                    Action::Reply(frame) => append_frame(&mut out, &frame),
-                    Action::ReplyThenClose(frame) => {
-                        append_frame(&mut out, &frame);
-                        hang_up = true;
+                    // A drain that has already earned a write's worth of
+                    // replies takes it here rather than waiting for the
+                    // decoder to run dry — see [`REPLY_HIGH_WATER`]. The peer
+                    // sees the same bytes in the same order, only sooner, so
+                    // none of the three orderings this loop guarantees moves:
+                    // the write happens *between* two replies, never inside
+                    // one, and never while a frame is half-decoded.
+                    if out.len() >= REPLY_HIGH_WATER && !flush_replies(&mut stream, &mut out).await
+                    {
+                        return;
                     }
-                },
+                }
                 // A proper prefix of a valid frame: read more.
                 Ok(None) => drained = true,
                 Err(error) => {
@@ -730,10 +770,17 @@ mod tests {
         assert!(rest.is_empty(), "the server kept talking after QUIT");
     }
 
-    /// Counts how many times the connection flushes, delegating everything else.
+    /// Counts how many times the connection flushes and records the largest
+    /// single write, delegating everything else.
+    ///
+    /// The write size is what makes the accumulation bound observable from
+    /// outside: the reply buffer is the connection's own, but every byte that
+    /// reaches the peer passes through here, so the largest write is exactly
+    /// the most one drain ever held.
     struct FlushCounting<S> {
         inner: S,
         flushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        max_write: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl<S: AsyncRead + Unpin> AsyncRead for FlushCounting<S> {
@@ -752,6 +799,8 @@ mod tests {
             cx: &mut std::task::Context<'_>,
             buf: &[u8],
         ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            self.max_write
+                .fetch_max(buf.len(), std::sync::atomic::Ordering::Relaxed);
             std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
         }
         fn poll_flush(
@@ -785,6 +834,7 @@ mod tests {
         let transport = FlushCounting {
             inner: server,
             flushes: std::sync::Arc::clone(&flushes),
+            max_write: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         // PING resolves in the service layer, so the router must stay
         // unreached — a reply that took the shard round trip would let the
@@ -811,6 +861,73 @@ mod tests {
             flushes.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "one drain of 64 pipelined commands must flush once, not per reply"
+        );
+    }
+
+    /// A drain writes before it accumulates without bound.
+    ///
+    /// Flushing at the drain boundary is what makes a pipelined batch cost one
+    /// syscall pair instead of one per reply — but a drain ends only when the
+    /// decoder holds no complete frame, and the decoder can hold a whole
+    /// [`READ_CEILING`] of pipelined requests. Without a high-water mark the
+    /// reply buffer grows to hold *every* reply that batch earns, where the
+    /// per-reply flush it replaced held one. [`REPLY_HIGH_WATER`] bounds it,
+    /// and the bound is observable from the peer's side: the largest single
+    /// write is the most one drain ever held.
+    #[tokio::test]
+    async fn a_drain_writes_before_it_accumulates_without_bound() {
+        /// Big enough that a handful of replies crosses the mark, small enough
+        /// that the mark is crossed by accumulation rather than by one reply.
+        const VALUE: usize = 64 * 1024;
+        const READS: usize = 8;
+
+        let pool = ShardPool::spawn(16, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
+        let flushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_write = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport = FlushCounting {
+            inner: server,
+            flushes: std::sync::Arc::clone(&flushes),
+            max_write: std::sync::Arc::clone(&max_write),
+        };
+        tokio::spawn(serve_connection(transport, pool));
+        let (mut r, mut w) = tokio::io::split(client);
+
+        let value = "v".repeat(VALUE);
+        let mut out = Vec::new();
+        encode(&req(&["SET", "k", &value]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        assert_eq!(read_frames(&mut r, 1).await[0], Frame::Simple("OK".into()));
+
+        // The `SET` is its own traffic; only the pipelined batch is under test.
+        flushes.store(0, std::sync::atomic::Ordering::Relaxed);
+        max_write.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        out.clear();
+        for _ in 0..READS {
+            encode(&req(&["GET", "k"]), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, READS).await;
+        assert!(
+            frames
+                .iter()
+                .all(|frame| *frame == Frame::Bulk(value.as_bytes().to_vec())),
+            "every reply of the batch must arrive whole and in order"
+        );
+
+        let largest = max_write.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            largest <= REPLY_HIGH_WATER + VALUE + 64,
+            "one drain accumulated {largest} bytes; the mark is {REPLY_HIGH_WATER} \
+             plus at most the one reply that crossed it"
+        );
+        assert!(
+            flushes.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "{READS} replies of {VALUE} B must cross the mark and write mid-drain"
         );
     }
 
@@ -1384,6 +1501,7 @@ mod tests {
         let mut sink = FlushCounting {
             inner: Vec::<u8>::new(),
             flushes: std::sync::Arc::clone(&flushes),
+            max_write: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         let mut out: Vec<u8> = Vec::new();
 
