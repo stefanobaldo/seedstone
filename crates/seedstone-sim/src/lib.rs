@@ -97,8 +97,16 @@ const TRACE_INIT: u64 = 0xcbf2_9ce4_8422_2325;
 /// only if their configurations are identical.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimConfig {
-    /// How many shards the server runs.
+    /// How many virtual shards the server runs.
     pub shards: u16,
+    /// How many executor tasks host those shards.
+    ///
+    /// Explicit, never read from the machine: production asks
+    /// `available_parallelism`, and doing that inside a simulation would make
+    /// the trace a function of the host — the definition of a determinism
+    /// violation. It is a dimension the sweep varies, not a detail the
+    /// environment supplies.
+    pub executors: u16,
     /// How many client hosts issue the workload.
     ///
     /// This is the lever that costs wall clock — turmoil polls every host on
@@ -131,6 +139,7 @@ impl SimConfig {
     pub const fn standard(workload_seed: u64, sim_seed: u64) -> Self {
         Self {
             shards: 1024,
+            executors: 10,
             clients: 128,
             string_keys: 4096,
             counter_keys: 64,
@@ -147,6 +156,7 @@ impl SimConfig {
     pub const fn mini(workload_seed: u64, sim_seed: u64) -> Self {
         Self {
             shards: 1024,
+            executors: 4,
             clients: 16,
             string_keys: 512,
             counter_keys: 8,
@@ -224,6 +234,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
     };
     let sink = HashSink(Arc::clone(&trace));
     let shards = cfg.shards;
+    let executors = cfg.executors;
     let planted = cfg.planted;
 
     sim.host(SERVER, move || {
@@ -231,7 +242,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         // needs its own future. The sink is shared on purpose — a restart
         // continues the same trace.
         let sink = sink.clone();
-        server(shards, dict_seed, sink, planted)
+        server(shards, executors, dict_seed, sink, planted)
     });
 
     for id in 0..cfg.clients {
@@ -404,8 +415,14 @@ impl Router for PlantedRouter {
 /// [`run_sim`]: [`ShardPool::spawn`] spawns onto the ambient tokio runtime,
 /// and under turmoil each host has its own. Spawned outside, the shards would
 /// land on whatever runtime happened to be current — or on none at all.
-async fn server(shards: u16, seed: DictSeed, sink: HashSink, planted: bool) -> turmoil::Result {
-    let pool = ShardPool::spawn(shards, seed, sink);
+async fn server(
+    shards: u16,
+    executors: u16,
+    seed: DictSeed,
+    sink: HashSink,
+    planted: bool,
+) -> turmoil::Result {
+    let pool = ShardPool::spawn(shards, executors, seed, sink);
     let listener = turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await?;
     loop {
         let (stream, _peer) = listener.accept().await?;
