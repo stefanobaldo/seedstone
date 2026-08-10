@@ -33,10 +33,20 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Runs the prohibition lints over one fixture and returns clippy's verdict.
+///
+/// `--locked` is what makes that verdict mean something over time. Each fixture
+/// commits its own `Cargo.lock`, so the versions of `rand` and `getrandom` the
+/// gate compiles against are the ones the prohibition paths in `clippy.toml`
+/// were written for. Without the flag cargo would quietly re-resolve to
+/// whatever is newest: a fixture could drift onto a release that moved or
+/// renamed the item its prohibition names, and the failure would arrive as a
+/// mystery on an unrelated pull request. With it, a lockfile that no longer
+/// matches its manifest is a hard error naming the fixture.
 fn clippy_on_fixture(name: &str) -> Output {
     let root = repo_root();
     Command::new("cargo")
-        .args(["clippy", "--quiet", "--target-dir"])
+        .args(["clippy", "--locked", "--quiet", "--target-dir"])
         .arg(root.join("target/fixtures"))
         .args([
             "--",
