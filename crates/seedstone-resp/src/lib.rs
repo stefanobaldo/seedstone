@@ -299,6 +299,20 @@ enum Element {
     ArrayHeader(usize),
 }
 
+/// What a RESP2 type byte says the element is.
+///
+/// Reading the type byte into this is the first thing the reader does, and it
+/// is where an unknown byte is refused — before a terminator is searched for,
+/// so junk cannot buy a peer any buffering at all.
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    Simple,
+    Error,
+    Integer,
+    Bulk,
+    Array,
+}
+
 /// How far into the current element the reader has got.
 ///
 /// This enum is the whole point of the rework: nothing already understood is
@@ -407,30 +421,46 @@ impl Decoding {
     ) -> Result<Option<Element>, ParseError> {
         // A bulk whose header is already parsed needs no scanning at all.
         if let Partial::BulkBody { header, len } = self.partial {
-            return Ok(self.finish_bulk(buf, header, len)?.map(Element::Value));
+            return Ok(self
+                .finish_bulk(buf, header, len, limits)?
+                .map(Element::Value));
         }
 
         let Some(&type_byte) = buf.get(self.scan) else {
             return Ok(None);
         };
         self.examined += 1;
+        // The type byte is decided on before anything is spent looking for a
+        // terminator. No continuation can rescue an unknown one, so waiting
+        // for a `\r\n` that may never come would turn one junk byte into a
+        // licence to buffer up to `max_frame_bytes` — a peer that opens with
+        // garbage has to be cut off on its first byte, not its 64 millionth.
+        let kind = match type_byte {
+            b'+' => Kind::Simple,
+            b'-' => Kind::Error,
+            b':' => Kind::Integer,
+            b'$' => Kind::Bulk,
+            b'*' => Kind::Array,
+            other => return Err(ParseError(format!("unknown RESP2 type byte: {other:#04x}"))),
+        };
+
         let content = self.scan + 1;
         let Some((line_end, next)) = self.find_crlf(buf, content) else {
             return Ok(None);
         };
         let field = &buf[content..line_end];
 
-        let element = match type_byte {
-            b'+' => Element::Value(Frame::Simple(
+        let element = match kind {
+            Kind::Simple => Element::Value(Frame::Simple(
                 String::from_utf8(field.to_vec())
                     .map_err(|_| ParseError("simple string is not valid UTF-8".into()))?,
             )),
-            b'-' => Element::Value(Frame::Error(
+            Kind::Error => Element::Value(Frame::Error(
                 String::from_utf8(field.to_vec())
                     .map_err(|_| ParseError("error string is not valid UTF-8".into()))?,
             )),
-            b':' => Element::Value(Frame::Integer(parse_i64(field)?)),
-            b'$' => {
+            Kind::Integer => Element::Value(Frame::Integer(parse_i64(field)?)),
+            Kind::Bulk => {
                 let len = parse_i64(field)?;
                 if len == -1 {
                     self.scan = next;
@@ -451,10 +481,11 @@ impl Decoding {
                     usize::try_from(len).map_err(|_| ParseError("bulk length too large".into()))?;
                 let header = next - self.scan;
                 self.partial = Partial::BulkBody { header, len };
-                return Ok(self.finish_bulk(buf, header, len)?.map(Element::Value));
+                return Ok(self
+                    .finish_bulk(buf, header, len, limits)?
+                    .map(Element::Value));
             }
-            b'*' => Element::ArrayHeader(self.array_header(field, limits)?),
-            other => return Err(ParseError(format!("unknown RESP2 type byte: {other:#04x}"))),
+            Kind::Array => Element::ArrayHeader(self.array_header(field, limits)?),
         };
         self.scan = next;
         Ok(Some(element))
@@ -510,6 +541,7 @@ impl Decoding {
         buf: &[u8],
         header: usize,
         len: usize,
+        limits: &DecoderLimits,
     ) -> Result<Option<Frame>, ParseError> {
         let overflow = || ParseError("bulk length overflows buffer offset".into());
         let end = header
@@ -525,6 +557,11 @@ impl Decoding {
         if &buf[payload_end..end] != b"\r\n" {
             return Err(ParseError("bulk payload missing CRLF terminator".into()));
         }
+        // Asked before the copy, not after. This is the one element whose
+        // cost is known before it exists, so a payload the budget cannot
+        // afford must never be materialised only to be thrown away — which is
+        // what charging it in `place`, after `to_vec`, would do.
+        self.afford(size_of::<Frame>().saturating_add(len), limits)?;
         self.examined += len;
         let payload = buf[payload_start..payload_end].to_vec();
         self.scan = end;
@@ -610,19 +647,30 @@ impl Decoding {
             .map(|filled| Frame::Array(filled.elements))
     }
 
+    /// Refuses `cost` further bytes of parsed representation when the budget
+    /// cannot cover them, without recording anything.
+    ///
+    /// Separate from [`Decoding::charge`] so a cost known *before* the thing
+    /// that costs it exists — a bulk payload, whose length its header
+    /// declares — can be refused before it is allocated.
+    fn afford(&self, cost: usize, limits: &DecoderLimits) -> Result<(), ParseError> {
+        if self.in_memory.saturating_add(cost) > limits.max_in_memory {
+            return Err(ParseError(format!(
+                "decoded frame exceeds the {}-byte in-memory limit",
+                limits.max_in_memory
+            )));
+        }
+        Ok(())
+    }
+
     /// Accounts for one frame against [`DecoderLimits::max_in_memory`].
     ///
     /// Charged *before* the frame is pushed, so the limit stops the array from
     /// growing rather than discovering afterwards that it did.
     fn charge(&mut self, frame: &Frame, limits: &DecoderLimits) -> Result<(), ParseError> {
         let cost = size_of::<Frame>().saturating_add(payload_bytes(frame));
+        self.afford(cost, limits)?;
         self.in_memory = self.in_memory.saturating_add(cost);
-        if self.in_memory > limits.max_in_memory {
-            return Err(ParseError(format!(
-                "decoded frame exceeds the {}-byte in-memory limit",
-                limits.max_in_memory
-            )));
-        }
         Ok(())
     }
 }
@@ -1053,6 +1101,38 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_type_byte_is_refused_before_a_terminator_is_waited_for() {
+        // Nothing that arrives later can make these bytes a frame, so the
+        // refusal must not be contingent on a `\r\n` ever showing up. If it
+        // were, one junk byte would buy a peer the right to have the server
+        // buffer up to `max_frame_bytes` on its behalf — the cheapest
+        // amplification there is, and it would be bought for free.
+        for junk in [&b"!"[..], b"!5", b"P", b"GET k", b"\0", b"HELLO world"] {
+            assert!(parse(junk).is_err(), "one-shot: {junk:?}");
+
+            let mut decoder = Decoder::new(DecoderLimits::default());
+            decoder.feed(junk);
+            assert!(decoder.try_next().is_err(), "streaming: {junk:?}");
+
+            // And byte by byte: the error lands on the first byte, not once
+            // the rest of the junk has been accumulated.
+            let mut decoder = Decoder::new(DecoderLimits::default());
+            decoder.feed(&junk[..1]);
+            let err = decoder.try_next().unwrap_err();
+            assert!(
+                err.to_string().starts_with("unknown RESP2 type byte"),
+                "unexpected error for {junk:?}: {err}"
+            );
+        }
+
+        // The five bytes that *are* valid keep waiting, so the guard rejects
+        // nothing it should accept.
+        for opener in [&b"+"[..], b"-", b":", b"$", b"*"] {
+            assert_eq!(parse(opener), Ok(None), "{opener:?}");
+        }
+    }
+
+    #[test]
     fn decoder_work_is_linear_in_input() {
         // The property the rework exists for. `bytes_examined` counts every
         // byte the state machine looks at or copies, so re-parsing a
@@ -1130,7 +1210,37 @@ mod tests {
             "the array was never started"
         );
 
-        // Two: a count that fits, filled with elements that do not. The wire
+        // Two: a payload the budget cannot afford is refused before it is
+        // copied. The declared length is known from the header, so allocating
+        // 16 MiB against a 1 MiB budget only to reject it would be the
+        // decoder doing exactly the work the limit exists to prevent.
+        let mut decoder = Decoder::new(limits);
+        let huge = MAX_BULK_LEN - 1;
+        decoder.feed(format!("${huge}\r\n").as_bytes());
+        assert_eq!(
+            decoder.try_next(),
+            Ok(None),
+            "the header alone is not yet a frame"
+        );
+        decoder.feed(&vec![b'b'; huge]);
+        decoder.feed(b"\r\n");
+        let err = decoder.try_next().unwrap_err();
+        assert!(
+            err.to_string().starts_with("decoded frame exceeds"),
+            "unexpected error: {err}"
+        );
+        // The message alone would be identical if the payload were copied
+        // first and charged afterwards, so it proves nothing on its own. The
+        // work counter is what separates the two: it advances by a payload's
+        // length only when the decoder actually reads that payload out, and
+        // this one it never touched.
+        assert!(
+            decoder.bytes_examined() < huge,
+            "the payload was copied before it was refused: examined {}",
+            decoder.bytes_examined()
+        );
+
+        // Three: a count that fits, filled with elements that do not. The wire
         // says nothing about the payload sizes to come, so this can only be
         // caught while the array fills — and it is caught as it fills, never
         // after the fact.
