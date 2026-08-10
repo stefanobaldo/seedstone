@@ -178,11 +178,15 @@ enum Action {
 /// can never be a valid frame.
 ///
 /// Complete frames are drained from the read buffer, mapped to commands and
-/// dispatched one at a time; each reply is written and **flushed** before the
-/// next frame is handled. The flush is not optional: a transport that buffers
-/// — a simulated one especially — will otherwise hold a reply the peer is
-/// blocked waiting for, and the deadlock only appears once the code is run
-/// under the simulator.
+/// dispatched one at a time; the replies accumulate and are written and
+/// **flushed together when the drain ends** — the moment before this loop
+/// would park on `read`. The flush placement is not optional: a transport
+/// that buffers — a simulated one especially — would otherwise hold a reply
+/// the peer is blocked waiting for, and the deadlock only appears once the
+/// code runs under the simulator. The invariant is that this loop never
+/// waits for bytes while a reply sits unflushed; batching within one drain
+/// preserves it, because a drain only ends when the decoder has no complete
+/// frame left.
 ///
 /// A frame that is well-formed RESP but not a command this server knows —
 /// wrong arity, unknown name — is answered with an error frame and the
@@ -229,29 +233,43 @@ where
 
     loop {
         // Drain every complete frame the decoder already holds before asking
-        // the transport for more.
-        loop {
-            let (reply, hang_up) = match decoder.try_next() {
+        // the transport for more. The replies accumulate in `out`; the write
+        // happens once, at the drain's end.
+        let mut hang_up = false;
+        let mut drained = false;
+        while !drained && !hang_up {
+            match decoder.try_next() {
                 Ok(Some(frame)) => match frame_to_action(frame) {
-                    Action::Dispatch(cmd) => (reply_to_frame(router.dispatch(cmd).await), false),
-                    Action::Reply(frame) => (frame, false),
-                    Action::ReplyThenClose(frame) => (frame, true),
+                    Action::Dispatch(cmd) => {
+                        append_frame(&mut out, &reply_to_frame(router.dispatch(cmd).await));
+                    }
+                    Action::Reply(frame) => append_frame(&mut out, &frame),
+                    Action::ReplyThenClose(frame) => {
+                        append_frame(&mut out, &frame);
+                        hang_up = true;
+                    }
                 },
                 // A proper prefix of a valid frame: read more.
-                Ok(None) => break,
+                Ok(None) => drained = true,
                 Err(error) => {
                     // Terminal, and that now covers the accumulation ceiling
                     // as well as malformed bytes: either way the decoder holds
                     // a half-read frame with no resync point. Report it and
                     // go, without draining.
-                    let frame = safe_error(&protocol_error(&error));
-                    write_frame(&mut stream, &frame, &mut out).await;
+                    //
+                    // The error frame is appended *behind* whatever this drain
+                    // already answered, so the peer sees the same order it
+                    // would have seen from a flush per reply: the replies it
+                    // earned, then the refusal.
+                    append_frame(&mut out, &safe_error(&protocol_error(&error)));
+                    flush_replies(&mut stream, &mut out).await;
                     return;
                 }
-            };
-            if !write_frame(&mut stream, &reply, &mut out).await || hang_up {
-                return;
             }
+        }
+
+        if !flush_replies(&mut stream, &mut out).await || hang_up {
+            return;
         }
 
         match stream.read(&mut read_buf).await {
@@ -329,15 +347,26 @@ fn resize_connection_buffers(
     }
 }
 
-/// Encodes `frame` and writes it, flushing before returning.
+/// Encodes `frame` onto the end of `out`, which may already hold earlier
+/// replies from the same drain.
+fn append_frame(out: &mut Vec<u8>, frame: &Frame) {
+    encode(frame, out);
+}
+
+/// Writes everything the drain accumulated and flushes once.
 ///
 /// Returns `false` if the write failed, which means the peer is gone.
-async fn write_frame<S>(stream: &mut S, frame: &Frame, out: &mut Vec<u8>) -> bool
+///
+/// An empty buffer is not a write: a drain that answered nothing — the first
+/// turn of the loop, or a read that completed no frame — must not spend a
+/// syscall pair saying so.
+async fn flush_replies<S>(stream: &mut S, out: &mut Vec<u8>) -> bool
 where
     S: AsyncWrite + Unpin,
 {
-    out.clear();
-    encode(frame, out);
+    if out.is_empty() {
+        return true;
+    }
     let delivered = stream.write_all(out).await.is_ok() && stream.flush().await.is_ok();
     // Cleared *before* the shed, not after the next `encode`. `Vec::shrink_to`
     // never shrinks below the length, so clearing at the top of the call only
@@ -699,6 +728,90 @@ mod tests {
         let mut rest = Vec::new();
         r.read_to_end(&mut rest).await.unwrap();
         assert!(rest.is_empty(), "the server kept talking after QUIT");
+    }
+
+    /// Counts how many times the connection flushes, delegating everything else.
+    struct FlushCounting<S> {
+        inner: S,
+        flushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for FlushCounting<S> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for FlushCounting<S> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// One drain of a pipelined batch is one flush, not one per reply.
+    ///
+    /// The syscall a flush becomes is per-batch work billed per command
+    /// otherwise, and the invariant the simulator needs is narrower than the
+    /// per-reply flush that used to provide it: never park on `read` with a
+    /// reply still buffered. A drain only ends when the decoder holds no
+    /// complete frame, so flushing there is exactly that invariant and nothing
+    /// more.
+    #[tokio::test]
+    async fn a_pipelined_batch_is_flushed_once_per_drain() {
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        let flushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport = FlushCounting {
+            inner: server,
+            flushes: std::sync::Arc::clone(&flushes),
+        };
+        // PING resolves in the service layer, so the router must stay
+        // unreached — a reply that took the shard round trip would let the
+        // drain end early and flush more than once for reasons unrelated to
+        // the placement under test.
+        tokio::spawn(serve_connection(transport, UnreachableRouter));
+
+        let mut batch = Vec::new();
+        for _ in 0..64 {
+            encode(&req(&["PING"]), &mut batch);
+        }
+        client.write_all(&batch).await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut got = Vec::new();
+        while got.len() < 64 * b"+PONG\r\n".len() {
+            let mut chunk = [0u8; 4096];
+            let n = client.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "server hung up mid-batch");
+            got.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(got, b"+PONG\r\n".repeat(64));
+        assert_eq!(
+            flushes.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one drain of 64 pipelined commands must flush once, not per reply"
+        );
     }
 
     /// `HELLO 3` must be refused with the `NOPROTO` prefix specifically.
@@ -1228,21 +1341,22 @@ mod tests {
 
     /// A large reply must not leave its allocation attached to the connection.
     ///
-    /// [`write_frame`] clears `out` twice, and the second clear is the load-
-    /// bearing one: `Vec::shrink_to` never shrinks below the length, so
-    /// shedding while the reply is still in the buffer is a no-op on exactly
-    /// the write that grew it. The bug that shape produces is invisible in a
-    /// pipeline — the next reply clears the buffer anyway — and shows up only
-    /// for the client that reads one big value and then goes quiet, which is
-    /// why it is asserted directly on the function rather than through a
+    /// [`flush_replies`] clears `out` after the write rather than before the
+    /// next `encode`, and that is the load-bearing half: `Vec::shrink_to`
+    /// never shrinks below the length, so shedding while the reply is still in
+    /// the buffer is a no-op on exactly the write that grew it. The bug that
+    /// shape produces is invisible in a pipeline — the next drain's first
+    /// `encode` finds an already-cleared buffer anyway — and shows up only for
+    /// the client that reads one big value and then goes quiet, which is why
+    /// it is asserted directly on the function rather than through a
     /// connection.
     #[tokio::test]
     async fn a_large_reply_sheds_its_buffer_before_the_next_one() {
         let mut sink: Vec<u8> = Vec::new();
         let mut out: Vec<u8> = Vec::new();
 
-        let big = Frame::Bulk(vec![b'v'; 4 * REPLY_SHED]);
-        assert!(write_frame(&mut sink, &big, &mut out).await);
+        append_frame(&mut out, &Frame::Bulk(vec![b'v'; 4 * REPLY_SHED]));
+        assert!(flush_replies(&mut sink, &mut out).await);
         assert!(sink.len() > 4 * REPLY_SHED, "the reply was truncated");
         assert!(
             out.capacity() <= REPLY_SHED,
@@ -1253,8 +1367,33 @@ mod tests {
         // Shedding cost nothing: the next reply is still encoded correctly
         // into the shrunken buffer.
         sink.clear();
-        assert!(write_frame(&mut sink, &Frame::Simple("OK".into()), &mut out).await);
+        append_frame(&mut out, &Frame::Simple("OK".into()));
+        assert!(flush_replies(&mut sink, &mut out).await);
         assert_eq!(sink, b"+OK\r\n");
+    }
+
+    /// A drain that answered nothing must not write, and must not flush.
+    ///
+    /// This is what keeps the batched loop from replacing one syscall pair per
+    /// reply with one per turn of the outer loop: every read that completes no
+    /// frame — a dribbled request, and the first turn of every connection —
+    /// reaches the flush with an empty buffer.
+    #[tokio::test]
+    async fn an_empty_drain_does_not_write() {
+        let flushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut sink = FlushCounting {
+            inner: Vec::<u8>::new(),
+            flushes: std::sync::Arc::clone(&flushes),
+        };
+        let mut out: Vec<u8> = Vec::new();
+
+        assert!(flush_replies(&mut sink, &mut out).await);
+        assert!(sink.inner.is_empty(), "an empty drain wrote bytes");
+        assert_eq!(
+            flushes.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an empty drain spent a flush"
+        );
     }
 
     /// A connection that went quiet gives back *all three* of its buffers.
@@ -1281,7 +1420,8 @@ mod tests {
         decoder.feed(&wire);
         while matches!(decoder.try_next(), Ok(Some(_))) {}
         let mut sink: Vec<u8> = Vec::new();
-        assert!(write_frame(&mut sink, &Frame::Bulk(big), &mut out).await);
+        append_frame(&mut out, &Frame::Bulk(big));
+        assert!(flush_replies(&mut sink, &mut out).await);
         for _ in 0..32 {
             let got = read_buf.len();
             resize_connection_buffers(&mut read_buf, &mut decoder, &mut out, &mut quiet, got);
