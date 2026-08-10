@@ -36,6 +36,24 @@ const DEFAULT_MAX_CLIENTS: usize = 10_000;
 /// deployment-format decision, not a flag.
 const SHARDS: u16 = 1024;
 
+/// How many executor tasks host those shards.
+///
+/// The shard count is part of the placement and cannot move; this one is a
+/// property of the machine, so it is read from it. Asking here — the
+/// composition root, where the worker count is already decided — keeps the
+/// two decisions side by side, and keeps the core free of any question about
+/// the host it happens to be running on.
+///
+/// A host that will not say how much parallelism it has gets one executor:
+/// the shape still works, and a node that refuses to start over this would be
+/// worse than a node that runs conservatively.
+fn executors() -> u16 {
+    let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    u16::try_from(available)
+        .unwrap_or(u16::MAX)
+        .clamp(1, SHARDS)
+}
+
 /// What a peer is told when the connection limit is already spent.
 ///
 /// Byte-exact to Redis: clients match on this text.
@@ -145,7 +163,7 @@ impl Server {
             listener,
             local_addr,
             max_clients: cfg.max_clients,
-            pool: ShardPool::spawn(SHARDS, seed, NoTrace),
+            pool: ShardPool::spawn(SHARDS, executors(), seed, NoTrace),
         })
     }
 
@@ -213,7 +231,16 @@ async fn refuse(mut stream: TcpStream) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, DEFAULT_BIND, MAX_CLIENTS_REACHED, USAGE};
+    use super::{Config, DEFAULT_BIND, MAX_CLIENTS_REACHED, SHARDS, USAGE, executors};
+
+    /// Whatever this host answers, the count has to be one the pool accepts:
+    /// at least one executor, never more than there are shards to host.
+    #[test]
+    fn the_executor_count_is_one_the_pool_can_be_spawned_with() {
+        let executors = executors();
+        assert!(executors >= 1, "no executor to host a shard");
+        assert!(executors <= SHARDS, "more executors than shards");
+    }
 
     #[test]
     fn args_parse_defaults_and_overrides() {
