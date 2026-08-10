@@ -212,6 +212,94 @@ fn every_select_in_simulated_code_is_biased() {
     );
 }
 
+/// The fixtures' lockfiles froze their dependency resolution — deliberately,
+/// because a gate that re-resolves against the registry is a gate that flakes —
+/// and that opened the one failure mode in this file which is a *silent green*:
+/// the workspace moves to a new `rand` and the prohibitions go on being proven
+/// against the old one, passing all the while.
+///
+/// The concrete instance it exists for: `rand::thread_rng` is deprecated in 0.9
+/// and gone in 0.10. The day the workspace bumps, that `clippy.toml` entry names
+/// an item production code can no longer call, while the fixture keeps compiling
+/// 0.9.5 and keeps reporting the prohibition enforced. Nothing else here would
+/// notice, because every other test in this file asks whether the fixtures are
+/// refused — never whether the fixtures are still the code that ships.
+///
+/// So this one compares versions rather than behaviour, and turns the drift into
+/// a red at the moment of the bump instead of a mystery some months later.
+#[test]
+fn fixture_locks_agree_with_the_workspace_on_the_rand_family() {
+    const WATCHED: [&str; 4] = ["rand", "rand_core", "rand_chacha", "getrandom"];
+
+    let root = repo_root();
+    let workspace = lock_versions(&root.join("Cargo.lock"), &WATCHED);
+    assert!(
+        !workspace.is_empty(),
+        "the workspace lockfile resolves none of {WATCHED:?}: either the scanner \
+         has stopped matching cargo's format or this gate is comparing nothing"
+    );
+
+    let mut compared = 0usize;
+    for fixture in FIXTURES {
+        // Named from `FIXTURES` rather than discovered by `read_dir`: a
+        // directory walk that finds nothing passes, which is the failure mode
+        // this whole test exists to remove.
+        let lock = root
+            .join("fixtures/determinism")
+            .join(fixture)
+            .join("Cargo.lock");
+        for (name, version) in lock_versions(&lock, &WATCHED) {
+            // The workspace may legitimately resolve a package the fixtures do
+            // not use, or resolve one twice at two versions. A fixture's version
+            // is fine as long as the workspace's graph contains it.
+            if !workspace.iter().any(|(n, _)| *n == name) {
+                continue;
+            }
+            assert!(
+                workspace.contains(&(name.clone(), version.clone())),
+                "{} pins {name} {version} but the workspace resolves {:?}: regenerate \
+                 the fixture lockfiles so the gate proves the prohibitions against \
+                 what production actually compiles",
+                lock.display(),
+                workspace
+                    .iter()
+                    .filter(|(n, _)| *n == name)
+                    .map(|(_, v)| v)
+                    .collect::<Vec<_>>(),
+            );
+            compared += 1;
+        }
+    }
+    assert!(
+        compared > 0,
+        "no fixture pinned any of {WATCHED:?}: this gate is looking at nothing"
+    );
+}
+
+/// `(name, version)` pairs for the watched packages of one `Cargo.lock`.
+///
+/// The format is a stability promise of cargo's — `[[package]]` blocks with
+/// `name = "…"` then `version = "…"` — so a line scanner is enough and the test
+/// adds no dependency. A lockfile that cannot be read is a panic, not a skip:
+/// every path this is called with is one the repository is expected to contain.
+fn lock_versions(lock: &Path, watched: &[&str]) -> Vec<(String, String)> {
+    let text =
+        std::fs::read_to_string(lock).unwrap_or_else(|e| panic!("reading {}: {e}", lock.display()));
+    let mut out = Vec::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        if let Some(name) = line.strip_prefix("name = \"") {
+            let name = name.trim_end_matches('"');
+            current = watched.contains(&name).then(|| name.to_owned());
+        } else if let Some(version) = line.strip_prefix("version = \"")
+            && let Some(name) = current.take()
+        {
+            out.push((name, version.trim_end_matches('"').to_owned()));
+        }
+    }
+    out
+}
+
 /// The `src` directory of every crate in the workspace.
 fn crate_source_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
