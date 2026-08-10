@@ -414,15 +414,18 @@ impl Decoding {
             let Some(element) = self.read_element(buf, limits)? else {
                 // Nothing can follow an unfinished frame, so every byte from
                 // `frame_start` on belongs to it: this is its wire size so far.
-                if buf.len() - self.frame_start > limits.max_frame_bytes {
-                    return Err(ParseError(format!(
-                        "frame exceeds the {}-byte buffering limit",
-                        limits.max_frame_bytes
-                    )));
-                }
+                check_frame_bytes(buf.len() - self.frame_start, limits)?;
                 return Ok(None);
             };
             if let Some(frame) = self.place(element, limits)? {
+                // The same ceiling on the completion path, and it is not
+                // redundant with the one above: without it a frame over the
+                // limit is refused only when a chunk boundary happens to fall
+                // while it is still incomplete, so the verdict would depend on
+                // how the peer split its writes. Checked here as well, the
+                // same bytes give the same answer at every chunking — which is
+                // the property everything above this crate reasons with.
+                check_frame_bytes(self.scan - self.frame_start, limits)?;
                 return Ok(Some(frame));
             }
         }
@@ -437,11 +440,10 @@ impl Decoding {
         buf: &[u8],
         limits: &DecoderLimits,
     ) -> Result<Option<Element>, ParseError> {
-        // A bulk whose header is already parsed needs no scanning at all.
+        // A bulk whose header is already parsed needs no scanning at all, and
+        // no pricing either: its cost was charged when its header was read.
         if let Partial::BulkBody { header, len } = self.partial {
-            return Ok(self
-                .finish_bulk(buf, header, len, limits)?
-                .map(Element::Value));
+            return Ok(self.finish_bulk(buf, header, len)?.map(Element::Value));
         }
 
         let Some(&type_byte) = buf.get(self.scan) else {
@@ -497,11 +499,16 @@ impl Decoding {
                 // function has no panicking path at all.
                 let len =
                     usize::try_from(len).map_err(|_| ParseError("bulk length too large".into()))?;
+                // Priced from the declared length, at the header, before a
+                // single payload byte is waited for. Charging it where the
+                // payload is copied would be too late in the way that matters:
+                // the copy is only reachable once the whole payload has been
+                // buffered, so a peer could make the decoder hold 16 MiB it
+                // had already been told it could not afford.
+                self.afford(size_of::<Frame>().saturating_add(len), limits)?;
                 let header = next - self.scan;
                 self.partial = Partial::BulkBody { header, len };
-                return Ok(self
-                    .finish_bulk(buf, header, len, limits)?
-                    .map(Element::Value));
+                return Ok(self.finish_bulk(buf, header, len)?.map(Element::Value));
             }
             Kind::Array => Element::ArrayHeader(self.array_header(field, limits)?),
         };
@@ -540,7 +547,12 @@ impl Decoding {
         // An array that cannot fit even as empty `Frame`s is refused at its
         // header, before one element is read — the count is a promise about
         // memory, and this is the only moment the promise is cheap to refuse.
-        if count.saturating_mul(size_of::<Frame>()) > limits.max_in_memory {
+        //
+        // Measured against what is *left* of the budget, not against the
+        // budget entire: an inner array is read on a budget its parent has
+        // already spent part of, and comparing against the whole would let it
+        // through to be caught one element at a time instead.
+        if count.saturating_mul(size_of::<Frame>()) > self.headroom(limits) {
             return Err(ParseError(format!(
                 "array of {count} elements exceeds the {}-byte in-memory limit",
                 limits.max_in_memory
@@ -559,7 +571,6 @@ impl Decoding {
         buf: &[u8],
         header: usize,
         len: usize,
-        limits: &DecoderLimits,
     ) -> Result<Option<Frame>, ParseError> {
         let overflow = || ParseError("bulk length overflows buffer offset".into());
         let end = header
@@ -575,12 +586,7 @@ impl Decoding {
         if &buf[payload_end..end] != b"\r\n" {
             return Err(ParseError("bulk payload missing CRLF terminator".into()));
         }
-        // Asked before the copy, not after. This is the one element whose
-        // cost is known before it exists, so a payload the budget cannot
-        // afford must never be materialised only to be thrown away — which is
-        // what charging it in `place`, after `to_vec`, would do.
-        self.afford(size_of::<Frame>().saturating_add(len), limits)?;
-        self.examined += len;
+        self.examined = self.examined.saturating_add(len);
         let payload = buf[payload_start..payload_end].to_vec();
         self.scan = end;
         self.partial = Partial::Start;
@@ -665,14 +671,23 @@ impl Decoding {
             .map(|filled| Frame::Array(filled.elements))
     }
 
+    /// What is left of [`DecoderLimits::max_in_memory`] for this frame.
+    ///
+    /// The single place the budget is read, so every refusal below is
+    /// measured against the same remaining room even though each words its
+    /// error for the thing it refused.
+    const fn headroom(&self, limits: &DecoderLimits) -> usize {
+        limits.max_in_memory.saturating_sub(self.in_memory)
+    }
+
     /// Refuses `cost` further bytes of parsed representation when the budget
     /// cannot cover them, without recording anything.
     ///
     /// Separate from [`Decoding::charge`] so a cost known *before* the thing
     /// that costs it exists — a bulk payload, whose length its header
-    /// declares — can be refused before it is allocated.
+    /// declares — can be refused before it is waited for.
     fn afford(&self, cost: usize, limits: &DecoderLimits) -> Result<(), ParseError> {
-        if self.in_memory.saturating_add(cost) > limits.max_in_memory {
+        if cost > self.headroom(limits) {
             return Err(ParseError(format!(
                 "decoded frame exceeds the {}-byte in-memory limit",
                 limits.max_in_memory
@@ -691,6 +706,22 @@ impl Decoding {
         self.in_memory = self.in_memory.saturating_add(cost);
         Ok(())
     }
+}
+
+/// Refuses a frame whose wire form is past
+/// [`DecoderLimits::max_frame_bytes`].
+///
+/// Applied at both ends of a frame's life — where it runs out of input and
+/// where it completes — which is what makes the verdict the same however the
+/// peer chunked its writes.
+fn check_frame_bytes(wire_bytes: usize, limits: &DecoderLimits) -> Result<(), ParseError> {
+    if wire_bytes > limits.max_frame_bytes {
+        return Err(ParseError(format!(
+            "frame exceeds the {}-byte buffering limit",
+            limits.max_frame_bytes
+        )));
+    }
+    Ok(())
 }
 
 /// The heap bytes a frame owns beyond the [`Frame`] itself.
@@ -1235,8 +1266,13 @@ mod tests {
             wire.extend_from_slice(&b":1\r\n".repeat(per_array));
         }
         let err = parse(&wire).unwrap_err();
+        // Refused at the *second* array's header, not element by element:
+        // that header is priced against what is left of the budget after its
+        // sibling spent half of it, so the count alone is already unaffordable
+        // by the time it is read.
         assert!(
-            err.to_string().starts_with("decoded frame exceeds"),
+            err.to_string()
+                .starts_with(&format!("array of {per_array} elements exceeds")),
             "unexpected error: {err}"
         );
 
@@ -1255,6 +1291,63 @@ mod tests {
             panic!("expected an array")
         };
         assert_eq!(outer.len(), 2);
+    }
+
+    #[test]
+    fn the_buffering_ceiling_does_not_depend_on_how_the_peer_chunks() {
+        // `feed` promises that chunk boundaries carry no meaning, and that
+        // promise is what everything above this crate reasons with — a
+        // simulator replaying a run cannot reproduce the peer's write sizes.
+        //
+        // The ceiling used to be tested only when the decoder ran out of
+        // input, so a frame over the limit was accepted whenever the last
+        // chunk completed it before the check could fire. It was not even
+        // monotonic in chunk size: the same 103 bytes were refused at chunk
+        // 65 and accepted at chunk 64 and again at chunk 103.
+        let mut wire = Vec::new();
+        encode(&Frame::Bulk(vec![b'w'; 80]), &mut wire);
+        let over = wire.len() - 1;
+
+        for chunk in 1..=wire.len() {
+            for (limit, expected_ok) in [(over, false), (wire.len(), true)] {
+                let mut decoder = Decoder::new(DecoderLimits {
+                    max_frame_bytes: limit,
+                    max_in_memory: DecoderLimits::default().max_in_memory,
+                });
+                let mut outcome = Ok(None);
+                for piece in wire.chunks(chunk) {
+                    decoder.feed(piece);
+                    outcome = decoder.try_next();
+                    if outcome.is_err() {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    outcome.is_ok(),
+                    expected_ok,
+                    "chunk {chunk}, limit {limit}: {outcome:?}"
+                );
+            }
+        }
+
+        // And the one-shot path agrees with every one of them, since it is
+        // the same state machine over a slice it does not own.
+        assert!(
+            parse_with_frame_limit(&wire, over).is_err(),
+            "one-shot disagrees with the chunked verdict"
+        );
+        assert!(parse_with_frame_limit(&wire, wire.len()).is_ok());
+    }
+
+    /// One-shot decode under a custom wire ceiling, for comparing the
+    /// streaming verdict against the slice one.
+    fn parse_with_frame_limit(buf: &[u8], max_frame_bytes: usize) -> Result<Option<Frame>, ()> {
+        let mut decoder = Decoder::new(DecoderLimits {
+            max_frame_bytes,
+            max_in_memory: DecoderLimits::default().max_in_memory,
+        });
+        decoder.feed(buf);
+        decoder.try_next().map_err(|_| ())
     }
 
     #[test]
@@ -1366,33 +1459,33 @@ mod tests {
             "the array was never started"
         );
 
-        // Two: a payload the budget cannot afford is refused before it is
-        // copied. The declared length is known from the header, so allocating
-        // 16 MiB against a 1 MiB budget only to reject it would be the
-        // decoder doing exactly the work the limit exists to prevent.
+        // Two: a payload the budget cannot afford is refused at its header,
+        // from the length the header declares — before the payload is waited
+        // for, never mind copied.
+        //
+        // The boundary here moved deliberately. Charging the payload where it
+        // is copied still refused it, but the copy is only reachable once the
+        // whole payload has been buffered, so the header alone used to answer
+        // "keep going" and a peer could make the decoder hold 16 MiB it had
+        // already been told it could not afford. The header is the last moment
+        // the refusal is free, so that is where it happens.
         let mut decoder = Decoder::new(limits);
         let huge = MAX_BULK_LEN - 1;
         decoder.feed(format!("${huge}\r\n").as_bytes());
-        assert_eq!(
-            decoder.try_next(),
-            Ok(None),
-            "the header alone is not yet a frame"
-        );
-        decoder.feed(&vec![b'b'; huge]);
-        decoder.feed(b"\r\n");
         let err = decoder.try_next().unwrap_err();
         assert!(
             err.to_string().starts_with("decoded frame exceeds"),
             "unexpected error: {err}"
         );
-        // The message alone would be identical if the payload were copied
-        // first and charged afterwards, so it proves nothing on its own. The
-        // work counter is what separates the two: it advances by a payload's
-        // length only when the decoder actually reads that payload out, and
-        // this one it never touched.
+        // Nothing of the payload was held: the refusal came out of ten bytes
+        // of header. `buffered` is the memory claim, and the work counter is
+        // the second half of it — the counter advances by a payload's length
+        // only when the decoder reads that payload out, and this one it never
+        // touched.
+        assert!(decoder.buffered() <= 16, "held {}", decoder.buffered());
         assert!(
             decoder.bytes_examined() < huge,
-            "the payload was copied before it was refused: examined {}",
+            "the payload was read out before it was refused: examined {}",
             decoder.bytes_examined()
         );
 

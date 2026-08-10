@@ -978,31 +978,38 @@ mod tests {
     /// doc names — and the server must answer and close rather than buffer
     /// forever.
     ///
-    /// The declared length matters, and it used to be wrong. This test opened
-    /// with `$1000000000\r\n`, which is far above [`MAX_BULK_LEN`]: the codec
-    /// refused that header on sight, so the refusal came from the *per-frame*
-    /// bulk ceiling and the accumulation ceiling was never reached at all.
-    /// The old assertion only looked for the word "exceeds", which both
-    /// messages carry, so deleting this layer's limit outright would have left
-    /// it green. The length below is one the codec accepts, which leaves the
-    /// ceiling as the only thing that can ever stop the dribble, and the
-    /// assertion names that ceiling's own number.
+    /// Which frame it opens with has been wrong twice, in opposite ways, and
+    /// both are worth keeping written down.
+    ///
+    /// It first opened with `$1000000000\r\n`, far above [`MAX_BULK_LEN`], so
+    /// the codec refused the header on sight and the refusal came from the
+    /// *per-frame* bulk ceiling; the accumulation ceiling was never reached.
+    /// The assertion looked only for "exceeds", which both messages carry, so
+    /// deleting this layer's limit outright left it green. It then opened with
+    /// a bulk length the codec accepts — and that stopped working for the
+    /// better reason: a declared length is now priced against `max_in_memory`
+    /// at the header, so any bulk big enough to dribble past this ceiling is
+    /// refused before its first payload byte.
+    ///
+    /// What is left, and what this now uses, is the shape that has no declared
+    /// length at all. A simple string ends at its terminator and nowhere else,
+    /// so a peer that never sends one can be stopped by nothing but the
+    /// accumulation ceiling — which is exactly the property under test, and
+    /// the assertion names that ceiling's own number.
     #[tokio::test]
     async fn a_frame_that_never_ends_is_cut_off_at_the_ceiling() {
         const CEILING: usize = 64 * 1024;
-        const { assert!(MAX_BULK_LEN > CEILING, "the promise must outlast it") };
 
         let pool = ShardPool::spawn(4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(8 * 1024);
         let task = tokio::spawn(serve_connection_limited(server, pool, CEILING));
         let (mut r, mut w) = tokio::io::split(client);
 
-        let header = format!("${MAX_BULK_LEN}\r\n");
         let writer = tokio::spawn(async move {
-            // A legal, never-satisfied length prefix: the codec accepts the
-            // header, so every byte after it is a payload byte it is still
-            // waiting for and nothing but the ceiling ever says stop.
-            w.write_all(header.as_bytes()).await?;
+            // `+` opens a line the codec will read until it finds `\r\n`. None
+            // is ever sent, and no length was promised that could bound the
+            // wait, so nothing but the ceiling ever says stop.
+            w.write_all(b"+").await?;
             loop {
                 w.write_all(&[b'x'; 4096]).await?;
             }
@@ -1075,6 +1082,52 @@ mod tests {
         assert!(
             text.contains(&format!(
                 "array of {count} elements exceeds the {CEILING}-byte in-memory limit"
+            )),
+            "unexpected refusal: {text}"
+        );
+        task.await.expect("the connection task must end cleanly");
+    }
+
+    /// The same promise for the other length-prefixed frame.
+    ///
+    /// This one was false until recently and is the reason the claim above is
+    /// worth a test each: the bulk payload used to be priced where it was
+    /// copied, which is only reachable once the whole payload has been
+    /// buffered, so a peer could make a connection hold megabytes it had
+    /// already been told it could not afford. The header carries the length,
+    /// so the header is where it is refused — and the peer here sends nothing
+    /// but the header.
+    #[tokio::test]
+    async fn a_bulk_too_large_to_hold_is_refused_at_its_header() {
+        const CEILING: usize = 64 * 1024;
+
+        let pool = ShardPool::spawn(4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(serve_connection_limited(server, pool, CEILING));
+        let (mut r, mut w) = tokio::io::split(client);
+
+        // A length the codec itself accepts — under `MAX_BULK_LEN`, so the
+        // per-frame ceiling cannot be what refuses it — that this
+        // connection's budget cannot hold.
+        let len = MAX_BULK_LEN / 2;
+        const {
+            assert!(
+                MAX_BULK_LEN / 2 > CEILING,
+                "the budget must be the binding one"
+            );
+        }
+        w.write_all(format!("${len}\r\n").as_bytes()).await.unwrap();
+        // Not one payload byte follows. If the refusal needed the payload,
+        // this would hang rather than fail — which is the point.
+        w.shutdown().await.unwrap();
+
+        let frames = read_frames(&mut r, 1).await;
+        let Frame::Error(text) = &frames[0] else {
+            panic!("expected an error frame, got {:?}", frames[0]);
+        };
+        assert!(
+            text.contains(&format!(
+                "decoded frame exceeds the {CEILING}-byte in-memory limit"
             )),
             "unexpected refusal: {text}"
         );
