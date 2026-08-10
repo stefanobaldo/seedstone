@@ -81,6 +81,17 @@ const READ_FLOOR: usize = 2 * 1024;
 /// and waits never pays for the capacity.
 const READ_CEILING: usize = 64 * 1024;
 
+/// Consecutive small reads before the read buffer gives its capacity back.
+///
+/// Hysteresis, and it is load-bearing rather than tidy. Growth and shedding
+/// are one step apart — a read that fills a 4 KiB buffer doubles it, and a
+/// 2 KiB read then satisfies the shed condition on the 8 KiB result — so a
+/// peer alternating full and quarter reads would reallocate on every single
+/// one, and pay five doublings to climb back each time. Requiring the quiet
+/// to persist makes shedding a statement about a connection that stopped
+/// rather than about one read that was small.
+const READ_QUIET_READS: u32 = 4;
+
 /// The reply buffer capacity a connection sheds back to after each write.
 ///
 /// Same reasoning as [`DecoderLimits::SHED`] on the read side, and the same
@@ -166,6 +177,7 @@ where
     // and it is the whole of what made this future large enough for clippy to
     // complain about.
     let mut read_buf = vec![0u8; READ_FLOOR];
+    let mut quiet_reads = 0u32;
     let mut out: Vec<u8> = Vec::new();
 
     loop {
@@ -201,7 +213,7 @@ where
             Ok(0) | Err(_) => return,
             Ok(got) => {
                 decoder.feed(&read_buf[..got]);
-                resize_read_buffer(&mut read_buf, got);
+                resize_read_buffer(&mut read_buf, &mut quiet_reads, got);
             }
         }
     }
@@ -210,16 +222,35 @@ where
 /// Sizes the read buffer to what this connection is actually reading.
 ///
 /// A read that filled the buffer says the peer had more waiting, so the next
-/// one asks for twice as much; a read that used a quarter of it or less says
-/// the peer is done, so the capacity goes back to the floor rather than
-/// staying attached to an idle connection. The two thresholds are deliberately
-/// far apart — a connection reading steadily at half its buffer neither grows
-/// nor sheds, which is the case that would otherwise reallocate on every read.
-fn resize_read_buffer(read_buf: &mut Vec<u8>, got: usize) {
+/// one asks for twice as much. A read that used a quarter of it or less is
+/// evidence the peer has stopped — but only evidence, so `quiet` counts how
+/// much of it has accumulated and the capacity goes back to the floor only
+/// once [`READ_QUIET_READS`] of them run consecutively. Anything that is
+/// neither resets the count.
+///
+/// The counter is what keeps the two rules from fighting: without it, growth
+/// and shedding sit one doubling apart and an alternating peer reallocates on
+/// every read. With it, a single busy read anywhere in the window cancels the
+/// shed, so the buffer only shrinks for a connection that genuinely went
+/// quiet — and then shrinks once.
+fn resize_read_buffer(read_buf: &mut Vec<u8>, quiet: &mut u32, got: usize) {
     if got == read_buf.len() {
+        *quiet = 0;
         let grown = read_buf.len().saturating_mul(2).min(READ_CEILING);
         read_buf.resize(grown, 0);
-    } else if read_buf.len() > READ_FLOOR && got.saturating_mul(4) <= read_buf.len() {
+        return;
+    }
+    // At the floor there is nothing to give back, so the count is meaningless
+    // rather than merely unused: leaving it running would shed on the first
+    // small read after a later growth, one read into the window instead of
+    // four.
+    if read_buf.len() == READ_FLOOR || got.saturating_mul(4) > read_buf.len() {
+        *quiet = 0;
+        return;
+    }
+    *quiet += 1;
+    if *quiet >= READ_QUIET_READS {
+        *quiet = 0;
         read_buf.truncate(READ_FLOOR);
         read_buf.shrink_to(READ_FLOOR);
     }
@@ -1086,28 +1117,57 @@ mod tests {
     #[test]
     fn the_read_buffer_grows_while_it_fills_and_sheds_when_it_stops() {
         let mut read_buf = vec![0u8; READ_FLOOR];
+        let mut quiet = 0u32;
 
         // Filling reads double it, up to the ceiling and no further.
         for _ in 0..32 {
             let got = read_buf.len();
-            resize_read_buffer(&mut read_buf, got);
+            resize_read_buffer(&mut read_buf, &mut quiet, got);
         }
         assert_eq!(read_buf.len(), READ_CEILING);
 
         // A read that used more than a quarter holds the size: this is the
         // steady state, and reallocating through it would cost more than the
         // capacity does.
-        resize_read_buffer(&mut read_buf, READ_CEILING / 2);
-        assert_eq!(read_buf.len(), READ_CEILING);
+        for _ in 0..2 * READ_QUIET_READS {
+            resize_read_buffer(&mut read_buf, &mut quiet, READ_CEILING / 2);
+            assert_eq!(read_buf.len(), READ_CEILING);
+        }
 
-        // A read that used a quarter or less gives the capacity back.
-        resize_read_buffer(&mut read_buf, READ_CEILING / 4);
+        // A quarter-or-less read is evidence, not a verdict: the capacity is
+        // held until the evidence accumulates.
+        for _ in 1..READ_QUIET_READS {
+            resize_read_buffer(&mut read_buf, &mut quiet, READ_CEILING / 4);
+            assert_eq!(read_buf.len(), READ_CEILING, "shed before the window ran");
+        }
+        resize_read_buffer(&mut read_buf, &mut quiet, READ_CEILING / 4);
         assert_eq!(read_buf.len(), READ_FLOOR);
         assert!(read_buf.capacity() <= READ_FLOOR * 2);
+    }
 
-        // And the floor is a floor: a tiny read at it changes nothing.
-        resize_read_buffer(&mut read_buf, 1);
-        assert_eq!(read_buf.len(), READ_FLOOR);
+    /// The pattern the hysteresis exists for.
+    ///
+    /// Growth and shedding sit one doubling apart, so a peer alternating a
+    /// buffer-filling read with a quarter-sized one hits both conditions
+    /// forever. Without the counter that is a reallocation on every read, and
+    /// five doublings to climb back after each shed. The buffer must instead
+    /// settle: a busy read anywhere in the window cancels the shed.
+    #[test]
+    fn an_alternating_peer_does_not_thrash_the_read_buffer() {
+        let mut read_buf = vec![0u8; READ_FLOOR];
+        let mut quiet = 0u32;
+
+        for _ in 0..64 {
+            let full = read_buf.len();
+            resize_read_buffer(&mut read_buf, &mut quiet, full);
+            let quarter = read_buf.len() / 4;
+            resize_read_buffer(&mut read_buf, &mut quiet, quarter);
+        }
+        assert_eq!(
+            read_buf.len(),
+            READ_CEILING,
+            "the buffer fell back instead of settling at the ceiling"
+        );
     }
 
     // --- helpers ---
