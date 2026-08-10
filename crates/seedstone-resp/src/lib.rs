@@ -57,12 +57,14 @@ pub enum Frame {
 /// about a frame a caller built itself. Encoding one of those used to be an
 /// abort waiting for the first caller careless enough to construct it.
 ///
-/// What the change buys is that the cost is now memory rather than a crash,
-/// not that the cost went away. The work stack holds every element of an
-/// array the moment that array's header is emitted, so it grows with the
-/// widest level as well as the deepest — a heap allocation proportional to
-/// the frame, which fails as an allocation failure rather than as an abort
-/// halfway down the call stack.
+/// What the change buys is a ceiling the machine sets rather than one a
+/// thread does, not a cost that went away. The work stack holds one pointer
+/// per frame still to emit, and an array pushes all of its children the
+/// moment its header goes out, so the peak follows the widest level's
+/// *element count* — pointers, not payload bytes. That is a heap allocation,
+/// and an allocation that cannot be served aborts too; the difference is that
+/// it is bounded by the memory available instead of by the few megabytes a
+/// thread's stack happens to be.
 ///
 /// # Example
 ///
@@ -787,7 +789,7 @@ impl Decoder {
     /// Appends freshly read wire bytes.
     ///
     /// Chunk boundaries carry no meaning: the same bytes produce the same
-    /// frames however they are split.
+    /// frames, and the same errors, however they are split.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.compact();
         self.buf.extend_from_slice(bytes);
@@ -1431,7 +1433,7 @@ mod tests {
         // Tiny on the wire, fat in memory: an integer element is 4 wire bytes
         // and a whole `Frame` once parsed, so an array of them amplifies by
         // eight. A bound on bytes read cannot see that; this one is on the
-        // parsed representation, and there are two places it bites.
+        // parsed representation, and there are three places it bites.
         let budget = 1024 * 1024;
         let limits = DecoderLimits {
             max_in_memory: budget,
