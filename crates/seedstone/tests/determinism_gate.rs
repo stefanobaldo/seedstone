@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::LazyLock;
 
 const FIXTURES: &[&str] = &[
     "instant_now",
@@ -61,10 +62,24 @@ fn clippy_on_fixture(name: &str) -> Output {
         .expect("failed to run cargo clippy on fixture")
 }
 
+/// One clippy run per fixture, shared by every test that reads one.
+///
+/// Two tests below assert unrelated properties of the same command's output.
+/// Run separately they would spend two processes per fixture to learn what one
+/// already said, and — sharing a `--target-dir` — the second pass would spend
+/// most of it waiting on the first's lock. Computing the runs once here keeps
+/// both tests independently named and independently reported while paying for
+/// the fixtures a single time.
+static CLIPPY_RUNS: LazyLock<Vec<(&'static str, Output)>> = LazyLock::new(|| {
+    FIXTURES
+        .iter()
+        .map(|name| (*name, clippy_on_fixture(name)))
+        .collect()
+});
+
 #[test]
 fn every_prohibition_denies_its_fixture() {
-    for name in FIXTURES {
-        let out = clippy_on_fixture(name);
+    for (name, out) in &*CLIPPY_RUNS {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             !out.status.success(),
@@ -90,8 +105,7 @@ fn config_validator_is_silent() {
     // Clippy can only tell that a path is unresolvable when the crate it names is
     // loaded into the compilation, so this has to run over every fixture: each one
     // pulls in the crate its own prohibition names.
-    for name in FIXTURES {
-        let out = clippy_on_fixture(name);
+    for (name, out) in &*CLIPPY_RUNS {
         let stderr = String::from_utf8_lossy(&out.stderr);
         for marker in [
             "error reading Clippy's configuration file",
