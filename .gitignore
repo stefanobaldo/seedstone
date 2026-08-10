@@ -1,3 +1,2 @@
 /target
 /fixtures/determinism/*/target
-/fixtures/determinism/*/Cargo.lock
