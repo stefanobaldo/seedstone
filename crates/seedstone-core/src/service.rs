@@ -58,23 +58,36 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 ///
 /// The two halves are not enforced with the same sharpness, and the
 /// difference is worth knowing. `max_in_memory` is checked *before* the
-/// memory is spent — a bulk payload is priced from its declared length ahead
-/// of the copy, an array from its count ahead of its first element — so the
-/// refusal costs nothing but the header. `max_frame_bytes` is checked after
-/// the bytes have already landed in the decoder's buffer, which is the same
-/// after-the-fact shape the count deleted from this loop had, and it overruns
-/// by at most one read ([`READ_CEILING`]). Moving it earlier would mean the
-/// decoder telling the reader how much to ask for, which is a wider contract
-/// than either half needs.
+/// memory is spent — a bulk payload is priced from the length its header
+/// declares, an array from its count, both ahead of the first byte either one
+/// promises — so the refusal costs nothing but the header. `max_frame_bytes`
+/// cannot be: a frame with no declared length, an unterminated `+` line most
+/// of all, reveals its size only by ending, so the bytes have already landed
+/// in the decoder's buffer when the check runs and the buffer overruns the
+/// ceiling by at most one read (`READ_CEILING`). What that does *not* mean is
+/// that the verdict depends on the reads: the codec applies the same ceiling
+/// where a frame completes as where it runs out, so the same bytes are
+/// refused whatever sizes the peer wrote them in.
 ///
 /// # Known cost
 ///
 /// Filling this buffer is linear in the bytes read — the decoder resumes
 /// where it stopped instead of re-parsing the frame from its first byte — so
-/// a dribbled frame costs what it weighs and no more. What remains is the
-/// weight itself: this is a *per connection* ceiling, and the product of it
-/// and the connection limit is not a number the machine has. It is a bound on
-/// the worst case one peer can impose, not a memory budget for all of them.
+/// a dribbled frame costs what it weighs and no more. Three things about the
+/// weight itself:
+///
+/// - **It is a *per connection* ceiling.** The product of it and the
+///   connection limit is not a number the machine has. It is a bound on the
+///   worst case one peer can impose, not a memory budget for all of them.
+/// - **One connection at its peak holds about twice it.** The wire bytes and
+///   the parsed representation are budgeted separately, at this figure each,
+///   and they coexist: the decoder is still holding a frame's bytes while the
+///   `Frame`s built from them accumulate. Call the per-connection peak
+///   ~128 MiB, plus the reply buffer, not ~64 MiB.
+/// - **The parsed side is accounted by length, and `Vec`s reserve by
+///   capacity.** A partly filled array is charged for the elements in it, not
+///   for the room it grew to hold them, so a `Vec` that doubled past its
+///   element count is undercounted by up to a further 2×.
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
 /// Bytes a connection's read buffer starts at, and sheds back to.
@@ -82,6 +95,16 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 /// A request is typically tens of bytes, and idle connections outnumber busy
 /// ones: at the connection limit's default of 10 000, every kilobyte reserved
 /// here is 10 MiB of resident memory bought before anyone has spoken.
+///
+/// The saving on a connection that went quiet is partial, and worth stating
+/// plainly rather than implying otherwise. This buffer gives back the up-to-
+/// [`READ_CEILING`] it grew to, but the decoder's buffer beside it grew with
+/// the same reads and only sheds above [`DecoderLimits::SHED`], so on a
+/// once-busy connection it keeps its batch-sized allocation. Lowering the
+/// codec's floor to match would need the hysteresis this side has —
+/// [`READ_QUIET_READS`] exists because growth and shedding sit one step apart
+/// — and shedding to a small floor after every batch would reallocate on
+/// every read of a connection that is merely between requests.
 const READ_FLOOR: usize = 2 * 1024;
 
 /// The largest single `read` a connection grows to.
@@ -104,10 +127,12 @@ const READ_QUIET_READS: u32 = 4;
 
 /// The reply buffer capacity a connection sheds back to after each write.
 ///
-/// Same reasoning as [`DecoderLimits::SHED`] on the read side, and the same
-/// number: one large reply otherwise leaves its allocation attached to the
-/// connection for the rest of that connection's life.
-const REPLY_SHED: usize = 256 * 1024;
+/// Same reasoning as [`DecoderLimits::SHED`] on the read side, and *the same
+/// number* — taken from it rather than restated, so the two cannot drift
+/// while a comment goes on claiming they agree. One large reply otherwise
+/// leaves its allocation attached to the connection for the rest of that
+/// connection's life.
+const REPLY_SHED: usize = DecoderLimits::SHED;
 
 /// How much of a peer-supplied byte string an error message may quote.
 const QUOTE_LIMIT: usize = 32;
@@ -250,10 +275,12 @@ fn resize_read_buffer(read_buf: &mut Vec<u8>, quiet: &mut u32, got: usize) {
         read_buf.resize(grown, 0);
         return;
     }
-    // At the floor there is nothing to give back, so the count is meaningless
-    // rather than merely unused: leaving it running would shed on the first
-    // small read after a later growth, one read into the window instead of
-    // four.
+    // At the floor there is nothing to give back, so counting quiet reads
+    // would be counting towards a shed that cannot happen. Nothing depends on
+    // the reset — the only way out of the floor is the growth branch above,
+    // which zeroes the counter itself, so no count can survive into a larger
+    // buffer — but a counter left running at the floor would be state with no
+    // reader, which is worse to maintain than one line that says so.
     if read_buf.len() == READ_FLOOR || got.saturating_mul(4) > read_buf.len() {
         *quiet = 0;
         return;
