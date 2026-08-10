@@ -246,13 +246,33 @@ fn ceiling(limit: usize) -> i64 {
 /// accept set, identical on every target. These two are the other half — what
 /// a peer may make the decoder *hold* while a frame is still arriving — and a
 /// caller sets them to whatever its own budget is.
+///
+/// # How the two relate
+///
+/// They are independent, and both orderings are legal, but they are not
+/// independent in *effect* and a caller choosing them should know which one
+/// it has made binding.
+///
+/// A frame's parsed form is never smaller than its wire form: the cheapest
+/// element on the wire is four bytes and the cheapest one in memory is a
+/// whole [`Frame`], and payload bytes cost one of each. So setting
+/// `max_in_memory <= max_frame_bytes` — which is what a caller with a single
+/// per-request budget naturally does — makes `max_in_memory` the binding
+/// bound for every frame, and `max_frame_bytes` catches only what is still
+/// accumulating: a frame with no declared length, an unterminated `+` line
+/// above all, whose size is not yet known to either check.
+///
+/// Nothing here enforces an ordering, because neither is wrong. What does
+/// depend on it is *which refusal a peer is told about*, and that is not
+/// something to build on — see [`Decoder::feed`].
 #[derive(Debug, Clone, Copy)]
 pub struct DecoderLimits {
     /// The most undecoded wire bytes one frame may occupy.
     ///
-    /// Checked when the decoder runs out of input, so it bounds the buffer a
-    /// dribbled frame can grow: a peer that opens a frame and never closes it
-    /// is cut off here rather than fed forever.
+    /// Checked both while a frame is still arriving — so it bounds the buffer
+    /// a dribbled frame can grow, and a peer that opens a frame and never
+    /// closes it is cut off rather than fed forever — and where the frame
+    /// completes, so the verdict does not depend on where the reads fell.
     pub max_frame_bytes: usize,
     /// The most memory the *parsed* form of one frame may occupy.
     ///
@@ -789,7 +809,22 @@ impl Decoder {
     /// Appends freshly read wire bytes.
     ///
     /// Chunk boundaries carry no meaning: the same bytes produce the same
-    /// frames, and the same errors, however they are split.
+    /// frames, and the same verdict on whether they are a frame at all,
+    /// however they are split. Nothing above this crate has to know how a
+    /// peer divided its writes.
+    ///
+    /// **What is not promised is *which* refusal is reported.** The two
+    /// [`DecoderLimits`] bounds are tested at different moments — the parsed
+    /// size as elements are built, the wire size as bytes accumulate and
+    /// again where a frame completes — so when they are set close together,
+    /// a frame that breaks both is refused by whichever one the chunking
+    /// reached first, and the message names that one. Set equal, as a caller
+    /// with a single per-request budget sets them, an over-long line reports
+    /// the in-memory limit when a read completes it and the buffering limit
+    /// when a read stops short of doing so. Both are refusals of the same
+    /// bytes for the same reason, and the text is for a human reading a log;
+    /// no caller should branch on it, and a replay is unaffected either way
+    /// because it feeds the same bytes in the same chunks.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.compact();
         self.buf.extend_from_slice(bytes);
@@ -1295,61 +1330,127 @@ mod tests {
         assert_eq!(outer.len(), 2);
     }
 
+    /// Feeds `wire` in `chunk`-sized pieces and reports the two things
+    /// [`Decoder::feed`] promises are chunk-independent: the frames produced,
+    /// and whether the bytes were accepted at all.
+    ///
+    /// Deliberately *not* the error text. Which of the two limits reports a
+    /// refusal depends on where the boundaries fell when they are set close
+    /// together, and the documentation says so; asserting on the message here
+    /// would pin behaviour the crate does not offer.
+    fn verdict(wire: &[u8], limits: DecoderLimits, chunk: usize) -> Result<Vec<Frame>, ()> {
+        let mut decoder = Decoder::new(limits);
+        let mut frames = Vec::new();
+        for piece in wire.chunks(chunk) {
+            decoder.feed(piece);
+            loop {
+                match decoder.try_next() {
+                    Ok(Some(frame)) => frames.push(frame),
+                    Ok(None) => break,
+                    Err(_) => return Err(()),
+                }
+            }
+        }
+        Ok(frames)
+    }
+
     #[test]
-    fn the_buffering_ceiling_does_not_depend_on_how_the_peer_chunks() {
+    fn the_verdict_does_not_depend_on_how_the_peer_chunks() {
         // `feed` promises that chunk boundaries carry no meaning, and that
-        // promise is what everything above this crate reasons with — a
-        // simulator replaying a run cannot reproduce the peer's write sizes.
+        // promise is what everything above this crate reasons with.
         //
-        // The ceiling used to be tested only when the decoder ran out of
+        // The wire ceiling used to be tested only when the decoder ran out of
         // input, so a frame over the limit was accepted whenever the last
         // chunk completed it before the check could fire. It was not even
         // monotonic in chunk size: the same 103 bytes were refused at chunk
         // 65 and accepted at chunk 64 and again at chunk 103.
-        let mut wire = Vec::new();
-        encode(&Frame::Bulk(vec![b'w'; 80]), &mut wire);
-        let over = wire.len() - 1;
+        let mut line = vec![b'+'];
+        line.extend(std::iter::repeat_n(b'x', 100));
+        line.extend_from_slice(b"\r\n");
+        let mut bulk = Vec::new();
+        encode(&Frame::Bulk(vec![b'w'; 80]), &mut bulk);
+        let pipeline = bulk.repeat(3);
 
-        for chunk in 1..=wire.len() {
-            for (limit, expected_ok) in [(over, false), (wire.len(), true)] {
-                let mut decoder = Decoder::new(DecoderLimits {
-                    max_frame_bytes: limit,
-                    max_in_memory: DecoderLimits::default().max_in_memory,
-                });
-                let mut outcome = Ok(None);
-                for piece in wire.chunks(chunk) {
-                    decoder.feed(piece);
-                    outcome = decoder.try_next();
-                    if outcome.is_err() {
-                        break;
-                    }
-                }
+        let ample = DecoderLimits::default().max_in_memory;
+        let cases: &[(&str, &[u8], DecoderLimits, bool)] = &[
+            // Both limits equal, which is what a caller with one per-request
+            // budget sets and what the connection layer above this crate
+            // does. This is the configuration the asymmetric cases below were
+            // missing, and the one where a frame can break both bounds at
+            // once — the case that decides which message a peer is told.
+            (
+                "equal limits, over both",
+                &line,
+                DecoderLimits {
+                    max_frame_bytes: 64,
+                    max_in_memory: 64,
+                },
+                false,
+            ),
+            (
+                "equal limits, under both",
+                &line,
+                DecoderLimits {
+                    max_frame_bytes: 200,
+                    max_in_memory: 200,
+                },
+                true,
+            ),
+            // And the wire ceiling on its own, which is the only way to reach
+            // the completion-path check: with the limits equal the parsed
+            // bound always binds first, because a frame's parsed form is
+            // never smaller than its wire form.
+            (
+                "wire ceiling one byte under",
+                &bulk,
+                DecoderLimits {
+                    max_frame_bytes: bulk.len() - 1,
+                    max_in_memory: ample,
+                },
+                false,
+            ),
+            (
+                "wire ceiling exact",
+                &bulk,
+                DecoderLimits {
+                    max_frame_bytes: bulk.len(),
+                    max_in_memory: ample,
+                },
+                true,
+            ),
+            // The ceiling is per frame, so three of them back to back at
+            // exactly the ceiling are three acceptances and not one refusal.
+            // A pipeline is also the only shape that can tell the completion
+            // check's `scan` from the buffer's length, which are the same
+            // number whenever a frame arrives alone.
+            (
+                "wire ceiling exact, pipelined",
+                &pipeline,
+                DecoderLimits {
+                    max_frame_bytes: bulk.len(),
+                    max_in_memory: ample,
+                },
+                true,
+            ),
+        ];
+
+        for (name, wire, limits, expected_ok) in cases {
+            // The whole-in-one-chunk run is the reference every split has to
+            // reproduce — frames included, not just accepted-or-not.
+            let reference = verdict(wire, *limits, wire.len());
+            assert_eq!(
+                reference.is_ok(),
+                *expected_ok,
+                "{name}: the reference verdict is not the one this case is for"
+            );
+            for chunk in 1..=wire.len() {
                 assert_eq!(
-                    outcome.is_ok(),
-                    expected_ok,
-                    "chunk {chunk}, limit {limit}: {outcome:?}"
+                    verdict(wire, *limits, chunk),
+                    reference,
+                    "{name}: chunk {chunk} disagrees with the whole"
                 );
             }
         }
-
-        // And the one-shot path agrees with every one of them, since it is
-        // the same state machine over a slice it does not own.
-        assert!(
-            parse_with_frame_limit(&wire, over).is_err(),
-            "one-shot disagrees with the chunked verdict"
-        );
-        assert!(parse_with_frame_limit(&wire, wire.len()).is_ok());
-    }
-
-    /// One-shot decode under a custom wire ceiling, for comparing the
-    /// streaming verdict against the slice one.
-    fn parse_with_frame_limit(buf: &[u8], max_frame_bytes: usize) -> Result<Option<Frame>, ()> {
-        let mut decoder = Decoder::new(DecoderLimits {
-            max_frame_bytes,
-            max_in_memory: DecoderLimits::default().max_in_memory,
-        });
-        decoder.feed(buf);
-        decoder.try_next().map_err(|_| ())
     }
 
     #[test]
