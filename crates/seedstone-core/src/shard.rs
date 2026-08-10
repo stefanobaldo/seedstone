@@ -235,6 +235,28 @@ pub trait Router: Clone + Send + Sync + 'static {
     /// command either has not started or has finished, but the caller does not
     /// always get to learn which.
     fn dispatch(&self, cmd: Command) -> impl Future<Output = Reply> + Send;
+
+    /// Routes a batch and resolves to one reply per command, in order.
+    ///
+    /// The default serves the batch one dispatch at a time — semantically
+    /// identical to dispatching each command on its own, which is exactly what
+    /// a test router or a deliberately racy one wants. [`ShardPool`] overrides
+    /// it with the grouped path.
+    ///
+    /// # Cancellation
+    ///
+    /// [`dispatch`](Router::dispatch)'s warning applies to every command in
+    /// the batch, and to an implementation that routes the whole batch before
+    /// the future is polled — which [`ShardPool`] does.
+    fn dispatch_many(&self, cmds: Vec<Command>) -> impl Future<Output = Vec<Reply>> + Send {
+        async move {
+            let mut replies = Vec::with_capacity(cmds.len());
+            for cmd in cmds {
+                replies.push(self.dispatch(cmd).await);
+            }
+            replies
+        }
+    }
 }
 
 /// A set of executor tasks, the virtual shards they host, and the inboxes
@@ -412,6 +434,65 @@ impl Router for ShardPool {
                 Ok(mut replies) if replies.len() == 1 => replies.pop().expect("checked non-empty"),
                 _ => Reply::Error(ReplyError::ShardUnavailable),
             }
+        }
+    }
+
+    fn dispatch_many(&self, cmds: Vec<Command>) -> impl Future<Output = Vec<Reply>> + Send {
+        let executors = usize::from(self.executors);
+        // Index-addressed buckets: iteration order is the executor order by
+        // construction, which is what keeps this path free of any map
+        // iteration — and so free of an iteration order that could differ
+        // between two runs of the same seed.
+        let mut buckets: Vec<Vec<(u16, Command)>> = Vec::new();
+        buckets.resize_with(executors, Vec::new);
+        // Where each command's reply will be found once the executors answer.
+        let mut positions = Vec::with_capacity(cmds.len());
+        for cmd in cmds {
+            let shard = shard_of(cmd.key(), self.shards);
+            let executor = usize::from(executor_of(shard, self.shards, self.executors));
+            positions.push((executor, buckets[executor].len()));
+            buckets[executor].push((shard, cmd));
+        }
+
+        // Scattered at call time, exactly as `dispatch` sends at call time: an
+        // executor starts on its bucket while the others are still being sent.
+        let mut pending: Vec<Option<oneshot::Receiver<Vec<Reply>>>> =
+            std::iter::repeat_with(|| None).take(executors).collect();
+        for (executor, cmds) in buckets.into_iter().enumerate() {
+            if cmds.is_empty() {
+                continue;
+            }
+            let (tx, rx) = oneshot::channel();
+            if self.inboxes[executor]
+                .send(Envelope { cmds, reply: tx })
+                .is_ok()
+            {
+                pending[executor] = Some(rx);
+            }
+        }
+
+        async move {
+            // Gathered in executor-index order — a fixed order, not the order
+            // the answers happened to arrive in.
+            let mut answered: Vec<Vec<Option<Reply>>> = Vec::with_capacity(pending.len());
+            for rx in pending {
+                answered.push(match rx {
+                    Some(rx) => rx
+                        .await
+                        .map(|replies| replies.into_iter().map(Some).collect())
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                });
+            }
+            positions
+                .into_iter()
+                .map(|(executor, offset)| {
+                    answered[executor]
+                        .get_mut(offset)
+                        .and_then(Option::take)
+                        .unwrap_or(Reply::Error(ReplyError::ShardUnavailable))
+                })
+                .collect()
         }
     }
 }
@@ -907,6 +988,79 @@ mod tests {
         shards.sort_unstable();
         shards.dedup();
         assert!(shards.len() > 1, "every key routed to one shard");
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_answered_in_request_order_across_executors() {
+        let pool = ShardPool::spawn(16, 4, DictSeed { k0: 9, k1: 9 }, NoTrace);
+        // Keys chosen to land on more than one executor, interleaved on purpose.
+        let keys: Vec<Vec<u8>> = (0..64u32)
+            .map(|i| format!("key:{i}").into_bytes())
+            .collect();
+        let executors_hit: std::collections::BTreeSet<u16> = keys
+            .iter()
+            .map(|k| executor_of(shard_of(k, 16), 16, 4))
+            .collect();
+        assert!(
+            executors_hit.len() > 1,
+            "test keys all landed on one executor"
+        );
+
+        let sets: Vec<Command> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| Command::Set {
+                key: key.clone(),
+                value: i.to_string().into_bytes(),
+            })
+            .collect();
+        let replies = pool.dispatch_many(sets).await;
+        assert!(replies.iter().all(|r| *r == Reply::Ok));
+
+        let gets: Vec<Command> = keys
+            .iter()
+            .map(|key| Command::Get { key: key.clone() })
+            .collect();
+        let replies = pool.dispatch_many(gets).await;
+        for (i, reply) in replies.iter().enumerate() {
+            assert_eq!(
+                *reply,
+                Reply::Bulk(Some(i.to_string().into_bytes())),
+                "reply {i} out of order or wrong"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_batch_answers_immediately_with_nothing() {
+        let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 1 }, NoTrace);
+        assert_eq!(pool.dispatch_many(Vec::new()).await, Vec::new());
+    }
+
+    /// The default implementation is the compatibility contract: a router that
+    /// only knows `dispatch` must serve batches, one command at a time, in order.
+    #[tokio::test]
+    async fn the_default_dispatch_many_loops_dispatch_in_order() {
+        #[derive(Clone)]
+        struct Echo;
+        impl Router for Echo {
+            async fn dispatch(&self, cmd: Command) -> Reply {
+                Reply::Bulk(Some(cmd.key().to_vec()))
+            }
+        }
+        let replies = Echo
+            .dispatch_many(vec![
+                Command::Get { key: b"a".to_vec() },
+                Command::Get { key: b"b".to_vec() },
+            ])
+            .await;
+        assert_eq!(
+            replies,
+            vec![
+                Reply::Bulk(Some(b"a".to_vec())),
+                Reply::Bulk(Some(b"b".to_vec()))
+            ]
+        );
     }
 
     /// One observed call: the shard, the replication position it ran at, the
