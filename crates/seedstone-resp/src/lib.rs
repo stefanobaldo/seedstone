@@ -894,6 +894,38 @@ impl Decoder {
         }
     }
 
+    /// Gives back buffer capacity down to `cap`.
+    ///
+    /// [`Decoder::feed`] already sheds to [`DecoderLimits::SHED`] on its own,
+    /// which is the right floor for a connection between requests: below it,
+    /// a decoder that is merely idle for a moment would reallocate its way
+    /// back up on the next batch. It is the wrong floor for a connection that
+    /// has *stopped*, and only the caller can tell those apart — the evidence
+    /// is the shape of its reads, which this crate never sees. So the policy
+    /// stays up there and this is the lever it pulls.
+    ///
+    /// Buffered bytes are never dropped: a frame still arriving survives a
+    /// shed intact, and the capacity simply cannot fall below what it
+    /// occupies. Calling this while one is in flight is therefore safe, and
+    /// merely less effective than calling it on a drained decoder.
+    pub fn shed_to(&mut self, cap: usize) {
+        // Dead bytes in front of the current frame would hold the length up
+        // and defeat the shrink, so they go first.
+        self.compact();
+        self.buf.shrink_to(cap);
+    }
+
+    /// Bytes this decoder's buffer currently reserves.
+    ///
+    /// The companion to [`Decoder::buffered`]: that one is what a peer has
+    /// sent and this one is what holding it costs. A caller sizing a
+    /// connection's footprint — or checking that a shed did what it said —
+    /// needs this one.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
     /// Bytes fed but not yet consumed by a delivered frame.
     ///
     /// Bytes of delivered frames may still be sitting in the buffer, waiting

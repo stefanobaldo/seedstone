@@ -96,15 +96,23 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 /// ones: at the connection limit's default of 10 000, every kilobyte reserved
 /// here is 10 MiB of resident memory bought before anyone has spoken.
 ///
-/// The saving on a connection that went quiet is partial, and worth stating
-/// plainly rather than implying otherwise. This buffer gives back the up-to-
-/// [`READ_CEILING`] it grew to, but the decoder's buffer beside it grew with
-/// the same reads and only sheds above [`DecoderLimits::SHED`], so on a
-/// once-busy connection it keeps its batch-sized allocation. Lowering the
-/// codec's floor to match would need the hysteresis this side has —
-/// [`READ_QUIET_READS`] exists because growth and shedding sit one step apart
-/// — and shedding to a small floor after every batch would reallocate on
-/// every read of a connection that is merely between requests.
+/// It is the floor for all three of a connection's buffers, not just this
+/// one. The decoder's and the reply buffer's own floors are a quarter of a
+/// megabyte each, which is the right size to hold between requests and far
+/// too much to hold for a connection that has stopped; both come down to this
+/// number on the same quiet verdict, in
+/// [`resize_connection_buffers`]. What that verdict needs is the hysteresis
+/// this side already had — [`READ_QUIET_READS`] exists because growth and
+/// shedding sit one step apart — which is why the policy lives here and the
+/// codec merely exposes the lever.
+///
+/// **The verdict is read from the reads, so a connection that stops entirely
+/// keeps what it holds.** Nothing wakes a connection task that is parked on a
+/// read, so a peer that goes silent mid-conversation is never re-measured; it
+/// is a peer that goes *quiet* — still talking, in small requests — that
+/// hands its capacity back. Closing that gap needs an idle signal this layer
+/// does not have, which is a clock, and a clock is not this buffer's decision
+/// to make.
 const READ_FLOOR: usize = 2 * 1024;
 
 /// The largest single `read` a connection grows to.
@@ -132,6 +140,10 @@ const READ_QUIET_READS: u32 = 4;
 /// while a comment goes on claiming they agree. One large reply otherwise
 /// leaves its allocation attached to the connection for the rest of that
 /// connection's life.
+///
+/// This is the floor for a connection still working. A connection that goes
+/// quiet drops below it, to [`READ_FLOOR`], along with the other two buffers
+/// — see [`resize_connection_buffers`].
 const REPLY_SHED: usize = DecoderLimits::SHED;
 
 /// How much of a peer-supplied byte string an error message may quote.
@@ -248,27 +260,49 @@ where
             Ok(0) | Err(_) => return,
             Ok(got) => {
                 decoder.feed(&read_buf[..got]);
-                resize_read_buffer(&mut read_buf, &mut quiet_reads, got);
+                resize_connection_buffers(
+                    &mut read_buf,
+                    &mut decoder,
+                    &mut out,
+                    &mut quiet_reads,
+                    got,
+                );
             }
         }
     }
 }
 
-/// Sizes the read buffer to what this connection is actually reading.
+/// Sizes a connection's three buffers to what it is actually doing.
 ///
-/// A read that filled the buffer says the peer had more waiting, so the next
-/// one asks for twice as much. A read that used a quarter of it or less is
-/// evidence the peer has stopped — but only evidence, so `quiet` counts how
-/// much of it has accumulated and the capacity goes back to the floor only
-/// once [`READ_QUIET_READS`] of them run consecutively. Anything that is
-/// neither resets the count.
+/// The read buffer is the one that grows here. A read that filled it says the
+/// peer had more waiting, so the next one asks for twice as much. A read that
+/// used a quarter of it or less is evidence the peer has stopped — but only
+/// evidence, so `quiet` counts how much of it has accumulated and the
+/// capacity goes back to the floor only once [`READ_QUIET_READS`] of them run
+/// consecutively. Anything that is neither resets the count.
 ///
 /// The counter is what keeps the two rules from fighting: without it, growth
 /// and shedding sit one doubling apart and an alternating peer reallocates on
 /// every read. With it, a single busy read anywhere in the window cancels the
-/// shed, so the buffer only shrinks for a connection that genuinely went
-/// quiet — and then shrinks once.
-fn resize_read_buffer(read_buf: &mut Vec<u8>, quiet: &mut u32, got: usize) {
+/// shed, so the buffers only shrink for a connection that genuinely went
+/// quiet — and then shrink once.
+///
+/// The decoder and the reply buffer shed on the same verdict rather than on
+/// one of their own, and that is the whole reason this function takes them.
+/// Each has a floor it manages alone — [`DecoderLimits::SHED`] and
+/// [`REPLY_SHED`], a quarter of a megabyte apiece — which is right for a
+/// connection between requests and much too generous for one that has
+/// stopped, and neither can tell those apart from where it sits: the evidence
+/// is the shape of the reads, and it arrives here. Read buffer aside, they
+/// are also the larger two, so leaving them out would have shed the smallest
+/// third of what a connection holds.
+fn resize_connection_buffers(
+    read_buf: &mut Vec<u8>,
+    decoder: &mut Decoder,
+    out: &mut Vec<u8>,
+    quiet: &mut u32,
+    got: usize,
+) {
     if got == read_buf.len() {
         *quiet = 0;
         let grown = read_buf.len().saturating_mul(2).min(READ_CEILING);
@@ -290,6 +324,8 @@ fn resize_read_buffer(read_buf: &mut Vec<u8>, quiet: &mut u32, got: usize) {
         *quiet = 0;
         read_buf.truncate(READ_FLOOR);
         read_buf.shrink_to(READ_FLOOR);
+        decoder.shed_to(READ_FLOOR);
+        out.shrink_to(READ_FLOOR);
     }
 }
 
@@ -1221,15 +1257,105 @@ mod tests {
         assert_eq!(sink, b"+OK\r\n");
     }
 
+    /// A connection that went quiet gives back *all three* of its buffers.
+    ///
+    /// The read buffer was the only one shedding to the floor, and it is the
+    /// smallest of the three: a connection that carried one large frame kept
+    /// [`DecoderLimits::SHED`] plus [`REPLY_SHED`] — a quarter of a megabyte
+    /// each — for the rest of its life, which is the term that dominates at
+    /// the connection limit. The quiet window is one decision, so it sheds
+    /// everything the connection grew, not just the buffer it is named after.
+    #[tokio::test]
+    async fn a_quiet_connection_sheds_every_buffer_it_grew() {
+        let mut decoder = Decoder::new(DecoderLimits::default());
+        let mut out: Vec<u8> = Vec::new();
+        let mut read_buf = vec![0u8; READ_FLOOR];
+        let mut quiet = 0u32;
+
+        // A request and a reply, both far past the shed thresholds, so all
+        // three buffers are holding the allocation a burst left behind.
+        let big = vec![b'v'; 4 * DecoderLimits::SHED];
+        let mut wire = Vec::new();
+        encode(&req(&["ECHO"]), &mut wire);
+        encode(&Frame::Bulk(big.clone()), &mut wire);
+        decoder.feed(&wire);
+        while matches!(decoder.try_next(), Ok(Some(_))) {}
+        let mut sink: Vec<u8> = Vec::new();
+        assert!(write_frame(&mut sink, &Frame::Bulk(big), &mut out).await);
+        for _ in 0..32 {
+            let got = read_buf.len();
+            resize_connection_buffers(&mut read_buf, &mut decoder, &mut out, &mut quiet, got);
+        }
+        assert_eq!(read_buf.len(), READ_CEILING);
+        assert_eq!(decoder.capacity(), DecoderLimits::SHED);
+        assert_eq!(out.capacity(), REPLY_SHED);
+
+        // The peer stops. One quiet window later, every one of them is back at
+        // the floor — and the decoder's is, specifically, not still at SHED.
+        for _ in 0..READ_QUIET_READS {
+            resize_connection_buffers(&mut read_buf, &mut decoder, &mut out, &mut quiet, 16);
+        }
+        assert_eq!(read_buf.len(), READ_FLOOR);
+        assert!(
+            decoder.capacity() <= READ_FLOOR,
+            "the decoder kept {} bytes",
+            decoder.capacity()
+        );
+        assert!(
+            out.capacity() <= READ_FLOOR,
+            "the reply buffer kept {} bytes",
+            out.capacity()
+        );
+    }
+
+    /// Shedding never costs a byte of a frame still arriving.
+    ///
+    /// A peer can dribble a large frame slowly enough that the quiet window
+    /// closes while its bytes are still in the decoder. The shed has to be a
+    /// release of *spare* capacity, so the frame must still complete, and
+    /// complete whole.
+    #[tokio::test]
+    async fn shedding_mid_frame_does_not_disturb_the_frame() {
+        let mut decoder = Decoder::new(DecoderLimits::default());
+        let mut out: Vec<u8> = Vec::new();
+        let mut read_buf = vec![0u8; READ_FLOOR];
+        let mut quiet = 0u32;
+
+        let value = vec![b'v'; 4 * DecoderLimits::SHED];
+        let mut wire = Vec::new();
+        encode(&req(&["ECHO"]), &mut wire);
+        encode(&Frame::Bulk(value.clone()), &mut wire);
+        let (head, tail) = wire.split_at(wire.len() / 2);
+        decoder.feed(head);
+        assert!(matches!(decoder.try_next(), Ok(Some(_))), "the name frame");
+        assert!(
+            matches!(decoder.try_next(), Ok(None)),
+            "the value is partial"
+        );
+
+        for _ in 0..4 * READ_QUIET_READS {
+            resize_connection_buffers(&mut read_buf, &mut decoder, &mut out, &mut quiet, 16);
+        }
+        assert!(
+            decoder.capacity() >= decoder.buffered(),
+            "the shed dropped buffered bytes"
+        );
+
+        decoder.feed(tail);
+        assert_eq!(decoder.try_next().unwrap(), Some(Frame::Bulk(value)));
+    }
+
     #[test]
     fn the_read_buffer_grows_while_it_fills_and_sheds_when_it_stops() {
+        let mut decoder = Decoder::new(DecoderLimits::default());
+        let mut out: Vec<u8> = Vec::new();
         let mut read_buf = vec![0u8; READ_FLOOR];
         let mut quiet = 0u32;
 
         // Filling reads double it, up to the ceiling and no further.
         for _ in 0..32 {
             let got = read_buf.len();
-            resize_read_buffer(&mut read_buf, &mut quiet, got);
+            resize_connection_buffers(&mut read_buf, &mut decoder, &mut out, &mut quiet, got);
         }
         assert_eq!(read_buf.len(), READ_CEILING);
 
@@ -1237,17 +1363,19 @@ mod tests {
         // steady state, and reallocating through it would cost more than the
         // capacity does.
         for _ in 0..2 * READ_QUIET_READS {
-            resize_read_buffer(&mut read_buf, &mut quiet, READ_CEILING / 2);
+            let half = READ_CEILING / 2;
+            resize_connection_buffers(&mut read_buf, &mut decoder, &mut out, &mut quiet, half);
             assert_eq!(read_buf.len(), READ_CEILING);
         }
 
         // A quarter-or-less read is evidence, not a verdict: the capacity is
         // held until the evidence accumulates.
+        let quarter = READ_CEILING / 4;
         for _ in 1..READ_QUIET_READS {
-            resize_read_buffer(&mut read_buf, &mut quiet, READ_CEILING / 4);
+            resize_connection_buffers(&mut read_buf, &mut decoder, &mut out, &mut quiet, quarter);
             assert_eq!(read_buf.len(), READ_CEILING, "shed before the window ran");
         }
-        resize_read_buffer(&mut read_buf, &mut quiet, READ_CEILING / 4);
+        resize_connection_buffers(&mut read_buf, &mut decoder, &mut out, &mut quiet, quarter);
         assert_eq!(read_buf.len(), READ_FLOOR);
         assert!(read_buf.capacity() <= READ_FLOOR * 2);
     }
@@ -1261,14 +1389,16 @@ mod tests {
     /// settle: a busy read anywhere in the window cancels the shed.
     #[test]
     fn an_alternating_peer_does_not_thrash_the_read_buffer() {
+        let mut decoder = Decoder::new(DecoderLimits::default());
+        let mut out: Vec<u8> = Vec::new();
         let mut read_buf = vec![0u8; READ_FLOOR];
         let mut quiet = 0u32;
 
         for _ in 0..64 {
             let full = read_buf.len();
-            resize_read_buffer(&mut read_buf, &mut quiet, full);
+            resize_connection_buffers(&mut read_buf, &mut decoder, &mut out, &mut quiet, full);
             let quarter = read_buf.len() / 4;
-            resize_read_buffer(&mut read_buf, &mut quiet, quarter);
+            resize_connection_buffers(&mut read_buf, &mut decoder, &mut out, &mut quiet, quarter);
         }
         assert_eq!(
             read_buf.len(),
