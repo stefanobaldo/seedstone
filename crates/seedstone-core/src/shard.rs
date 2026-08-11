@@ -30,13 +30,14 @@
 //! *above* the shard, in code that sends two messages with an `await` between
 //! them. The simulator plants exactly that race.
 
-use crate::dict::{Dict, DictSeed};
+use crate::dict::{Dict, DictSeed, Entry};
 use crate::log::{NoopLog, Record, ReplicationLog};
 use crate::slot::{executor_of, shard_of};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 /// How often an idle shard advances an in-flight rehash.
 const REHASH_TICK: Duration = Duration::from_millis(100);
@@ -103,6 +104,32 @@ impl ReplyError {
     }
 }
 
+/// How long a `Set` asks its key to live, in the unit the client chose.
+///
+/// Kept in that unit rather than resolved to a [`Duration`] at the service
+/// layer so the command is exactly what the peer asked for, and so the one
+/// place that turns a span into a deadline is the handler that has `now`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expiry {
+    /// Seconds, from `EX`.
+    Ex(u64),
+    /// Milliseconds, from `PX`.
+    Px(u64),
+}
+
+/// The condition a `Set` is subject to.
+///
+/// Absent, a `Set` always stores. Present, it stores only if the key's
+/// existence matches — and a `Set` that stores nothing is not a failure, it is
+/// an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cond {
+    /// Only if the key does not exist, from `NX`.
+    Nx,
+    /// Only if the key already exists, from `XX`.
+    Xx,
+}
+
 /// A command addressed to the shard that owns its key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -117,6 +144,14 @@ pub enum Command {
         key: Vec<u8>,
         /// The bytes to store, kept verbatim.
         value: Vec<u8>,
+        /// How long the key should live, or `None` to store it without a
+        /// deadline. A `Set` with no expiry clears any deadline the key it
+        /// overwrote was carrying — Redis's semantics, and the reason the
+        /// absence of an option is a decision rather than a silence.
+        expiry: Option<Expiry>,
+        /// The condition the write is subject to, or `None` to write
+        /// unconditionally.
+        cond: Option<Cond>,
     },
     /// Remove `key`.
     Del {
@@ -131,25 +166,52 @@ pub enum Command {
         /// The amount to add; may be negative.
         delta: i64,
     },
+    /// Give `key` a deadline `seconds` from now, or delete it if that deadline
+    /// is not in the future.
+    Expire {
+        /// The key to put a deadline on.
+        key: Vec<u8>,
+        /// How many seconds from now; zero or negative deletes the key.
+        seconds: i64,
+    },
+    /// Report how long `key` has left.
+    Ttl {
+        /// The key to ask about.
+        key: Vec<u8>,
+    },
+    /// Report whether `key` exists.
+    Exists {
+        /// The key to ask about.
+        key: Vec<u8>,
+    },
 }
 
 impl Command {
     /// The key this command addresses — what [`shard_of`] routes on.
+    ///
+    /// Exactly one key, for every command there is and every command there
+    /// will be: a request naming several keys is split into one command per
+    /// key before it reaches a shard, because the shards that own them are not
+    /// in general the same shard.
     #[must_use]
     pub fn key(&self) -> &[u8] {
         match self {
             Self::Get { key }
             | Self::Set { key, .. }
             | Self::Del { key }
-            | Self::IncrBy { key, .. } => key,
+            | Self::IncrBy { key, .. }
+            | Self::Expire { key, .. }
+            | Self::Ttl { key }
+            | Self::Exists { key } => key,
         }
     }
 
     /// A stable one-byte tag for this command's variant.
     ///
-    /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4. These values are folded
-    /// into the simulator's trace hash, so they are part of what a replay
-    /// compares: changing one changes every recorded hash.
+    /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
+    /// `Exists` = 7. These values are folded into the simulator's trace hash,
+    /// so they are part of what a replay compares: changing one changes every
+    /// recorded hash.
     #[must_use]
     pub const fn kind(&self) -> u8 {
         match self {
@@ -157,6 +219,9 @@ impl Command {
             Self::Set { .. } => 2,
             Self::Del { .. } => 3,
             Self::IncrBy { .. } => 4,
+            Self::Expire { .. } => 5,
+            Self::Ttl { .. } => 6,
+            Self::Exists { .. } => 7,
         }
     }
 }
@@ -549,11 +614,19 @@ async fn run_executor<T: TraceSink, L: ReplicationLog>(
                 // No `await` inside this loop, so a batch is applied as a unit:
                 // nothing from another connection lands between its commands.
                 let mut replies = Vec::with_capacity(cmds.len());
+                // One clock reading for the whole envelope, taken here rather
+                // than inside a handler. A handler that read the clock itself
+                // would still be synchronous — this is not the no-await rule —
+                // but the commands of one batch would then expire keys against
+                // several different instants, which is a difference nothing
+                // about the batch justifies. Reading it once also keeps the
+                // cost at one per envelope rather than one per command.
+                let now = Instant::now();
                 for (shard, cmd) in &cmds {
                     let state = &mut states[usize::from(shard - first_shard)];
                     let at = state.seq;
                     let answer =
-                        apply(&mut state.dict, &mut state.log, &mut state.seq, *shard, cmd);
+                        apply(&mut state.dict, &mut state.log, &mut state.seq, *shard, cmd, now);
                     trace.record(*shard, at, cmd, &answer);
                     replies.push(answer);
                 }
@@ -599,21 +672,54 @@ async fn run_executor<T: TraceSink, L: ReplicationLog>(
 ///
 /// The key and value are cloned into the dict because [`TraceSink`] observes
 /// the command after the fact and so must outlive this call.
+///
+/// `now` is the instant the whole envelope is being served at, supplied by the
+/// executor: a handler must not read a clock of its own, or two commands of
+/// one batch could disagree about which keys are still alive.
 fn apply<L: ReplicationLog>(
     dict: &mut Dict,
     log: &mut L,
     seq: &mut u64,
     shard: u16,
     cmd: &Command,
+    now: Instant,
 ) -> Reply {
-    match cmd {
-        Command::Get { key } => Reply::Bulk(dict.get(key).map(<[u8]>::to_vec)),
+    // Lazy expiry, once, before any arm has looked at the key. Here rather
+    // than in each arm on purpose: it makes "an expired key is dead to every
+    // command" a property of the dispatch instead of a rule seven handlers
+    // have to remember, and a command added later inherits it without knowing
+    // it exists. Every command addresses exactly one key, which is what lets
+    // one check stand in front of all of them.
+    if let Err(failed) = evict_if_expired(dict, log, seq, shard, cmd.key(), now) {
+        return failed;
+    }
 
-        Command::Set { key, value } => {
+    match cmd {
+        Command::Get { key } => Reply::Bulk(dict.get(key).map(|entry| entry.value.clone())),
+
+        Command::Set {
+            key,
+            value,
+            expiry,
+            cond,
+        } => {
+            // A condition the keyspace does not meet is answered, not failed:
+            // the peer asked for a write that was allowed not to happen.
+            match cond {
+                Some(Cond::Nx) if dict.get(key).is_some() => return Reply::Bulk(None),
+                Some(Cond::Xx) if dict.get(key).is_none() => return Reply::Bulk(None),
+                _ => {}
+            }
             if let Err(failed) = append(log, seq, shard) {
                 return failed;
             }
-            dict.insert(key.clone(), value.clone());
+            dict.insert(
+                key.clone(),
+                Entry {
+                    value: value.clone(),
+                    expires_at: deadline(now, *expiry),
+                },
+            );
             Reply::Ok
         }
 
@@ -629,10 +735,10 @@ fn apply<L: ReplicationLog>(
         }
 
         Command::IncrBy { key, delta } => {
-            let current = match dict.get(key) {
-                None => 0,
-                Some(bytes) => match parse_i64(bytes) {
-                    Some(n) => n,
+            let (current, expires_at) = match dict.get(key) {
+                None => (0, None),
+                Some(entry) => match parse_i64(&entry.value) {
+                    Some(n) => (n, entry.expires_at),
                     None => return Reply::Error(ReplyError::NotAnInteger),
                 },
             };
@@ -642,10 +748,117 @@ fn apply<L: ReplicationLog>(
             if let Err(failed) = append(log, seq, shard) {
                 return failed;
             }
-            dict.insert(key.clone(), next.to_string().into_bytes());
+            // The deadline rides along, as it does in Redis: an increment
+            // changes what a counter holds, not how long it lives.
+            dict.insert(
+                key.clone(),
+                Entry {
+                    value: next.to_string().into_bytes(),
+                    expires_at,
+                },
+            );
             Reply::Integer(next)
         }
+
+        Command::Expire { key, seconds } => {
+            if dict.get(key).is_none() {
+                return Reply::Integer(0);
+            }
+            if let Err(failed) = append(log, seq, shard) {
+                return failed;
+            }
+            if *seconds <= 0 {
+                // A deadline that is not in the future is a deletion, and
+                // Redis reports it as an applied expiry rather than as a
+                // delete — the client asked for the key to be gone by a time
+                // that has passed, and it is.
+                dict.remove(key);
+            } else if let Some(entry) = dict.get_mut(key) {
+                // Present a moment ago, and a handler cannot be suspended, so
+                // nothing can have removed it in between.
+                let span = u64::try_from(*seconds).expect("a positive i64 is a u64");
+                entry.expires_at = deadline(now, Some(Expiry::Ex(span)));
+            }
+            Reply::Integer(1)
+        }
+
+        Command::Ttl { key } => match dict.get(key).map(|entry| entry.expires_at) {
+            None => Reply::Integer(-2),
+            Some(None) => Reply::Integer(-1),
+            Some(Some(at)) => Reply::Integer(remaining_seconds(at, now)),
+        },
+
+        Command::Exists { key } => Reply::Integer(i64::from(dict.get(key).is_some())),
     }
+}
+
+/// Removes `key` if its deadline has passed, appending the deletion to the log
+/// exactly as an explicit `Del` would.
+///
+/// An expiration is a change to the keyspace, so it takes a replication
+/// position like every other one: a later phase replaying the log has to see
+/// the key disappear where it disappeared here, and the [`TraceSink`] — which
+/// folds the position each command ran at — sees the position the removal
+/// consumed. Neither has to know what a deadline is.
+///
+/// The deadline is the first instant the entry is gone, so a key is expired
+/// when `now` has reached it and not only once it is past.
+///
+/// Returns the reply to send instead when the record could not be written. A
+/// removal that cannot be logged must not happen, for the same reason a `Del`
+/// that cannot be logged does not: the alternative is a keyspace that has
+/// moved past a log which does not describe it. The entry stays, and the
+/// command that met it is refused rather than answered from a value that
+/// should be gone.
+fn evict_if_expired<L: ReplicationLog>(
+    dict: &mut Dict,
+    log: &mut L,
+    seq: &mut u64,
+    shard: u16,
+    key: &[u8],
+    now: Instant,
+) -> Result<(), Reply> {
+    let Some(expires_at) = dict.get(key).and_then(|entry| entry.expires_at) else {
+        return Ok(());
+    };
+    if expires_at > now {
+        return Ok(());
+    }
+    append(log, seq, shard)?;
+    dict.remove(key);
+    Ok(())
+}
+
+/// The instant an expiry option lands on, or `None` for a key with no
+/// deadline.
+///
+/// A deadline the clock cannot represent — a span so large that `now` plus it
+/// leaves [`Instant`]'s range — is stored as no deadline at all. No instant
+/// this process can reach is past it, so the two are indistinguishable to
+/// every command that will ever ask, except that `TTL` reports such a key as
+/// having no deadline; the alternative is an arithmetic panic on a
+/// peer-supplied number.
+fn deadline(now: Instant, expiry: Option<Expiry>) -> Option<Instant> {
+    let span = match expiry? {
+        Expiry::Ex(seconds) => Duration::from_secs(seconds),
+        Expiry::Px(millis) => Duration::from_millis(millis),
+    };
+    now.checked_add(span)
+}
+
+/// How many seconds are left before `deadline`, rounded up.
+///
+/// Up rather than to nearest so that a key which is still alive never reads as
+/// `0`, which is the value a client tests for. Saturating rather than
+/// truncating on the way to `i64`: a remaining span that does not fit is
+/// further off than any client will wait, and reporting the largest number
+/// there is says that better than a wrapped one.
+fn remaining_seconds(expires_at: Instant, now: Instant) -> i64 {
+    let left = expires_at.saturating_duration_since(now);
+    let seconds = left
+        .as_secs()
+        .saturating_add(u64::from(left.subsec_nanos() > 0));
+    i64::try_from(seconds).unwrap_or(i64::MAX)
 }
 
 /// Appends one record for a mutation about to happen, advancing `seq`.
@@ -699,18 +912,333 @@ pub fn parse_i64(bytes: &[u8]) -> Option<i64> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tokio::time::Instant;
+
+    /// One shard's state, driven through [`apply`] directly.
+    ///
+    /// The expiry tests need two things a pool deliberately does not offer:
+    /// the `now` each command sees, which in production is the executor's to
+    /// choose, and the dict a handler left behind — an expired entry has to be
+    /// shown *gone*, not merely invisible to a read.
+    struct Shard {
+        dict: Dict,
+        log: NoopLog,
+        seq: u64,
+    }
+
+    impl Shard {
+        fn new() -> Self {
+            Self {
+                dict: Dict::with_seed(DictSeed { k0: 5, k1: 7 }),
+                log: NoopLog,
+                seq: 0,
+            }
+        }
+
+        fn run(&mut self, cmd: &Command, now: Instant) -> Reply {
+            apply(&mut self.dict, &mut self.log, &mut self.seq, 0, cmd, now)
+        }
+    }
+
+    /// `SET key value`, with no options.
+    fn set(key: &[u8], value: &[u8]) -> Command {
+        Command::Set {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            expiry: None,
+            cond: None,
+        }
+    }
+
+    /// `SET key value EX seconds`.
+    fn set_ex(key: &[u8], value: &[u8], seconds: u64) -> Command {
+        Command::Set {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            expiry: Some(Expiry::Ex(seconds)),
+            cond: None,
+        }
+    }
+
+    fn get(key: &[u8]) -> Command {
+        Command::Get { key: key.to_vec() }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn set_with_ex_expires_lazily() {
+        let mut shard = Shard::new();
+        assert_eq!(
+            shard.run(&set_ex(b"k", b"v", 30), Instant::now()),
+            Reply::Ok
+        );
+
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert_eq!(
+            shard.run(&get(b"k"), Instant::now()),
+            Reply::Bulk(Some(b"v".to_vec())),
+            "a key one second short of its deadline is still a key"
+        );
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(shard.run(&get(b"k"), Instant::now()), Reply::Bulk(None));
+        // The read is what removed it. A deadline that only hid the entry would
+        // leave the keyspace growing with values nothing can ever reach again.
+        assert_eq!(
+            shard.dict.len(),
+            0,
+            "the expired entry survived the read that reported it gone"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn set_nx_xx_algebra() {
+        let mut shard = Shard::new();
+        let conditional = |value: &[u8], cond: Cond| Command::Set {
+            key: b"k".to_vec(),
+            value: value.to_vec(),
+            expiry: None,
+            cond: Some(cond),
+        };
+
+        // XX on an absent key stores nothing and says so.
+        assert_eq!(
+            shard.run(&conditional(b"first", Cond::Xx), Instant::now()),
+            Reply::Bulk(None)
+        );
+        assert_eq!(shard.run(&get(b"k"), Instant::now()), Reply::Bulk(None));
+
+        // NX on an absent key stores.
+        assert_eq!(
+            shard.run(&conditional(b"first", Cond::Nx), Instant::now()),
+            Reply::Ok
+        );
+        assert_eq!(
+            shard.run(&get(b"k"), Instant::now()),
+            Reply::Bulk(Some(b"first".to_vec()))
+        );
+
+        // NX on a present key refuses, and leaves the value it found alone.
+        assert_eq!(
+            shard.run(&conditional(b"second", Cond::Nx), Instant::now()),
+            Reply::Bulk(None)
+        );
+        assert_eq!(
+            shard.run(&get(b"k"), Instant::now()),
+            Reply::Bulk(Some(b"first".to_vec())),
+            "a refused NX overwrote the value anyway"
+        );
+
+        // XX on a present key replaces it.
+        assert_eq!(
+            shard.run(&conditional(b"second", Cond::Xx), Instant::now()),
+            Reply::Ok
+        );
+        assert_eq!(
+            shard.run(&get(b"k"), Instant::now()),
+            Reply::Bulk(Some(b"second".to_vec()))
+        );
+
+        // And a plain SET clears the deadline the key it overwrote carried —
+        // Redis's semantics, and the reason a rewritten key is not silently
+        // still on its predecessor's clock.
+        assert_eq!(
+            shard.run(&set_ex(b"t", b"v", 30), Instant::now()),
+            Reply::Ok
+        );
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert_eq!(shard.run(&set(b"t", b"w"), Instant::now()), Reply::Ok);
+        tokio::time::advance(Duration::from_hours(1)).await;
+        assert_eq!(
+            shard.run(&get(b"t"), Instant::now()),
+            Reply::Bulk(Some(b"w".to_vec())),
+            "a plain SET left the old deadline in place"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expire_and_ttl() {
+        let mut shard = Shard::new();
+        let ttl = |key: &[u8]| Command::Ttl { key: key.to_vec() };
+        let expire = |key: &[u8], seconds: i64| Command::Expire {
+            key: key.to_vec(),
+            seconds,
+        };
+
+        assert_eq!(
+            shard.run(&ttl(b"k"), Instant::now()),
+            Reply::Integer(-2),
+            "TTL of a key that does not exist"
+        );
+        assert_eq!(
+            shard.run(&expire(b"k", 10), Instant::now()),
+            Reply::Integer(0),
+            "EXPIRE of a key that does not exist"
+        );
+
+        assert_eq!(shard.run(&set(b"k", b"v"), Instant::now()), Reply::Ok);
+        assert_eq!(
+            shard.run(&ttl(b"k"), Instant::now()),
+            Reply::Integer(-1),
+            "TTL of a key with no deadline"
+        );
+
+        assert_eq!(
+            shard.run(&expire(b"k", 100), Instant::now()),
+            Reply::Integer(1)
+        );
+        assert_eq!(shard.run(&ttl(b"k"), Instant::now()), Reply::Integer(100));
+        // Rounded up, so a key with any time left never reads as zero — which
+        // is a value a client tests for.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert_eq!(shard.run(&ttl(b"k"), Instant::now()), Reply::Integer(100));
+
+        // A non-positive expiry deletes the key, and still reports that the
+        // deadline was applied rather than that nothing was there.
+        assert_eq!(
+            shard.run(&expire(b"k", 0), Instant::now()),
+            Reply::Integer(1)
+        );
+        assert_eq!(shard.run(&get(b"k"), Instant::now()), Reply::Bulk(None));
+        assert_eq!(shard.dict.len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_keys_are_dead_to_every_command() {
+        let mut shard = Shard::new();
+        // One key per command, all past the same deadline: every arm meets an
+        // entry that is still in the dict and already gone, which is the state
+        // a handler that skipped the liveness check would answer from.
+        for key in [&b"get"[..], b"exists", b"ttl", b"del", b"incrby"] {
+            assert_eq!(shard.run(&set_ex(key, b"1", 10), Instant::now()), Reply::Ok);
+        }
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let now = Instant::now();
+
+        assert_eq!(shard.run(&get(b"get"), now), Reply::Bulk(None));
+        assert_eq!(
+            shard.run(
+                &Command::Exists {
+                    key: b"exists".to_vec()
+                },
+                now
+            ),
+            Reply::Integer(0)
+        );
+        assert_eq!(
+            shard.run(
+                &Command::Ttl {
+                    key: b"ttl".to_vec()
+                },
+                now
+            ),
+            Reply::Integer(-2)
+        );
+        assert_eq!(
+            shard.run(
+                &Command::Del {
+                    key: b"del".to_vec()
+                },
+                now
+            ),
+            Reply::Removed(false)
+        );
+        assert_eq!(
+            shard.run(
+                &Command::IncrBy {
+                    key: b"incrby".to_vec(),
+                    delta: 7
+                },
+                now
+            ),
+            Reply::Integer(7),
+            "an expired counter must start from zero"
+        );
+
+        // Each was removed by the command that met it, not merely hidden from
+        // it: what is left is the counter INCRBY re-created.
+        assert_eq!(shard.dict.len(), 1);
+    }
+
+    /// An expiry is a deletion, and a deletion is a logged mutation.
+    ///
+    /// The record is what a later phase replays; the replication position it
+    /// consumes is what the trace sink folds. So an expiration is visible to
+    /// both without either having to know what a deadline is.
+    #[tokio::test(start_paused = true)]
+    async fn an_expiry_is_logged_exactly_as_a_delete_is() {
+        #[derive(Clone, Default)]
+        struct Recording(Arc<Mutex<Vec<(u16, u64)>>>);
+
+        impl ReplicationLog for Recording {
+            fn append(&mut self, rec: Record<'_>) -> std::io::Result<()> {
+                self.0.lock().expect("log mutex").push((rec.shard, rec.seq));
+                Ok(())
+            }
+            fn sync(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log = Recording::default();
+        let mut dict = Dict::with_seed(DictSeed { k0: 5, k1: 7 });
+        let mut seq = 0;
+        let mut shard_log = log.clone();
+
+        let set = set_ex(b"k", b"v", 30);
+        assert_eq!(
+            apply(&mut dict, &mut shard_log, &mut seq, 3, &set, Instant::now()),
+            Reply::Ok
+        );
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        // A read appends nothing of its own, so the second record below is the
+        // expiry's and nothing else.
+        let read = get(b"k");
+        assert_eq!(
+            apply(
+                &mut dict,
+                &mut shard_log,
+                &mut seq,
+                3,
+                &read,
+                Instant::now()
+            ),
+            Reply::Bulk(None)
+        );
+        assert_eq!(*log.0.lock().expect("log mutex"), vec![(3, 0), (3, 1)]);
+        assert_eq!(seq, 2, "the expiry did not consume a replication position");
+    }
+
+    /// The sink's side of the same fact: a position disappears from the trace
+    /// where an expiry took one, so a run in which a key expired cannot hash
+    /// like a run in which it did not.
+    #[tokio::test(start_paused = true)]
+    async fn the_sink_sees_the_position_an_expiry_consumed() {
+        let sink = Recorder::default();
+        let pool = ShardPool::spawn(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone());
+
+        pool.dispatch(set_ex(b"k", b"v", 1)).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        pool.dispatch(get(b"k")).await;
+        pool.dispatch(set(b"k", b"again")).await;
+
+        let seen = sink.0.lock().expect("recorder mutex").clone();
+        assert_eq!(
+            seen,
+            vec![
+                (0, 0, 2, Reply::Ok),
+                // The read ran at position 1 and evicted the key there.
+                (0, 1, 1, Reply::Bulk(None)),
+                // So the next write is at 2, not at 1: the gap is the expiry.
+                (0, 2, 2, Reply::Ok),
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn commands_round_trip_through_the_pool() {
         let pool = ShardPool::spawn(16, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
-        assert_eq!(
-            pool.dispatch(Command::Set {
-                key: b"k".to_vec(),
-                value: b"v".to_vec()
-            })
-            .await,
-            Reply::Ok
-        );
+        assert_eq!(pool.dispatch(set(b"k", b"v")).await, Reply::Ok);
         assert_eq!(
             pool.dispatch(Command::Get { key: b"k".to_vec() }).await,
             Reply::Bulk(Some(b"v".to_vec()))
@@ -757,31 +1285,21 @@ mod tests {
     /// with no runtime under it. If `apply` ever became `async`, or grew an
     /// `await`, this would stop compiling — which is the point. A comment
     /// saying "do not await here" would not.
+    ///
+    /// The `now` it passes is the same reading a handler would otherwise have
+    /// taken for itself, and taking it here is what shows a handler does not
+    /// need a clock — or a runtime to hold one.
     #[test]
     fn a_handler_runs_to_completion_without_a_runtime() {
         let mut dict = Dict::with_seed(DictSeed { k0: 7, k1: 9 });
         let mut log = NoopLog;
         let mut seq = 0;
+        let now = Instant::now();
 
-        let set = apply(
-            &mut dict,
-            &mut log,
-            &mut seq,
-            0,
-            &Command::Set {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
-            },
-        );
-        assert_eq!(set, Reply::Ok);
+        let stored = apply(&mut dict, &mut log, &mut seq, 0, &set(b"k", b"v"), now);
+        assert_eq!(stored, Reply::Ok);
         assert_eq!(
-            apply(
-                &mut dict,
-                &mut log,
-                &mut seq,
-                0,
-                &Command::Get { key: b"k".to_vec() }
-            ),
+            apply(&mut dict, &mut log, &mut seq, 0, &get(b"k"), now),
             Reply::Bulk(Some(b"v".to_vec()))
         );
     }
@@ -791,20 +1309,15 @@ mod tests {
         let mut dict = Dict::with_seed(DictSeed { k0: 1, k1: 1 });
         let mut log = NoopLog;
         let mut seq = 0;
-        let mut run = |cmd: &Command, seq: &mut u64| apply(&mut dict, &mut log, seq, 3, cmd);
+        let now = Instant::now();
+        let mut run = |cmd: &Command, seq: &mut u64| apply(&mut dict, &mut log, seq, 3, cmd, now);
 
         // A read moves nothing.
         run(&Command::Get { key: b"a".to_vec() }, &mut seq);
         assert_eq!(seq, 0);
 
         // A write does.
-        run(
-            &Command::Set {
-                key: b"a".to_vec(),
-                value: b"1".to_vec(),
-            },
-            &mut seq,
-        );
+        run(&set(b"a", b"1"), &mut seq);
         assert_eq!(seq, 1);
 
         // A delete that removes nothing writes no record: replaying it would
@@ -827,13 +1340,7 @@ mod tests {
         );
         assert_eq!(seq, 2, "'1' is a valid integer, so this one does count");
 
-        run(
-            &Command::Set {
-                key: b"txt".to_vec(),
-                value: b"abc".to_vec(),
-            },
-            &mut seq,
-        );
+        run(&set(b"txt", b"abc"), &mut seq);
         assert_eq!(seq, 3);
         run(
             &Command::IncrBy {
@@ -904,11 +1411,8 @@ mod tests {
     async fn incr_by_reports_overflow_instead_of_panicking() {
         let pool = ShardPool::spawn(4, 4, DictSeed { k0: 3, k1: 4 }, NoTrace);
         assert_eq!(
-            pool.dispatch(Command::Set {
-                key: b"c".to_vec(),
-                value: i64::MAX.to_string().into_bytes(),
-            })
-            .await,
+            pool.dispatch(set(b"c", i64::MAX.to_string().as_bytes()))
+                .await,
             Reply::Ok
         );
         assert_eq!(
@@ -937,14 +1441,7 @@ mod tests {
             .await,
             Reply::Integer(-3)
         );
-        assert_eq!(
-            pool.dispatch(Command::Set {
-                key: b"fresh".to_vec(),
-                value: b"100".to_vec()
-            })
-            .await,
-            Reply::Ok
-        );
+        assert_eq!(pool.dispatch(set(b"fresh", b"100")).await, Reply::Ok);
         assert_eq!(
             pool.dispatch(Command::IncrBy {
                 key: b"fresh".to_vec(),
@@ -966,11 +1463,7 @@ mod tests {
 
         for (i, key) in keys.iter().enumerate() {
             assert_eq!(
-                pool.dispatch(Command::Set {
-                    key: key.clone(),
-                    value: i.to_string().into_bytes(),
-                })
-                .await,
+                pool.dispatch(set(key, i.to_string().as_bytes())).await,
                 Reply::Ok
             );
         }
@@ -1009,10 +1502,7 @@ mod tests {
         let sets: Vec<Command> = keys
             .iter()
             .enumerate()
-            .map(|(i, key)| Command::Set {
-                key: key.clone(),
-                value: i.to_string().into_bytes(),
-            })
+            .map(|(i, key)| set(key, i.to_string().as_bytes()))
             .collect();
         let replies = pool.dispatch_many(sets).await;
         assert!(replies.iter().all(|r| *r == Reply::Ok));
@@ -1087,11 +1577,7 @@ mod tests {
         let pool = ShardPool::spawn(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone());
 
         pool.dispatch(Command::Get { key: b"k".to_vec() }).await;
-        pool.dispatch(Command::Set {
-            key: b"k".to_vec(),
-            value: b"1".to_vec(),
-        })
-        .await;
+        pool.dispatch(set(b"k", b"1")).await;
         pool.dispatch(Command::IncrBy {
             key: b"k".to_vec(),
             delta: 4,
@@ -1137,11 +1623,7 @@ mod tests {
             .clone();
 
         for key in [&a, &b, &a, &b] {
-            pool.dispatch(Command::Set {
-                key: key.clone(),
-                value: b"v".to_vec(),
-            })
-            .await;
+            pool.dispatch(set(key, b"v")).await;
         }
         let seen = sink.0.lock().expect("recorder mutex").clone();
         let positions: Vec<(u16, u64)> = seen
@@ -1178,11 +1660,7 @@ mod tests {
             move |_shard| log.clone()
         });
 
-        pool.dispatch(Command::Set {
-            key: b"k".to_vec(),
-            value: b"v".to_vec(),
-        })
-        .await;
+        pool.dispatch(set(b"k", b"v")).await;
         pool.dispatch(Command::Get { key: b"k".to_vec() }).await;
         pool.dispatch(Command::Del {
             key: b"absent".to_vec(),
@@ -1222,11 +1700,7 @@ mod tests {
             ShardPool::spawn_with_log(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace, |_shard| Failing);
 
         assert_eq!(
-            pool.dispatch(Command::Set {
-                key: b"k".to_vec(),
-                value: b"v".to_vec(),
-            })
-            .await,
+            pool.dispatch(set(b"k", b"v")).await,
             Reply::Error(ReplyError::LogWriteFailed)
         );
         // And the write did not land: the refusal is not cosmetic.

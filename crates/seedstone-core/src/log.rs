@@ -187,17 +187,23 @@ fn crc32_iso_hdlc(data: &[u8]) -> u32 {
 ///
 /// The body — the ten fixed bytes plus the payload — must not exceed 64 MiB.
 ///
-/// Two things discharge that obligation today, neither of them here. The RESP
-/// codec caps a single payload at [`seedstone_resp::MAX_BULK_LEN`] (16 MiB),
-/// and the command layer's arity table caps a command at two payloads — so the
-/// largest record any accepted command can produce is about 32 MiB plus
-/// framing, comfortably under the 64 MiB ceiling.
+/// Three things discharge that obligation today, none of them here. The RESP
+/// codec caps a single payload at [`seedstone_resp::MAX_BULK_LEN`] (16 MiB); a
+/// command carries at most two payloads of that size, a key and a value, since
+/// the options it may also carry are small literals and short numbers
+/// (`SET k v EX 30` adds tens of bytes, not a third payload); and a record
+/// describes one key, because a shard command addresses exactly one key and a
+/// request naming many is fanned out into one command — and so one record —
+/// per key before it reaches a shard. So the largest record any accepted
+/// command can produce is about 32 MiB plus framing, comfortably under the
+/// 64 MiB ceiling.
 ///
-/// **The second half of that is an assumption, not an enforcement.** It lives
-/// in the arity table, and a command carrying a third payload breaks the
-/// arithmetic without touching this file. [`seedstone_resp::MAX_BULK_LEN`]'s
-/// own documentation states the same assumption from the other side; whoever
-/// adds such a command owns re-deriving both.
+/// **All three are assumptions here, not enforcements.** They live in the
+/// command layer, and a command carrying a third unbounded payload — or a
+/// record built from a whole multi-key request — breaks the arithmetic without
+/// touching this file. [`seedstone_resp::MAX_BULK_LEN`]'s own documentation
+/// states the same from the other side; whoever adds such a command owns
+/// re-deriving both.
 ///
 /// The `debug_assert!` below is a development tripwire, not that rejection: it
 /// turns a violation into a panic in debug, test and simulator builds. In

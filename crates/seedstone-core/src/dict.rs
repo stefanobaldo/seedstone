@@ -18,6 +18,7 @@
 use std::hash::Hasher;
 
 use siphasher::sip::SipHasher13;
+use tokio::time::Instant;
 
 /// The SipHash key pair that fixes a dict's hashing.
 ///
@@ -33,11 +34,39 @@ pub struct DictSeed {
     pub k1: u64,
 }
 
+/// What a key maps to: the bytes stored under it and, if it has one, the
+/// instant it stops being visible at.
+///
+/// The deadline is absolute, and it is a [`tokio::time::Instant`] rather than
+/// a wall-clock reading: under the simulator that clock is virtual, so a
+/// deadline is a point in the *run* and a replay reaches it at the same point.
+/// The relative form a client sends is resolved against `now` before it gets
+/// here.
+///
+/// The dict never looks at the deadline. It stores what it is handed and hands
+/// it back, and whether an entry is still alive is decided by the shard —
+/// which is the only layer that can log the removal an expiry amounts to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// The bytes stored under the key, kept verbatim.
+    pub value: Vec<u8>,
+    /// When the entry expires, or `None` if it never does.
+    pub expires_at: Option<Instant>,
+}
+
 /// One hash bucket: the entries whose hash selected it, in insertion order.
 ///
 /// Collisions are resolved by chaining. The load factor is held at 1, so a
 /// bucket holds one entry on average and the linear scan below is cheap.
-type Bucket = Vec<(Vec<u8>, Vec<u8>)>;
+///
+/// Each element carries the key's hash beside the key and its entry. It is the
+/// same word [`bucket_index`] selected the bucket with, stored rather than
+/// recomputed, and it buys two things: a chain scan settles a miss on one
+/// integer comparison instead of a full key comparison, and [`Dict::rehash_step`]
+/// migrates an entry without a second pass through SipHash. It moves
+/// nothing — the hash stored is the hash placement already used, so every key
+/// lands where it always did.
+type Bucket = Vec<(u64, Vec<u8>, Entry)>;
 
 /// A table of buckets. Its length is always a power of two.
 ///
@@ -84,28 +113,41 @@ impl Dict {
         }
     }
 
-    /// Returns the value stored under `key`, or `None` if there is none.
+    /// Returns the entry stored under `key`, or `None` if there is none.
     ///
     /// While a rehash is in flight the key may live in either table, so both
     /// are probed. A lookup never advances the rehash: reads are on the hot
     /// path and must not pay for a migration.
     #[must_use]
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+    pub fn get(&self, key: &[u8]) -> Option<&Entry> {
         let hash = hash_key(self.seed, key);
-        if let Some((_, value)) = find(&self.old, hash, key) {
-            return Some(value);
+        if let Some(entry) = find(&self.old, hash, key) {
+            return Some(entry);
         }
-        let (_, value) = find(self.new.as_ref()?, hash, key)?;
-        Some(value)
+        find(self.new.as_ref()?, hash, key)
     }
 
-    /// Stores `value` under `key`, replacing any value already there.
+    /// Returns the entry stored under `key` for modification in place.
+    ///
+    /// For a change that leaves the key where it is — a new deadline on a key
+    /// that already exists, which is the whole of what `EXPIRE` does. Like
+    /// [`get`](Dict::get) it does not advance a rehash in flight: nothing was
+    /// added, and the migration is paid for by the writes that grow the table.
+    pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
+        let hash = hash_key(self.seed, key);
+        if let Some(entry) = find_mut(&mut self.old, hash, key) {
+            return Some(entry);
+        }
+        find_mut(self.new.as_mut()?, hash, key)
+    }
+
+    /// Stores `entry` under `key`, replacing any entry already there.
     ///
     /// Overwriting an existing key leaves it where it is — including in the
     /// old table mid-rehash, from where it will migrate like any other entry.
     /// Moving it would risk leaving a stale copy behind, and the entry is
     /// reachable either way.
-    pub fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) {
+    pub fn insert(&mut self, key: Vec<u8>, entry: Entry) {
         // A write pays for one bucket of the migration it is competing with,
         // which is what keeps the two tables from coexisting indefinitely.
         //
@@ -124,14 +166,14 @@ impl Dict {
         }
 
         let hash = hash_key(self.seed, &key);
-        if let Some(entry) = find_mut(&mut self.old, hash, &key) {
-            entry.1 = value;
+        if let Some(existing) = find_mut(&mut self.old, hash, &key) {
+            *existing = entry;
             return;
         }
         if let Some(new) = self.new.as_mut()
-            && let Some(entry) = find_mut(new, hash, &key)
+            && let Some(existing) = find_mut(new, hash, &key)
         {
-            entry.1 = value;
+            *existing = entry;
             return;
         }
 
@@ -139,12 +181,12 @@ impl Dict {
         // survive the rehash, so it never has to be migrated.
         let table = self.new.as_mut().unwrap_or(&mut self.old);
         let index = bucket_index(hash, table.len());
-        table[index].push((key, value));
+        table[index].push((hash, key, entry));
         self.len += 1;
     }
 
-    /// Removes `key` and returns the value it held, or `None` if it was absent.
-    pub fn remove(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+    /// Removes `key` and returns the entry it held, or `None` if it was absent.
+    pub fn remove(&mut self, key: &[u8]) -> Option<Entry> {
         if self.is_rehashing() {
             self.rehash_step(1);
         }
@@ -199,10 +241,12 @@ impl Dict {
             .saturating_add(buckets)
             .min(self.old.len());
         for index in self.rehash_index..end {
-            for entry in self.old[index].drain(..) {
-                let hash = hash_key(self.seed, &entry.0);
-                let target = bucket_index(hash, new.len());
-                new[target].push(entry);
+            for slot in self.old[index].drain(..) {
+                // The hash the entry was placed with, carried since that
+                // placement: a migration is a re-bucketing and never a
+                // rehashing, so a doubled table costs no SipHash at all.
+                let target = bucket_index(slot.0, new.len());
+                new[target].push(slot);
             }
         }
         self.rehash_index = end;
@@ -276,7 +320,7 @@ impl Dict {
     /// and then every bucket of the larger table that bucket expands into,
     /// which is exactly the cursors sharing its low bits. The loop ends when
     /// the increment carries back into the bits the smaller mask covers.
-    pub fn scan<F: FnMut(&[u8], &[u8])>(&self, cursor: u64, mut visit: F) -> u64 {
+    pub fn scan<F: FnMut(&[u8], &Entry)>(&self, cursor: u64, mut visit: F) -> u64 {
         // Nothing to hand back and nothing to come back for. Redis does the
         // same, and it is what lets a caller sweep an empty keyspace in one
         // call instead of one per bucket. It cannot weaken the guarantee: if
@@ -348,8 +392,9 @@ fn empty_table(buckets: usize) -> Table {
 
 /// Hashes `key` under `seed`.
 ///
-/// A free function rather than a method because [`Dict::rehash_step`] needs it
-/// while it holds a mutable borrow of the tables.
+/// A free function taking the seed by value rather than a method: a hash is a
+/// property of the seed and the key alone, and every caller below computes one
+/// while it is about to borrow a table.
 fn hash_key(seed: DictSeed, key: &[u8]) -> u64 {
     let mut hasher = SipHasher13::new_with_keys(seed.k0, seed.k1);
     hasher.write(key);
@@ -375,11 +420,11 @@ fn mask_of(table: &Table) -> u64 {
 }
 
 /// Hands every entry of the bucket `cursor` selects in `table` to `visit`.
-fn visit_bucket<F: FnMut(&[u8], &[u8])>(table: &Table, cursor: u64, visit: &mut F) {
+fn visit_bucket<F: FnMut(&[u8], &Entry)>(table: &Table, cursor: u64, visit: &mut F) {
     let index = usize::try_from(cursor & mask_of(table))
         .expect("a masked cursor is below the bucket count, which is a usize");
-    for (key, value) in &table[index] {
-        visit(key, value);
+    for (_, key, entry) in &table[index] {
+        visit(key, entry);
     }
 }
 
@@ -393,24 +438,40 @@ const fn reverse_increment(cursor: u64, mask: u64) -> u64 {
     widened.reverse_bits().wrapping_add(1).reverse_bits()
 }
 
-fn find<'a>(table: &'a Table, hash: u64, key: &[u8]) -> Option<&'a (Vec<u8>, Vec<u8>)> {
+/// Whether a chain element is `key`'s, given the hash `key` was looked up with.
+///
+/// The stored hash is compared first, so a scan settles a miss on one word and
+/// only the entry that could be a match pays for a key comparison. The key
+/// comparison behind it is not redundant: it is what makes a hash collision a
+/// miss rather than a wrong answer.
+fn matches(slot: &(u64, Vec<u8>, Entry), hash: u64, key: &[u8]) -> bool {
+    slot.0 == hash && slot.1.as_slice() == key
+}
+
+fn find<'a>(table: &'a Table, hash: u64, key: &[u8]) -> Option<&'a Entry> {
     let bucket = &table[bucket_index(hash, table.len())];
-    bucket.iter().find(|(k, _)| k.as_slice() == key)
+    bucket
+        .iter()
+        .find(|slot| matches(slot, hash, key))
+        .map(|slot| &slot.2)
 }
 
-fn find_mut<'a>(table: &'a mut Table, hash: u64, key: &[u8]) -> Option<&'a mut (Vec<u8>, Vec<u8>)> {
+fn find_mut<'a>(table: &'a mut Table, hash: u64, key: &[u8]) -> Option<&'a mut Entry> {
     let index = bucket_index(hash, table.len());
-    table[index].iter_mut().find(|(k, _)| k.as_slice() == key)
+    table[index]
+        .iter_mut()
+        .find(|slot| matches(slot, hash, key))
+        .map(|slot| &mut slot.2)
 }
 
-fn remove_from(table: &mut Table, hash: u64, key: &[u8]) -> Option<Vec<u8>> {
+fn remove_from(table: &mut Table, hash: u64, key: &[u8]) -> Option<Entry> {
     let index = bucket_index(hash, table.len());
     let bucket = &mut table[index];
-    let position = bucket.iter().position(|(k, _)| k.as_slice() == key)?;
+    let position = bucket.iter().position(|slot| matches(slot, hash, key))?;
     // `remove` rather than `swap_remove`: it keeps the surviving entries in
     // insertion order, so a bucket's contents stay a function of the operation
     // sequence alone and iteration over it is easy to reason about.
-    Some(bucket.remove(position).1)
+    Some(bucket.remove(position).2)
 }
 
 #[cfg(test)]
@@ -421,6 +482,21 @@ mod tests {
         DictSeed { k0: 7, k1: 11 }
     }
 
+    /// An entry with no deadline — what every test in this module stores. The
+    /// dict never reads that field, so a deadline here would exercise nothing;
+    /// what a deadline means is the shard's, and is tested there.
+    fn entry(value: &[u8]) -> Entry {
+        Entry {
+            value: value.to_vec(),
+            expires_at: None,
+        }
+    }
+
+    /// The value stored under `key`, or `None` if the key is absent.
+    fn value<'a>(d: &'a Dict, key: &[u8]) -> Option<&'a [u8]> {
+        d.get(key).map(|entry| entry.value.as_slice())
+    }
+
     /// Inserts ascending numeric keys until a rehash is in flight, and returns
     /// how many were inserted. Panics rather than looping forever if growth
     /// never triggers.
@@ -429,7 +505,7 @@ mod tests {
         while !d.is_rehashing() {
             d.insert(
                 count.to_string().into_bytes(),
-                count.to_string().into_bytes(),
+                entry(count.to_string().as_bytes()),
             );
             count += 1;
             assert!(count < 1_000, "the dict never started rehashing");
@@ -500,19 +576,19 @@ mod tests {
     #[test]
     fn insert_get_remove_round_trip() {
         let mut d = Dict::with_seed(seed());
-        d.insert(b"a".to_vec(), b"1".to_vec());
-        assert_eq!(d.get(b"a"), Some(&b"1"[..]));
-        d.insert(b"a".to_vec(), b"2".to_vec()); // overwrite, len stays 1
-        assert_eq!((d.len(), d.get(b"a")), (1, Some(&b"2"[..])));
-        assert_eq!(d.remove(b"a"), Some(b"2".to_vec()));
-        assert_eq!((d.len(), d.get(b"a")), (0, None));
+        d.insert(b"a".to_vec(), entry(b"1"));
+        assert_eq!(value(&d, b"a"), Some(&b"1"[..]));
+        d.insert(b"a".to_vec(), entry(b"2")); // overwrite, len stays 1
+        assert_eq!((d.len(), value(&d, b"a")), (1, Some(&b"2"[..])));
+        assert_eq!(d.remove(b"a").map(|e| e.value), Some(b"2".to_vec()));
+        assert_eq!((d.len(), value(&d, b"a")), (0, None));
     }
 
     #[test]
     fn survives_growth_through_many_inserts() {
         let mut d = Dict::with_seed(seed());
         for i in 0..10_000u32 {
-            d.insert(i.to_string().into_bytes(), i.to_string().into_bytes());
+            d.insert(i.to_string().into_bytes(), entry(i.to_string().as_bytes()));
         }
         while d.is_rehashing() {
             d.rehash_step(16);
@@ -520,7 +596,7 @@ mod tests {
         assert_eq!(d.len(), 10_000);
         for i in (0..10_000u32).step_by(97) {
             assert_eq!(
-                d.get(i.to_string().as_bytes()),
+                value(&d, i.to_string().as_bytes()),
                 Some(i.to_string().as_bytes())
             );
         }
@@ -532,14 +608,14 @@ mod tests {
         assert_eq!(d.len(), 0);
         assert!(d.is_empty());
         assert!(!d.is_rehashing());
-        assert_eq!(d.get(b"absent"), None);
+        assert_eq!(value(&d, b"absent"), None);
     }
 
     #[test]
     fn removing_an_absent_key_reports_it_and_leaves_len_alone() {
         let mut d = Dict::with_seed(seed());
-        d.insert(b"present".to_vec(), b"v".to_vec());
-        assert_eq!(d.remove(b"absent"), None);
+        d.insert(b"present".to_vec(), entry(b"v"));
+        assert!(d.remove(b"absent").is_none());
         assert_eq!(d.len(), 1);
     }
 
@@ -554,7 +630,7 @@ mod tests {
         assert!(d.is_rehashing());
         for i in 0..inserted {
             assert_eq!(
-                d.get(i.to_string().as_bytes()),
+                value(&d, i.to_string().as_bytes()),
                 Some(i.to_string().as_bytes()),
                 "key {i} went missing mid-rehash"
             );
@@ -569,14 +645,14 @@ mod tests {
         let inserted = fill_until_rehashing(&mut d);
 
         // Key 0 predates the growth, so it can only be in the old table.
-        assert_eq!(d.remove(b"0"), Some(b"0".to_vec()));
-        assert_eq!(d.get(b"0"), None);
+        assert_eq!(d.remove(b"0").map(|e| e.value), Some(b"0".to_vec()));
+        assert_eq!(value(&d, b"0"), None);
         assert_eq!(d.len(), inserted - 1);
 
         // And it stays gone once the rehash completes: the migration must not
         // resurrect it from a bucket it was never removed from.
         drain_rehash(&mut d);
-        assert_eq!(d.get(b"0"), None);
+        assert_eq!(value(&d, b"0"), None);
         assert_eq!(d.len(), inserted - 1);
     }
 
@@ -587,16 +663,19 @@ mod tests {
 
         // Key 0 lives in the old table; the overwrite must update it in place
         // rather than leave a second copy in the new one.
-        d.insert(b"0".to_vec(), b"overwritten".to_vec());
+        d.insert(b"0".to_vec(), entry(b"overwritten"));
         assert_eq!(d.len(), inserted);
-        assert_eq!(d.get(b"0"), Some(&b"overwritten"[..]));
+        assert_eq!(value(&d, b"0"), Some(&b"overwritten"[..]));
 
         drain_rehash(&mut d);
         assert_eq!(d.len(), inserted);
-        assert_eq!(d.get(b"0"), Some(&b"overwritten"[..]));
+        assert_eq!(value(&d, b"0"), Some(&b"overwritten"[..]));
         // A duplicate would survive the first removal and still answer reads.
-        assert_eq!(d.remove(b"0"), Some(b"overwritten".to_vec()));
-        assert_eq!(d.get(b"0"), None);
+        assert_eq!(
+            d.remove(b"0").map(|e| e.value),
+            Some(b"overwritten".to_vec())
+        );
+        assert_eq!(value(&d, b"0"), None);
     }
 
     #[test]
@@ -613,7 +692,7 @@ mod tests {
         assert_eq!(d.len(), inserted);
         for i in 0..inserted {
             assert_eq!(
-                d.get(i.to_string().as_bytes()),
+                value(&d, i.to_string().as_bytes()),
                 Some(i.to_string().as_bytes()),
                 "key {i} was lost by the migration"
             );
@@ -647,7 +726,7 @@ mod tests {
         assert_eq!(d.len(), inserted);
         for i in 0..inserted {
             assert_eq!(
-                d.get(i.to_string().as_bytes()),
+                value(&d, i.to_string().as_bytes()),
                 Some(i.to_string().as_bytes())
             );
         }
@@ -664,17 +743,17 @@ mod tests {
         let mut a = Dict::with_seed(seed());
         let mut b = Dict::with_seed(seed());
         for i in 0..200u32 {
-            a.insert(i.to_string().into_bytes(), i.to_string().into_bytes());
+            a.insert(i.to_string().into_bytes(), entry(i.to_string().as_bytes()));
         }
         for i in (0..200u32).rev() {
-            b.insert(i.to_string().into_bytes(), b"stale".to_vec());
-            b.insert(i.to_string().into_bytes(), i.to_string().into_bytes());
+            b.insert(i.to_string().into_bytes(), entry(b"stale"));
+            b.insert(i.to_string().into_bytes(), entry(i.to_string().as_bytes()));
         }
         assert_eq!(a.len(), b.len());
         for i in 0..200u32 {
             assert_eq!(
-                a.get(i.to_string().as_bytes()),
-                b.get(i.to_string().as_bytes()),
+                value(&a, i.to_string().as_bytes()),
+                value(&b, i.to_string().as_bytes()),
                 "key {i}"
             );
         }
@@ -688,7 +767,7 @@ mod tests {
         let mut expected = BTreeSet::new();
         for i in 0..2_000u32 {
             let key = i.to_string().into_bytes();
-            d.insert(key.clone(), i.to_string().into_bytes());
+            d.insert(key.clone(), entry(i.to_string().as_bytes()));
             expected.insert(key);
             // Remove an older key every third insert, so the table shrinks and
             // grows while rehashes are in flight.
@@ -704,12 +783,12 @@ mod tests {
         }
         assert_eq!(d.len(), expected.len());
         for key in &expected {
-            assert_eq!(d.get(key), Some(key.as_slice()), "key {key:?}");
+            assert_eq!(value(&d, key), Some(key.as_slice()), "key {key:?}");
         }
         for i in 0..2_000u32 {
             let key = i.to_string().into_bytes();
             if !expected.contains(&key) {
-                assert_eq!(d.get(&key), None, "key {i} should be gone");
+                assert_eq!(value(&d, &key), None, "key {i} should be gone");
             }
         }
 
@@ -729,7 +808,7 @@ mod tests {
     fn scan_visits_every_key_when_static() {
         let mut d = Dict::with_seed(seed());
         for i in 0..500u32 {
-            d.insert(i.to_string().into_bytes(), vec![]);
+            d.insert(i.to_string().into_bytes(), entry(b""));
         }
         let mut seen = std::collections::BTreeSet::new();
         let mut c = 0;
@@ -757,7 +836,7 @@ mod tests {
         // at least once even though the table grows (and rehashes) mid-scan.
         let mut d = Dict::with_seed(seed());
         for i in 0..64u32 {
-            d.insert(format!("stable-{i}").into_bytes(), vec![]);
+            d.insert(format!("stable-{i}").into_bytes(), entry(b""));
         }
         let mut seen = std::collections::BTreeSet::new();
         let mut c = 0;
@@ -776,7 +855,7 @@ mod tests {
             assert!(steps < 10_000, "the cursor never returned to 0");
 
             for _ in 0..8 {
-                d.insert(format!("noise-{extra}").into_bytes(), vec![]);
+                d.insert(format!("noise-{extra}").into_bytes(), entry(b""));
                 extra += 1;
             }
             d.rehash_step(1);
@@ -807,7 +886,7 @@ mod tests {
 
         let mut d = Dict::with_seed(seed());
         for i in 0..100u32 {
-            d.insert(i.to_string().into_bytes(), vec![]);
+            d.insert(i.to_string().into_bytes(), entry(b""));
         }
         drain_rehash(&mut d);
 
@@ -882,7 +961,7 @@ mod tests {
         // start doubling and demand the guarantee at each one.
         let mut d = Dict::with_seed(seed());
         for i in 0..100u32 {
-            d.insert(format!("stable-{i}").into_bytes(), vec![]);
+            d.insert(format!("stable-{i}").into_bytes(), entry(b""));
         }
         drain_rehash(&mut d);
         let cycle = d.old.len();
@@ -890,7 +969,7 @@ mod tests {
         for grow_at in 0..cycle {
             let mut d = Dict::with_seed(seed());
             for i in 0..100u32 {
-                d.insert(format!("stable-{i}").into_bytes(), vec![]);
+                d.insert(format!("stable-{i}").into_bytes(), entry(b""));
             }
             drain_rehash(&mut d);
             assert_eq!(d.old.len(), cycle);
@@ -903,7 +982,7 @@ mod tests {
                 if step == grow_at {
                     // Write until the table starts doubling, exactly here.
                     while !d.is_rehashing() {
-                        d.insert(format!("noise-{noise}").into_bytes(), vec![]);
+                        d.insert(format!("noise-{noise}").into_bytes(), entry(b""));
                         noise += 1;
                     }
                 }
@@ -952,7 +1031,7 @@ mod tests {
         // in any other order fails on the second call instead of hanging.
         let mut d = Dict::with_seed(seed());
         for i in 0..64u32 {
-            d.insert(format!("stable-{i}").into_bytes(), vec![]);
+            d.insert(format!("stable-{i}").into_bytes(), entry(b""));
         }
         let started_over = d.new.as_ref().map_or(d.old.len(), Vec::len);
 
@@ -982,7 +1061,7 @@ mod tests {
             assert!(steps < 10_000, "the cycle never came back to cursor 0");
 
             for _ in 0..8 {
-                d.insert(format!("noise-{noise}").into_bytes(), vec![]);
+                d.insert(format!("noise-{noise}").into_bytes(), entry(b""));
                 noise += 1;
             }
             d.rehash_step(1);
@@ -1006,15 +1085,18 @@ mod tests {
 
         let mut d = Dict::with_seed(seed());
         for i in 0..50u32 {
-            d.insert(i.to_string().into_bytes(), format!("v{i}").into_bytes());
+            d.insert(
+                i.to_string().into_bytes(),
+                entry(format!("v{i}").as_bytes()),
+            );
         }
         drain_rehash(&mut d);
 
         let mut seen = BTreeMap::new();
         let mut c = 0;
         loop {
-            c = d.scan(c, |k, v| {
-                seen.insert(k.to_vec(), v.to_vec());
+            c = d.scan(c, |k, entry| {
+                seen.insert(k.to_vec(), entry.value.clone());
             });
             if c == 0 {
                 break;

@@ -176,15 +176,26 @@ const MAX_ARRAY_DEPTH: usize = 64;
 ///   well under that, so no accepted command can produce a record the log
 ///   would refuse to write.
 ///
-///   **That last point rests on an assumption this crate does not enforce:
-///   that no command carries more than two payloads.** It is the command
-///   layer's arity table that holds it up, not the codec — nothing here ties
-///   the number of bulks in an array to the number a command expects, and
-///   [`DecoderLimits::max_in_memory`] bounds only the total, which is the log
-///   record's ceiling and not the arity rule. A third bulk argument (`MSET`,
-///   `SET … EX`, a multi-key `DEL`) puts four payloads in one record and
-///   breaks the arithmetic, so whoever adds one owns re-checking it against
-///   the log's ceiling.
+///   **That last point rests on what one record can carry, which this crate
+///   does not enforce.** Nothing here ties the number of bulks in an array to
+///   what a command does with them, and [`DecoderLimits::max_in_memory`]
+///   bounds only the total, which is the log record's ceiling and not a rule
+///   about arity. What holds the arithmetic up is two properties of the layers
+///   above, and a command that breaks either one breaks it:
+///
+///   - **A command carries at most two payloads of unbounded size** — a key
+///     and a value. The options it may also carry are small literals and short
+///     numbers: `SET k v EX 30` adds `EX` and `30`, which is tens of bytes on
+///     top of the two payloads, not a third one at this ceiling.
+///   - **A record describes one key.** A shard command addresses exactly one
+///     key, because the shard that owns each key is not in general the same
+///     shard, so a request naming many (`MSET`, a multi-key `DEL`) is fanned
+///     out into one command — and so one record — per key before any of them
+///     reaches a shard. The record never holds the whole request.
+///
+///   A third unbounded payload, or a record built from a whole multi-key
+///   request, puts the arithmetic back in question, and whoever adds one owns
+///   re-checking it against the log's ceiling.
 pub const MAX_BULK_LEN: usize = 16 * 1024 * 1024;
 
 /// The largest [`Frame::Array`] element count [`parse`] accepts.

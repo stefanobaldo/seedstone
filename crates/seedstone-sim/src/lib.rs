@@ -435,6 +435,11 @@ impl Router for PlantedRouter {
             .dispatch(Command::Set {
                 key,
                 value: updated.to_string().into_bytes(),
+                // The write the honest `INCRBY` would have made: same value,
+                // same absence of options. The only thing planted here is that
+                // it is a second message.
+                expiry: None,
+                cond: None,
             })
             .await
         {
