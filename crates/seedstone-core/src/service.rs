@@ -167,6 +167,28 @@ const REPLY_SHED: usize = DecoderLimits::SHED;
 /// a bulk string on the wire is a protocol violation, not a partial write.
 const REPLY_HIGH_WATER: usize = REPLY_SHED;
 
+/// How many keyed commands one chunk of a drain may accumulate before it
+/// dispatches them.
+///
+/// A drain hands its keyed commands to the router as a batch rather than one
+/// at a time, and a drain ends only when the decoder holds no complete frame —
+/// so without a mark, one batch would grow to hold every command a full
+/// [`READ_CEILING`] of pipelined requests decodes to. The same shape of
+/// argument as [`REPLY_HIGH_WATER`], one layer earlier: that one bounds the
+/// bytes a drain holds, this one bounds the commands.
+///
+/// Three things at once, in fact. The pending-command vector, the reply vector
+/// it is answered with, and how long one batch occupies whatever runs it —
+/// [`Router::dispatch_many`] may apply a batch without yielding between
+/// commands, so the batch's length is the delay it can impose on everything
+/// else queued behind it.
+///
+/// The number sits above what a pipelining client sends in one round trip, so
+/// the ordinary burst is still a single batch, while leaving a full
+/// [`READ_CEILING`] of the smallest commands a dozen-odd batches rather than
+/// one.
+const CHUNK_COMMANDS: usize = 128;
+
 /// How much of a peer-supplied byte string an error message may quote.
 const QUOTE_LIMIT: usize = 32;
 
@@ -195,25 +217,51 @@ enum Action {
     ReplyThenClose(Frame),
 }
 
+/// One decoded request's place in a chunk.
+///
+/// A request is either answered already — a connection command, or anything
+/// the peer got wrong — or waiting on the router, in which case the slot
+/// carries where in the chunk's batch its command went. Holding both kinds in
+/// one ordered vector is what puts a batch back into request order after it
+/// comes back grouped by whoever ran it.
+enum Slot {
+    /// Answered here; this frame goes out as it stands.
+    Ready(Frame),
+    /// Answered by the router; the index is into the chunk's batch.
+    Pending(usize),
+}
+
 /// Serves one connection until the peer disconnects or sends something that
 /// can never be a valid frame.
 ///
-/// Complete frames are drained from the read buffer, mapped to commands and
-/// dispatched one at a time; the replies accumulate and are written and
-/// **flushed together when the drain ends** — the moment before this loop
-/// would park on `read`. The flush placement is not optional: a transport
-/// that buffers — a simulated one especially — would otherwise hold a reply
-/// the peer is blocked waiting for, and the deadlock only appears once the
-/// code runs under the simulator. The invariant is that this loop never
-/// waits for bytes while a reply sits unflushed; batching within one drain
-/// preserves it, because a drain only ends when the decoder has no complete
-/// frame left.
+/// Complete frames are drained from the read buffer and mapped to actions;
+/// the replies accumulate and are written and **flushed together when the
+/// drain ends** — the moment before this loop would park on `read`. The flush
+/// placement is not optional: a transport that buffers — a simulated one
+/// especially — would otherwise hold a reply the peer is blocked waiting for,
+/// and the deadlock only appears once the code runs under the simulator. The
+/// invariant is that this loop never waits for bytes while a reply sits
+/// unflushed; batching within one drain preserves it, because a drain only
+/// ends when the decoder has no complete frame left.
 ///
-/// Accumulation is bounded rather than open-ended: a drain that reaches
-/// [`REPLY_HIGH_WATER`] writes there and carries on into the same buffer, so
-/// what one connection can hold does not scale with how much its peer chose
-/// to pipeline. Writing earlier can never violate the invariant above — it
-/// only shortens the time a reply spends buffered.
+/// A drain is made of **chunks**. Within a chunk, a connection command is
+/// answered on the spot and a keyed one joins a batch, both taking a [`Slot`]
+/// in the order the peer wrote them; closing the chunk dispatches the batch
+/// with [`Router::dispatch_many`], splices each reply into its slot, and
+/// appends the lot in request order. So a keyed command is no longer awaited
+/// where it is decoded — which is the point, since a batch reaches whoever
+/// owns its keys in one message per owner instead of one per command — and
+/// request order is restored by the slots rather than by the awaiting. A chunk
+/// closes when the decoder runs dry, when the batch reaches
+/// [`CHUNK_COMMANDS`], and at `QUIT` or a protocol error.
+///
+/// Accumulation is bounded rather than open-ended, on both axes: a drain that
+/// reaches [`REPLY_HIGH_WATER`] writes there and carries on into the same
+/// buffer, and a chunk that reaches [`CHUNK_COMMANDS`] dispatches there and
+/// carries on in the same drain. What one connection can hold therefore does
+/// not scale with how much its peer chose to pipeline. Writing earlier can
+/// never violate the invariant above — it only shortens the time a reply
+/// spends buffered.
 ///
 /// A frame that is well-formed RESP but not a command this server knows —
 /// wrong arity, unknown name — is answered with an error frame and the
@@ -257,6 +305,10 @@ where
     let mut read_buf = vec![0u8; READ_FLOOR];
     let mut quiet_reads = 0u32;
     let mut out: Vec<u8> = Vec::new();
+    // The chunk under construction. Both live outside the loop so their
+    // capacity survives a chunk boundary instead of being rebuilt per drain.
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut batch: Vec<Command> = Vec::new();
 
     loop {
         // Drain every complete frame the decoder already holds before asking
@@ -266,29 +318,28 @@ where
         let mut drained = false;
         while !drained && !hang_up {
             match decoder.try_next() {
-                Ok(Some(frame)) => {
-                    match frame_to_action(frame) {
-                        Action::Dispatch(cmd) => {
-                            append_frame(&mut out, &reply_to_frame(router.dispatch(cmd).await));
-                        }
-                        Action::Reply(frame) => append_frame(&mut out, &frame),
-                        Action::ReplyThenClose(frame) => {
-                            append_frame(&mut out, &frame);
-                            hang_up = true;
+                Ok(Some(frame)) => match frame_to_action(frame) {
+                    Action::Dispatch(cmd) => {
+                        slots.push(Slot::Pending(batch.len()));
+                        batch.push(cmd);
+                        // A batch at the mark is dispatched here rather than
+                        // held until the decoder runs dry — see
+                        // [`CHUNK_COMMANDS`]. The peer sees the same frames in
+                        // the same order, so no ordering this loop guarantees
+                        // moves; only how many commands one message carries.
+                        if batch.len() >= CHUNK_COMMANDS
+                            && !emit_chunk(&mut stream, &mut out, &router, &mut slots, &mut batch)
+                                .await
+                        {
+                            return;
                         }
                     }
-                    // A drain that has already earned a write's worth of
-                    // replies takes it here rather than waiting for the
-                    // decoder to run dry — see [`REPLY_HIGH_WATER`]. The peer
-                    // sees the same bytes in the same order, only sooner, so
-                    // none of the three orderings this loop guarantees moves:
-                    // the write happens *between* two replies, never inside
-                    // one, and never while a frame is half-decoded.
-                    if out.len() >= REPLY_HIGH_WATER && !flush_replies(&mut stream, &mut out).await
-                    {
-                        return;
+                    Action::Reply(frame) => slots.push(Slot::Ready(frame)),
+                    Action::ReplyThenClose(frame) => {
+                        slots.push(Slot::Ready(frame));
+                        hang_up = true;
                     }
-                }
+                },
                 // A proper prefix of a valid frame: read more.
                 Ok(None) => drained = true,
                 Err(error) => {
@@ -297,10 +348,15 @@ where
                     // a half-read frame with no resync point. Report it and
                     // go, without draining.
                     //
-                    // The error frame is appended *behind* whatever this drain
-                    // already answered, so the peer sees the same order it
-                    // would have seen from a flush per reply: the replies it
-                    // earned, then the refusal.
+                    // The chunk closes *first*, so the error frame is appended
+                    // behind whatever this drain already earned — the same
+                    // order the peer would have seen from a flush per reply:
+                    // the replies, then the refusal. A chunk that could not be
+                    // emitted means the peer is already gone, and there is
+                    // nobody left to refuse.
+                    if !emit_chunk(&mut stream, &mut out, &router, &mut slots, &mut batch).await {
+                        return;
+                    }
                     append_frame(&mut out, &safe_error(&protocol_error(&error)));
                     flush_replies(&mut stream, &mut out).await;
                     return;
@@ -308,6 +364,13 @@ where
             }
         }
 
+        // The drain is over — either dry or hung up — so the open chunk closes
+        // before anything is written or read. `QUIT` takes this path too: its
+        // `OK` is the last slot of the last chunk, and nothing pipelined
+        // behind it was ever decoded.
+        if !emit_chunk(&mut stream, &mut out, &router, &mut slots, &mut batch).await {
+            return;
+        }
         if !flush_replies(&mut stream, &mut out).await || hang_up {
             return;
         }
@@ -385,6 +448,77 @@ fn resize_connection_buffers(
         decoder.shed_to(READ_FLOOR);
         out.shrink_to(READ_FLOOR);
     }
+}
+
+/// Closes one chunk: dispatches its batch and appends every slot's frame to
+/// `out`, in request order.
+///
+/// Returns `false` if a write failed, which means the peer is gone.
+///
+/// This is where the two orders meet. The batch is answered grouped by
+/// whoever owns the keys — [`Router::dispatch_many`] promises only that reply
+/// *i* answers command *i* — and `slots` is the record of where each of those
+/// commands sat among the requests the peer actually wrote, connection
+/// commands included. Walking the slots is therefore the only thing standing
+/// between a batched dispatch and a reordered response stream.
+///
+/// A batch shorter than its slots claim is not a corruption to propagate: a
+/// router that dropped commands leaves the extra slots answered with
+/// [`ReplyError::ShardUnavailable`], so the peer still gets one frame per
+/// request and the stream stays in step.
+///
+/// An empty chunk is not a write, and an empty batch is not a dispatch — the
+/// drain that answered only connection commands must leave the router
+/// untouched, which is a property the layer above tests directly.
+async fn emit_chunk<S, R>(
+    stream: &mut S,
+    out: &mut Vec<u8>,
+    router: &R,
+    slots: &mut Vec<Slot>,
+    batch: &mut Vec<Command>,
+) -> bool
+where
+    S: AsyncWrite + Unpin,
+    R: Router,
+{
+    if slots.is_empty() {
+        return true;
+    }
+    let mut replies: Vec<Option<Reply>> = if batch.is_empty() {
+        Vec::new()
+    } else {
+        // By value: the batch's buffer travels on into the router rather than
+        // being copied out of it. `slots` keeps its capacity across chunks;
+        // this one is handed over and regrown.
+        router
+            .dispatch_many(std::mem::take(batch))
+            .await
+            .into_iter()
+            .map(Some)
+            .collect()
+    };
+    for slot in slots.drain(..) {
+        let frame = match slot {
+            Slot::Ready(frame) => frame,
+            Slot::Pending(index) => reply_to_frame(
+                replies
+                    .get_mut(index)
+                    .and_then(Option::take)
+                    .unwrap_or(Reply::Error(ReplyError::ShardUnavailable)),
+            ),
+        };
+        append_frame(out, &frame);
+        // A chunk that has already earned a write's worth of replies takes it
+        // here rather than waiting for the drain to end — see
+        // [`REPLY_HIGH_WATER`]. The peer sees the same bytes in the same
+        // order, only sooner, so none of the orderings the drain guarantees
+        // moves: the write happens *between* two replies, never inside one,
+        // and never while a frame is half-decoded.
+        if out.len() >= REPLY_HIGH_WATER && !flush_replies(stream, out).await {
+            return false;
+        }
+    }
+    true
 }
 
 /// Encodes `frame` onto the end of `out`, which may already hold earlier
@@ -993,6 +1127,59 @@ mod tests {
         assert_eq!(frames[2], Frame::Simple("PONG".into()));
         assert_eq!(frames[3], Frame::Bulk(b"v".to_vec()));
         assert_eq!(frames[4], Frame::Bulk(b"done".to_vec()));
+    }
+
+    /// Replies come back in request order even though keyed commands scatter
+    /// across executors and connection commands never leave the connection —
+    /// the fourth ordering constraint, the one the chunked drain adds.
+    ///
+    /// The three the drain already held are about *when* a write happens. This
+    /// one is about *what order the bytes are in*, and it only became possible
+    /// to break when a drain stopped awaiting each reply where it dispatched
+    /// it: a batch answered by several executors comes back grouped by
+    /// executor, and the slots are what put it back into the order the peer
+    /// wrote.
+    #[tokio::test]
+    async fn a_pipelined_mix_is_answered_in_request_order() {
+        let pool = ShardPool::spawn(16, 4, DictSeed { k0: 3, k1: 5 }, NoTrace);
+        let (client, server) = tokio::io::duplex(1 << 20);
+        tokio::spawn(serve_connection(server, pool));
+        let (mut r, mut w) = tokio::io::split(client);
+
+        let mut out = Vec::new();
+        for i in 0..48u32 {
+            encode(
+                &req(&["SET", &format!("key:{i}"), &i.to_string()]),
+                &mut out,
+            );
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 48).await;
+        assert!(frames.iter().all(|f| *f == Frame::Simple("OK".into())));
+
+        out.clear();
+        for i in 0..48u32 {
+            encode(&req(&["GET", &format!("key:{i}")]), &mut out);
+            if i % 8 == 0 {
+                encode(&req(&["PING"]), &mut out);
+            }
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 48 + 6).await;
+        // One frame per request, in exactly the order the requests were
+        // written: each GET's bulk, with a PONG in place wherever a PING was
+        // interleaved.
+        let mut in_request_order = Vec::new();
+        for i in 0..48u32 {
+            in_request_order.push(Frame::Bulk(i.to_string().into_bytes()));
+            if i % 8 == 0 {
+                in_request_order.push(Frame::Simple("PONG".into()));
+            }
+        }
+        assert_eq!(frames, in_request_order);
     }
 
     #[tokio::test]
