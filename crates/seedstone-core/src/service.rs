@@ -755,6 +755,12 @@ fn keyed_command(upper: &[u8], name: &[u8], args: &[Vec<u8>]) -> Result<Command,
             [key, value] => Ok(Command::Set {
                 key: key.clone(),
                 value: value.clone(),
+                // The options a shard now understands are not spelled on the
+                // wire yet: this layer accepts the two-argument form only, so
+                // every `SET` it builds is an unconditional write with no
+                // deadline.
+                expiry: None,
+                cond: None,
             }),
             _ => Err(wrong_arity("set")),
         },

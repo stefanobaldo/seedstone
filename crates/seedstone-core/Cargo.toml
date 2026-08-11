@@ -12,5 +12,12 @@ tokio.workspace = true
 siphasher.workspace = true
 seedstone-resp = { path = "../seedstone-resp" }
 
+# `test-util` is what makes `tokio::time` a clock a test can hold still and
+# step by hand, which is the only way a deadline is testable without waiting
+# for one. Deliberately not a dependency: the paused clock must be unreachable
+# from a production build.
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true
