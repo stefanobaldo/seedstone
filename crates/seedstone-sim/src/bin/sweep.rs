@@ -6,8 +6,14 @@
 //! seed on that line goes straight into `replay`.
 //!
 //! ```text
-//! sweep --seeds N [--workload-seed W] [--mini] [--plant]
+//! sweep --seeds N [--workload-seed W] [--mini] [--plant] [--hashes]
 //! ```
+//!
+//! `--hashes` prints every seed's trace hash, passing or not, which is what
+//! turns a sweep into something a fresh process can be held against: the
+//! hashes are computed in one long-lived process here, and a trace that is
+//! only reproducible at the position a run happens to occupy is not
+//! reproducible at all.
 //!
 //! Exits 1 if any seed violated the lost-update invariant.
 
@@ -17,7 +23,7 @@ use std::process::ExitCode;
 #[path = "shared/args.rs"]
 mod args;
 
-const USAGE: &str = "usage: sweep --seeds N [--workload-seed W] [--mini] [--plant]";
+const USAGE: &str = "usage: sweep --seeds N [--workload-seed W] [--mini] [--plant] [--hashes]";
 
 fn main() -> ExitCode {
     let args = match args::Args::from_env() {
@@ -40,6 +46,13 @@ fn main() -> ExitCode {
     let mut violations = 0u64;
     for sim_seed in 1..=seeds {
         let outcome = run_sim(&args.config(sim_seed));
+        if args.hashes {
+            // One flat line per seed, printed whatever the outcome: a sample
+            // of these is fed back to `replay` from a fresh process, so the
+            // format is parsed by a script and must not depend on whether the
+            // seed passed.
+            println!("seed={} trace=0x{:016x}", sim_seed, outcome.trace_hash);
+        }
         if !outcome.invariant_holds() {
             violations += 1;
             // Printed as it happens rather than collected: a sweep that is
@@ -80,4 +93,23 @@ fn fail(message: &str) -> ExitCode {
     eprintln!("sweep: {message}");
     eprintln!("{USAGE}");
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    /// The usage line is the only documentation a caller gets at the moment
+    /// they need it, and a flag that exists but is not named there is a flag
+    /// nobody finds.
+    #[test]
+    fn the_usage_line_names_every_flag_sweep_accepts() {
+        for flag in [
+            "--seeds",
+            "--workload-seed",
+            "--mini",
+            "--plant",
+            "--hashes",
+        ] {
+            assert!(super::USAGE.contains(flag), "usage does not name {flag}");
+        }
+    }
 }
