@@ -29,6 +29,15 @@ pub struct Args {
     pub mini: bool,
     /// `--plant` — route `INCRBY` through the deliberately racy router.
     pub plant: bool,
+    /// `--hashes` — print every seed's trace hash, not just the failures'.
+    /// `sweep` only.
+    ///
+    /// Off by default because a passing sweep's output is meant to be read by
+    /// a person. It is turned on when the hashes are the product: a sweep's
+    /// in-process hashes only mean something once a fresh process has been
+    /// asked to reproduce them, and there is nothing to compare against
+    /// without this.
+    pub hashes: bool,
 }
 
 /// The workload seed a sweep pins when none is given.
@@ -42,15 +51,26 @@ impl Args {
     /// ignore, since silently running a different configuration than the one
     /// asked for is exactly the failure this harness exists to rule out.
     pub fn from_env() -> Result<Self, String> {
+        Self::parse(std::env::args().skip(1))
+    }
+
+    /// The parser itself, over any sequence of arguments.
+    ///
+    /// Split from [`Self::from_env`] so the flags can be tested without a
+    /// process to hang them on: a parser that is only reachable through
+    /// `std::env` is a parser that gets verified by running the binary and
+    /// reading its output.
+    pub fn parse<I: IntoIterator<Item = String>>(argv: I) -> Result<Self, String> {
         let mut parsed = Self {
             sim_seed: None,
             seeds: None,
             workload_seed: DEFAULT_WORKLOAD_SEED,
             mini: false,
             plant: false,
+            hashes: false,
         };
 
-        let mut argv = std::env::args().skip(1);
+        let mut argv = argv.into_iter();
         while let Some(arg) = argv.next() {
             match arg.as_str() {
                 "--sim-seed" => parsed.sim_seed = Some(number(&arg, argv.next())?),
@@ -58,6 +78,7 @@ impl Args {
                 "--workload-seed" => parsed.workload_seed = number(&arg, argv.next())?,
                 "--mini" => parsed.mini = true,
                 "--plant" => parsed.plant = true,
+                "--hashes" => parsed.hashes = true,
                 other => return Err(format!("unknown argument `{other}`")),
             }
         }
@@ -83,4 +104,37 @@ fn number(flag: &str, value: Option<String>) -> Result<u64, String> {
     value
         .parse()
         .map_err(|_| format!("{flag} needs a non-negative integer, got `{value}`"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Result<Args, String> {
+        Args::parse(argv.iter().map(|arg| (*arg).to_string()))
+    }
+
+    #[test]
+    fn hashes_is_off_unless_it_is_asked_for() {
+        let args = parse(&["--seeds", "10"]).expect("a plain sweep parses");
+        assert!(!args.hashes, "printing every hash is not the default");
+    }
+
+    #[test]
+    fn hashes_parses_as_a_flag_of_its_own() {
+        let args = parse(&["--seeds", "10", "--hashes"]).expect("--hashes parses");
+        assert!(args.hashes);
+        // The flag must not swallow the value of its neighbour, which is what
+        // a hand-written parser gets wrong when a boolean is added beside the
+        // options that do take one.
+        assert_eq!(args.seeds, Some(10));
+    }
+
+    /// A near-miss must not be silently ignored: the whole reason this parser
+    /// refuses unknown flags is that running a different configuration than the
+    /// one asked for is the failure the harness exists to rule out.
+    #[test]
+    fn a_misspelt_hashes_is_refused_rather_than_dropped() {
+        assert!(parse(&["--seeds", "10", "--hash"]).is_err());
+    }
 }
