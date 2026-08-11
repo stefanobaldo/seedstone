@@ -953,6 +953,91 @@ mod tests {
         }
     }
 
+    /// A router that records the size of every batch it is handed, and
+    /// otherwise is a [`ShardPool`].
+    ///
+    /// The chunk bound is a property of the connection loop, not of anything
+    /// the peer can see: two chunks and one chunk produce the same bytes in
+    /// the same order. Inferring it from writes would be reading the
+    /// transport's segmentation instead. This sits where the bound actually
+    /// applies and writes down what it saw.
+    #[derive(Clone)]
+    struct BatchSizes {
+        sizes: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+        inner: ShardPool,
+    }
+
+    impl Router for BatchSizes {
+        async fn dispatch(&self, cmd: Command) -> Reply {
+            self.inner.dispatch(cmd).await
+        }
+
+        async fn dispatch_many(&self, cmds: Vec<Command>) -> Vec<Reply> {
+            self.sizes.lock().expect("sizes mutex").push(cmds.len());
+            self.inner.dispatch_many(cmds).await
+        }
+    }
+
+    /// A drain longer than one chunk dispatches mid-drain instead of holding
+    /// every command until the decoder runs dry.
+    ///
+    /// This is [`CHUNK_COMMANDS`]' half of the accumulation bound, the
+    /// command-side twin of the byte-side one
+    /// [`a_drain_writes_before_it_accumulates_without_bound`] holds. Both
+    /// halves are asserted, not one: a drain of a full [`READ_CEILING`] of
+    /// tiny commands earns almost no reply bytes, so the byte mark would never
+    /// fire and an unbounded batch would sail past it.
+    ///
+    /// The two assertions are deliberately different in kind. *Every batch is
+    /// within the mark* is the bound itself, and it is what would fail if the
+    /// mid-drain close were deleted. *Some batch is exactly the mark* is what
+    /// says the bound was reached rather than merely respected — without it a
+    /// test whose reads happened to be small would pass while proving nothing.
+    #[tokio::test]
+    async fn a_long_pipeline_is_dispatched_in_bounded_chunks() {
+        /// Enough requests that the connection's read buffer climbs from
+        /// [`READ_FLOOR`] to [`READ_CEILING`] — the climb costs about a
+        /// ceiling's worth of bytes on its own — and then fills it, so at
+        /// least one drain carries far more than one chunk. A request below is
+        /// a little over 32 bytes on the wire.
+        const REQUESTS: usize = 4 * READ_CEILING / 32;
+
+        let sizes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = BatchSizes {
+            sizes: std::sync::Arc::clone(&sizes),
+            inner: ShardPool::spawn(16, 4, DictSeed { k0: 8, k1: 8 }, NoTrace),
+        };
+        let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
+        tokio::spawn(serve_connection(server, router));
+        let (mut r, mut w) = tokio::io::split(client);
+
+        let mut out = Vec::new();
+        for i in 0..REQUESTS {
+            encode(&req(&["SET", &format!("key:{i}"), "v"]), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, REQUESTS).await;
+        assert!(frames.iter().all(|f| *f == Frame::Simple("OK".into())));
+
+        let sizes = sizes.lock().expect("sizes mutex").clone();
+        assert_eq!(
+            sizes.iter().sum::<usize>(),
+            REQUESTS,
+            "every command must be dispatched exactly once"
+        );
+        assert!(
+            sizes.iter().all(|&size| size <= CHUNK_COMMANDS),
+            "a batch of {} commands passed the mark of {CHUNK_COMMANDS}",
+            sizes.iter().copied().max().unwrap_or(0)
+        );
+        assert!(
+            sizes.contains(&CHUNK_COMMANDS),
+            "no chunk ever closed mid-drain, so the bound was never reached"
+        );
+    }
+
     /// One drain of a pipelined batch is one flush, not one per reply.
     ///
     /// The syscall a flush becomes is per-batch work billed per command
