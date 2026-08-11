@@ -16,12 +16,31 @@
 //!
 //! # Why concurrency comes from client *hosts*
 //!
-//! Each client issues its operations strictly sequentially; what interleaves
-//! is which client's message the server sees next, and that is a property of
-//! the simulated network. Collapse the clients into one host and turmoil's
-//! seed reaches nothing — the trace becomes a pure function of the workload
-//! seed, and a sweep over `sim_seed` reads as a clean PASS while measuring
-//! nothing at all.
+//! Each client issues its operations in order and waits for a burst's replies
+//! before issuing the next; what interleaves is which client's message the
+//! server sees next, and that is a property of the simulated network. Collapse
+//! the clients into one host and turmoil's seed reaches nothing — the trace
+//! becomes a pure function of the workload seed, and a sweep over `sim_seed`
+//! reads as a clean PASS while measuring nothing at all.
+//!
+//! # Why the clients pipeline
+//!
+//! [`SimConfig::pipeline_depth`] is what puts more than one command in a
+//! server drain, and a drain with one command in it exercises no grouping and
+//! no batching at all: it decodes one command, forms a chunk of one and
+//! dispatches a batch of one, whatever the executor count. At depth 1 the
+//! completion order is the arrival order by construction, so
+//! [`SimConfig::executors`] reaches nothing the trace can see and the harness
+//! reports a clean PASS over a path production never takes under load. Depth
+//! is therefore not a workload flavour but a precondition for the executor
+//! dimension to exist.
+//!
+//! # The executor dimension
+//!
+//! [`SimConfig::executors`] is sweepable state, not an environment reading:
+//! correctness must not depend on how many executor tasks host the virtual
+//! shards, while the schedule — and so the trace — legitimately does.
+//! `tests/executor_mapping.rs` holds both halves.
 //!
 //! # The invariant
 //!
@@ -74,8 +93,10 @@ const SIM_DURATION: Duration = Duration::from_mins(10);
 /// How often the verifier client re-checks whether the workload has finished.
 const VERIFIER_POLL: Duration = Duration::from_millis(10);
 
-/// Read buffer size for a client connection. One reply at a time, so this is
-/// generous.
+/// Read buffer size for a client connection.
+///
+/// A burst's replies may well exceed this; the read loop reassembles across
+/// reads either way, so the size is a working-set choice and not a limit.
 const CLIENT_CHUNK: usize = 4096;
 
 /// The odd 64-bit constant from Fibonacci hashing, used both to decorrelate
@@ -124,6 +145,18 @@ pub struct SimConfig {
     pub counter_keys: u32,
     /// How many operations each client issues before it disconnects.
     pub ops_per_client: u32,
+    /// How many operations a client writes before reading any of their
+    /// replies.
+    ///
+    /// The lever that gives a server drain something to group. At 1 every
+    /// drain decodes one command and dispatches a batch of one, so neither the
+    /// per-executor grouping nor the chunk bound is reached and
+    /// [`SimConfig::executors`] becomes invisible to the trace — a harness
+    /// measuring nothing while passing. Kept comfortably below the drain's own
+    /// chunk bound: splitting a batch across chunks is a bound the service
+    /// layer's own tests exercise directly, and buying it here would cost a
+    /// sweep several times its wall clock for coverage that already exists.
+    pub pipeline_depth: u32,
     /// Seeds the per-client operation generators.
     pub workload_seed: u64,
     /// Seeds turmoil: the network's latencies and the order hosts run in.
@@ -144,6 +177,7 @@ impl SimConfig {
             string_keys: 4096,
             counter_keys: 64,
             ops_per_client: 25,
+            pipeline_depth: 8,
             workload_seed,
             sim_seed,
             planted: false,
@@ -161,6 +195,7 @@ impl SimConfig {
             string_keys: 512,
             counter_keys: 8,
             ops_per_client: 40,
+            pipeline_depth: 8,
             workload_seed,
             sim_seed,
             planted: false,
@@ -436,11 +471,14 @@ async fn server(
     }
 }
 
-/// One client host: connect, issue `ops_per_client` operations one at a time,
-/// disconnect.
+/// One client host: connect, issue `ops_per_client` operations in bursts of
+/// `pipeline_depth`, disconnect.
 ///
-/// Sequential on purpose — see the module documentation. The only source of
-/// interleaving is that there are many of these.
+/// Ordered on purpose — see the module documentation. A client never has two
+/// *bursts* outstanding, so what interleaves is which client's burst the
+/// server sees next; that there are many of these is the only source of
+/// interleaving between connections, and the depth is the only source of
+/// batching within one.
 async fn client(id: u16, cfg: SimConfig, shared: Shared) -> turmoil::Result {
     // Decorrelated per client so client 1's stream is not client 0's shifted
     // by one, which a plain `workload_seed + id` would give.
@@ -449,32 +487,55 @@ async fn client(id: u16, cfg: SimConfig, shared: Shared) -> turmoil::Result {
     );
     let mut conn = Conn::connect().await?;
 
-    for _ in 0..cfg.ops_per_client {
-        let roll = rng.random_range(0..100u32);
-        if roll < 20 {
-            let key = rng.random_range(0..cfg.counter_keys);
-            let delta = rng.random_range(-10..=10i64);
-            let reply = conn
-                .request(&command(&["INCRBY", &counter_key(key), &delta.to_string()]))
-                .await?;
+    // A depth of zero would issue nothing forever; one is the degenerate
+    // request/response client, which is a shape worth being able to ask for.
+    let depth = cfg.pipeline_depth.max(1);
+    let mut burst: Vec<Frame> = Vec::with_capacity(depth as usize);
+    // One entry per command in the burst, so a reply's index is its command's:
+    // `Some(delta)` for the increments the invariant tracks, `None` for
+    // everything else.
+    let mut deltas: Vec<Option<i64>> = Vec::with_capacity(depth as usize);
+
+    let mut issued = 0u32;
+    while issued < cfg.ops_per_client {
+        let this_burst = depth.min(cfg.ops_per_client - issued);
+        burst.clear();
+        deltas.clear();
+
+        // The rolls are drawn in the same order at any depth, so the workload
+        // a seed describes is the same workload however it is pipelined.
+        for _ in 0..this_burst {
+            let roll = rng.random_range(0..100u32);
+            if roll < 20 {
+                let key = rng.random_range(0..cfg.counter_keys);
+                let delta = rng.random_range(-10..=10i64);
+                burst.push(command(&["INCRBY", &counter_key(key), &delta.to_string()]));
+                deltas.push(Some(delta));
+            } else if roll < 60 {
+                let key = rng.random_range(0..cfg.string_keys);
+                burst.push(command(&["SET", &string_key(key), &format!("v{key}")]));
+                deltas.push(None);
+            } else if roll < 90 {
+                let key = rng.random_range(0..cfg.string_keys);
+                burst.push(command(&["GET", &string_key(key)]));
+                deltas.push(None);
+            } else {
+                let key = rng.random_range(0..cfg.string_keys);
+                burst.push(command(&["DEL", &string_key(key)]));
+                deltas.push(None);
+            }
+        }
+
+        for (reply, delta) in conn.request_many(&burst).await?.iter().zip(&deltas) {
             // Only an acknowledged increment is owed to us. Anything else —
             // an error frame, a reply shape we did not expect — is not a
             // promise the server made, so counting it would manufacture a
             // violation the system never committed.
-            if let Frame::Integer(_) = reply {
+            if let (Frame::Integer(_), Some(delta)) = (reply, delta) {
                 *lock(&shared.expected) += delta;
             }
-        } else if roll < 60 {
-            let key = rng.random_range(0..cfg.string_keys);
-            conn.request(&command(&["SET", &string_key(key), &format!("v{key}")]))
-                .await?;
-        } else if roll < 90 {
-            let key = rng.random_range(0..cfg.string_keys);
-            conn.request(&command(&["GET", &string_key(key)])).await?;
-        } else {
-            let key = rng.random_range(0..cfg.string_keys);
-            conn.request(&command(&["DEL", &string_key(key)])).await?;
         }
+        issued += this_burst;
     }
 
     *lock(&shared.done) += 1;
@@ -550,22 +611,39 @@ impl Conn {
     }
 
     /// Sends one command and reads exactly one reply.
+    async fn request(&mut self, frame: &Frame) -> turmoil::Result<Frame> {
+        let mut replies = self.request_many(std::slice::from_ref(frame)).await?;
+        replies
+            .pop()
+            .ok_or_else(|| "one request was answered with nothing".into())
+    }
+
+    /// Sends a burst of commands in one write and reads exactly that many
+    /// replies, in request order.
+    ///
+    /// Written as one buffer rather than one write per command: a burst
+    /// delivered as several messages would let the server drain each alone,
+    /// which is the depth-1 shape again under a different name.
     ///
     /// `flush` after `write_all` even though turmoil's socket sends on write:
     /// a transport that buffers would otherwise hold a request the client is
     /// blocked waiting on, and that deadlock would only appear under whatever
     /// transport we ported to next.
-    async fn request(&mut self, frame: &Frame) -> turmoil::Result<Frame> {
+    async fn request_many(&mut self, frames: &[Frame]) -> turmoil::Result<Vec<Frame>> {
         self.out.clear();
-        encode(frame, &mut self.out);
+        for frame in frames {
+            encode(frame, &mut self.out);
+        }
         self.stream.write_all(&self.out).await?;
         self.stream.flush().await?;
 
+        let mut replies = Vec::with_capacity(frames.len());
         let mut chunk = [0u8; CLIENT_CHUNK];
-        loop {
+        while replies.len() < frames.len() {
             if let Some((reply, used)) = parse(&self.buf)? {
                 self.buf.drain(..used);
-                return Ok(reply);
+                replies.push(reply);
+                continue;
             }
             let got = self.stream.read(&mut chunk).await?;
             if got == 0 {
@@ -573,6 +651,7 @@ impl Conn {
             }
             self.buf.extend_from_slice(&chunk[..got]);
         }
+        Ok(replies)
     }
 }
 
@@ -616,7 +695,7 @@ mod tests {
         // was intended. When it was (a new command kind, a new folded field),
         // update the constant in the same commit that caused it, and say so in
         // the message. Never update it to make a red suite green.
-        const MINI_1_42: u64 = 0x2bbb_5d5f_3268_c6c6;
+        const MINI_1_42: u64 = 0xc221_2b92_ae7a_4378;
 
         let outcome = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(
