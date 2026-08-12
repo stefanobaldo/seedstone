@@ -449,6 +449,16 @@ impl Dict {
     ///   [`may_hold_deadlines`](Dict::may_hold_deadlines) — it is what keeps
     ///   this off the tick of the shards, nearly all of them, that have no
     ///   expiries to reclaim.
+    /// - **The report is a snapshot, and it stops being true the moment the
+    ///   dict is written to.** Each key named was due at `now`; an insert
+    ///   under that same key afterwards replaces the entry with a live one,
+    ///   and removing it on the strength of this list would then destroy data
+    ///   no deadline had reached. Removals do not carry that hazard — one
+    ///   cannot resurrect another key — which is why the sweep may work
+    ///   through the list a removal at a time. A caller that writes anything
+    ///   else in between must re-check. The borrow does not enforce this: the
+    ///   keys come back owned and outlive the `&self` that produced them, so
+    ///   it is a contract rather than a lifetime.
     ///
     /// A key is expired once `now` has *reached* its deadline, which is the
     /// same instant the lazy path uses: the two halves must not disagree about
