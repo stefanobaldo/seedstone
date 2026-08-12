@@ -63,7 +63,7 @@
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use seedstone_core::dict::DictSeed;
-use seedstone_core::service::serve_connection;
+use seedstone_core::service::{NodeInfo, serve_connection};
 // The two error texts are imported, not copied. The planted router has to be
 // indistinguishable from the honest one except in its atomicity, and these
 // strings enter the trace hash — a private copy that drifted would make a
@@ -464,14 +464,22 @@ async fn server(
 ) -> turmoil::Result {
     let pool = ShardPool::spawn(shards, executors, seed, sink);
     let listener = turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await?;
+    // One per host, as it is in production: it describes the node, not the
+    // connection. No workload here asks a host about itself, so nothing reads
+    // it — it is here because the connection code takes one.
+    let node = NodeInfo::for_tests();
     loop {
         let (stream, _peer) = listener.accept().await?;
         // The choice is per connection only because that is where the router
         // is handed over; it is the same choice every time.
         if planted {
-            tokio::spawn(serve_connection(stream, PlantedRouter(pool.clone())));
+            tokio::spawn(serve_connection(
+                stream,
+                PlantedRouter(pool.clone()),
+                node.clone(),
+            ));
         } else {
-            tokio::spawn(serve_connection(stream, pool.clone()));
+            tokio::spawn(serve_connection(stream, pool.clone(), node.clone()));
         }
     }
 }

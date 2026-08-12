@@ -9,9 +9,10 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use seedstone_core::dict::DictSeed;
-use seedstone_core::service::serve_connection;
+use seedstone_core::service::{NodeInfo, serve_connection};
 use seedstone_core::shard::{NoTrace, ShardPool};
 use seedstone_resp::{Frame, encode};
 use tokio::io::AsyncWriteExt;
@@ -186,6 +187,16 @@ impl Server {
     /// runtime does.
     pub async fn run(self) {
         let clients = Arc::new(Semaphore::new(self.max_clients));
+        // Assembled once, here, because this is the only place that knows any
+        // of it: the port the kernel actually gave out, the moment the node
+        // began serving, and the count this loop is about to start
+        // maintaining. Every connection gets a clone.
+        let node = NodeInfo {
+            version: env!("CARGO_PKG_VERSION"),
+            tcp_port: self.local_addr.port(),
+            started: tokio::time::Instant::now(),
+            connected: Arc::new(AtomicU64::new(0)),
+        };
         loop {
             tokio::select! {
                 // `biased` for the reason the shard loop states: unbiased arm
@@ -205,8 +216,12 @@ impl Server {
                     match Arc::clone(&clients).try_acquire_owned() {
                         Ok(permit) => {
                             let router = self.pool.clone();
+                            let node = node.clone();
                             tokio::spawn(async move {
-                                serve_connection(stream, router).await;
+                                // Held for exactly as long as the connection
+                                // is, the same way the permit beside it is.
+                                let _attached = Attached::count(&node.connected);
+                                serve_connection(stream, router, node).await;
                                 drop(permit);
                             });
                         }
@@ -215,6 +230,31 @@ impl Server {
                 }
             }
         }
+    }
+}
+
+/// Counts one attached connection for as long as it is held.
+///
+/// A guard rather than a decrement written after the `await`, and for the same
+/// reason the semaphore permit next to it is one: a connection ends by `QUIT`,
+/// by a protocol error, by the peer vanishing, by the transport failing, or by
+/// the task being dropped underneath it, and a line placed after the call is
+/// only reached on the subset of those that return. `connected_clients` is a
+/// gauge, so an increment that is not always paired does not lose a sample —
+/// it makes every later reading wrong, for the lifetime of the process.
+struct Attached(Arc<AtomicU64>);
+
+impl Attached {
+    /// Counts a connection, and keeps counting it until the guard is dropped.
+    fn count(connected: &Arc<AtomicU64>) -> Self {
+        connected.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(connected))
+    }
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

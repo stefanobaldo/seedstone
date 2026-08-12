@@ -10,10 +10,14 @@
 //! It is the only place where bytes a peer chose become something the rest of
 //! the system acts on, so it owns the limits:
 //!
-//! - **Where a command is answered.** A command about the connection itself —
-//!   `PING`, `ECHO`, `QUIT`, `HELLO` — has no key, so there is no shard it
-//!   could belong to; it is answered here and no shard hears of it. Only keyed
-//!   commands become messages. [`Action`] is that decision made explicit.
+//! - **Where a command is answered.** A command about the connection itself or
+//!   about the node behind it — `PING`, `ECHO`, `QUIT`, `HELLO`, `INFO`,
+//!   `COMMAND`, `CLIENT` — has no key, so there is no shard it could belong
+//!   to; it is answered here and no shard hears of it. Only keyed commands
+//!   become messages. [`Action`] is that decision made explicit. What those
+//!   answers need to know about the process they run in arrives as
+//!   [`NodeInfo`], because this layer has no clock, no port and no way to
+//!   count its peers of its own.
 //!
 //! - **Bounded buffering.** [`MAX_REQUEST_BYTES`] caps what one connection can
 //!   make the server hold, on top of the per-frame ceilings the codec
@@ -33,7 +37,10 @@
 use crate::shard::{Command, Cond, Expiry, Reply, ReplyError, Router, parse_i64};
 use seedstone_resp::{Decoder, DecoderLimits, Frame, ParseError, encode};
 use std::mem::take;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::Instant;
 
 /// How many bytes one connection may hold while a frame is still incomplete.
 ///
@@ -227,6 +234,63 @@ const MAX_EXPIRE_SECONDS: i64 = i64::MAX / 1000;
 /// What this server answers `HELLO` with, and what it calls itself.
 const SERVER_NAME: &str = "seedstone";
 
+/// The deployment shape this node is in, as `HELLO` and `INFO` both report it.
+///
+/// One constant for the two answers rather than a literal in each: a node that
+/// told `HELLO` one thing and `INFO` another would be a node whose clients
+/// disagree about what they are connected to, and that is exactly the kind of
+/// drift a second literal invites.
+const SERVER_MODE: &str = "standalone";
+
+/// What a connection may say about the node it is running on.
+///
+/// Every field is a fact about the process, not about the connection, so this
+/// is assembled once where the process is — the composition root — and cloned
+/// per connection. It is a parameter rather than something this layer reads for
+/// itself because none of it is knowable here: the port is the one the kernel
+/// chose, the start is a reading of a clock, and the peer count is maintained
+/// by the accept loop. Passing them in is what keeps the connection layer a
+/// pure function of its inputs, and therefore replayable.
+#[derive(Clone, Debug)]
+pub struct NodeInfo {
+    /// The version this node reports.
+    pub version: &'static str,
+    /// The port the listener actually bound, which with an ephemeral port is
+    /// not the port the configuration asked for.
+    pub tcp_port: u16,
+    /// When the node started, on the monotonic clock.
+    ///
+    /// A [`tokio::time::Instant`] and never a `SystemTime`: uptime is a span,
+    /// and a span measured against a clock an operator can step backwards is
+    /// not a span. It is also the clock the simulator controls, so a replay
+    /// reports the uptime the run had rather than the one the wall had.
+    pub started: Instant,
+    /// How many connections are attached right now.
+    ///
+    /// Shared with whoever accepts connections, which is the only party that
+    /// can maintain it; this layer only ever reads it.
+    pub connected: Arc<AtomicU64>,
+}
+
+impl NodeInfo {
+    /// A node description for callers that have no node to describe: the tests
+    /// here, and the simulator.
+    ///
+    /// The port is Redis's default, so that the value is recognisable rather
+    /// than arbitrary. The count starts at zero and stays there: maintaining it
+    /// belongs to whoever accepts connections, and neither caller has a
+    /// workload that asks.
+    #[must_use]
+    pub fn for_tests() -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION"),
+            tcp_port: 6379,
+            started: Instant::now(),
+            connected: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
 /// What to do with one request frame.
 ///
 /// The distinction the type draws is where a command is answered.
@@ -305,12 +369,12 @@ enum Slot {
 /// `QUIT` is the third case: the reply is written and flushed, and then this
 /// returns. Anything the peer pipelined behind it is deliberately not read —
 /// it asked to leave.
-pub async fn serve_connection<S, R>(stream: S, router: R)
+pub async fn serve_connection<S, R>(stream: S, router: R, node: NodeInfo)
 where
     S: AsyncRead + AsyncWrite + Unpin,
     R: Router,
 {
-    serve_connection_limited(stream, router, MAX_REQUEST_BYTES).await;
+    serve_connection_limited(stream, router, node, MAX_REQUEST_BYTES).await;
 }
 
 /// [`serve_connection`] with the accumulation ceiling as a parameter.
@@ -321,8 +385,12 @@ where
 /// identically — so a test on the real constant would be the slowest thing in
 /// the suite by a wide margin, and this layer's stated primary defence would
 /// go on having no coverage at all.
-async fn serve_connection_limited<S, R>(mut stream: S, router: R, max_request_bytes: usize)
-where
+async fn serve_connection_limited<S, R>(
+    mut stream: S,
+    router: R,
+    node: NodeInfo,
+    max_request_bytes: usize,
+) where
     S: AsyncRead + AsyncWrite + Unpin,
     R: Router,
 {
@@ -350,7 +418,7 @@ where
         let mut drained = false;
         while !drained && !hang_up {
             match decoder.try_next() {
-                Ok(Some(frame)) => match frame_to_action(frame) {
+                Ok(Some(frame)) => match frame_to_action(frame, &node) {
                     Action::Dispatch(cmd) => {
                         slots.push(Slot::Pending(batch.len()));
                         batch.push(cmd);
@@ -710,12 +778,117 @@ fn quote(bytes: &[u8]) -> String {
 /// Every failure below is answered and survived: a frame that is well-formed
 /// RESP but not a command this server can run is the peer's mistake, not a
 /// reason to desynchronise the stream.
-fn frame_to_action(frame: Frame) -> Action {
-    match action_for(frame) {
+fn frame_to_action(frame: Frame, node: &NodeInfo) -> Action {
+    match action_for(frame, node) {
         Ok(action) => action,
         Err(message) => Action::Reply(safe_error(&message)),
     }
 }
+
+/// What a command does with the arguments that follow its name.
+///
+/// One signature for every entry of [`COMMANDS`], whether or not a particular
+/// command has any use for the node it is handed. The uniformity is the point:
+/// it is what lets the surface be a table rather than a match, and the table is
+/// what keeps `COMMAND COUNT` from drifting away from it.
+type Handler = fn(&mut [Vec<u8>], &NodeInfo) -> Result<Action, String>;
+
+/// Every command name this server accepts, and what each one does about its
+/// arguments.
+///
+/// The single source of truth for the command surface. A name is dispatched by
+/// being found here and `COMMAND COUNT` answers with how many entries there
+/// are, so the number a client is told is exactly the number of commands the
+/// server will run. A literal kept alongside the table could disagree with it;
+/// a length cannot.
+///
+/// Ordered by the traffic a command carries rather than alphabetically. The
+/// lookup is a scan and it is on the path every request takes, so the keyed
+/// commands — which are effectively all of the traffic — come first, and the
+/// ones a connection sends once or never come last.
+///
+/// `args` is emptied as it is matched: see [`action_for`].
+const COMMANDS: &[(&[u8], Handler)] = &[
+    (b"GET", |args, _| match args {
+        [key] => Ok(Action::Dispatch(Command::Get { key: take(key) })),
+        _ => Err(wrong_arity("get")),
+    }),
+    (b"SET", |args, _| match args {
+        [key, value, options @ ..] => {
+            // Parsed before the key and the value are taken, so a refused
+            // option leaves nothing half-consumed.
+            let (expiry, cond) = set_options(options)?;
+            Ok(Action::Dispatch(Command::Set {
+                key: take(key),
+                value: take(value),
+                expiry,
+                cond,
+            }))
+        }
+        _ => Err(wrong_arity("set")),
+    }),
+    (b"DEL", |args, _| {
+        per_key(args, "del", |key| Command::Del { key })
+    }),
+    (b"EXISTS", |args, _| {
+        per_key(args, "exists", |key| Command::Exists { key })
+    }),
+    (b"EXPIRE", |args, _| match args {
+        [key, seconds] => {
+            let seconds = expire_seconds(seconds)?;
+            Ok(Action::Dispatch(Command::Expire {
+                key: take(key),
+                seconds,
+            }))
+        }
+        _ => Err(wrong_arity("expire")),
+    }),
+    (b"TTL", |args, _| match args {
+        [key] => Ok(Action::Dispatch(Command::Ttl { key: take(key) })),
+        _ => Err(wrong_arity("ttl")),
+    }),
+    (b"INCRBY", |args, _| match args {
+        [key, delta] => {
+            let delta =
+                parse_i64(delta).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
+            Ok(Action::Dispatch(Command::IncrBy {
+                key: take(key),
+                delta,
+            }))
+        }
+        _ => Err(wrong_arity("incrby")),
+    }),
+    // From here down: the connection's own business, answered without a shard
+    // ever hearing of it, because there is no key to route on.
+    (b"PING", |args, _| match args {
+        [] => Ok(Action::Reply(Frame::Simple("PONG".into()))),
+        [message] => Ok(Action::Reply(Frame::Bulk(take(message)))),
+        _ => Err(wrong_arity("ping")),
+    }),
+    (b"ECHO", |args, _| match args {
+        [message] => Ok(Action::Reply(Frame::Bulk(take(message)))),
+        _ => Err(wrong_arity("echo")),
+    }),
+    (b"HELLO", |args, node| hello(args, node)),
+    (b"INFO", |args, node| {
+        Ok(Action::Reply(Frame::Bulk(info(node, args).into_bytes())))
+    }),
+    (b"COMMAND", |args, _| match args {
+        // Redis answers with a description of every command it has. This one
+        // has nothing to describe, and an empty array is a client with no
+        // hints rather than a client that failed to connect.
+        [] => Ok(Action::Reply(Frame::Array(Vec::new()))),
+        [sub, rest @ ..] => command(sub, rest),
+    }),
+    (b"CLIENT", |args, _| match args {
+        [] => Err(wrong_arity("client")),
+        [sub, rest @ ..] => client(sub, rest),
+    }),
+    (b"QUIT", |args, _| match args {
+        [] => Ok(Action::ReplyThenClose(Frame::Simple("OK".into()))),
+        _ => Err(wrong_arity("quit")),
+    }),
+];
 
 /// [`frame_to_action`]'s body, with the error path expressed as `Err`.
 ///
@@ -726,7 +899,7 @@ fn frame_to_action(frame: Frame) -> Action {
 /// reply is *moved* out of the array the codec built. What is left behind is an
 /// empty `Vec` that dies with the array, and the alternative is a second copy
 /// of every value the peer wrote, on the path every write takes.
-fn action_for(frame: Frame) -> Result<Action, String> {
+fn action_for(frame: Frame, node: &NodeInfo) -> Result<Action, String> {
     let Frame::Array(parts) = frame else {
         return Err("ERR Protocol error: expected an array of bulk strings".into());
     };
@@ -749,33 +922,125 @@ fn action_for(frame: Frame) -> Result<Action, String> {
     // ASCII-uppercase only, which is what the command names are.
     let upper: Vec<u8> = name.to_ascii_uppercase();
 
-    // The connection's own commands, answered without a shard hearing of
-    // them: they are about this socket, and there is no key to route on.
-    match upper.as_slice() {
-        b"PING" => {
-            return match args {
-                [] => Ok(Action::Reply(Frame::Simple("PONG".into()))),
-                [message] => Ok(Action::Reply(Frame::Bulk(take(message)))),
-                _ => Err(wrong_arity("ping")),
-            };
-        }
-        b"ECHO" => {
-            return match args {
-                [message] => Ok(Action::Reply(Frame::Bulk(take(message)))),
-                _ => Err(wrong_arity("echo")),
-            };
-        }
-        b"QUIT" => {
-            return match args {
-                [] => Ok(Action::ReplyThenClose(Frame::Simple("OK".into()))),
-                _ => Err(wrong_arity("quit")),
-            };
-        }
-        b"HELLO" => return hello(args),
-        _ => {}
-    }
+    let Some((_, handler)) = COMMANDS
+        .iter()
+        .find(|(known, _)| *known == upper.as_slice())
+    else {
+        // The name is peer-supplied. It is quoted, not echoed.
+        return Err(format!("ERR unknown command '{}'", quote(name)));
+    };
+    handler(args, node)
+}
 
-    keyed_action(&upper, name, args)
+/// Answers `COMMAND` and the subcommands a client sends before it sends
+/// anything a user asked for.
+///
+/// `COMMAND DOCS` is what redis-cli sends the moment it connects, and it reads
+/// the reply before it prints a prompt — so an error there is not an
+/// unfriendly message, it is a session that never starts. Answering with
+/// nothing costs the user their command hints and nothing else.
+fn command(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
+    if sub.eq_ignore_ascii_case(b"COUNT") {
+        if !rest.is_empty() {
+            return Err(wrong_arity("command|count"));
+        }
+        // The table's length, so the count cannot disagree with what dispatch
+        // accepts. See [`COMMANDS`].
+        let count = i64::try_from(COMMANDS.len())
+            .expect("the command surface is a handful of entries, written out in one table");
+        return Ok(Action::Reply(Frame::Integer(count)));
+    }
+    if sub.eq_ignore_ascii_case(b"DOCS") {
+        // Redis takes command names here and describes those. With nothing to
+        // say about any of them, the answer is the same either way.
+        return Ok(Action::Reply(Frame::Array(Vec::new())));
+    }
+    Err(unknown_subcommand("COMMAND", sub))
+}
+
+/// Answers the `CLIENT` subcommands a client sends about itself on connect.
+///
+/// Both are taken and dropped. They name a connection this server has nowhere
+/// to show the name of — there is no `CLIENT LIST` here to show it in — but
+/// go-redis and redis-py both send `SETINFO` as part of establishing a
+/// connection and treat a refusal as a failed one, so the stub answers `OK`
+/// rather than being honest about doing nothing with it.
+fn client(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
+    let (name, arity) = if sub.eq_ignore_ascii_case(b"SETNAME") {
+        ("client|setname", 1)
+    } else if sub.eq_ignore_ascii_case(b"SETINFO") {
+        ("client|setinfo", 2)
+    } else {
+        return Err(unknown_subcommand("CLIENT", sub));
+    };
+    if rest.len() == arity {
+        Ok(Action::Reply(Frame::Simple("OK".into())))
+    } else {
+        Err(wrong_arity(name))
+    }
+}
+
+/// The unknown-subcommand message, byte-exact to Redis down to the full stop
+/// and the pointer at the help text clients print back to their users.
+///
+/// `container` is the containing command's own name, a literal from
+/// [`COMMANDS`]; the subcommand is peer-supplied, so it is quoted rather than
+/// echoed.
+fn unknown_subcommand(container: &str, sub: &[u8]) -> String {
+    format!(
+        "ERR unknown subcommand '{}'. Try {container} HELP.",
+        quote(sub)
+    )
+}
+
+/// Renders the `INFO` sections a peer asked for, or all of them if it named
+/// none.
+///
+/// A section name nobody recognises contributes nothing rather than being an
+/// error — `INFO nosuch` is an empty bulk, which is how Redis answers one and
+/// leaves the client to notice that the field it wanted is absent.
+///
+/// **The field names are Redis's own, `redis_` prefix and all.** `INFO`'s
+/// contract is its field names: everything that reads this output looks up
+/// `redis_version` or `redis_mode` by that exact spelling, so renaming them
+/// after this server would produce a document that is honest and unreadable.
+/// What the server calls itself is `HELLO`'s answer, which has a field for it.
+///
+/// Only what this node can state truthfully is printed. A field invented to
+/// fill out the section is a number some dashboard will plot.
+fn info(node: &NodeInfo, wanted: &[Vec<u8>]) -> String {
+    use std::fmt::Write as _;
+
+    let asked_for = |section: &[u8]| {
+        wanted.is_empty() || wanted.iter().any(|name| name.eq_ignore_ascii_case(section))
+    };
+    // Writing into a `String` cannot fail, so discarding the results is the
+    // whole of what there is to do with them.
+    let mut text = String::new();
+    if asked_for(b"server") {
+        let _ = write!(
+            text,
+            "# Server\r\n\
+             redis_version:{}\r\n\
+             redis_mode:{SERVER_MODE}\r\n\
+             tcp_port:{}\r\n\
+             uptime_in_seconds:{}\r\n\r\n",
+            node.version,
+            node.tcp_port,
+            // Whole seconds on the monotonic clock, and saturating at zero:
+            // subtracting instants this way cannot go negative however the
+            // clock behaved.
+            node.started.elapsed().as_secs(),
+        );
+    }
+    if asked_for(b"clients") {
+        let _ = write!(
+            text,
+            "# Clients\r\nconnected_clients:{}\r\n\r\n",
+            node.connected.load(Ordering::Relaxed),
+        );
+    }
+    text
 }
 
 /// Answers `HELLO`, which is how a client asks what it is talking to.
@@ -783,7 +1048,7 @@ fn action_for(frame: Frame) -> Result<Action, String> {
 /// This server speaks RESP2 and only RESP2, so the version argument has
 /// exactly one accepted value. The refusal for every other one is
 /// [`NOPROTO`] — see that constant for why the exact text is a contract.
-fn hello(args: &[Vec<u8>]) -> Result<Action, String> {
+fn hello(args: &[Vec<u8>], node: &NodeInfo) -> Result<Action, String> {
     let version = match args {
         [] => 2,
         [version, rest @ ..] => {
@@ -802,7 +1067,7 @@ fn hello(args: &[Vec<u8>]) -> Result<Action, String> {
         }
     };
     if version == 2 {
-        Ok(Action::Reply(hello_frame()))
+        Ok(Action::Reply(hello_frame(node)))
     } else {
         Err(NOPROTO.to_owned())
     }
@@ -810,78 +1075,23 @@ fn hello(args: &[Vec<u8>]) -> Result<Action, String> {
 
 /// The `HELLO` reply: a flat array of key-value pairs, which is how RESP2
 /// carries a map.
-fn hello_frame() -> Frame {
+///
+/// The version and the mode are read from the node rather than written out
+/// here, so that a client asking `HELLO` and a client reading `INFO` are told
+/// the same two things by construction.
+fn hello_frame(node: &NodeInfo) -> Frame {
     Frame::Array(vec![
         Frame::Bulk(b"server".to_vec()),
         Frame::Bulk(SERVER_NAME.as_bytes().to_vec()),
         Frame::Bulk(b"version".to_vec()),
-        Frame::Bulk(env!("CARGO_PKG_VERSION").as_bytes().to_vec()),
+        Frame::Bulk(node.version.as_bytes().to_vec()),
         Frame::Bulk(b"proto".to_vec()),
         Frame::Integer(2),
         Frame::Bulk(b"mode".to_vec()),
-        Frame::Bulk(b"standalone".to_vec()),
+        Frame::Bulk(SERVER_MODE.as_bytes().to_vec()),
         Frame::Bulk(b"role".to_vec()),
         Frame::Bulk(b"master".to_vec()),
     ])
-}
-
-/// Maps a keyed command to what should happen because of it: one [`Command`]
-/// for the shard that owns its key, or — for the two commands that take a list
-/// of keys — the fan-out of one command per key.
-///
-/// `upper` is the uppercased name matched on; `name` is the original bytes,
-/// kept only so an unknown command can be quoted back as the peer spelled it.
-/// `args` is emptied as it is matched: see [`action_for`].
-fn keyed_action(upper: &[u8], name: &[u8], args: &mut [Vec<u8>]) -> Result<Action, String> {
-    match upper {
-        b"GET" => match args {
-            [key] => Ok(Action::Dispatch(Command::Get { key: take(key) })),
-            _ => Err(wrong_arity("get")),
-        },
-        b"SET" => match args {
-            [key, value, options @ ..] => {
-                // Parsed before the key and the value are taken, so a refused
-                // option leaves nothing half-consumed.
-                let (expiry, cond) = set_options(options)?;
-                Ok(Action::Dispatch(Command::Set {
-                    key: take(key),
-                    value: take(value),
-                    expiry,
-                    cond,
-                }))
-            }
-            _ => Err(wrong_arity("set")),
-        },
-        b"DEL" => per_key(args, "del", |key| Command::Del { key }),
-        b"EXISTS" => per_key(args, "exists", |key| Command::Exists { key }),
-        b"EXPIRE" => match args {
-            [key, seconds] => {
-                let seconds = expire_seconds(seconds)?;
-                Ok(Action::Dispatch(Command::Expire {
-                    key: take(key),
-                    seconds,
-                }))
-            }
-            _ => Err(wrong_arity("expire")),
-        },
-        b"TTL" => match args {
-            [key] => Ok(Action::Dispatch(Command::Ttl { key: take(key) })),
-            _ => Err(wrong_arity("ttl")),
-        },
-        b"INCRBY" => match args {
-            [key, delta] => {
-                let delta = parse_i64(delta)
-                    .ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
-                Ok(Action::Dispatch(Command::IncrBy {
-                    key: take(key),
-                    delta,
-                }))
-            }
-            _ => Err(wrong_arity("incrby")),
-        },
-        // The name is peer-supplied. It is quoted, not echoed.
-        _ => Err(format!("ERR unknown command '{}'", quote(name))),
-    }
 }
 
 /// Builds the action for a command that names one key or many.
@@ -1034,7 +1244,7 @@ mod tests {
     async fn serves_resp_over_a_duplex_stream() {
         let pool = ShardPool::spawn(16, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(4096);
-        tokio::spawn(serve_connection(server, pool));
+        tokio::spawn(serve_connection(server, pool, NodeInfo::for_tests()));
         let (mut r, mut w) = tokio::io::split(client);
         let mut out = Vec::new();
         encode(&req(&["SET", "k", "v"]), &mut out);
@@ -1344,7 +1554,11 @@ mod tests {
     #[tokio::test]
     async fn connection_commands_never_reach_the_router() {
         let (client, server) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(serve_connection(server, UnreachableRouter));
+        tokio::spawn(serve_connection(
+            server,
+            UnreachableRouter,
+            NodeInfo::for_tests(),
+        ));
         let (mut r, mut w) = tokio::io::split(client);
 
         let mut out = Vec::new();
@@ -1358,6 +1572,8 @@ mod tests {
             &["HELLO"],
             &["HELLO", "2"],
             &["HELLO", "3"],
+            &["HELLO", "notanumber"],
+            &["HELLO", "2", "AUTH", "user", "pass"],
             // Last: it closes the connection.
             &["QUIT"],
         ] {
@@ -1366,7 +1582,7 @@ mod tests {
         w.write_all(&out).await.unwrap();
         w.flush().await.unwrap();
 
-        let frames = read_frames(&mut r, 10).await;
+        let frames = read_frames(&mut r, 12).await;
         assert_eq!(frames[0], Frame::Simple("PONG".into()));
         assert_eq!(frames[1], Frame::Simple("PONG".into()), "case-insensitive");
         assert_eq!(frames[2], Frame::Bulk(b"hi".to_vec()));
@@ -1375,8 +1591,19 @@ mod tests {
         assert!(matches!(&frames[5], Frame::Error(e) if e.contains("wrong number of arguments")));
         assert_eq!(frames[6], frames[7], "HELLO and HELLO 2 answer the same");
         assert_eq!(frames[8], Frame::Error(NOPROTO.into()));
+        // The other two `HELLO` refusals are contracts with real clients in the
+        // same way `NOPROTO` is, so they are written out rather than matched on
+        // loosely.
         assert_eq!(
             frames[9],
+            Frame::Error("ERR Protocol version is not an integer or out of range".into())
+        );
+        assert_eq!(
+            frames[10],
+            Frame::Error("ERR Syntax error in HELLO option 'AUTH'".into())
+        );
+        assert_eq!(
+            frames[11],
             Frame::Simple("OK".into()),
             "QUIT is acknowledged"
         );
@@ -1491,7 +1718,7 @@ mod tests {
             inner: ShardPool::spawn(16, 4, DictSeed { k0: 8, k1: 8 }, NoTrace),
         };
         let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
-        tokio::spawn(serve_connection(server, router));
+        tokio::spawn(serve_connection(server, router, NodeInfo::for_tests()));
         let (mut r, mut w) = tokio::io::split(client);
 
         let mut out = Vec::new();
@@ -1542,7 +1769,11 @@ mod tests {
         // unreached — a reply that took the shard round trip would let the
         // drain end early and flush more than once for reasons unrelated to
         // the placement under test.
-        tokio::spawn(serve_connection(transport, UnreachableRouter));
+        tokio::spawn(serve_connection(
+            transport,
+            UnreachableRouter,
+            NodeInfo::for_tests(),
+        ));
 
         let mut batch = Vec::new();
         for _ in 0..64 {
@@ -1592,7 +1823,7 @@ mod tests {
             flushes: std::sync::Arc::clone(&flushes),
             max_write: std::sync::Arc::clone(&max_write),
         };
-        tokio::spawn(serve_connection(transport, pool));
+        tokio::spawn(serve_connection(transport, pool, NodeInfo::for_tests()));
         let (mut r, mut w) = tokio::io::split(client);
 
         let value = "v".repeat(VALUE);
@@ -1671,6 +1902,201 @@ mod tests {
         );
     }
 
+    /// `INFO` is the first thing an operator asks a server, and the sections
+    /// it names are what tooling reads. Only the fields this node can answer
+    /// truthfully are printed; a section nobody has is an empty bulk rather
+    /// than an error, exactly as Redis answers one.
+    #[tokio::test]
+    async fn info_prints_the_minimal_sections() {
+        let (mut r, mut w, _pool) = connected(4);
+        let mut out = Vec::new();
+        let requests: [&[&str]; 5] = [
+            &["INFO"],
+            &["INFO", "server"],
+            // Section names are case-insensitive, as Redis takes them.
+            &["INFO", "CLIENTS"],
+            // Several at once, answered in the server's own order rather than
+            // the order they were asked in — again as Redis answers them.
+            &["INFO", "clients", "server"],
+            &["INFO", "nosuch"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        let everything = bulk_text(&frames[0]);
+        for field in [
+            "# Server",
+            "version:",
+            "mode:standalone",
+            "tcp_port:",
+            "uptime_in_seconds:",
+            "# Clients",
+            "connected_clients:",
+        ] {
+            assert!(
+                everything.contains(field),
+                "INFO printed no {field}: {everything:?}"
+            );
+        }
+
+        let server = bulk_text(&frames[1]);
+        assert!(server.contains("# Server"), "{server:?}");
+        assert!(
+            !server.contains("# Clients"),
+            "INFO server printed a section nobody asked for: {server:?}"
+        );
+
+        let clients = bulk_text(&frames[2]);
+        assert!(clients.contains("# Clients"), "{clients:?}");
+        assert!(
+            !clients.contains("# Server"),
+            "INFO CLIENTS printed a section nobody asked for: {clients:?}"
+        );
+
+        let both = bulk_text(&frames[3]);
+        assert_eq!(
+            both.find("# Server")
+                .map(|at| at < both.find("# Clients").unwrap()),
+            Some(true),
+            "two named sections must come back, in the server's order: {both:?}"
+        );
+
+        assert_eq!(
+            frames[4],
+            Frame::Bulk(Vec::new()),
+            "an unknown section is an empty bulk, not an error"
+        );
+    }
+
+    /// `COMMAND` and its subcommands, which a client sends before it sends
+    /// anything the user asked for.
+    ///
+    /// redis-cli opens every session with `COMMAND DOCS`. Answering it with an
+    /// error would not merely be unfriendly — the reply is read before the
+    /// prompt appears, so a session that cannot survive it never starts. Each
+    /// one is followed by a keyed command here for that reason: the point is
+    /// that the connection is still usable afterwards.
+    #[tokio::test]
+    async fn command_subcommands_answer_without_breaking_the_session() {
+        let (mut r, mut w, _pool) = connected(4);
+        let mut out = Vec::new();
+        let requests: [&[&str]; 8] = [
+            &["COMMAND"],
+            &["SET", "a", "1"],
+            &["COMMAND", "COUNT"],
+            &["SET", "b", "2"],
+            &["COMMAND", "DOCS"],
+            &["GET", "b"],
+            &["COMMAND", "NOSUCH"],
+            &["GET", "a"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        assert!(matches!(frames[0], Frame::Array(_)), "{:?}", frames[0]);
+        assert_eq!(frames[1], Frame::Simple("OK".into()));
+        // Derived, not restated: the count is the command table's length, and
+        // a test that wrote a number here would be a second place to keep in
+        // step with the surface. What the number *means* — that every entry is
+        // a command the server runs — is the test below.
+        assert_eq!(
+            frames[2],
+            Frame::Integer(i64::try_from(COMMANDS.len()).unwrap())
+        );
+        assert_eq!(frames[3], Frame::Simple("OK".into()));
+        assert_eq!(frames[4], Frame::Array(Vec::new()));
+        assert_eq!(frames[5], Frame::Bulk(b"2".to_vec()));
+        assert_eq!(
+            frames[6],
+            Frame::Error("ERR unknown subcommand 'NOSUCH'. Try COMMAND HELP.".into())
+        );
+        assert_eq!(frames[7], Frame::Bulk(b"1".to_vec()));
+    }
+
+    /// `COMMAND COUNT` is the table's length, so the number is only truthful
+    /// if every entry of the table is a command the server actually runs.
+    ///
+    /// Each name is sent with no arguments and the reply is checked for one
+    /// thing: that it is not `unknown command`. Most answer an arity error,
+    /// which is exactly the point — an arity error is a command that was
+    /// dispatched. `QUIT` is the one name left out, because it would end the
+    /// connection the rest of the loop is using; it is covered by
+    /// `connection_commands_never_reach_the_router`.
+    #[tokio::test]
+    async fn every_name_in_the_command_table_is_a_command_the_server_runs() {
+        let (mut r, mut w, _pool) = connected(4);
+        let names: Vec<&[u8]> = COMMANDS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| *name != b"QUIT")
+            .collect();
+        let mut out = Vec::new();
+        for name in &names {
+            encode(&Frame::Array(vec![Frame::Bulk(name.to_vec())]), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, names.len()).await;
+        for (name, frame) in names.iter().zip(&frames) {
+            let name = String::from_utf8_lossy(name);
+            assert!(
+                !matches!(frame, Frame::Error(e) if e.contains("unknown command")),
+                "{name} is counted by COMMAND COUNT but is not dispatched: {frame:?}"
+            );
+        }
+    }
+
+    /// What a client tells the server about itself, accepted and dropped.
+    ///
+    /// go-redis and redis-py both send `CLIENT SETINFO` on connect and treat a
+    /// failure as a connection failure, so the stub has to answer `OK` rather
+    /// than refuse a subcommand it does nothing with.
+    #[tokio::test]
+    async fn client_stubs_return_ok() {
+        let (mut r, mut w, _pool) = connected(4);
+        let mut out = Vec::new();
+        let requests: [&[&str]; 6] = [
+            &["CLIENT", "SETINFO", "lib-name", "x"],
+            &["CLIENT", "SETNAME", "n"],
+            &["client", "setname", "n"],
+            &["CLIENT", "anythingelse"],
+            &["CLIENT"],
+            &["PING"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        assert_eq!(frames[0], Frame::Simple("OK".into()));
+        assert_eq!(frames[1], Frame::Simple("OK".into()));
+        assert_eq!(frames[2], Frame::Simple("OK".into()), "case-insensitive");
+        assert_eq!(
+            frames[3],
+            Frame::Error("ERR unknown subcommand 'anythingelse'. Try CLIENT HELP.".into())
+        );
+        assert_eq!(
+            frames[4],
+            Frame::Error("ERR wrong number of arguments for 'client' command".into())
+        );
+        assert_eq!(
+            frames[5],
+            Frame::Simple("PONG".into()),
+            "a refused subcommand left the connection unusable"
+        );
+    }
+
     /// A connection command sits in the same stream as a keyed one, and the
     /// pipeline must not reorder or lose either.
     #[tokio::test]
@@ -1711,7 +2137,7 @@ mod tests {
     async fn a_pipelined_mix_is_answered_in_request_order() {
         let pool = ShardPool::spawn(16, 4, DictSeed { k0: 3, k1: 5 }, NoTrace);
         let (client, server) = tokio::io::duplex(1 << 20);
-        tokio::spawn(serve_connection(server, pool));
+        tokio::spawn(serve_connection(server, pool, NodeInfo::for_tests()));
         let (mut r, mut w) = tokio::io::split(client);
 
         let mut out = Vec::new();
@@ -1949,7 +2375,7 @@ mod tests {
     async fn a_disconnect_ends_the_connection_task() {
         let pool = ShardPool::spawn(4, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(4096);
-        let task = tokio::spawn(serve_connection(server, pool));
+        let task = tokio::spawn(serve_connection(server, pool, NodeInfo::for_tests()));
         drop(client);
         // Returns rather than spinning on EOF.
         task.await.expect("the connection task must end cleanly");
@@ -2050,7 +2476,12 @@ mod tests {
 
         let pool = ShardPool::spawn(4, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(8 * 1024);
-        let task = tokio::spawn(serve_connection_limited(server, pool, CEILING));
+        let task = tokio::spawn(serve_connection_limited(
+            server,
+            pool,
+            NodeInfo::for_tests(),
+            CEILING,
+        ));
         let (mut r, mut w) = tokio::io::split(client);
 
         let writer = tokio::spawn(async move {
@@ -2104,7 +2535,12 @@ mod tests {
 
         let pool = ShardPool::spawn(4, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(4096);
-        let task = tokio::spawn(serve_connection_limited(server, pool, CEILING));
+        let task = tokio::spawn(serve_connection_limited(
+            server,
+            pool,
+            NodeInfo::for_tests(),
+            CEILING,
+        ));
         let (mut r, mut w) = tokio::io::split(client);
 
         // A legal count — well under `MAX_ARRAY_LEN` — that this connection's
@@ -2151,7 +2587,12 @@ mod tests {
 
         let pool = ShardPool::spawn(4, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(4096);
-        let task = tokio::spawn(serve_connection_limited(server, pool, CEILING));
+        let task = tokio::spawn(serve_connection_limited(
+            server,
+            pool,
+            NodeInfo::for_tests(),
+            CEILING,
+        ));
         let (mut r, mut w) = tokio::io::split(client);
 
         // A length the codec itself accepts — under `MAX_BULK_LEN`, so the
@@ -2431,9 +2872,21 @@ mod tests {
     ) {
         let pool = ShardPool::spawn(shards, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(serve_connection(server, pool.clone()));
+        tokio::spawn(serve_connection(
+            server,
+            pool.clone(),
+            NodeInfo::for_tests(),
+        ));
         let (r, w) = tokio::io::split(client);
         (r, w, pool)
+    }
+
+    /// The text of a bulk reply, for the assertions that read `INFO`.
+    fn bulk_text(frame: &Frame) -> String {
+        match frame {
+            Frame::Bulk(bytes) => String::from_utf8(bytes.clone()).expect("INFO is not UTF-8"),
+            other => panic!("expected a bulk reply, got {other:?}"),
+        }
     }
 
     fn req(parts: &[&str]) -> Frame {

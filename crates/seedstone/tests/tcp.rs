@@ -89,6 +89,64 @@ async fn over_limit_connections_are_told_and_closed() {
     );
 }
 
+/// `INFO` reports facts about the node, and the node is only assembled here.
+///
+/// The port is the one the kernel chose, which no layer below the accept loop
+/// can know, and `connected_clients` is a count only the accept loop maintains
+/// — so this is the only place either can be wrong. The count has to come back
+/// down on every way a connection can end, and the two below are the ways that
+/// are not a return from the connection loop: a peer that says `QUIT` and a
+/// peer that simply vanishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn info_reports_the_bound_port_and_the_live_connection_count() {
+    let addr = started(4).await;
+
+    let mut observer = TcpStream::connect(addr).await.unwrap();
+    assert!(
+        info_text(&mut observer)
+            .await
+            .contains(&format!("tcp_port:{}", addr.port())),
+        "INFO did not report the port the listener actually bound"
+    );
+    assert!(
+        connected_clients(&mut observer).await >= 1,
+        "the observer's own connection was not counted"
+    );
+
+    // A peer that leaves politely, and one that is simply dropped.
+    let mut quitter = TcpStream::connect(addr).await.unwrap();
+    let mut vanisher = TcpStream::connect(addr).await.unwrap();
+    round_trip(&mut quitter, &["PING"]).await;
+    round_trip(&mut vanisher, &["PING"]).await;
+    assert!(
+        connected_clients(&mut observer).await >= 3,
+        "three connections were attached and INFO saw fewer"
+    );
+
+    assert_eq!(
+        round_trip(&mut quitter, &["QUIT"]).await,
+        Frame::Simple("OK".into())
+    );
+    drop(quitter);
+    drop(vanisher);
+
+    // The decrement happens on the connection's task, so it is a yield away
+    // rather than an instant away — the same shape as the permit above.
+    let mut settled = false;
+    for _ in 0..100 {
+        if connected_clients(&mut observer).await == 1 {
+            settled = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        settled,
+        "connected_clients never came back down: {}",
+        info_text(&mut observer).await
+    );
+}
+
 // --- helpers ---
 
 /// Binds an ephemeral port, spawns the accept loop, returns the address.
@@ -110,6 +168,24 @@ async fn round_trip(stream: &mut TcpStream, parts: &[&str]) -> Frame {
     stream.write_all(&out).await.unwrap();
     stream.flush().await.unwrap();
     read_frames(stream, 1).await.remove(0)
+}
+
+/// The text of one `INFO` reply.
+async fn info_text(stream: &mut TcpStream) -> String {
+    match round_trip(stream, &["INFO"]).await {
+        Frame::Bulk(bytes) => String::from_utf8(bytes).expect("INFO is not UTF-8"),
+        other => panic!("INFO answered {other:?}"),
+    }
+}
+
+/// What `INFO` currently says `connected_clients` is.
+async fn connected_clients(stream: &mut TcpStream) -> u64 {
+    let text = info_text(stream).await;
+    text.lines()
+        .find_map(|line| line.strip_prefix("connected_clients:"))
+        .unwrap_or_else(|| panic!("INFO has no connected_clients: {text:?}"))
+        .parse()
+        .expect("connected_clients is not a number")
 }
 
 fn req(parts: &[&str]) -> Frame {
