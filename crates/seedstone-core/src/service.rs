@@ -993,12 +993,28 @@ fn unknown_subcommand(container: &str, sub: &[u8]) -> String {
     )
 }
 
+/// The `INFO` arguments that name no section but the whole document.
+///
+/// Redis takes all three where a section name goes and answers each with
+/// everything it has, and `all` is the spelling operators and metrics
+/// exporters reach for — treating it as an ordinary section name would answer
+/// the most common form of the command with nothing at all.
+///
+/// Measured against Redis 8.10.0: each of the three answers a document of the
+/// same order of size as the unargumented `INFO`, and one of them anywhere in
+/// the argument list wins over the section names beside it — `INFO all nosuch`
+/// is the whole document while `INFO nosuch server` is the server section
+/// alone.
+const INFO_WHOLE_DOCUMENT: [&[u8]; 3] = [b"all", b"default", b"everything"];
+
 /// Renders the `INFO` sections a peer asked for, or all of them if it named
 /// none.
 ///
 /// A section name nobody recognises contributes nothing rather than being an
 /// error — `INFO nosuch` is an empty bulk, which is how Redis answers one and
-/// leaves the client to notice that the field it wanted is absent.
+/// leaves the client to notice that the field it wanted is absent. The three
+/// names in [`INFO_WHOLE_DOCUMENT`] are the exception: they ask for no section
+/// in particular and get everything.
 ///
 /// **The field names are Redis's own, `redis_` prefix and all.** `INFO`'s
 /// contract is its field names: everything that reads this output looks up
@@ -1011,9 +1027,17 @@ fn unknown_subcommand(container: &str, sub: &[u8]) -> String {
 fn info(node: &NodeInfo, wanted: &[Vec<u8>]) -> String {
     use std::fmt::Write as _;
 
-    let asked_for = |section: &[u8]| {
-        wanted.is_empty() || wanted.iter().any(|name| name.eq_ignore_ascii_case(section))
-    };
+    // One of the whole-document names anywhere in the list drops the filter
+    // entirely, which is how Redis resolves them against the section names
+    // beside them.
+    let unfiltered = wanted.is_empty()
+        || wanted.iter().any(|name| {
+            INFO_WHOLE_DOCUMENT
+                .iter()
+                .any(|whole| name.eq_ignore_ascii_case(whole))
+        });
+    let asked_for =
+        |section: &[u8]| unfiltered || wanted.iter().any(|name| name.eq_ignore_ascii_case(section));
     // Writing into a `String` cannot fail, so discarding the results is the
     // whole of what there is to do with them.
     let mut text = String::new();
@@ -1910,7 +1934,7 @@ mod tests {
     async fn info_prints_the_minimal_sections() {
         let (mut r, mut w, _pool) = connected(4);
         let mut out = Vec::new();
-        let requests: [&[&str]; 5] = [
+        let requests: [&[&str]; 9] = [
             &["INFO"],
             &["INFO", "server"],
             // Section names are case-insensitive, as Redis takes them.
@@ -1919,6 +1943,16 @@ mod tests {
             // the order they were asked in — again as Redis answers them.
             &["INFO", "clients", "server"],
             &["INFO", "nosuch"],
+            // The three names that ask for no section but the whole document.
+            // `INFO all` is what an operator types and what a metrics exporter
+            // scrapes, so answering it as an unknown section would answer the
+            // command's most common form with nothing.
+            &["INFO", "all"],
+            &["INFO", "DEFAULT"],
+            &["INFO", "everything"],
+            // And one of them beats the section names beside it, in either
+            // position, as measured on Redis.
+            &["INFO", "nosuch", "all"],
         ];
         for parts in requests {
             encode(&req(parts), &mut out);
@@ -1975,6 +2009,25 @@ mod tests {
             Frame::Bulk(Vec::new()),
             "an unknown section is an empty bulk, not an error"
         );
+
+        // Compared field by field rather than against `everything` verbatim:
+        // `uptime_in_seconds` is free to tick between two frames of one
+        // pipeline, and a test that demanded two identical documents would be
+        // a flake waiting for a slow machine.
+        for (i, name) in [
+            (5, "all"),
+            (6, "DEFAULT"),
+            (7, "everything"),
+            (8, "nosuch all"),
+        ] {
+            let text = bulk_text(&frames[i]);
+            for field in whole_document {
+                assert!(
+                    text.contains(field),
+                    "INFO {name} must answer the whole document, and printed no {field}: {text:?}"
+                );
+            }
+        }
     }
 
     /// `COMMAND` and its subcommands, which a client sends before it sends
