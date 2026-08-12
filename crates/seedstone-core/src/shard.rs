@@ -65,8 +65,9 @@ const REHASH_BUCKETS_PER_TICK: usize = 1024;
 /// This is the whole of the active half of expiration: a key nothing touches
 /// again is reclaimed only when the cursor reaches its bucket, so the budget
 /// sets how long a dead entry can hold its memory. A table of N buckets is
-/// walked in `N / 256` ticks — under a second for anything up to a couple of
-/// thousand buckets, and about four minutes for a million-bucket table.
+/// walked in `N / 256` ticks, and [`HOUSEKEEPING_TICK`] is ten a second — so
+/// 2048 buckets are a full cycle in eight ticks, under a second, and a
+/// million-bucket table takes 3906 ticks, six and a half minutes.
 ///
 /// Smaller than [`REHASH_BUCKETS_PER_TICK`], and deliberately: a rehash is a
 /// state the dict has to leave, paying two lookups on every miss until it
@@ -74,6 +75,16 @@ const REHASH_BUCKETS_PER_TICK: usize = 1024;
 /// is also the more expensive walk per bucket — it reads every entry's
 /// deadline rather than moving whole chains — and it runs against every owned
 /// dict that could hold a deadline, where most rehashes are over.
+///
+/// **The budget bounds the walk, not the tick.** What this number caps is the
+/// cursor steps [`Dict::expire_step`] takes; the removals that follow are
+/// extra, and each costs more than a bucket of walking. Every reported key is
+/// hashed a second time — the walk returns key bytes, so [`Dict::remove`]
+/// hashes each one again — and while a rehash is in flight each of those
+/// `remove` calls also advances it by a bucket. A tick that sweeps buckets
+/// full of due deadlines therefore costs meaningfully more than this constant
+/// alone suggests, and its worst case scales with how many swept entries are
+/// due rather than with the budget.
 const EXPIRE_BUCKETS_PER_TICK: usize = 256;
 
 /// Every way a shard can refuse a command.
