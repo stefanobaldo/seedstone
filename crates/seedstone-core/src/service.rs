@@ -2113,6 +2113,27 @@ mod tests {
         }
     }
 
+    /// The other half of that truthfulness: no name appears in the table twice.
+    ///
+    /// Dispatch takes the *first* match while `COMMAND COUNT` reports *every*
+    /// entry, so a duplicated name inflates the count above the number of
+    /// commands a client can actually reach — and the test above cannot see
+    /// it, because both copies of a duplicate dispatch perfectly well. Only a
+    /// count of distinct names catches it.
+    #[test]
+    fn no_name_appears_in_the_command_table_twice() {
+        let mut names: Vec<&[u8]> = COMMANDS.iter().map(|(name, _)| *name).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "COMMAND COUNT answers {total}, but the table holds only {} distinct names",
+            names.len()
+        );
+    }
+
     /// What a client tells the server about itself, accepted and dropped.
     ///
     /// go-redis and redis-py both send `CLIENT SETINFO` on connect and treat a
