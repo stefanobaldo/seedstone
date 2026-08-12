@@ -42,23 +42,52 @@
 //! shards, while the schedule — and so the trace — legitimately does.
 //! `tests/executor_mapping.rs` holds both halves.
 //!
-//! # The invariant
+//! # Three key families, three invariants
 //!
-//! Counter keys are touched only by `INCRBY`, which is order-independent, so
-//! their sum has a well-defined expected value no matter how the schedule
+//! **Counter keys** are touched only by `INCRBY`, which is order-independent,
+//! so their sum has a well-defined expected value no matter how the schedule
 //! falls out. Every client adds the delta of each *acknowledged* `INCRBY` to
 //! a shared expected total; a final verifier client reads every counter back
 //! and sums what is actually there. The two differ **iff** an update was
-//! lost. The remaining keys take `GET`/`SET`/`DEL` for coverage and carry no
-//! sum invariant — `SET` overwrites, so it has no order-independent total.
+//! lost. They are the one family several clients share, so they are where the
+//! contention is.
 //!
-//! # The planted race
+//! **Plain keys** take `GET`/`SET`/`DEL` and never carry a deadline. They are
+//! partitioned by client, which is what lets a client hold an exact model of
+//! them: what it last wrote is what a read must return, at any point and at
+//! the end of the run. There is no sum invariant to have — `SET` overwrites —
+//! so the model is the invariant.
+//!
+//! **Volatile keys** carry deadlines, and are partitioned the same way. A
+//! client records the deadline it asked for, sampled from its own clock
+//! *before* the request left, and holds every later read of that key against
+//! it: a value returned well after the deadline is a **stale read**, an
+//! absence well before it is a **spurious death**. "Well" is [`SLACK`] — the
+//! band inside which the client cannot tell what the server's clock said, so
+//! it refuses to judge. Both counters must be zero, and both must have
+//! actually decided something: [`SimOutcome`] carries the check counts beside
+//! the violation counts, because an invariant that never ran is not a
+//! passing one.
+//!
+//! # Why a client settles before it leaves
+//!
+//! The workload is over in a fraction of a simulated second, which is less
+//! than the deadlines it hands out. So a client ends by sleeping past them —
+//! [`SETTLE_CAP`] bounds how far — and reading back every key it owns: the
+//! volatile ones it waited out must be gone, and the plain ones, which no
+//! deadline was ever put on, must still be exactly what it wrote. That pass
+//! is what puts the active sweep under test. The sweep runs on a timer
+//! nothing else here waits for, and it is the one thing in this server that
+//! mutates a keyspace with no command behind it.
+//!
+//! # The planted bugs
 //!
 //! [`SimConfig::planted`] swaps the honest router for [`PlantedRouter`], which
-//! serves `INCRBY` as a read-modify-write pair instead of one atomic message.
-//! That is the harness testing itself: a simulation that has never failed has
-//! not been shown capable of failing, and `planted_race.rs` requires the sweep
-//! to catch this one and a separate process to replay it byte for byte.
+//! serves one [`Plant`]: a lost update, a server that never expires anything,
+//! or one that expires everything at once. That is the harness testing
+//! itself — a simulation that has never failed has not been shown capable of
+//! failing — and each invariant above owns a plant that it, and only it, is
+//! required to catch.
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -68,12 +97,15 @@ use seedstone_core::service::{NodeInfo, serve_connection};
 // indistinguishable from the honest one except in its atomicity, and these
 // strings enter the trace hash — a private copy that drifted would make a
 // planted trace differ for a reason unrelated to the race.
-use seedstone_core::shard::{Command, Reply, ReplyError, Router, ShardPool, TraceSink, parse_i64};
+use seedstone_core::shard::{
+    Command, Expiry, HOUSEKEEPING_TICK, Reply, ReplyError, Router, ShardPool, TraceSink, parse_i64,
+};
 use seedstone_resp::{Decoder, DecoderLimits, Frame, encode};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Instant;
 
 /// The port the simulated server listens on. Redis's, for familiarity; in a
 /// simulation nothing else is competing for it.
@@ -92,6 +124,77 @@ const SIM_DURATION: Duration = Duration::from_mins(10);
 
 /// How often the verifier client re-checks whether the workload has finished.
 const VERIFIER_POLL: Duration = Duration::from_millis(10);
+
+/// The least simulated time a message spends on the wire.
+///
+/// turmoil's own default, spelled out here rather than inherited: [`SLACK`]
+/// is derived from the pair, and a bound derived from a dependency's
+/// undocumented default goes quietly wrong the day the dependency changes it.
+const MIN_MESSAGE_LATENCY: Duration = Duration::from_millis(0);
+
+/// The most simulated time a message spends on the wire.
+///
+/// See [`MIN_MESSAGE_LATENCY`]. This one is also the width of the client's
+/// ignorance about the server's clock, which is what [`SLACK`] pays for.
+const MAX_MESSAGE_LATENCY: Duration = Duration::from_millis(100);
+
+/// How far outside a deadline a client insists on being before it will call
+/// the server wrong.
+///
+/// A client samples its clock before it sends and after it reads, and the
+/// server's handler ran somewhere in between. The two expiration invariants
+/// are stated so that only the safe end of that interval is ever used — "the
+/// key was certainly due" from a *send* taken after the deadline, "certainly
+/// alive" from a *reply* taken before it — which leaves one thing unpaid for:
+/// the deadline itself. The server computed it from its own clock when the
+/// handler ran, so it lands up to one message's latency later than the
+/// instant the client recorded. One [`MAX_MESSAGE_LATENCY`] covers that
+/// exactly.
+///
+/// The band is twice that plus a [`HOUSEKEEPING_TICK`] regardless, because
+/// the two errors are not symmetric: a band too wide costs coverage, a band
+/// too tight reports violations the server never committed — and a harness
+/// that cries wolf is worth less than one that stays quiet. What the extra
+/// buys concretely is the reclamation lag (the sweep only removes on a tick)
+/// and the microseconds of clock skew between two simulated hosts, whose
+/// paused clocks start at whatever the wall clock said when turmoil built
+/// each runtime.
+const SLACK: Duration = Duration::from_millis(300);
+
+const _: () = assert!(
+    SLACK.as_millis() == 2 * MAX_MESSAGE_LATENCY.as_millis() + HOUSEKEEPING_TICK.as_millis(),
+    "SLACK is derived from the network's latency and the shard's housekeeping \
+     cadence: change either and this band has to be re-derived, not re-typed"
+);
+
+/// The longest a client naps between bursts, in milliseconds.
+///
+/// The workload needs some simulated time to pass: every deadline it hands
+/// out outlives the handful of milliseconds a burst costs, so with no pause
+/// at all no read would land on the far side of one until the settle. It also
+/// scatters the bursts against the server's 10 Hz housekeeping tick instead
+/// of packing them into one interval.
+///
+/// Simulated time is *not* free, which is what keeps this small — see
+/// [`SETTLE_CAP`].
+const BURST_NAP_MAX_MS: u32 = 60;
+
+/// The longest a client waits for its own deadlines before reading everything
+/// back.
+///
+/// Simulated time costs wall clock, and not in proportion to what happens in
+/// it: turmoil steps every host with running software on every one-
+/// millisecond tick, and delivering messages across the topology is the
+/// dominant cost of a run whether or not any were sent. A client asleep is a
+/// client still being stepped — so a settle long enough to outlast every
+/// deadline in [`DEADLINES`] would multiply the swept shape's wall clock for
+/// coverage it does not need.
+///
+/// Capping it costs nothing but the keys whose deadlines outlive the wait,
+/// and those are simply not decided: the band skips them, [`SimOutcome`]'s
+/// check counts say so, and the workload hands out enough short deadlines
+/// that the pass decides most of what it reads.
+const SETTLE_CAP: Duration = Duration::from_millis(300);
 
 /// Read buffer size for a client connection.
 ///
@@ -133,11 +236,29 @@ pub struct SimConfig {
     /// This is the lever that costs wall clock — turmoil polls every host on
     /// every tick — and also the lever that buys schedule sensitivity.
     pub clients: u16,
-    /// How many keys take `GET`/`SET`/`DEL`.
+    /// How many keys take `GET`/`SET`/`DEL` and never carry a deadline.
     ///
-    /// Kept above `shards` on purpose: with fewer keys than shards the shard
-    /// dimension is degenerate and the simulation stops exercising placement.
-    pub string_keys: u32,
+    /// Split evenly between the clients, so each owns a slice nothing else
+    /// writes: that exclusivity is what lets a client model the family
+    /// exactly and assert on every read, and it is why cross-client
+    /// contention lives on the counters instead.
+    ///
+    /// Kept above `shards` on purpose in the swept shape: with fewer keys
+    /// than shards the shard dimension is degenerate and the simulation stops
+    /// exercising placement.
+    pub plain_keys: u32,
+    /// How many keys carry deadlines and take `SET … EX`/`PX`, `EXPIRE`,
+    /// `TTL` and `GET`.
+    ///
+    /// Partitioned per client like [`SimConfig::plain_keys`], and for the
+    /// same reason: the two expiration invariants are a statement about what
+    /// *this* client asked for, which another client writing the same key
+    /// would make unprovable rather than merely harder.
+    ///
+    /// Kept small per client so a key is written and read back several times
+    /// within one run — a family large enough to be touched once each is a
+    /// family whose deadlines nothing ever observes.
+    pub volatile_keys: u32,
     /// How many keys take `INCRBY` and carry the sum invariant.
     ///
     /// Fewer counters means more contention on each, which is what surfaces a
@@ -161,8 +282,8 @@ pub struct SimConfig {
     pub workload_seed: u64,
     /// Seeds turmoil: the network's latencies and the order hosts run in.
     pub sim_seed: u64,
-    /// Whether to route `INCRBY` through the deliberately racy router.
-    pub planted: bool,
+    /// Which deliberate defect, if any, to serve the workload through.
+    pub planted: Option<Plant>,
 }
 
 impl SimConfig {
@@ -174,13 +295,14 @@ impl SimConfig {
             shards: 1024,
             executors: 10,
             clients: 128,
-            string_keys: 4096,
+            plain_keys: 2048,
+            volatile_keys: 1024,
             counter_keys: 64,
             ops_per_client: 25,
             pipeline_depth: 8,
             workload_seed,
             sim_seed,
-            planted: false,
+            planted: None,
         }
     }
 
@@ -192,18 +314,83 @@ impl SimConfig {
             shards: 1024,
             executors: 4,
             clients: 16,
-            string_keys: 512,
+            plain_keys: 256,
+            volatile_keys: 128,
             counter_keys: 8,
             ops_per_client: 40,
             pipeline_depth: 8,
             workload_seed,
             sim_seed,
-            planted: false,
+            planted: None,
         }
     }
 }
 
+/// A deliberate defect the harness can serve its own workload through.
+///
+/// Each one is the bug an invariant exists to find, and every invariant has
+/// one: a guarantee nobody has watched fail is a guarantee nobody has
+/// measured. They live *above* the shard, in [`PlantedRouter`], for two
+/// reasons. The first is that this is where a real one would live — a shard
+/// handler is a plain `fn` that cannot await, so a lost update cannot be
+/// planted inside it. The second is structural: a defect inside
+/// `seedstone-core` would have to be a cargo feature or a runtime flag, and
+/// `cargo build --workspace` unifies features, so the feature the simulator
+/// turned on would be compiled into the production binary. A test harness
+/// does not get to put broken code in the shipped server.
+///
+/// What that trades away is the cause: these rewrite requests rather than
+/// break handlers, so what they prove is that an invariant catches the
+/// *observation* — a key alive past its deadline, a key dead before it. The
+/// observation is the whole of what a client can see, and it is what the
+/// invariant is written against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plant {
+    /// `INCRBY` served as a read-modify-write pair instead of one atomic
+    /// message, so a concurrent increment can be overwritten. Caught by the
+    /// counter sum.
+    LostUpdate,
+    /// Every deadline dropped on the way in: the server answers as though it
+    /// had accepted one and then keeps the key forever. What a broken
+    /// liveness check looks like from a client. Caught by `stale_reads`.
+    ServeExpired,
+    /// Every write given a one-millisecond deadline, whatever the client
+    /// asked for and whether or not it asked at all. What an active sweep
+    /// that stopped checking `expires_at` looks like from a client. Caught by
+    /// `spurious_deaths` and by the plain keys' model.
+    SweepEatsAll,
+}
+
+impl Plant {
+    /// The name this plant is selected by on a command line, and printed
+    /// under in a sweep's summary.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::LostUpdate => "lost-update",
+            Self::ServeExpired => "serve-expired",
+            Self::SweepEatsAll => "sweep-eats-all",
+        }
+    }
+
+    /// Every plant, so a caller listing or sweeping them cannot miss one
+    /// added later.
+    pub const ALL: [Self; 3] = [Self::LostUpdate, Self::ServeExpired, Self::SweepEatsAll];
+
+    /// The plant `name` selects, if it names one.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|plant| plant.name() == name)
+    }
+}
+
 /// What one run produced.
+///
+/// The three violation counts come paired with the number of replies their
+/// invariant actually *decided*. A zero violation count is evidence only
+/// beside a non-zero check count — this is the same discipline the counter
+/// sum is held to, where a workload that acknowledged no `INCRBY` satisfies
+/// `0 == 0` while proving nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimOutcome {
     /// The fold of every command the server completed, in the order it
@@ -214,16 +401,54 @@ pub struct SimOutcome {
     pub expected_sum: i64,
     /// The sum of every counter key read back at the end.
     pub actual_sum: i64,
+    /// Reads that returned a value for a key certainly past its deadline.
+    pub stale_reads: u64,
+    /// Reads that returned nothing for a key certainly still within its
+    /// deadline.
+    pub spurious_deaths: u64,
+    /// Reads of a plain key that disagreed with what its owner last wrote.
+    pub plain_mismatches: u64,
+    /// Volatile reads decided against a passed deadline — the denominator of
+    /// [`SimOutcome::stale_reads`].
+    pub dead_checks: u64,
+    /// Volatile reads decided against a future deadline — the denominator of
+    /// [`SimOutcome::spurious_deaths`].
+    pub alive_checks: u64,
+    /// Plain reads decided against a client's model — the denominator of
+    /// [`SimOutcome::plain_mismatches`].
+    pub plain_checks: u64,
 }
 
 impl SimOutcome {
-    /// Whether the run lost an update.
+    /// Whether every invariant the run measures held.
     ///
-    /// `INCRBY` is order-independent, so a schedule cannot legitimately move
-    /// this: any difference is an acknowledged increment that did not survive.
+    /// The counter sum first: `INCRBY` is order-independent, so a schedule
+    /// cannot legitimately move it and any difference is an acknowledged
+    /// increment that did not survive. Then the three keyspace invariants,
+    /// each of which a schedule is equally powerless to excuse — a deadline
+    /// is a deadline, and a key nobody else can write is what its owner last
+    /// wrote.
     #[must_use]
     pub const fn invariant_holds(&self) -> bool {
         self.expected_sum == self.actual_sum
+            && self.stale_reads == 0
+            && self.spurious_deaths == 0
+            && self.plain_mismatches == 0
+    }
+
+    /// Whether the run's invariants decided anything at all.
+    ///
+    /// Not part of [`SimOutcome::invariant_holds`] on purpose: a sweep's job
+    /// is to report violations, and a run that happened to check nothing is
+    /// not a violation. It is a failure of the *harness*, which is a claim
+    /// for a test to make about a configuration, not for a seed to make about
+    /// the system.
+    #[must_use]
+    pub const fn invariants_were_exercised(&self) -> bool {
+        self.expected_sum != 0
+            && self.dead_checks > 0
+            && self.alive_checks > 0
+            && self.plain_checks > 0
     }
 }
 
@@ -250,15 +475,13 @@ pub const fn mix(h: u64, v: u64) -> u64 {
 pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
     let mut sim = turmoil::Builder::new()
         .simulation_duration(SIM_DURATION)
+        .min_message_latency(MIN_MESSAGE_LATENCY)
+        .max_message_latency(MAX_MESSAGE_LATENCY)
         .rng_seed(cfg.sim_seed)
         .build();
 
     let trace = Arc::new(Mutex::new(TRACE_INIT));
-    let shared = Shared {
-        expected: Arc::new(Mutex::new(0)),
-        actual: Arc::new(Mutex::new(0)),
-        done: Arc::new(Mutex::new(0)),
-    };
+    let shared = Shared::default();
 
     // The dict seed is derived from the simulator seed so two seeds do not
     // share a bucket layout: a hash collision that only shows up under one
@@ -290,26 +513,45 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
 
     sim.run().expect("simulation failed");
 
+    let tally = *lock(&shared.0);
     SimOutcome {
         trace_hash: *lock(&trace),
-        expected_sum: *lock(&shared.expected),
-        actual_sum: *lock(&shared.actual),
+        expected_sum: tally.expected,
+        actual_sum: tally.actual,
+        stale_reads: tally.stale_reads,
+        spurious_deaths: tally.spurious_deaths,
+        plain_mismatches: tally.plain_mismatches,
+        dead_checks: tally.dead_checks,
+        alive_checks: tally.alive_checks,
+        plain_checks: tally.plain_checks,
     }
 }
 
-/// State the client hosts and the verifier share.
+/// What the client hosts and the verifier write into, and the run reads out.
 ///
-/// Every host in a turmoil simulation runs on the same OS thread, so these
-/// mutexes are never actually contended; they are here because [`TraceSink`]
-/// and the futures turmoil holds must be `Send`.
-#[derive(Clone)]
-struct Shared {
+/// Every host in a turmoil simulation runs on the same OS thread, so this
+/// mutex is never actually contended; it is here because [`TraceSink`] and
+/// the futures turmoil holds must be `Send`.
+#[derive(Clone, Default)]
+struct Shared(Arc<Mutex<Tally>>);
+
+/// Everything the hosts count between them.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tally {
     /// The sum of every acknowledged `INCRBY` delta.
-    expected: Arc<Mutex<i64>>,
+    expected: i64,
     /// The sum of every counter read back at the end.
-    actual: Arc<Mutex<i64>>,
+    actual: i64,
     /// How many client hosts have finished their workload.
-    done: Arc<Mutex<u32>>,
+    done: u32,
+    /// Violations, and the checks that could have found them. See
+    /// [`SimOutcome`], whose fields these become.
+    stale_reads: u64,
+    spurious_deaths: u64,
+    plain_mismatches: u64,
+    dead_checks: u64,
+    alive_checks: u64,
+    plain_checks: u64,
 }
 
 /// Takes a lock that cannot be contended, and says so if it was poisoned.
@@ -380,21 +622,28 @@ fn fold_reply(h: u64, reply: &Reply) -> u64 {
     }
 }
 
-/// A router that turns the atomic `INCRBY` into a read-modify-write race.
+/// A router that serves the workload through one deliberate defect.
 ///
 /// This is the harness's self-test: a simulator that never fails proves
-/// nothing, so the branch ships a bug the sweep is required to find. The bug
-/// is deliberately *above* the shard, which is where a real one would live —
-/// the shard's handler is a plain `fn` and cannot await, so no lost update can
-/// be planted inside it. Here `INCRBY` becomes `GET`, compute, `SET`: two
-/// shard round-trips with an await between them, so another connection's
-/// increment can land in the window and be overwritten.
-///
-/// Every other command passes straight through, so the only thing that differs
-/// from an honest run is the atomicity of the one command carrying the
-/// invariant.
+/// nothing, so the branch ships bugs the sweep is required to find. See
+/// [`Plant`] for what each is and why they live here rather than in the
+/// server. Everything the chosen plant does not touch passes straight
+/// through, so an honest run and a planted one differ in exactly one thing.
 #[derive(Clone)]
-pub struct PlantedRouter(pub ShardPool);
+pub struct PlantedRouter {
+    /// The honest pool underneath.
+    pool: ShardPool,
+    /// The one thing this router does wrong.
+    plant: Plant,
+}
+
+impl PlantedRouter {
+    /// Wraps `pool` so that `plant`'s defect is what the workload meets.
+    #[must_use]
+    pub const fn new(pool: ShardPool, plant: Plant) -> Self {
+        Self { pool, plant }
+    }
+}
 
 impl Router for PlantedRouter {
     // Spelled `async fn` rather than the trait's desugared `-> impl Future`:
@@ -403,11 +652,68 @@ impl Router for PlantedRouter {
     // desugared form for a reason that does not apply here — it sends on the
     // inbox before the future is awaited.
     async fn dispatch(&self, cmd: Command) -> Reply {
+        match self.plant {
+            Plant::LostUpdate => self.lose_updates(cmd).await,
+            Plant::ServeExpired => self.pool.dispatch(never_expire(cmd)).await,
+            Plant::SweepEatsAll => self.pool.dispatch(expire_at_once(cmd)).await,
+        }
+    }
+}
+
+/// Strips the deadline out of every command that would have set one.
+///
+/// A `SET` keeps its value and loses its expiry; an `EXPIRE` becomes the
+/// `EXISTS` it would have answered like, so the client is told the deadline
+/// was accepted while nothing takes one. The result is a server that expires
+/// nothing, which is what a client sees when a liveness check is missing.
+fn never_expire(cmd: Command) -> Command {
+    match cmd {
+        Command::Set {
+            key, value, cond, ..
+        } => Command::Set {
+            key,
+            value,
+            expiry: None,
+            cond,
+        },
+        // `EXPIRE` on a live key answers 1 and on a missing one 0 — exactly
+        // `EXISTS`'s two answers, for exactly the same keys.
+        Command::Expire { key, .. } => Command::Exists { key },
+        other => other,
+    }
+}
+
+/// Gives every write a deadline one millisecond away, whatever it asked for.
+///
+/// Including the writes that asked for none: that is the point, since the
+/// defect being imitated is a sweep that stopped distinguishing an entry with
+/// a deadline from one without. `EXPIRE` is left alone — it is already a
+/// request to die, and rewriting it would only hide which half of the
+/// keyspace this reaches.
+fn expire_at_once(cmd: Command) -> Command {
+    match cmd {
+        Command::Set {
+            key, value, cond, ..
+        } => Command::Set {
+            key,
+            value,
+            expiry: Some(Expiry::Px(1)),
+            cond,
+        },
+        other => other,
+    }
+}
+
+impl PlantedRouter {
+    /// `INCRBY` as `GET`, compute, `SET`: two shard round-trips with an await
+    /// between them, so another connection's increment can land in the window
+    /// and be overwritten.
+    async fn lose_updates(&self, cmd: Command) -> Reply {
         let Command::IncrBy { key, delta } = cmd else {
-            return self.0.dispatch(cmd).await;
+            return self.pool.dispatch(cmd).await;
         };
 
-        let current = match self.0.dispatch(Command::Get { key: key.clone() }).await {
+        let current = match self.pool.dispatch(Command::Get { key: key.clone() }).await {
             Reply::Bulk(Some(value)) => match parse_i64(&value) {
                 Some(current) => current,
                 None => return Reply::Error(ReplyError::NotAnInteger),
@@ -434,7 +740,7 @@ impl Router for PlantedRouter {
         tokio::task::yield_now().await;
 
         match self
-            .0
+            .pool
             .dispatch(Command::Set {
                 key,
                 value: updated.to_string().into_bytes(),
@@ -463,7 +769,7 @@ async fn server(
     executors: u16,
     seed: DictSeed,
     sink: HashSink,
-    planted: bool,
+    planted: Option<Plant>,
 ) -> turmoil::Result {
     let pool = ShardPool::spawn(shards, executors, seed, sink);
     let listener = turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await?;
@@ -475,10 +781,10 @@ async fn server(
         let (stream, _peer) = listener.accept().await?;
         // The choice is per connection only because that is where the router
         // is handed over; it is the same choice every time.
-        if planted {
+        if let Some(plant) = planted {
             tokio::spawn(serve_connection(
                 stream,
-                PlantedRouter(pool.clone()),
+                PlantedRouter::new(pool.clone(), plant),
                 node.clone(),
             ));
         } else {
@@ -488,13 +794,15 @@ async fn server(
 }
 
 /// One client host: connect, issue `ops_per_client` operations in bursts of
-/// `pipeline_depth`, disconnect.
+/// `pipeline_depth`, settle, read back everything it owns, disconnect.
 ///
 /// Ordered on purpose — see the module documentation. A client never has two
 /// *bursts* outstanding, so what interleaves is which client's burst the
 /// server sees next; that there are many of these is the only source of
 /// interleaving between connections, and the depth is the only source of
-/// batching within one.
+/// batching within one. Within a burst the order is total too, which is what
+/// lets the model be updated reply by reply: a `SET` and a later `GET` of the
+/// same key in one burst reach the same shard in the order they were written.
 async fn client(id: u16, cfg: SimConfig, shared: Shared) -> turmoil::Result {
     // Decorrelated per client so client 1's stream is not client 0's shifted
     // by one, which a plain `workload_seed + id` would give.
@@ -502,60 +810,523 @@ async fn client(id: u16, cfg: SimConfig, shared: Shared) -> turmoil::Result {
         cfg.workload_seed ^ GOLDEN.wrapping_mul(u64::from(id).wrapping_add(1)),
     );
     let mut conn = Conn::connect().await?;
+    let mut model = Model::new(id, &cfg, shared.clone());
 
     // A depth of zero would issue nothing forever; one is the degenerate
     // request/response client, which is a shape worth being able to ask for.
     let depth = cfg.pipeline_depth.max(1);
-    let mut burst: Vec<Frame> = Vec::with_capacity(depth as usize);
-    // One entry per command in the burst, so a reply's index is its command's:
-    // `Some(delta)` for the increments the invariant tracks, `None` for
-    // everything else.
-    let mut deltas: Vec<Option<i64>> = Vec::with_capacity(depth as usize);
-
     let mut issued = 0u32;
     while issued < cfg.ops_per_client {
         let this_burst = depth.min(cfg.ops_per_client - issued);
-        burst.clear();
-        deltas.clear();
-
+        // Sampled before the burst is even composed, so every deadline it
+        // hands out is one the server cannot have reached earlier than.
+        let sent = Instant::now();
+        let mut burst = Vec::with_capacity(this_burst as usize);
+        let mut checks = Vec::with_capacity(this_burst as usize);
         // The rolls are drawn in the same order at any depth, so the workload
         // a seed describes is the same workload however it is pipelined.
-        for _ in 0..this_burst {
-            let roll = rng.random_range(0..100u32);
-            if roll < 20 {
-                let key = rng.random_range(0..cfg.counter_keys);
-                let delta = rng.random_range(-10..=10i64);
-                burst.push(command(&["INCRBY", &counter_key(key), &delta.to_string()]));
-                deltas.push(Some(delta));
-            } else if roll < 60 {
-                let key = rng.random_range(0..cfg.string_keys);
-                burst.push(command(&["SET", &string_key(key), &format!("v{key}")]));
-                deltas.push(None);
-            } else if roll < 90 {
-                let key = rng.random_range(0..cfg.string_keys);
-                burst.push(command(&["GET", &string_key(key)]));
-                deltas.push(None);
-            } else {
-                let key = rng.random_range(0..cfg.string_keys);
-                burst.push(command(&["DEL", &string_key(key)]));
-                deltas.push(None);
-            }
+        for op in 0..this_burst {
+            let (frame, check) = model.compose(&mut rng, sent, issued + op);
+            burst.push(frame);
+            checks.push(check);
         }
+        let replies = conn.request_many(&burst).await?;
+        model.observe(&replies, &checks, sent, Instant::now());
 
-        for (reply, delta) in conn.request_many(&burst).await?.iter().zip(&deltas) {
-            // Only an acknowledged increment is owed to us. Anything else —
-            // an error frame, a reply shape we did not expect — is not a
-            // promise the server made, so counting it would manufacture a
-            // violation the system never committed.
-            if let (Frame::Integer(_), Some(delta)) = (reply, delta) {
-                *lock(&shared.expected) += delta;
-            }
-        }
         issued += this_burst;
+        let nap = rng.random_range(0..=BURST_NAP_MAX_MS);
+        tokio::time::sleep(Duration::from_millis(u64::from(nap))).await;
     }
 
-    *lock(&shared.done) += 1;
+    model.settle(&mut conn, depth as usize).await?;
+    lock(&shared.0).done += 1;
     Ok(())
+}
+
+/// One client's slice of a key family.
+struct KeyRange {
+    /// Where this client's keys start in the family.
+    first: u32,
+    /// How many it owns.
+    len: u32,
+}
+
+impl KeyRange {
+    /// Splits `total` keys evenly between `clients` and takes `id`'s share.
+    ///
+    /// A remainder is left unused rather than handed to the last client: an
+    /// uneven slice would give one client a differently shaped workload for a
+    /// reason nobody reading a failing seed would remember.
+    fn new(id: u16, total: u32, clients: u16) -> Self {
+        let len = (total / u32::from(clients.max(1))).max(1);
+        Self {
+            first: u32::from(id) * len,
+            len,
+        }
+    }
+
+    /// The family-wide index of the `slot`-th key this client owns.
+    const fn key(&self, slot: u32) -> u32 {
+        self.first + slot
+    }
+
+    /// A slot drawn from this client's own slice.
+    fn pick(&self, rng: &mut ChaCha8Rng) -> u32 {
+        rng.random_range(0..self.len)
+    }
+}
+
+/// What a client believes about one plain key it owns.
+#[derive(Clone)]
+enum Known {
+    /// Never written, or written and answered with something the client could
+    /// not read. Nothing is asserted about the key until it is written again.
+    Nothing,
+    /// Deleted by its owner, and nothing has written it since.
+    Absent,
+    /// Written by its owner with these bytes, and nothing has written it
+    /// since.
+    Value(Vec<u8>),
+}
+
+/// What one reply is worth to the client that asked for it.
+///
+/// Built with the command and consumed with the reply: a reply's index in a
+/// burst is its command's, so this is how a client keeps hold of what it was
+/// expecting without having to read it back off the wire.
+enum Check {
+    /// Coverage only — the reply carries no claim. `TTL` is here: it is in
+    /// the workload so its command kind is traced and its arithmetic runs,
+    /// and what it could assert is a weaker form of what the `GET`
+    /// invariants already assert.
+    Ignored,
+    /// An `INCRBY` this client owes the shared expected sum, if it is
+    /// acknowledged.
+    Counter(i64),
+    /// A `SET` of an owned plain key: the model adopts `value` if it took.
+    PlainSet { slot: u32, value: Vec<u8> },
+    /// A `DEL` of one to three owned plain keys — the variadic form, which
+    /// the service layer fans out one command per key. How many it removes is
+    /// the model's to predict: the *distinct* slots it believes hold a value,
+    /// since a key named twice is removed once.
+    PlainDel { slots: Vec<u32> },
+    /// An `EXISTS` over one to three owned plain keys, fanned out the same
+    /// way. How many it counts is also the model's to predict, and by the
+    /// opposite rule: a key named twice counts twice, because each name is
+    /// its own command.
+    PlainExists { slots: Vec<u32> },
+    /// A `GET` of an owned plain key, held against the model.
+    PlainGet { slot: u32 },
+    /// A `SET` of an owned volatile key: the model adopts `deadline` if it
+    /// took.
+    VolatileSet { slot: u32, deadline: Instant },
+    /// An `EXPIRE` of an owned volatile key: the model adopts `deadline` only
+    /// if the server says there was a key there to take it.
+    VolatileExpire { slot: u32, deadline: Instant },
+    /// A `GET` of an owned volatile key — the two expiration invariants.
+    VolatileGet { slot: u32 },
+}
+
+/// A deadline a `SET` can ask for: the option, its argument, and what the two
+/// come to in milliseconds.
+struct Deadline {
+    option: &'static str,
+    argument: u64,
+    millis: u64,
+}
+
+/// The deadlines the workload hands out.
+///
+/// Spread deliberately across the run's own timescale. The short ones are
+/// dead before their client has finished issuing, which is what makes a stale
+/// read reachable while the server is still under load; the long ones outlive
+/// the whole workload, which is what makes a spurious death reachable at all.
+/// None exceeds a second, because the settle at the end waits out the longest
+/// of them and every millisecond of that is paid for in ticks. Both options
+/// appear because `EX` and `PX` are separate arms of the parser and separate
+/// arithmetic in the handler.
+const DEADLINES: [Deadline; 6] = [
+    Deadline {
+        option: "PX",
+        argument: 1,
+        millis: 1,
+    },
+    Deadline {
+        option: "PX",
+        argument: 20,
+        millis: 20,
+    },
+    Deadline {
+        option: "PX",
+        argument: 60,
+        millis: 60,
+    },
+    Deadline {
+        option: "PX",
+        argument: 150,
+        millis: 150,
+    },
+    Deadline {
+        option: "PX",
+        argument: 300,
+        millis: 300,
+    },
+    // The one that outlives the settle, and the only way to reach the `EX`
+    // arm of the option parser: keys given this are never decided dead, only
+    // decided alive, which is the half of the invariant nothing else reaches.
+    Deadline {
+        option: "EX",
+        argument: 1,
+        millis: 1000,
+    },
+];
+
+/// The span `EXPIRE` asks for, in seconds — its argument has no finer unit,
+/// so a key it touches is one whose death this run will not see. What it is
+/// here for is the command itself: a deadline set by a path other than `SET`,
+/// and the only source of keys certain to be *alive* late in the workload.
+const EXPIRE_SECONDS: u64 = 1;
+
+/// One client's picture of the keys it owns, and the invariants it holds the
+/// server to over them.
+struct Model {
+    /// How many counter keys there are. The one family this client does not
+    /// own a slice of: they are shared, which is where the contention is.
+    counter_keys: u32,
+    plain: KeyRange,
+    volatile: KeyRange,
+    /// What this client last wrote to each plain key it owns.
+    plain_state: Vec<Known>,
+    /// The deadline it last asked for on each volatile key it owns, sampled
+    /// from its own clock *before* the request left — so the deadline the
+    /// server computed is this instant or later, never earlier.
+    deadlines: Vec<Option<Instant>>,
+    shared: Shared,
+}
+
+impl Model {
+    /// The model client `id` starts with: it owns nothing yet and believes
+    /// nothing.
+    fn new(id: u16, cfg: &SimConfig, shared: Shared) -> Self {
+        let plain = KeyRange::new(id, cfg.plain_keys, cfg.clients);
+        let volatile = KeyRange::new(id, cfg.volatile_keys, cfg.clients);
+        Self {
+            counter_keys: cfg.counter_keys,
+            plain_state: vec![Known::Nothing; plain.len as usize],
+            deadlines: vec![None; volatile.len as usize],
+            plain,
+            volatile,
+            shared,
+        }
+    }
+
+    /// One to three plain slots, for the commands that take several keys.
+    ///
+    /// Repeats are not prevented: `DEL k k` and `EXISTS k k` mean different
+    /// things in Redis and are separately worth getting right, so the model
+    /// predicts both and lets the draw decide which one it is looking at.
+    fn several(&self, rng: &mut ChaCha8Rng) -> Vec<u32> {
+        (0..rng.random_range(1..=3u32))
+            .map(|_| self.plain.pick(rng))
+            .collect()
+    }
+
+    /// A command over several of this client's plain keys.
+    fn plain_command(&self, name: &str, slots: &[u32]) -> Frame {
+        let mut parts = Vec::with_capacity(slots.len() + 1);
+        parts.push(name.to_owned());
+        parts.extend(slots.iter().map(|slot| plain_key(self.plain.key(*slot))));
+        command(&parts.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    /// Draws one operation, and what its reply will be worth.
+    ///
+    /// `sent` is the instant the burst this belongs to was composed at, which
+    /// is what every deadline here is measured from; `seq` is the client's
+    /// own operation counter, which goes into written values so a value that
+    /// turns up under the wrong key is visible as such.
+    fn compose(&self, rng: &mut ChaCha8Rng, sent: Instant, seq: u32) -> (Frame, Check) {
+        match rng.random_range(0..100u32) {
+            0..20 => {
+                let key = rng.random_range(0..self.counter_keys);
+                let delta = rng.random_range(-10..=10i64);
+                (
+                    command(&["INCRBY", &counter_key(key), &delta.to_string()]),
+                    Check::Counter(delta),
+                )
+            }
+            20..32 => {
+                let slot = self.plain.pick(rng);
+                let value = format!("{seq}@{}", self.plain.key(slot));
+                let frame = command(&["SET", &plain_key(self.plain.key(slot)), &value]);
+                (
+                    frame,
+                    Check::PlainSet {
+                        slot,
+                        value: value.into_bytes(),
+                    },
+                )
+            }
+            32..42 => {
+                let slot = self.plain.pick(rng);
+                (
+                    command(&["GET", &plain_key(self.plain.key(slot))]),
+                    Check::PlainGet { slot },
+                )
+            }
+            42..46 => {
+                let slots = self.several(rng);
+                (self.plain_command("DEL", &slots), Check::PlainDel { slots })
+            }
+            46..50 => {
+                let slots = self.several(rng);
+                (
+                    self.plain_command("EXISTS", &slots),
+                    Check::PlainExists { slots },
+                )
+            }
+            50..68 => {
+                let slot = self.volatile.pick(rng);
+                let deadline = &DEADLINES[rng.random_range(0..DEADLINES.len())];
+                let frame = command(&[
+                    "SET",
+                    &volatile_key(self.volatile.key(slot)),
+                    &format!("{seq}@{}", self.volatile.key(slot)),
+                    deadline.option,
+                    &deadline.argument.to_string(),
+                ]);
+                (
+                    frame,
+                    Check::VolatileSet {
+                        slot,
+                        deadline: sent + Duration::from_millis(deadline.millis),
+                    },
+                )
+            }
+            68..82 => {
+                let slot = self.volatile.pick(rng);
+                (
+                    command(&["GET", &volatile_key(self.volatile.key(slot))]),
+                    Check::VolatileGet { slot },
+                )
+            }
+            82..92 => {
+                let slot = self.volatile.pick(rng);
+                let frame = command(&[
+                    "EXPIRE",
+                    &volatile_key(self.volatile.key(slot)),
+                    &EXPIRE_SECONDS.to_string(),
+                ]);
+                (
+                    frame,
+                    Check::VolatileExpire {
+                        slot,
+                        deadline: sent + Duration::from_secs(EXPIRE_SECONDS),
+                    },
+                )
+            }
+            _ => {
+                let slot = self.volatile.pick(rng);
+                (
+                    command(&["TTL", &volatile_key(self.volatile.key(slot))]),
+                    Check::Ignored,
+                )
+            }
+        }
+    }
+
+    /// Reads a burst's replies: updates the model, and reports what the
+    /// invariants make of them.
+    ///
+    /// In order, because the burst was applied in order — a `SET` and a later
+    /// `GET` of the same key inside one burst reach their shard that way
+    /// round, so the model the `GET` is judged against is the one its own
+    /// predecessors left.
+    fn observe(&mut self, replies: &[Frame], checks: &[Check], sent: Instant, received: Instant) {
+        for (reply, check) in replies.iter().zip(checks) {
+            match check {
+                Check::Ignored => {}
+                // Only an acknowledged increment is owed to us. Anything else
+                // — an error frame, a reply shape we did not expect — is not
+                // a promise the server made, so counting it would manufacture
+                // a violation the system never committed. Every arm below
+                // reads its reply the same way.
+                Check::Counter(delta) => {
+                    if matches!(reply, Frame::Integer(_)) {
+                        lock(&self.shared.0).expected += delta;
+                    }
+                }
+                Check::PlainSet { slot, value } => {
+                    self.plain_state[*slot as usize] = match reply {
+                        Frame::Simple(text) if text == "OK" => Known::Value(value.clone()),
+                        _ => Known::Nothing,
+                    };
+                }
+                Check::PlainDel { slots } => self.check_plain_fan_out(slots, reply, true),
+                Check::PlainExists { slots } => self.check_plain_fan_out(slots, reply, false),
+                Check::PlainGet { slot } => self.check_plain(*slot, reply),
+                Check::VolatileSet { slot, deadline } => {
+                    self.deadlines[*slot as usize] = match reply {
+                        Frame::Simple(text) if text == "OK" => Some(*deadline),
+                        _ => None,
+                    };
+                }
+                // A zero says the key was already gone, which is no statement
+                // about when it will next die: the model gives up on it until
+                // its owner writes it again.
+                Check::VolatileExpire { slot, deadline } => {
+                    self.deadlines[*slot as usize] = match reply {
+                        Frame::Integer(1) => Some(*deadline),
+                        _ => None,
+                    };
+                }
+                Check::VolatileGet { slot } => self.check_volatile(*slot, reply, sent, received),
+            }
+        }
+    }
+
+    /// Holds a variadic `DEL` or `EXISTS` against the model, and — for `DEL` —
+    /// applies it.
+    ///
+    /// The count is the whole of what the fan-out returns, and it is exactly
+    /// predictable here because the keys belong to this client alone. The two
+    /// commands count differently on a repeated key, which is the point of
+    /// letting the draw repeat one: `DEL k k` removes it once, `EXISTS k k`
+    /// finds it twice.
+    fn check_plain_fan_out(&mut self, slots: &[u32], reply: &Frame, removing: bool) {
+        let mut counted = 0i64;
+        let mut predictable = true;
+        let mut seen: Vec<u32> = Vec::with_capacity(slots.len());
+        for slot in slots {
+            match self.plain_state[*slot as usize] {
+                Known::Nothing => predictable = false,
+                Known::Absent => {}
+                // A removal takes the key out, so naming it twice can only
+                // remove it once; a count sees it every time it is named.
+                Known::Value(_) if removing && seen.contains(slot) => {}
+                Known::Value(_) => counted += 1,
+            }
+            seen.push(*slot);
+        }
+
+        if predictable {
+            let mut tally = lock(&self.shared.0);
+            tally.plain_checks += 1;
+            if *reply != Frame::Integer(counted) {
+                tally.plain_mismatches += 1;
+            }
+        }
+
+        if removing {
+            let removed = matches!(reply, Frame::Integer(_));
+            for slot in slots {
+                self.plain_state[*slot as usize] = if removed {
+                    Known::Absent
+                } else {
+                    Known::Nothing
+                };
+            }
+        }
+    }
+
+    /// Holds a `GET` of a plain key against what this client last wrote.
+    ///
+    /// Sound because the family is partitioned: nothing else in the
+    /// simulation writes this key, so "what I last wrote" is the whole truth
+    /// about it and no schedule excuses a difference. Strict about the reply
+    /// shape for the same reason the volatile check is lenient about it —
+    /// there, an error frame is a question left unanswered; here, a `GET` of
+    /// a key this client owns has no legitimate way to fail.
+    fn check_plain(&self, slot: u32, reply: &Frame) {
+        let agrees = match (&self.plain_state[slot as usize], reply) {
+            (Known::Nothing, _) => return,
+            (Known::Absent, reply) => matches!(reply, Frame::Null),
+            (Known::Value(value), Frame::Bulk(got)) => got == value,
+            (Known::Value(_), _) => false,
+        };
+        let mut tally = lock(&self.shared.0);
+        tally.plain_checks += 1;
+        if !agrees {
+            tally.plain_mismatches += 1;
+        }
+    }
+
+    /// Holds a `GET` of a volatile key against the deadline this client asked
+    /// for.
+    ///
+    /// `sent` is a lower bound on when the server ran the read and `received`
+    /// an upper bound, so each half takes the end that makes it conservative:
+    /// a value is called stale only when even the *earliest* the read could
+    /// have run was past the deadline, and an absence spurious only when even
+    /// the *latest* it could have run was before it. Inside the band the
+    /// client says nothing — which is not a pass, and is why what was decided
+    /// is counted beside what was violated.
+    fn check_volatile(&self, slot: u32, reply: &Frame, sent: Instant, received: Instant) {
+        let Some(deadline) = self.deadlines[slot as usize] else {
+            return;
+        };
+        // Only a value or its absence answers the question. Anything else is
+        // the server declining to, and counting it would inflate the very
+        // number that says this invariant ran.
+        let present = match reply {
+            Frame::Bulk(_) => true,
+            Frame::Null => false,
+            _ => return,
+        };
+        let mut tally = lock(&self.shared.0);
+        if sent > deadline + SLACK {
+            tally.dead_checks += 1;
+            if present {
+                tally.stale_reads += 1;
+            }
+        } else if received + SLACK < deadline {
+            tally.alive_checks += 1;
+            if !present {
+                tally.spurious_deaths += 1;
+            }
+        }
+    }
+
+    /// The last thing a client does: wait out the deadlines it asked for, as
+    /// far as [`SETTLE_CAP`] allows, then read back everything it owns.
+    ///
+    /// This is where the active sweep is under test. The workload is over in
+    /// a fraction of a simulated second and the deadlines it handed out are
+    /// longer than that, so without the wait a run would end with the
+    /// keyspace full of entries nothing had reclaimed and nothing would ever
+    /// have looked. After it, two things must hold at once: every volatile
+    /// key whose deadline was waited out is gone, and every plain key — which
+    /// no deadline was ever put on — is exactly what its owner wrote. A sweep
+    /// that eats the living fails the second; a server that spares the dead
+    /// fails the first.
+    async fn settle(&mut self, conn: &mut Conn, depth: usize) -> turmoil::Result<()> {
+        if let Some(last) = self.deadlines.iter().flatten().max() {
+            // A millisecond past the band, so a deadline waited out is
+            // decidedly behind us and the read below counts as a check —
+            // but never longer than [`SETTLE_CAP`], whose documentation says
+            // what the wait costs and what capping it gives up.
+            let until = (*last).min(Instant::now() + SETTLE_CAP) + SLACK + Duration::from_millis(1);
+            tokio::time::sleep_until(until).await;
+        }
+
+        let mut frames = Vec::new();
+        let mut checks = Vec::new();
+        for slot in 0..self.volatile.len {
+            frames.push(command(&["GET", &volatile_key(self.volatile.key(slot))]));
+            checks.push(Check::VolatileGet { slot });
+        }
+        for slot in 0..self.plain.len {
+            frames.push(command(&["GET", &plain_key(self.plain.key(slot))]));
+            checks.push(Check::PlainGet { slot });
+        }
+
+        for (burst, checks) in frames.chunks(depth).zip(checks.chunks(depth)) {
+            let sent = Instant::now();
+            let replies = conn.request_many(burst).await?;
+            self.observe(&replies, checks, sent, Instant::now());
+        }
+        Ok(())
+    }
 }
 
 /// The last client: waits for the workload to drain, then reads every counter.
@@ -564,36 +1335,54 @@ async fn client(id: u16, cfg: SimConfig, shared: Shared) -> turmoil::Result {
 /// *settled on*: a counter read while an increment is still in flight is not
 /// a lost update, it is an early read.
 async fn verifier(cfg: SimConfig, shared: Shared) -> turmoil::Result {
-    while *lock(&shared.done) < u32::from(cfg.clients) {
+    while lock(&shared.0).done < u32::from(cfg.clients) {
         // Simulated time: this costs ticks, not wall clock.
         tokio::time::sleep(VERIFIER_POLL).await;
     }
 
     let mut conn = Conn::connect().await?;
     let mut total: i64 = 0;
-    for key in 0..cfg.counter_keys {
-        let reply = conn.request(&command(&["GET", &counter_key(key)])).await?;
-        total += match reply {
-            // Never incremented, or incremented back out of existence.
-            Frame::Null => 0,
-            Frame::Bulk(value) => {
-                parse_i64(&value).ok_or_else(|| format!("counter {key} is not an integer"))?
-            }
-            other => return Err(format!("counter {key} answered with {other:?}").into()),
-        };
+    // Read in bursts rather than one round trip per counter. Nothing is
+    // racing any more — every client has finished — so what a serial read
+    // would buy is only simulated seconds, and those are paid for in ticks
+    // the whole simulation walks through.
+    let depth = cfg.pipeline_depth.max(1) as usize;
+    let keys: Vec<Frame> = (0..cfg.counter_keys)
+        .map(|key| command(&["GET", &counter_key(key)]))
+        .collect();
+    for (batch, burst) in keys.chunks(depth).enumerate() {
+        for (offset, reply) in conn.request_many(burst).await?.into_iter().enumerate() {
+            let key = batch * depth + offset;
+            total += match reply {
+                // Never incremented, or incremented back out of existence.
+                Frame::Null => 0,
+                Frame::Bulk(value) => {
+                    parse_i64(&value).ok_or_else(|| format!("counter {key} is not an integer"))?
+                }
+                other => return Err(format!("counter {key} answered with {other:?}").into()),
+            };
+        }
     }
-    *lock(&shared.actual) = total;
+    lock(&shared.0).actual = total;
     Ok(())
 }
 
-/// The name of a counter key — touched only by `INCRBY`.
+/// The name of a counter key — touched only by `INCRBY`, shared by every
+/// client.
 fn counter_key(index: u32) -> String {
     format!("counter-{index}")
 }
 
-/// The name of a string key — touched by `GET`, `SET` and `DEL`.
-fn string_key(index: u32) -> String {
-    format!("k{index}")
+/// The name of a plain key — `GET`/`SET`/`DEL`, never a deadline, owned by
+/// one client.
+fn plain_key(index: u32) -> String {
+    format!("plain-{index}")
+}
+
+/// The name of a volatile key — always written with a deadline, owned by one
+/// client.
+fn volatile_key(index: u32) -> String {
+    format!("volatile-{index}")
 }
 
 /// Builds a RESP2 command frame: an array of bulk strings, as a real client
@@ -631,14 +1420,6 @@ impl Conn {
             decoder: Decoder::new(DecoderLimits::default()),
             out: Vec::new(),
         })
-    }
-
-    /// Sends one command and reads exactly one reply.
-    async fn request(&mut self, frame: &Frame) -> turmoil::Result<Frame> {
-        let mut replies = self.request_many(std::slice::from_ref(frame)).await?;
-        replies
-            .pop()
-            .ok_or_else(|| "one request was answered with nothing".into())
     }
 
     /// Sends a burst of commands in one write and reads exactly that many
@@ -686,10 +1467,15 @@ mod tests {
         let a = run_sim(&SimConfig::mini(1, 42));
         let b = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(a.trace_hash, b.trace_hash, "in-process determinism");
-        assert!(a.invariant_holds(), "atomic INCRBY must not lose updates");
-        // Without this the invariant assertion is vacuous: a workload that
-        // issued no acknowledged `INCRBY` at all satisfies `0 == 0`.
-        assert_ne!(a.expected_sum, 0, "the workload acknowledged no INCRBY");
+        assert!(a.invariant_holds(), "every invariant must hold: {a:?}");
+        // Without this every assertion above is vacuous: a workload that
+        // acknowledged no `INCRBY` satisfies `0 == 0`, and one whose reads all
+        // landed inside the band satisfies "no stale reads" without having
+        // looked at one.
+        assert!(
+            a.invariants_were_exercised(),
+            "the run decided nothing: {a:?}"
+        );
         assert_eq!(
             a.expected_sum, b.expected_sum,
             "a pinned workload seed must issue the same increments"
@@ -717,7 +1503,7 @@ mod tests {
         // was intended. When it was (a new command kind, a new folded field),
         // update the constant in the same commit that caused it, and say so in
         // the message. Never update it to make a red suite green.
-        const MINI_1_42: u64 = 0xc221_2b92_ae7a_4378;
+        const MINI_1_42: u64 = 0xe3a9_2f89_c6c3_aa9b;
 
         let outcome = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(
@@ -726,7 +1512,19 @@ mod tests {
         );
         // The workload behind the hash, pinned separately: the two can drift
         // apart, and a changed workload with a coincidentally equal hash is the
-        // one failure the assertion above cannot see.
-        assert_eq!(outcome.expected_sum, 99, "the recorded workload moved");
+        // one failure the assertion above cannot see. The check counts are
+        // pinned for a second reason — they are what says the expiration
+        // invariants ran, and a workload that quietly stopped reaching them
+        // would otherwise keep passing.
+        assert_eq!(outcome.expected_sum, 264, "the recorded workload moved");
+        assert_eq!(
+            (
+                outcome.dead_checks,
+                outcome.alive_checks,
+                outcome.plain_checks
+            ),
+            (49, 9, 139),
+            "the recorded workload decides a different number of checks"
+        );
     }
 }

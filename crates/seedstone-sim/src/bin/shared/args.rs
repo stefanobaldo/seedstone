@@ -14,7 +14,7 @@
 //! that are not its own, so a typo like `sweep --sim-seed 3` fails loudly
 //! rather than sweeping some default.
 
-use seedstone_sim::SimConfig;
+use seedstone_sim::{Plant, SimConfig};
 
 /// Every option either binary accepts.
 pub struct Args {
@@ -27,8 +27,13 @@ pub struct Args {
     pub workload_seed: u64,
     /// `--mini` — the small configuration, for tests and quick checks.
     pub mini: bool,
-    /// `--plant` — route `INCRBY` through the deliberately racy router.
-    pub plant: bool,
+    /// `--plant NAME` — serve the workload through one deliberate defect.
+    ///
+    /// Named rather than boolean: there are three of them now, one per
+    /// invariant, and a flag that silently selects the first would be a way
+    /// to run a self-test that proves nothing about the counter it was
+    /// pointed at.
+    pub plant: Option<Plant>,
     /// `--hashes` — print every seed's trace hash, not just the failures'.
     /// `sweep` only.
     ///
@@ -66,7 +71,7 @@ impl Args {
             seeds: None,
             workload_seed: DEFAULT_WORKLOAD_SEED,
             mini: false,
-            plant: false,
+            plant: None,
             hashes: false,
         };
 
@@ -77,7 +82,7 @@ impl Args {
                 "--seeds" => parsed.seeds = Some(number(&arg, argv.next())?),
                 "--workload-seed" => parsed.workload_seed = number(&arg, argv.next())?,
                 "--mini" => parsed.mini = true,
-                "--plant" => parsed.plant = true,
+                "--plant" => parsed.plant = Some(plant(argv.next())?),
                 "--hashes" => parsed.hashes = true,
                 other => return Err(format!("unknown argument `{other}`")),
             }
@@ -96,6 +101,28 @@ impl Args {
         cfg.planted = self.plant;
         cfg
     }
+}
+
+/// Reads the plant name that follows `--plant`.
+///
+/// The message lists every plant there is rather than saying the name was
+/// wrong: this flag is typed by someone reproducing a failure, and the set is
+/// short enough to print.
+fn plant(value: Option<String>) -> Result<Plant, String> {
+    let names = || {
+        Plant::ALL
+            .iter()
+            .map(|plant| plant.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let value = value.ok_or_else(|| format!("--plant needs one of: {}", names()))?;
+    Plant::from_name(&value).ok_or_else(|| {
+        format!(
+            "--plant does not know `{value}`; it takes one of: {}",
+            names()
+        )
+    })
 }
 
 /// Reads the value that follows a flag.
@@ -136,5 +163,23 @@ mod tests {
     #[test]
     fn a_misspelt_hashes_is_refused_rather_than_dropped() {
         assert!(parse(&["--seeds", "10", "--hash"]).is_err());
+    }
+
+    /// `--plant` was a boolean before there were three plants, and a boolean
+    /// that grows a value is how a hand-written parser starts swallowing its
+    /// neighbour's argument.
+    #[test]
+    fn plant_takes_a_name() {
+        let args = parse(&["--seeds", "10", "--plant", "serve-expired"]).expect("a name parses");
+        assert_eq!(args.plant, Some(Plant::ServeExpired));
+        assert_eq!(args.seeds, Some(10));
+    }
+
+    /// A plant nobody planted is worse than no plant: the run would be honest
+    /// and the self-test would read as a pass.
+    #[test]
+    fn an_unknown_or_missing_plant_is_refused() {
+        assert!(parse(&["--seeds", "10", "--plant", "nonesuch"]).is_err());
+        assert!(parse(&["--seeds", "10", "--plant"]).is_err());
     }
 }

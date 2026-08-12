@@ -17,13 +17,13 @@
 //!
 //! Exits 1 if any seed violated the lost-update invariant.
 
-use seedstone_sim::run_sim;
+use seedstone_sim::{Plant, run_sim};
 use std::process::ExitCode;
 
 #[path = "shared/args.rs"]
 mod args;
 
-const USAGE: &str = "usage: sweep --seeds N [--workload-seed W] [--mini] [--plant] [--hashes]";
+const USAGE: &str = "usage: sweep --seeds N [--workload-seed W] [--mini] [--plant NAME] [--hashes]";
 
 fn main() -> ExitCode {
     let args = match args::Args::from_env() {
@@ -59,8 +59,14 @@ fn main() -> ExitCode {
             // cancelled — by CI, by a person — has still reported what it
             // found up to that point.
             println!(
-                "FAIL seed={} trace=0x{:016x} expected={} actual={}",
-                sim_seed, outcome.trace_hash, outcome.expected_sum, outcome.actual_sum
+                "FAIL seed={} trace=0x{:016x} expected={} actual={} stale={} spurious={} plain={}",
+                sim_seed,
+                outcome.trace_hash,
+                outcome.expected_sum,
+                outcome.actual_sum,
+                outcome.stale_reads,
+                outcome.spurious_deaths,
+                outcome.plain_mismatches
             );
         }
     }
@@ -70,7 +76,7 @@ fn main() -> ExitCode {
         seeds,
         shape(&args),
         args.workload_seed,
-        args.plant,
+        args.plant.map_or("none", Plant::name),
         violations
     );
 

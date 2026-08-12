@@ -5,7 +5,7 @@
 //! `replay` binary reproduces the same seed's trace hash from a separate
 //! process says a reported failure is something another machine can pick up.
 
-use seedstone_sim::{SimConfig, run_sim};
+use seedstone_sim::{Plant, SimConfig, run_sim};
 
 /// How far the search for a failing seed runs before giving up.
 const SEEDS: u64 = 64;
@@ -15,7 +15,7 @@ fn planted_race_is_caught_and_replays_across_processes() {
     let mut failing = None;
     for sim_seed in 1..=SEEDS {
         let mut cfg = SimConfig::mini(1, sim_seed);
-        cfg.planted = true;
+        cfg.planted = Some(Plant::LostUpdate);
         let outcome = run_sim(&cfg);
         if !outcome.invariant_holds() {
             failing = Some((sim_seed, outcome));
@@ -27,7 +27,13 @@ fn planted_race_is_caught_and_replays_across_processes() {
 
     let run = || {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_replay"))
-            .args(["--sim-seed", &seed.to_string(), "--mini", "--plant"])
+            .args([
+                "--sim-seed",
+                &seed.to_string(),
+                "--mini",
+                "--plant",
+                Plant::LostUpdate.name(),
+            ])
             .output()
             .expect("replay spawn");
         String::from_utf8(out.stdout).unwrap()
