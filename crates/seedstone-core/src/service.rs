@@ -30,8 +30,9 @@
 //!   against that is a debug assertion, which is not there in release. This is
 //!   the enforcement point that is.
 
-use crate::shard::{Command, Reply, ReplyError, Router, parse_i64};
+use crate::shard::{Command, Cond, Expiry, Reply, ReplyError, Router, parse_i64};
 use seedstone_resp::{Decoder, DecoderLimits, Frame, ParseError, encode};
+use std::mem::take;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// How many bytes one connection may hold while a frame is still incomplete.
@@ -199,6 +200,30 @@ const QUOTE_LIMIT: usize = 32;
 /// this prefix. A clearer message would break the client.
 pub const NOPROTO: &str = "NOPROTO unsupported protocol version";
 
+/// What a peer spelling a command's options wrong is told.
+///
+/// Byte-exact to Redis, which says no more than this whichever option was at
+/// fault: the same text for an unknown option, for a repeated one, and for one
+/// whose argument is missing.
+pub const SYNTAX_ERROR: &str = "ERR syntax error";
+
+/// The largest span, in seconds, an expiry option may name.
+///
+/// Redis's own ceiling, and the reason it has one is arithmetic: it holds a
+/// deadline in milliseconds, so a span in seconds is multiplied by a thousand
+/// before anything is done with it, and a value past `i64::MAX / 1000` cannot
+/// survive that. Matching the ceiling is what makes the refusal byte-exact
+/// rather than merely sensible.
+///
+/// It also closes a hole on this side. The shard turns a span into an
+/// [`Instant`](std::time::Instant) and stores *no deadline* when that
+/// arithmetic leaves the clock's range — the only answer available to it, since
+/// the alternative is a panic on a number a peer chose. Reached from `EXPIRE`,
+/// that would clear the deadline a key already had and still report success,
+/// which is a key made immortal by an argument nobody could have meant. The
+/// number is refused here, where it is still a number.
+const MAX_EXPIRE_SECONDS: i64 = i64::MAX / 1000;
+
 /// What this server answers `HELLO` with, and what it calls itself.
 const SERVER_NAME: &str = "seedstone";
 
@@ -211,6 +236,11 @@ const SERVER_NAME: &str = "seedstone";
 enum Action {
     /// A keyed command: route it and reply with what the shard says.
     Dispatch(Command),
+    /// One request naming several keys, split into the one-key commands the
+    /// shards that own them can run. The replies are summed into a single
+    /// integer — see [`fan_out`], which also states what the split costs in
+    /// atomicity.
+    FanOut(Vec<Command>),
     /// Answer with this frame; the connection continues.
     Reply(Frame),
     /// Answer with this frame, then hang up.
@@ -253,7 +283,9 @@ enum Slot {
 /// owns its keys in one message per owner instead of one per command — and
 /// request order is restored by the slots rather than by the awaiting. A chunk
 /// closes when the decoder runs dry, when the batch reaches
-/// [`CHUNK_COMMANDS`], and at `QUIT` or a protocol error.
+/// [`CHUNK_COMMANDS`], before a multi-key request fans out — see [`fan_out`],
+/// which has to run *after* what the peer wrote in front of it — and at `QUIT`
+/// or a protocol error.
 ///
 /// Accumulation is bounded rather than open-ended, on both axes: a drain that
 /// reaches [`REPLY_HIGH_WATER`] writes there and carries on into the same
@@ -333,6 +365,19 @@ where
                         {
                             return;
                         }
+                    }
+                    Action::FanOut(cmds) => {
+                        // The chunk closes *before* the fan-out runs, and that
+                        // is an ordering requirement rather than tidiness: the
+                        // commands already batched were written by the peer
+                        // ahead of this one, and dispatching these while those
+                        // wait would run a `DEL k` before the `SET k v` the
+                        // peer pipelined in front of it.
+                        if !emit_chunk(&mut stream, &mut out, &router, &mut slots, &mut batch).await
+                        {
+                            return;
+                        }
+                        slots.push(Slot::Ready(fan_out(&router, cmds).await));
                     }
                     Action::Reply(frame) => slots.push(Slot::Ready(frame)),
                     Action::ReplyThenClose(frame) => {
@@ -491,7 +536,7 @@ where
         // being copied out of it. `slots` keeps its capacity across chunks;
         // this one is handed over and regrown.
         router
-            .dispatch_many(std::mem::take(batch))
+            .dispatch_many(take(batch))
             .await
             .into_iter()
             .map(Some)
@@ -573,6 +618,36 @@ fn reply_to_frame(reply: Reply) -> Frame {
     }
 }
 
+/// Runs one command per key and answers the request with their sum.
+///
+/// This is how a variadic `DEL` or `EXISTS` is served: the keys of one request
+/// are in general owned by different shards, so there is no single shard the
+/// request could be sent to, and it becomes one command per key.
+///
+/// **The set is not a transaction.** Each key's command is atomic on the shard
+/// that owns it — that is the shard runtime's guarantee and it is unaffected —
+/// but the commands run one after another, and another connection's work can
+/// land between any two of them. A peer that deletes three keys can therefore
+/// be observed halfway through. Redis in cluster mode makes the same trade, and
+/// it is the only one available here: the alternative is a lock spanning
+/// shards, which would put the multi-key path's cost in front of every
+/// single-key one.
+///
+/// A shard that answers with an error ends the fan-out and that error is the
+/// reply. A partial count reported as a total would be worse than a refusal:
+/// the peer cannot tell the two apart.
+async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>) -> Frame {
+    let mut total: i64 = 0;
+    for cmd in cmds {
+        total = match router.dispatch(cmd).await {
+            Reply::Removed(removed) => total.saturating_add(i64::from(removed)),
+            Reply::Integer(n) => total.saturating_add(n),
+            other => return reply_to_frame(other),
+        };
+    }
+    Frame::Integer(total)
+}
+
 /// Builds an error frame whose text cannot split the response.
 ///
 /// Any `\r` or `\n` is replaced, and the result is truncated, so the frame
@@ -645,6 +720,12 @@ fn frame_to_action(frame: Frame) -> Action {
 /// [`frame_to_action`]'s body, with the error path expressed as `Err`.
 ///
 /// Command names are matched case-insensitively, as Redis does.
+///
+/// The arguments are taken apart rather than read: a decoded frame already owns
+/// its bulk payloads, so every one of them that ends up in a [`Command`] or a
+/// reply is *moved* out of the array the codec built. What is left behind is an
+/// empty `Vec` that dies with the array, and the alternative is a second copy
+/// of every value the peer wrote, on the path every write takes.
 fn action_for(frame: Frame) -> Result<Action, String> {
     let Frame::Array(parts) = frame else {
         return Err("ERR Protocol error: expected an array of bulk strings".into());
@@ -658,7 +739,10 @@ fn action_for(frame: Frame) -> Result<Action, String> {
         }
     }
 
-    let Some((name, args)) = args.split_first() else {
+    // Split rather than indexed, so the name and the arguments are two disjoint
+    // borrows: the name is read to the end — an unknown command is quoted back
+    // by it — while the arguments are being emptied.
+    let Some((name, args)) = args.split_first_mut() else {
         return Err("ERR Protocol error: empty command".into());
     };
 
@@ -671,13 +755,13 @@ fn action_for(frame: Frame) -> Result<Action, String> {
         b"PING" => {
             return match args {
                 [] => Ok(Action::Reply(Frame::Simple("PONG".into()))),
-                [message] => Ok(Action::Reply(Frame::Bulk(message.clone()))),
+                [message] => Ok(Action::Reply(Frame::Bulk(take(message)))),
                 _ => Err(wrong_arity("ping")),
             };
         }
         b"ECHO" => {
             return match args {
-                [message] => Ok(Action::Reply(Frame::Bulk(message.clone()))),
+                [message] => Ok(Action::Reply(Frame::Bulk(take(message)))),
                 _ => Err(wrong_arity("echo")),
             };
         }
@@ -691,7 +775,7 @@ fn action_for(frame: Frame) -> Result<Action, String> {
         _ => {}
     }
 
-    keyed_command(&upper, name, args).map(Action::Dispatch)
+    keyed_action(&upper, name, args)
 }
 
 /// Answers `HELLO`, which is how a client asks what it is talking to.
@@ -741,45 +825,195 @@ fn hello_frame() -> Frame {
     ])
 }
 
-/// Maps a keyed command to the [`Command`] a shard will run.
+/// Maps a keyed command to what should happen because of it: one [`Command`]
+/// for the shard that owns its key, or — for the two commands that take a list
+/// of keys — the fan-out of one command per key.
 ///
 /// `upper` is the uppercased name matched on; `name` is the original bytes,
 /// kept only so an unknown command can be quoted back as the peer spelled it.
-fn keyed_command(upper: &[u8], name: &[u8], args: &[Vec<u8>]) -> Result<Command, String> {
+/// `args` is emptied as it is matched: see [`action_for`].
+fn keyed_action(upper: &[u8], name: &[u8], args: &mut [Vec<u8>]) -> Result<Action, String> {
     match upper {
         b"GET" => match args {
-            [key] => Ok(Command::Get { key: key.clone() }),
+            [key] => Ok(Action::Dispatch(Command::Get { key: take(key) })),
             _ => Err(wrong_arity("get")),
         },
         b"SET" => match args {
-            [key, value] => Ok(Command::Set {
-                key: key.clone(),
-                value: value.clone(),
-                // The options a shard now understands are not spelled on the
-                // wire yet: this layer accepts the two-argument form only, so
-                // every `SET` it builds is an unconditional write with no
-                // deadline.
-                expiry: None,
-                cond: None,
-            }),
+            [key, value, options @ ..] => {
+                // Parsed before the key and the value are taken, so a refused
+                // option leaves nothing half-consumed.
+                let (expiry, cond) = set_options(options)?;
+                Ok(Action::Dispatch(Command::Set {
+                    key: take(key),
+                    value: take(value),
+                    expiry,
+                    cond,
+                }))
+            }
             _ => Err(wrong_arity("set")),
         },
-        b"DEL" => match args {
-            [key] => Ok(Command::Del { key: key.clone() }),
-            _ => Err(wrong_arity("del")),
+        b"DEL" => per_key(args, "del", |key| Command::Del { key }),
+        b"EXISTS" => per_key(args, "exists", |key| Command::Exists { key }),
+        b"EXPIRE" => match args {
+            [key, seconds] => {
+                let seconds = expire_seconds(seconds)?;
+                Ok(Action::Dispatch(Command::Expire {
+                    key: take(key),
+                    seconds,
+                }))
+            }
+            _ => Err(wrong_arity("expire")),
+        },
+        b"TTL" => match args {
+            [key] => Ok(Action::Dispatch(Command::Ttl { key: take(key) })),
+            _ => Err(wrong_arity("ttl")),
         },
         b"INCRBY" => match args {
-            [key, delta] => parse_i64(delta)
-                .map(|delta| Command::IncrBy {
-                    key: key.clone(),
+            [key, delta] => {
+                let delta = parse_i64(delta)
+                    .ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
+                Ok(Action::Dispatch(Command::IncrBy {
+                    key: take(key),
                     delta,
-                })
-                .ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned()),
+                }))
+            }
             _ => Err(wrong_arity("incrby")),
         },
         // The name is peer-supplied. It is quoted, not echoed.
         _ => Err(format!("ERR unknown command '{}'", quote(name))),
     }
+}
+
+/// Builds the action for a command that names one key or many.
+///
+/// One key stays a single dispatch — the common case, and the one that travels
+/// in the drain's batch with everything else. Several become a [`fan_out`],
+/// with the atomicity that costs stated there.
+fn per_key(
+    args: &mut [Vec<u8>],
+    name: &str,
+    command: fn(Vec<u8>) -> Command,
+) -> Result<Action, String> {
+    match args {
+        [] => Err(wrong_arity(name)),
+        [key] => Ok(Action::Dispatch(command(take(key)))),
+        keys => Ok(Action::FanOut(
+            keys.iter_mut().map(|key| command(take(key))).collect(),
+        )),
+    }
+}
+
+/// Parses the options a `SET` may carry after its key and value.
+///
+/// Walked left to right, case-insensitively, taking at most one of `EX`/`PX`
+/// and at most one of `NX`/`XX`. Everything else — an option this server does
+/// not know, a second expiry, a second condition, an `EX` with nothing after it
+/// — is [`SYNTAX_ERROR`], which is the single answer Redis gives to all of
+/// them.
+fn set_options(mut rest: &[Vec<u8>]) -> Result<(Option<Expiry>, Option<Cond>), String> {
+    let mut expiry: Option<Expiry> = None;
+    let mut cond: Option<Cond> = None;
+    while let Some((option, tail)) = rest.split_first() {
+        if let Some(unit) = expiry_unit(option) {
+            // The duplicate is refused before the argument is looked at, as
+            // Redis does it: `EX 10 EX 0` is a syntax error, not an invalid
+            // expire time.
+            if expiry.is_some() {
+                return Err(SYNTAX_ERROR.to_owned());
+            }
+            let Some((span, after)) = tail.split_first() else {
+                return Err(SYNTAX_ERROR.to_owned());
+            };
+            expiry = Some((unit.expiry)(set_expire_span(span, unit.ceiling)?));
+            rest = after;
+        } else if let Some(wanted) = condition(option) {
+            if cond.is_some() {
+                return Err(SYNTAX_ERROR.to_owned());
+            }
+            cond = Some(wanted);
+            rest = tail;
+        } else {
+            return Err(SYNTAX_ERROR.to_owned());
+        }
+    }
+    Ok((expiry, cond))
+}
+
+/// What an expiry option decides about the span that follows it.
+///
+/// A span stays in the unit the client chose all the way to the shard — see
+/// [`Expiry`] — so an option settles two things here and nothing else: which
+/// [`Expiry`] the number becomes, and how large that unit lets it be.
+struct ExpiryUnit {
+    /// Builds the [`Expiry`] for a span in this unit.
+    expiry: fn(u64) -> Expiry,
+    /// The largest span this unit may carry.
+    ceiling: i64,
+}
+
+/// The unit an expiry option names, if it names one.
+fn expiry_unit(option: &[u8]) -> Option<ExpiryUnit> {
+    if option.eq_ignore_ascii_case(b"EX") {
+        Some(ExpiryUnit {
+            expiry: Expiry::Ex,
+            ceiling: MAX_EXPIRE_SECONDS,
+        })
+    } else if option.eq_ignore_ascii_case(b"PX") {
+        // Already in the unit that ceiling exists to protect, so anything
+        // positive an `i64` can hold is a span Redis accepts.
+        Some(ExpiryUnit {
+            expiry: Expiry::Px,
+            ceiling: i64::MAX,
+        })
+    } else {
+        None
+    }
+}
+
+/// The condition a `SET` option names, if it names one.
+const fn condition(option: &[u8]) -> Option<Cond> {
+    if option.eq_ignore_ascii_case(b"NX") {
+        Some(Cond::Nx)
+    } else if option.eq_ignore_ascii_case(b"XX") {
+        Some(Cond::Xx)
+    } else {
+        None
+    }
+}
+
+/// Parses the span an `EX`/`PX` names: strictly positive, and within what the
+/// unit can carry.
+///
+/// A `SET` whose deadline has already passed is not a write Redis performs and
+/// then undoes — it is refused outright, so zero and negative spans are errors
+/// rather than deletions. `ceiling` is what the option's unit may carry; see
+/// [`expiry_unit`].
+fn set_expire_span(span: &[u8], ceiling: i64) -> Result<u64, String> {
+    let span = parse_i64(span).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
+    if span <= 0 || span > ceiling {
+        return Err(invalid_expire("set"));
+    }
+    u64::try_from(span).map_err(|_| invalid_expire("set"))
+}
+
+/// Parses `EXPIRE`'s span, which unlike `SET`'s may be zero or negative.
+///
+/// A deadline in the past is a deletion the client asked for in the past tense,
+/// and Redis performs it. What it refuses is a span it cannot do arithmetic on
+/// — see [`MAX_EXPIRE_SECONDS`], in both directions.
+fn expire_seconds(seconds: &[u8]) -> Result<i64, String> {
+    let seconds =
+        parse_i64(seconds).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
+    if !(-MAX_EXPIRE_SECONDS..=MAX_EXPIRE_SECONDS).contains(&seconds) {
+        return Err(invalid_expire("expire"));
+    }
+    Ok(seconds)
+}
+
+/// The invalid-expiry message, with the command's own lowercase name — a
+/// literal from the table above, never peer-supplied text.
+fn invalid_expire(name: &str) -> String {
+    format!("ERR invalid expire time in '{name}' command")
 }
 
 /// The arity message, with the command's own lowercase name — a literal from
@@ -846,6 +1080,249 @@ mod tests {
             "{:?}",
             frames[7]
         );
+    }
+
+    /// Every `SET` option this server takes, every way of getting them wrong,
+    /// and the exact text of each refusal.
+    ///
+    /// The refusals are written out as literals rather than taken from the
+    /// constants that produce them. A client matching on `ERR syntax error`
+    /// cannot see this server's constants, so a test that quoted them would go
+    /// on passing after a typo landed in one — which is the only failure this
+    /// test exists to catch.
+    #[tokio::test]
+    async fn set_option_parsing_is_redis_exact() {
+        let (mut r, mut w, _pool) = connected(16);
+        let mut out = Vec::new();
+        let requests: [&[&str]; 21] = [
+            &["SET", "k", "v", "EX", "10"],
+            &["TTL", "k"],
+            &["SET", "k", "other", "PX", "500", "NX"],
+            &["GET", "k"],
+            &["SET", "fresh", "v", "PX", "500", "NX"],
+            &["SET", "k", "v", "XX"],
+            &["TTL", "k"],
+            &["SET", "absent", "v", "XX"],
+            &["set", "c", "v", "ex", "10", "Nx"],
+            &["TTL", "c"],
+            &["SET", "k", "v", "EX", "10", "PX", "5"],
+            &["SET", "k", "v", "NX", "XX"],
+            &["SET", "k", "v", "EX", "10", "EX", "10"],
+            &["SET", "k", "v", "EX"],
+            &["SET", "k", "v", "KEEPTTL"],
+            &["SET", "k", "v", "EX", "0"],
+            &["SET", "k", "v", "EX", "-1"],
+            &["SET", "k", "v", "EX", "9223372036854775807"],
+            &["SET", "k", "v", "PX", "0"],
+            &["SET", "k", "v", "EX", "notanum"],
+            &["GET", "k"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        let syntax = Frame::Error("ERR syntax error".into());
+        let expire = Frame::Error("ERR invalid expire time in 'set' command".into());
+        // Sized to the requests above, so one added without its answer is a
+        // compile error rather than a `zip` that quietly stops early.
+        let expected: [Frame; 21] = [
+            Frame::Simple("OK".into()),
+            Frame::Integer(10),
+            Frame::Null,
+            Frame::Bulk(b"v".to_vec()),
+            Frame::Simple("OK".into()),
+            Frame::Simple("OK".into()),
+            // A `SET` with no expiry option clears the deadline it overwrote.
+            Frame::Integer(-1),
+            Frame::Null,
+            Frame::Simple("OK".into()),
+            Frame::Integer(10),
+            syntax.clone(),
+            syntax.clone(),
+            syntax.clone(),
+            syntax.clone(),
+            syntax,
+            expire.clone(),
+            expire.clone(),
+            expire.clone(),
+            expire,
+            Frame::Error("ERR value is not an integer or out of range".into()),
+            // Every refusal above left the connection usable.
+            Frame::Bulk(b"v".to_vec()),
+        ];
+        for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
+            assert_eq!(got, want, "request {i}: {:?}", requests[i]);
+        }
+    }
+
+    /// `DEL` and `EXISTS` name any number of keys, and answer with one integer
+    /// however many shards those keys live on.
+    #[tokio::test]
+    async fn del_and_exists_fan_out() {
+        let (mut r, mut w, _pool) = connected(16);
+        let mut out = Vec::new();
+        let requests: [&[&str]; 12] = [
+            &["SET", "a", "1"],
+            &["SET", "b", "2"],
+            &["DEL", "a", "b", "missing"],
+            &["EXISTS", "a", "b", "b"],
+            &["SET", "a", "1"],
+            // Duplicates count once each, as Redis does.
+            &["EXISTS", "a", "a", "missing"],
+            &["EXISTS", "a"],
+            &["DEL", "a"],
+            &["DEL", "a"],
+            &["EXISTS", "missing"],
+            &["DEL"],
+            &["EXISTS"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        assert_eq!(frames[0], Frame::Simple("OK".into()));
+        assert_eq!(frames[1], Frame::Simple("OK".into()));
+        assert_eq!(frames[2], Frame::Integer(2), "two of three keys existed");
+        assert_eq!(frames[3], Frame::Integer(0), "the DEL removed both");
+        assert_eq!(frames[4], Frame::Simple("OK".into()));
+        assert_eq!(frames[5], Frame::Integer(2), "a repeated key counts twice");
+        assert_eq!(frames[6], Frame::Integer(1), "one key is still one integer");
+        assert_eq!(frames[7], Frame::Integer(1));
+        assert_eq!(frames[8], Frame::Integer(0));
+        assert_eq!(frames[9], Frame::Integer(0));
+        assert_eq!(
+            frames[10],
+            Frame::Error("ERR wrong number of arguments for 'del' command".into())
+        );
+        assert_eq!(
+            frames[11],
+            Frame::Error("ERR wrong number of arguments for 'exists' command".into())
+        );
+    }
+
+    /// A fan-out runs behind whatever the peer pipelined in front of it.
+    ///
+    /// A keyed command decoded earlier in the same drain is sitting in the
+    /// chunk's batch, dispatched only when the chunk closes — so a fan-out that
+    /// dispatched where it was decoded would run *ahead* of commands the peer
+    /// wrote first. The `DEL` below would then find a key its own `SET` had not
+    /// written yet, and the reply stream would be in order while the keyspace
+    /// was not.
+    #[tokio::test]
+    async fn a_fan_out_runs_behind_the_commands_pipelined_before_it() {
+        let (mut r, mut w, _pool) = connected(16);
+        let mut out = Vec::new();
+        for parts in [&["SET", "a", "1"][..], &["DEL", "a", "b"], &["EXISTS", "a"]] {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 3).await;
+        assert_eq!(frames[0], Frame::Simple("OK".into()));
+        assert_eq!(
+            frames[1],
+            Frame::Integer(1),
+            "the fan-out ran before the SET the peer wrote in front of it"
+        );
+        assert_eq!(frames[2], Frame::Integer(0));
+    }
+
+    /// The keyspace's three questions about a key's lifetime, answered exactly
+    /// as Redis answers them — including the two negative `TTL`s, which clients
+    /// distinguish.
+    #[tokio::test]
+    async fn expire_ttl_and_exists_answer_like_redis() {
+        let (mut r, mut w, _pool) = connected(16);
+        let mut out = Vec::new();
+        let requests: [&[&str]; 12] = [
+            &["SET", "k", "v"],
+            &["TTL", "k"],
+            &["TTL", "missing"],
+            &["EXISTS", "k"],
+            &["EXPIRE", "k", "100"],
+            &["TTL", "k"],
+            &["EXPIRE", "missing", "10"],
+            // A deadline that is not in the future removes the key, and Redis
+            // reports it as an applied expiry.
+            &["EXPIRE", "k", "0"],
+            &["EXISTS", "k"],
+            &["EXPIRE", "k", "notanum"],
+            &["EXPIRE", "k"],
+            &["TTL"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        assert_eq!(frames[0], Frame::Simple("OK".into()));
+        assert_eq!(frames[1], Frame::Integer(-1), "a key with no deadline");
+        assert_eq!(frames[2], Frame::Integer(-2), "a key that is not there");
+        assert_eq!(frames[3], Frame::Integer(1));
+        assert_eq!(frames[4], Frame::Integer(1));
+        assert_eq!(frames[5], Frame::Integer(100));
+        assert_eq!(frames[6], Frame::Integer(0), "nothing to expire");
+        assert_eq!(frames[7], Frame::Integer(1));
+        assert_eq!(frames[8], Frame::Integer(0), "the key is gone");
+        assert_eq!(
+            frames[9],
+            Frame::Error("ERR value is not an integer or out of range".into())
+        );
+        assert_eq!(
+            frames[10],
+            Frame::Error("ERR wrong number of arguments for 'expire' command".into())
+        );
+        assert_eq!(
+            frames[11],
+            Frame::Error("ERR wrong number of arguments for 'ttl' command".into())
+        );
+    }
+
+    /// A span too large to be turned into a deadline is refused here, where
+    /// the number is still a number.
+    ///
+    /// The shard resolves a span against its clock and stores nothing when the
+    /// arithmetic leaves the clock's range — which, for an `EXPIRE` that got
+    /// that far, would clear the deadline the key already had and still report
+    /// success: `SET k v EX 30` followed by `EXPIRE k <i64::MAX>` would make
+    /// the key immortal. Redis refuses the argument instead, and so does this.
+    #[tokio::test]
+    async fn an_expire_span_that_cannot_be_represented_is_refused() {
+        let (mut r, mut w, _pool) = connected(16);
+        let mut out = Vec::new();
+        let requests: [&[&str]; 5] = [
+            &["SET", "k", "v", "EX", "30"],
+            &["EXPIRE", "k", "9223372036854775807"],
+            &["EXPIRE", "k", "-9223372036854775808"],
+            &["TTL", "k"],
+            &["EXISTS", "k"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        let refused = Frame::Error("ERR invalid expire time in 'expire' command".into());
+        assert_eq!(frames[0], Frame::Simple("OK".into()));
+        assert_eq!(frames[1], refused, "a span past the ceiling");
+        assert_eq!(frames[2], refused, "and past the floor");
+        assert_eq!(
+            frames[3],
+            Frame::Integer(30),
+            "the refused EXPIRE must not have touched the deadline"
+        );
+        assert_eq!(frames[4], Frame::Integer(1));
     }
 
     /// A router that cannot be dispatched to.
