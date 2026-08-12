@@ -1349,6 +1349,20 @@ mod tests {
     /// The sink's side of the same fact: a position disappears from the trace
     /// where an expiry took one, so a run in which a key expired cannot hash
     /// like a run in which it did not.
+    ///
+    /// The read and the write that follows it go in one batch, for the reason
+    /// spelled out on
+    /// [`a_command_is_traced_where_its_effects_begin_not_where_its_record_landed`]:
+    /// two seconds of virtual time is twenty housekeeping ticks, and the active
+    /// sweep is racing these dispatches for the same expired key. A batch is
+    /// applied as a unit with no `await` inside it, so nothing lands in between
+    /// and the *lazy* path is what these assertions read.
+    ///
+    /// Dispatching the two separately happened to survive only because this
+    /// keyspace holds a single key: the lazy eviction empties the dict, which
+    /// clears the flag the sweep needs before the tick arm can run. Adding a
+    /// second key makes the sweep reclaim the key first, and the trace then
+    /// carries the sweep's own removal instead of the gap this test is about.
     #[tokio::test(start_paused = true)]
     async fn the_sink_sees_the_position_an_expiry_consumed() {
         let sink = Recorder::default();
@@ -1356,8 +1370,8 @@ mod tests {
 
         pool.dispatch(set_ex(b"k", b"v", 1)).await;
         tokio::time::advance(Duration::from_secs(2)).await;
-        pool.dispatch(get(b"k")).await;
-        pool.dispatch(set(b"k", b"again")).await;
+        pool.dispatch_many(vec![get(b"k"), set(b"k", b"again")])
+            .await;
 
         let seen = sink.0.lock().expect("recorder mutex").clone();
         assert_eq!(
