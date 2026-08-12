@@ -19,7 +19,7 @@ use std::process::ExitCode;
 #[path = "shared/args.rs"]
 mod args;
 
-const USAGE: &str = "usage: replay --sim-seed S [--workload-seed W] [--mini] [--plant]";
+const USAGE: &str = "usage: replay --sim-seed S [--workload-seed W] [--mini] [--plant NAME]";
 
 fn main() -> ExitCode {
     let args = match args::Args::from_env() {
@@ -42,11 +42,21 @@ fn main() -> ExitCode {
 
     let outcome = run_sim(&args.config(sim_seed));
     let held = outcome.invariant_holds();
+    // Every counter, whatever the verdict, and each violation over the number
+    // of replies its invariant decided: a zero on its own does not say whether
+    // the invariant held or never ran.
     println!(
-        "trace_hash=0x{:016x} expected={} actual={} invariant={}",
+        "trace_hash=0x{:016x} expected={} actual={} stale={}/{} spurious={}/{} plain={}/{} \
+         invariant={}",
         outcome.trace_hash,
         outcome.expected_sum,
         outcome.actual_sum,
+        outcome.stale_reads,
+        outcome.dead_checks,
+        outcome.spurious_deaths,
+        outcome.alive_checks,
+        outcome.plain_mismatches,
+        outcome.plain_checks,
         if held { "ok" } else { "violated" }
     );
 

@@ -41,7 +41,13 @@ use tokio::time::Instant;
 
 /// How often a shard does the work no command asked it for: advancing an
 /// in-flight rehash, sweeping expired keys, and syncing its log.
-const HOUSEKEEPING_TICK: Duration = Duration::from_millis(100);
+///
+/// Public because it is a fact about the server a test harness has to know
+/// rather than assume: the granularity at which a deadline that nothing
+/// touches again is actually reclaimed is this number, and the simulator's
+/// expiration invariants are derived from it. Read from here, a change to
+/// the cadence reaches everything that depends on it; copied, it would not.
+pub const HOUSEKEEPING_TICK: Duration = Duration::from_millis(100);
 
 /// Buckets migrated per rehash tick.
 ///
