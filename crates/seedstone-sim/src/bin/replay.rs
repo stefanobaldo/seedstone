@@ -7,11 +7,11 @@
 //! stdout directly, with no parsing in between.
 //!
 //! ```text
-//! replay --sim-seed S [--workload-seed W] [--mini] [--plant]
+//! replay --sim-seed S [--workload-seed W] [--mini] [--plant NAME]
 //! ```
 //!
-//! Exits 1 if the run violated the lost-update invariant, so it also works as
-//! a plain check.
+//! Exits 1 if the run violated any invariant, so it also works as a plain
+//! check.
 
 use seedstone_sim::run_sim;
 use std::process::ExitCode;
