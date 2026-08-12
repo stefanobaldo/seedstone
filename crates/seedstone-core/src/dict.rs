@@ -49,6 +49,20 @@ pub struct DictSeed {
 /// walk produces is a list of keys, and removing them stays the shard's, which
 /// is the only layer that can log the removal an expiry amounts to. Everywhere
 /// else the dict stores this field and hands it back untouched.
+///
+/// # What it costs
+///
+/// The deadline is stored inline on every entry, whether or not that entry has
+/// one, and an `Option<Instant>` is 16 bytes — `Instant` is 16 and the niche
+/// absorbs the discriminant, so `None` is not cheaper. A bucket slot,
+/// `(u64, Vec<u8>, Entry)` — see [`Bucket`] — is therefore 72 bytes against
+/// the 48 a plain `(Vec<u8>, Vec<u8>)` would take: 8 for the stored hash,
+/// which is a deliberate trade of space for a cheaper chain scan, and 16 for
+/// this field, which the great majority of keys in a real keyspace never use.
+///
+/// Stated here so nobody has to derive it from the layout. Whether it is the
+/// right trade — against a side table of deadlines, or a packed representation
+/// — is a design question, and this doc is not where it gets settled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// The bytes stored under the key, kept verbatim.
