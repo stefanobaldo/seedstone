@@ -1372,16 +1372,23 @@ mod tests {
     /// The read and the write that follows it go in one batch, for the reason
     /// spelled out on
     /// [`a_command_is_traced_where_its_effects_begin_not_where_its_record_landed`]:
-    /// two seconds of virtual time is twenty housekeeping ticks, and the active
-    /// sweep is racing these dispatches for the same expired key. A batch is
-    /// applied as a unit with no `await` inside it, so nothing lands in between
-    /// and the *lazy* path is what these assertions read.
+    /// the active sweep is a standing claim on the same expired key, and a
+    /// batch is applied as a unit with no `await` inside it, so nothing lands
+    /// between the two and the *lazy* path is what these assertions read.
     ///
-    /// Dispatching the two separately happened to survive only because this
-    /// keyspace holds a single key: the lazy eviction empties the dict, which
-    /// clears the flag the sweep needs before the tick arm can run. Adding a
-    /// second key makes the sweep reclaim the key first, and the trace then
-    /// carries the sweep's own removal instead of the gap this test is about.
+    /// What the batch buys is that guarantee by construction rather than by
+    /// scheduling. The separate-dispatch form it replaced was not failing, but
+    /// its ordering rested on several properties no test states: the tick's
+    /// `MissedTickBehavior::Delay`, which makes one two-second jump ready the
+    /// interval *once* rather than firing the twenty ticks it spans;
+    /// `dispatch_many` scattering its envelopes synchronously at call time;
+    /// and the executor's `biased` `select!`, which lets a queued envelope
+    /// beat an already-ready tick. Provoking the sweep at all took two changes
+    /// together — a second key, so the lazy eviction no longer empties the
+    /// dict and clears the flag the sweep needs, *and* explicit yields to let
+    /// the tick arm run — after which the trace carries the sweep's own
+    /// removal instead of the gap this test is about. The batch removes the
+    /// dependence on every one of those properties.
     #[tokio::test(start_paused = true)]
     async fn the_sink_sees_the_position_an_expiry_consumed() {
         let sink = Recorder::default();
@@ -1415,10 +1422,12 @@ mod tests {
     /// different arms.
     ///
     /// The two writes go in one batch on purpose. What they are about to meet
-    /// is a *lazily* expired key, and the housekeeping sweep is now racing them
-    /// for it: two seconds of virtual time is twenty of its ticks, and a key
-    /// reclaimed by the sweep between the two dispatches would be met by the
-    /// second command as an absence rather than as an expiry. A batch is
+    /// is a *lazily* expired key, and the housekeeping sweep is a standing
+    /// claim on it: the tick's `MissedTickBehavior::Delay` means one
+    /// two-second jump readies the interval once rather than firing the twenty
+    /// ticks it spans, but once is enough — a key the sweep reclaimed between
+    /// the two dispatches would be met by the second command as an absence
+    /// rather than as an expiry. A batch is
     /// applied as a unit with no `await` inside it, so nothing lands in
     /// between and the lazy path is what the assertions below are reading.
     #[tokio::test(start_paused = true)]

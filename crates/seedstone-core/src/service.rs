@@ -995,10 +995,16 @@ fn unknown_subcommand(container: &str, sub: &[u8]) -> String {
 
 /// The `INFO` arguments that name no section but the whole document.
 ///
-/// Redis takes all three where a section name goes and answers each with
-/// everything it has, and `all` is the spelling operators and metrics
-/// exporters reach for — treating it as an ordinary section name would answer
-/// the most common form of the command with nothing at all.
+/// Redis takes all three where a section name goes and answers each with a
+/// whole document rather than one section, and `all` is the spelling operators
+/// and metrics exporters reach for — treating it as an ordinary section name
+/// would answer the most common form of the command with nothing at all.
+///
+/// The three are not interchangeable there: Redis's `default` omits
+/// `# Commandstats` and `# Latencystats`, which `all` and `everything` both
+/// carry. They collapse to one behaviour *here* only because the two sections
+/// this server prints are in Redis's default set, leaving the distinction
+/// nothing to select. A section added outside that set would have to honour it.
 ///
 /// Measured against Redis 8.10.0: each of the three answers a document of the
 /// same order of size as the unargumented `INFO`, and one of them anywhere in
