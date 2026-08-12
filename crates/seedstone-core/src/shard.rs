@@ -39,8 +39,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-/// How often an idle shard advances an in-flight rehash.
-const REHASH_TICK: Duration = Duration::from_millis(100);
+/// How often a shard does the work no command asked it for: advancing an
+/// in-flight rehash, sweeping expired keys, and syncing its log.
+const HOUSEKEEPING_TICK: Duration = Duration::from_millis(100);
 
 /// Buckets migrated per rehash tick.
 ///
@@ -58,6 +59,22 @@ const REHASH_TICK: Duration = Duration::from_millis(100);
 /// own cost stays in the same class as one large command, which is what the
 /// no-await rule actually constrains.
 const REHASH_BUCKETS_PER_TICK: usize = 1024;
+
+/// Buckets swept for expired keys per housekeeping tick.
+///
+/// This is the whole of the active half of expiration: a key nothing touches
+/// again is reclaimed only when the cursor reaches its bucket, so the budget
+/// sets how long a dead entry can hold its memory. A table of N buckets is
+/// walked in `N / 256` ticks — under a second for anything up to a couple of
+/// thousand buckets, and about four minutes for a million-bucket table.
+///
+/// Smaller than [`REHASH_BUCKETS_PER_TICK`], and deliberately: a rehash is a
+/// state the dict has to leave, paying two lookups on every miss until it
+/// does, while a sweep is a standing cost every tick of the process's life. It
+/// is also the more expensive walk per bucket — it reads every entry's
+/// deadline rather than moving whole chains — and it runs against every owned
+/// dict that could hold a deadline, where most rehashes are over.
+const EXPIRE_BUCKETS_PER_TICK: usize = 256;
 
 /// Every way a shard can refuse a command.
 ///
@@ -435,6 +452,7 @@ impl ShardPool {
                 }),
                 seq: 0,
                 log: make_log(shard),
+                expire_cursor: 0,
             };
             match &mut pending {
                 Some((first_shard, states))
@@ -577,6 +595,12 @@ struct ShardState<L> {
     dict: Dict,
     seq: u64,
     log: L,
+    /// Where the active expiry sweep resumes on the next housekeeping tick.
+    ///
+    /// A [`Dict::scan`] cursor, and it belongs to the shard rather than to the
+    /// dict for the same reason a `SCAN` command's does: the dict offers a
+    /// position, and what keeps a position between calls is whoever is walking.
+    expire_cursor: u64,
 }
 
 /// One executor task: own a contiguous range of shards, answer the inbox,
@@ -593,7 +617,13 @@ async fn run_executor<T: TraceSink, L: ReplicationLog>(
     trace: T,
     mut inbox: mpsc::UnboundedReceiver<Envelope>,
 ) {
-    let mut tick = tokio::time::interval(REHASH_TICK);
+    let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
+    // A shard that fell behind resumes at its normal spacing instead of firing
+    // a burst of catch-up ticks. The default is that burst, and it is the last
+    // thing a shard that has just been saturated needs: it would meet the end
+    // of a stall with every tick the stall cost, back to back, ahead of the
+    // work that piled up behind them.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // `interval` yields its first tick immediately; consume it so the first
     // real tick is one period away.
     tick.tick().await;
@@ -647,8 +677,20 @@ async fn run_executor<T: TraceSink, L: ReplicationLog>(
             // every owned dict by the same budget: the same per-dict drain
             // rate, and the same aggregate work, as independent tickers.
             _ = tick.tick() => {
-                for state in &mut states {
+                // One clock reading for the whole tick, for the reason the
+                // envelope arm takes one for the whole batch: the shards of an
+                // executor should not disagree about which keys this tick found
+                // expired.
+                let now = Instant::now();
+                for (offset, state) in states.iter_mut().enumerate() {
                     state.dict.rehash_step(REHASH_BUCKETS_PER_TICK);
+                    // The inverse of the envelope arm's `shard - first_shard`:
+                    // these states were built from a `0..shards` walk in
+                    // ascending order, so a range's offsets are shard ids and
+                    // fit the `u16` a shard id is.
+                    let shard = first_shard
+                        + u16::try_from(offset).expect("a shard range is shorter than u16::MAX");
+                    sweep_expired(state, shard, &trace, now);
                     // The durability point, and the only place in a shard that
                     // can afford to be one: `append` runs inside a handler that
                     // cannot `await`, so it must stay cheap, while this arm is
@@ -666,6 +708,47 @@ async fn run_executor<T: TraceSink, L: ReplicationLog>(
             }
         }
     }
+}
+
+/// Reclaims a budget's worth of expired keys from one shard, logging and
+/// tracing each removal exactly as an explicit `Del` is.
+///
+/// The active half of expiration, and the half [`evict_if_expired`] cannot be:
+/// a key nothing ever addresses again meets no command, so nothing lazy can
+/// reclaim it. Together they are the guarantee — a key stops being visible at
+/// its deadline, and stops costing memory shortly after.
+///
+/// A removal here is a keyspace mutation like any other, so it takes a
+/// replication position and appends its record *before* the entry goes, and it
+/// reaches the [`TraceSink`] as the `Del` it amounts to. Nothing downstream has
+/// to know a sweep exists.
+///
+/// An append that fails abandons the rest of this tick's budget and leaves the
+/// cursor where it was: the entries keep their deadlines, and the same buckets
+/// are swept again on the next tick. Skipping them would mean waiting a whole
+/// cycle to retry a key the log has already refused to let go.
+fn sweep_expired<T: TraceSink, L: ReplicationLog>(
+    state: &mut ShardState<L>,
+    shard: u16,
+    trace: &T,
+    now: Instant,
+) {
+    let (next, dead) = state
+        .dict
+        .expire_step(state.expire_cursor, EXPIRE_BUCKETS_PER_TICK, now);
+    for key in dead {
+        let at = state.seq;
+        if append(&mut state.log, &mut state.seq, shard).is_err() {
+            return;
+        }
+        // The command an expiry is indistinguishable from, built once and used
+        // for both the removal and the trace so the key is not cloned to say
+        // the same thing twice.
+        let cmd = Command::Del { key };
+        state.dict.remove(cmd.key());
+        trace.record(shard, at, &cmd, &Reply::Removed(true));
+    }
+    state.expire_cursor = next;
 }
 
 /// Runs one command against a shard's own state.
@@ -1277,6 +1360,14 @@ mod tests {
     /// first — where the command's effects began, not where its own record
     /// landed. Both write paths are exercised, because they append in
     /// different arms.
+    ///
+    /// The two writes go in one batch on purpose. What they are about to meet
+    /// is a *lazily* expired key, and the housekeeping sweep is now racing them
+    /// for it: two seconds of virtual time is twenty of its ticks, and a key
+    /// reclaimed by the sweep between the two dispatches would be met by the
+    /// second command as an absence rather than as an expiry. A batch is
+    /// applied as a unit with no `await` inside it, so nothing lands in
+    /// between and the lazy path is what the assertions below are reading.
     #[tokio::test(start_paused = true)]
     async fn a_command_is_traced_where_its_effects_begin_not_where_its_record_landed() {
         let sink = Recorder::default();
@@ -1285,11 +1376,13 @@ mod tests {
         pool.dispatch(set_ex(b"written", b"v", 1)).await;
         pool.dispatch(set_ex(b"counted", b"1", 1)).await;
         tokio::time::advance(Duration::from_secs(2)).await;
-        pool.dispatch(set(b"written", b"again")).await;
-        pool.dispatch(Command::IncrBy {
-            key: b"counted".to_vec(),
-            delta: 7,
-        })
+        pool.dispatch_many(vec![
+            set(b"written", b"again"),
+            Command::IncrBy {
+                key: b"counted".to_vec(),
+                delta: 7,
+            },
+        ])
         .await;
         pool.dispatch(get(b"written")).await;
 
@@ -1308,6 +1401,160 @@ mod tests {
                 // commands is exactly what the contract says can happen.
                 (0, 6, 1, Reply::Bulk(Some(b"again".to_vec()))),
             ]
+        );
+    }
+
+    /// The half of expiration lazy eviction cannot do.
+    ///
+    /// Every key here is written once and never addressed again, so no command
+    /// ever meets one: under lazy expiry alone the thousand entries would sit
+    /// in the dict for the life of the process, and the only thing that can
+    /// reclaim them is the shard's own tick. The evidence is the trace — a
+    /// `Del` per key, at a replication position of its own — because it is
+    /// produced without anything touching the keyspace, which is exactly the
+    /// claim.
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_reclaims_untouched_expired_keys() {
+        const KEYS: u64 = 1_000;
+        let keys = usize::try_from(KEYS).expect("a thousand keys is a usize");
+
+        let sink = Recorder::default();
+        // One shard, so the positions below are one sequence rather than an
+        // interleaving, and every key's sweep is driven by one cursor.
+        let pool = ShardPool::spawn(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone());
+        for i in 0..KEYS {
+            assert_eq!(
+                pool.dispatch(set_ex(format!("k{i}").as_bytes(), b"v", 1))
+                    .await,
+                Reply::Ok
+            );
+        }
+
+        // Past every deadline, with nothing having read a single key.
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        let removals = |sink: &Recorder| {
+            sink.0
+                .lock()
+                .expect("recorder mutex")
+                .iter()
+                .filter(|(_, _, kind, reply)| *kind == 3 && *reply == Reply::Removed(true))
+                .count()
+        };
+
+        // Drive the housekeeping tick until the cursor has been round the
+        // table. The bound is a guard rather than an acceptance criterion: a
+        // sweep that never reclaims anything must fail the test rather than
+        // hang it.
+        let mut ticks = 0;
+        while removals(&sink) < keys {
+            tokio::time::advance(HOUSEKEEPING_TICK).await;
+            ticks += 1;
+            assert!(
+                ticks < 64,
+                "after {ticks} ticks the sweep had reclaimed {} of {KEYS} keys",
+                removals(&sink)
+            );
+        }
+
+        // Exactly one removal per key: a sweep that visited a bucket twice in a
+        // cycle, or that reported a key it had already removed, would overshoot.
+        assert_eq!(removals(&sink), keys);
+        let seen = sink.0.lock().expect("recorder mutex").clone();
+        assert_eq!(
+            seen.len(),
+            2 * keys,
+            "the trace holds something other than the thousand writes and their expiries"
+        );
+        // Each expiry consumed a replication position of its own, immediately
+        // after the thousand writes: an expiry is a logged mutation, whoever
+        // caused it.
+        let positions: Vec<u64> = seen[keys..].iter().map(|(_, seq, _, _)| *seq).collect();
+        assert_eq!(positions, (KEYS..2 * KEYS).collect::<Vec<u64>>());
+
+        // And the keyspace really is empty: the read below runs at the position
+        // the sweep left behind and consumes nothing, so it evicted nothing —
+        // there was nothing left for it to evict.
+        assert_eq!(
+            pool.dispatch(get(b"k0")).await,
+            Reply::Bulk(None),
+            "a key the sweep reported gone answered a read"
+        );
+        let last = sink.0.lock().expect("recorder mutex").last().cloned();
+        assert_eq!(last, Some((0, 2 * KEYS, 1, Reply::Bulk(None))));
+    }
+
+    /// A sweep's removal is a logged mutation, so a log that cannot take the
+    /// record does not get the removal either.
+    ///
+    /// The ordering `apply` documents for a command holds for the tick as well:
+    /// the record is written before the entry goes, and a refused record leaves
+    /// the keyspace behind the log rather than ahead of it. The dead entry
+    /// keeps its deadline and the cursor keeps its place, so the same buckets
+    /// are swept again — which is what makes the failure a delay rather than a
+    /// leak.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_whose_record_cannot_be_written_leaves_the_key() {
+        #[derive(Clone, Default)]
+        struct Breakable(Arc<Mutex<bool>>);
+
+        impl ReplicationLog for Breakable {
+            fn append(&mut self, _rec: Record<'_>) -> std::io::Result<()> {
+                if *self.0.lock().expect("log mutex") {
+                    return Err(std::io::Error::other("the disk went away"));
+                }
+                Ok(())
+            }
+            fn sync(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log = Breakable::default();
+        let sink = Recorder::default();
+        let pool = ShardPool::spawn_with_log(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone(), {
+            let log = log.clone();
+            move |_shard| log.clone()
+        });
+        assert_eq!(pool.dispatch(set_ex(b"k", b"v", 1)).await, Reply::Ok);
+
+        *log.0.lock().expect("log mutex") = true;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        for _ in 0..8 {
+            tokio::time::advance(HOUSEKEEPING_TICK).await;
+        }
+
+        // The entry is still there. A read cannot say so directly — it would
+        // report a live key and an evicted one identically — but it can say it
+        // by failing: the lazy path meets the same expired entry and the same
+        // broken log, and refuses for the same reason. A key the sweep had
+        // removed would have answered `Bulk(None)` instead.
+        assert_eq!(
+            pool.dispatch(get(b"k")).await,
+            Reply::Error(ReplyError::LogWriteFailed),
+            "the sweep removed a key whose record could not be written"
+        );
+
+        // With the log back, the sweep reaches the same bucket again and
+        // reclaims it — the buckets it abandoned were retried, not skipped.
+        *log.0.lock().expect("log mutex") = false;
+        let mut ticks = 0;
+        while sink
+            .0
+            .lock()
+            .expect("recorder mutex")
+            .last()
+            .map(|(_, _, kind, _)| *kind)
+            != Some(3)
+        {
+            tokio::time::advance(HOUSEKEEPING_TICK).await;
+            ticks += 1;
+            assert!(ticks < 64, "the sweep never came back for the key");
+        }
+        assert_eq!(
+            sink.0.lock().expect("recorder mutex").last().cloned(),
+            Some((0, 1, 3, Reply::Removed(true))),
+            "the expiry did not take the position after the write"
         );
     }
 

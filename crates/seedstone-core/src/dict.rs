@@ -43,9 +43,12 @@ pub struct DictSeed {
 /// The relative form a client sends is resolved against `now` before it gets
 /// here.
 ///
-/// The dict never looks at the deadline. It stores what it is handed and hands
-/// it back, and whether an entry is still alive is decided by the shard —
-/// which is the only layer that can log the removal an expiry amounts to.
+/// The dict compares the deadline to a clock in exactly one place —
+/// [`Dict::expire_step`], which walks the table on the shard's tick looking for
+/// entries nothing will ever ask for again. It acts on none of them: what that
+/// walk produces is a list of keys, and removing them stays the shard's, which
+/// is the only layer that can log the removal an expiry amounts to. Everywhere
+/// else the dict stores this field and hands it back untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// The bytes stored under the key, kept verbatim.
@@ -417,6 +420,67 @@ impl Dict {
         }
     }
 
+    /// Reports the keys whose deadline has passed in the next stretch of the
+    /// cursor's cycle, and returns where the following call resumes.
+    ///
+    /// This is the active half of expiration. Lazily evicting a key when a
+    /// command next touches it reclaims nothing from a key no command ever
+    /// touches again, and a keyspace whose writers have moved on is exactly
+    /// where the dead entries pile up. Walking the table on a timer is what
+    /// bounds that, and the budget is what keeps the walk from becoming a stall.
+    ///
+    /// # Contract
+    ///
+    /// - Reporting is all it does. The entries are still there when it
+    ///   returns, and removing them is the caller's — which is what lets the
+    ///   shard write each removal's replication record *before* the removal,
+    ///   as it does for every other mutation.
+    /// - The cursor is [`scan`](Dict::scan)'s, advanced the same way and
+    ///   carrying the same guarantees: a cycle starts at `0` and ends when a
+    ///   call returns `0`, and a key present throughout one is reported at
+    ///   least once whatever the table does underneath.
+    /// - `budget_buckets` bounds the work: the call takes at most that many
+    ///   cursor steps, each covering one bucket of the smaller table and,
+    ///   while a rehash is in flight, the two buckets of the larger one it
+    ///   expands into. It stops early when the cycle ends, never running past
+    ///   `0` into a second lap.
+    /// - A dict that can hold no deadline is not walked at all: the cursor
+    ///   comes back unchanged and nothing is reported. See
+    ///   [`may_hold_deadlines`](Dict::may_hold_deadlines) — it is what keeps
+    ///   this off the tick of the shards, nearly all of them, that have no
+    ///   expiries to reclaim.
+    ///
+    /// A key is expired once `now` has *reached* its deadline, which is the
+    /// same instant the lazy path uses: the two halves must not disagree about
+    /// which keys are alive.
+    #[must_use]
+    pub fn expire_step(
+        &self,
+        cursor: u64,
+        budget_buckets: usize,
+        now: Instant,
+    ) -> (u64, Vec<Vec<u8>>) {
+        if !self.may_hold_deadlines {
+            return (cursor, Vec::new());
+        }
+
+        let mut dead = Vec::new();
+        let mut next = cursor;
+        for _ in 0..budget_buckets {
+            // Nothing mutates the table between these steps, so the buckets
+            // they cover are disjoint and no key can be reported twice.
+            next = self.scan(next, |key, entry| {
+                if entry.expires_at.is_some_and(|at| at <= now) {
+                    dead.push(key.to_vec());
+                }
+            });
+            if next == 0 {
+                break;
+            }
+        }
+        (next, dead)
+    }
+
     /// Allocates the new table and puts the dict into the rehashing state.
     ///
     /// Growth is triggered at a load factor of 1 — one entry per bucket on
@@ -534,6 +598,7 @@ fn remove_from(table: &mut Table, hash: u64, key: &[u8]) -> Option<Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn seed() -> DictSeed {
         DictSeed { k0: 7, k1: 11 }
@@ -1215,6 +1280,179 @@ mod tests {
         assert!(
             steps <= ended_over,
             "a cycle over {ended_over} buckets took {steps} steps"
+        );
+    }
+
+    /// An entry whose deadline is `expires_at`.
+    fn dated(value: &[u8], expires_at: Instant) -> Entry {
+        Entry {
+            value: value.to_vec(),
+            expires_at: Some(expires_at),
+        }
+    }
+
+    /// Sweeps from `cursor` to the end of the cycle at `budget` buckets a call
+    /// and returns every key reported dead, in the order the cursor reached
+    /// them.
+    fn sweep_from(d: &Dict, cursor: u64, budget: usize, now: Instant) -> Vec<Vec<u8>> {
+        let mut dead = Vec::new();
+        let mut cursor = cursor;
+        let mut steps = 0;
+        loop {
+            let (next, mut batch) = d.expire_step(cursor, budget, now);
+            dead.append(&mut batch);
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+            steps += 1;
+            assert!(steps < 10_000, "the sweep's cursor never returned to 0");
+        }
+        dead
+    }
+
+    #[test]
+    fn the_sweep_never_eats_the_living() {
+        use std::collections::BTreeSet;
+
+        // Built forwards from one reading rather than backwards from `now`, so
+        // no arithmetic here can leave `Instant`'s range.
+        let start = Instant::now();
+        let (past, now, future) = (
+            start,
+            start + Duration::from_secs(1),
+            start + Duration::from_mins(1),
+        );
+
+        // Half the keyspace past its deadline, a quarter still ahead of one,
+        // a quarter carrying none at all. The two survivor kinds are different
+        // failures: a sweep that ignored the deadline would take the future
+        // one, and a sweep that treated "no deadline" as "expired at zero"
+        // would take the other.
+        let mut d = Dict::with_seed(seed());
+        let mut expired = BTreeSet::new();
+        let mut alive = BTreeSet::new();
+        for i in 0..200u32 {
+            let key = format!("k{i}").into_bytes();
+            match i % 4 {
+                0 | 1 => {
+                    d.insert(key.clone(), dated(b"v", past));
+                    expired.insert(key);
+                }
+                2 => {
+                    d.insert(key.clone(), entry(b"v"));
+                    alive.insert(key);
+                }
+                _ => {
+                    d.insert(key.clone(), dated(b"v", future));
+                    alive.insert(key);
+                }
+            }
+        }
+
+        let dead = sweep_from(&d, 0, 4, now);
+        assert_eq!(
+            dead.len(),
+            expired.len(),
+            "the sweep reported a key twice or missed one"
+        );
+        assert_eq!(
+            dead.iter().cloned().collect::<BTreeSet<_>>(),
+            expired,
+            "the sweep did not report exactly the keys whose deadline had passed"
+        );
+
+        // And what it reported is what a caller can remove: the survivors are
+        // all still there afterwards, and nothing else is.
+        for key in &dead {
+            assert!(
+                d.remove(key).is_some(),
+                "key {key:?} was not there to remove"
+            );
+        }
+        assert_eq!(d.len(), alive.len());
+        for key in &alive {
+            assert!(d.get(key).is_some(), "the sweep ate {key:?}");
+        }
+    }
+
+    /// The fast path the flag exists for, asserted where it is observable: a
+    /// dict that can hold no deadline hands the cursor straight back, so the
+    /// sweep costs a keyspace without expiries one branch per tick rather than
+    /// a walk of its table.
+    #[test]
+    fn a_dict_that_holds_no_deadline_is_not_walked_at_all() {
+        let now = Instant::now();
+        let mut d = Dict::with_seed(seed());
+        for i in 0..100u32 {
+            d.insert(format!("k{i}").into_bytes(), entry(b"v"));
+        }
+
+        // A walked cursor cannot come back where it started: a step always
+        // moves it. Two starting points, because one of them could be the
+        // cursor a completed cycle happens to return.
+        assert_eq!(d.expire_step(0, 4, now), (0, Vec::new()));
+        assert_eq!(d.expire_step(1 << 63, 4, now), (1 << 63, Vec::new()));
+
+        // And it is skipped work, not lost work: one dated entry and the walk
+        // happens again.
+        d.insert(b"dated".to_vec(), dated(b"v", now));
+        assert_ne!(
+            d.expire_step(0, 4, now).0,
+            0,
+            "a dict holding a deadline was not walked"
+        );
+    }
+
+    #[test]
+    fn the_sweep_respects_its_budget() {
+        use std::collections::BTreeSet;
+
+        // Fifty entries over a table that has settled at sixty-four buckets, so
+        // a budget of four is a small fraction of a cycle and several of the
+        // buckets it covers are empty.
+        let past = Instant::now();
+        let now = past + Duration::from_secs(1);
+        let mut d = Dict::with_seed(seed());
+        for i in 0..50u32 {
+            d.insert(format!("k{i}").into_bytes(), dated(b"v", past));
+        }
+        drain_rehash(&mut d);
+        assert_eq!(d.old.len(), 64, "the table is not the size this test wants");
+
+        // Where four ordinary scan steps end, and what they see on the way:
+        // the budget is spent in exactly that traversal and no further.
+        let mut expected_cursor = 0;
+        let mut expected_dead = BTreeSet::new();
+        for _ in 0..4 {
+            expected_cursor = d.scan(expected_cursor, |key, _| {
+                expected_dead.insert(key.to_vec());
+            });
+        }
+
+        let (cursor, dead) = d.expire_step(0, 4, now);
+        assert_eq!(cursor, expected_cursor, "the sweep overran its budget");
+        assert_eq!(dead.iter().cloned().collect::<BTreeSet<_>>(), expected_dead);
+        assert!(!dead.is_empty(), "four buckets of fifty keys held none");
+        assert!(
+            dead.len() < 50,
+            "a budgeted step reported the whole keyspace"
+        );
+
+        // The rest is left for later rather than skipped: resuming from the
+        // cursor the budgeted call handed back reports every key it did not,
+        // and between them they cover the keyspace exactly once.
+        let mut covered: BTreeSet<Vec<u8>> = dead.iter().cloned().collect();
+        for key in sweep_from(&d, cursor, 4, now) {
+            assert!(
+                covered.insert(key.clone()),
+                "key {key:?} was reported twice in one cycle"
+            );
+        }
+        assert_eq!(
+            covered.len(),
+            50,
+            "the cycle did not reach the keys the budget left behind"
         );
     }
 
