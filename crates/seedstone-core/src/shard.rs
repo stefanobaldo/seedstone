@@ -113,6 +113,14 @@ pub enum ReplyError {
     /// dispatch path has no `unwrap`.
     ShardUnavailable,
     /// A mutation whose log record could not be written.
+    ///
+    /// **A read can answer this too, and that is new.** A command meeting a
+    /// key whose deadline has passed must log the eviction before removing it,
+    /// like any other keyspace mutation — so `Get`, `Ttl` and `Exists` reach
+    /// the log on exactly the paths where they evict, and fail here if it
+    /// refuses. A client reading this as "my write did not land" would be
+    /// reading it too narrowly: it means the shard could not record a change
+    /// it was about to make, and so did not make it.
     LogWriteFailed,
 }
 
