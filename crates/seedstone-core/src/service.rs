@@ -1324,8 +1324,31 @@ mod tests {
     /// cannot see this server's constants, so a test that quoted them would go
     /// on passing after a typo landed in one — which is the only failure this
     /// test exists to catch.
+    ///
+    /// # Where this departs from Redis
+    ///
+    /// The option *algebra* below is Redis's own — the accepted spellings, the
+    /// case-insensitivity, the mutual exclusions, and every refusal's exact
+    /// text. What is not Redis's is the size of the surface: this server
+    /// implements `EX`, `PX`, `NX` and `XX`, and refuses everything else with
+    /// `ERR syntax error`. Redis 8.10.0 accepts several forms this test asserts
+    /// a refusal for, measured on a live server:
+    ///
+    /// - `KEEPTTL`, `GET`, `EXAT` and `PXAT` — all four answer normally there
+    ///   and are genuinely unimplemented here. Refusing an option outright is
+    ///   the deliberate choice over accepting it and silently not honouring
+    ///   it: a client that asked to keep a TTL and was told `OK` by a server
+    ///   that dropped it has been lied to, and finds out when the key vanishes.
+    /// - A *repeated* option — `EX 10 EX 10`, `NX NX`, `PX 5 PX 5` — which
+    ///   Redis takes, letting the last one win. This server refuses it, so
+    ///   that a client sending an option twice with two different values is
+    ///   told rather than silently given one of them.
+    ///
+    /// Every row below that Redis also refuses is byte-identical to what Redis
+    /// answers. The divergences are the ones named here and no others; a row
+    /// added to this test is a claim about one or the other, so say which.
     #[tokio::test]
-    async fn set_option_parsing_is_redis_exact() {
+    async fn set_options_parse_as_redis_does_over_the_surface_this_server_has() {
         let (mut r, mut w, _pool) = connected(16);
         let mut out = Vec::new();
         let requests: [&[&str]; 21] = [
@@ -1341,8 +1364,10 @@ mod tests {
             &["TTL", "c"],
             &["SET", "k", "v", "EX", "10", "PX", "5"],
             &["SET", "k", "v", "NX", "XX"],
+            // Divergence: Redis takes a repeated option and lets the last win.
             &["SET", "k", "v", "EX", "10", "EX", "10"],
             &["SET", "k", "v", "EX"],
+            // Divergence: an option Redis has and this server does not.
             &["SET", "k", "v", "KEEPTTL"],
             &["SET", "k", "v", "EX", "0"],
             &["SET", "k", "v", "EX", "-1"],
