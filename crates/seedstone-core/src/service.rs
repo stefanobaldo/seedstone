@@ -1927,16 +1927,21 @@ mod tests {
         w.flush().await.unwrap();
 
         let frames = read_frames(&mut r, requests.len()).await;
-        let everything = bulk_text(&frames[0]);
-        for field in [
+        // The field names are asserted in full, `redis_` prefix and all: that
+        // prefix *is* the contract this document owes its readers — see
+        // [`info`] — so a test matching the bare `version:` would go on passing
+        // after a rename that broke every exporter reading it.
+        let whole_document = [
             "# Server",
-            "version:",
-            "mode:standalone",
+            "redis_version:",
+            "redis_mode:standalone",
             "tcp_port:",
             "uptime_in_seconds:",
             "# Clients",
             "connected_clients:",
-        ] {
+        ];
+        let everything = bulk_text(&frames[0]);
+        for field in whole_document {
             assert!(
                 everything.contains(field),
                 "INFO printed no {field}: {everything:?}"
