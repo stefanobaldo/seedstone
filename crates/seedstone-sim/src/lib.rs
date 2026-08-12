@@ -69,7 +69,7 @@ use seedstone_core::service::{NodeInfo, serve_connection};
 // strings enter the trace hash — a private copy that drifted would make a
 // planted trace differ for a reason unrelated to the race.
 use seedstone_core::shard::{Command, Reply, ReplyError, Router, ShardPool, TraceSink, parse_i64};
-use seedstone_resp::{Frame, encode, parse};
+use seedstone_resp::{Decoder, DecoderLimits, Frame, encode};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -610,8 +610,15 @@ fn command(parts: &[&str]) -> Frame {
 /// A client's connection: the real codec over a simulated socket.
 struct Conn {
     stream: turmoil::net::TcpStream,
-    /// Bytes read from the server that do not yet form a whole frame.
-    buf: Vec<u8>,
+    /// Reply bytes read from the server, resumed across reads.
+    ///
+    /// The same [`Decoder`] the server's own connection loop runs, for the
+    /// reason its documentation gives socket readers: a one-shot `parse` over
+    /// a growing buffer re-parses every already-complete element on each read
+    /// that stops short of a frame. A client here reads small replies and
+    /// would not feel that, but an in-tree counterexample to the codec's own
+    /// advice is worth less than the twenty lines it saves.
+    decoder: Decoder,
     /// Scratch for encoding, reused so a client does not allocate per request.
     out: Vec<u8>,
 }
@@ -621,7 +628,7 @@ impl Conn {
     async fn connect() -> turmoil::Result<Self> {
         Ok(Self {
             stream: turmoil::net::TcpStream::connect((SERVER, PORT)).await?,
-            buf: Vec::new(),
+            decoder: Decoder::new(DecoderLimits::default()),
             out: Vec::new(),
         })
     }
@@ -656,8 +663,7 @@ impl Conn {
         let mut replies = Vec::with_capacity(frames.len());
         let mut chunk = [0u8; CLIENT_CHUNK];
         while replies.len() < frames.len() {
-            if let Some((reply, used)) = parse(&self.buf)? {
-                self.buf.drain(..used);
+            if let Some(reply) = self.decoder.try_next()? {
                 replies.push(reply);
                 continue;
             }
@@ -665,7 +671,7 @@ impl Conn {
             if got == 0 {
                 return Err("the server closed the connection mid-request".into());
             }
-            self.buf.extend_from_slice(&chunk[..got]);
+            self.decoder.feed(&chunk[..got]);
         }
         Ok(replies)
     }
