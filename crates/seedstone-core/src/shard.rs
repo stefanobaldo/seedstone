@@ -648,7 +648,7 @@ async fn run_executor<T: TraceSink, L: ReplicationLog>(
             biased;
 
             envelope = inbox.recv() => {
-                let Some(Envelope { cmds, reply }) = envelope else {
+                let Some(Envelope { mut cmds, reply }) = envelope else {
                     break;
                 };
                 // No `await` inside this loop, so a batch is applied as a unit:
@@ -662,8 +662,12 @@ async fn run_executor<T: TraceSink, L: ReplicationLog>(
                 // about the batch justifies. Reading it once also keeps the
                 // cost at one per envelope rather than one per command.
                 let now = Instant::now();
-                for (shard, cmd) in &cmds {
-                    let state = &mut states[usize::from(shard - first_shard)];
+                // By mutable reference, so a handler can move a command's value
+                // into the dict instead of copying it — see `apply`. The trace
+                // reads the command *after* the handler has had it, and reads
+                // only fields no handler takes.
+                for (shard, cmd) in &mut cmds {
+                    let state = &mut states[usize::from(*shard - first_shard)];
                     let at = state.seq;
                     let answer =
                         apply(&mut state.dict, &mut state.log, &mut state.seq, *shard, cmd, now);
@@ -763,8 +767,13 @@ fn sweep_expired<T: TraceSink, L: ReplicationLog>(
 /// no-op. `seq` advances only when a record is appended, so the log a shard
 /// produces is gapless.
 ///
-/// The key and value are cloned into the dict because [`TraceSink`] observes
-/// the command after the fact and so must outlive this call.
+/// **The command is taken apart, not read.** A value stored under a key is
+/// *moved* out of the command and into the dict rather than copied — on the
+/// write path that is the difference between one copy of a payload and two, and
+/// the payload is the largest thing a peer can send. The key cannot be treated
+/// that way: [`TraceSink`] observes the command after this call and folds its
+/// key, so the key is cloned and the command's own copy is left intact. What a
+/// handler may take is exactly what the trace does not read.
 ///
 /// `now` is the instant the whole envelope is being served at, supplied by the
 /// executor: a handler must not read a clock of its own, or two commands of
@@ -774,7 +783,7 @@ fn apply<L: ReplicationLog>(
     log: &mut L,
     seq: &mut u64,
     shard: u16,
-    cmd: &Command,
+    cmd: &mut Command,
     now: Instant,
 ) -> Reply {
     // Lazy expiry, once, before any arm has looked at the key. Here rather
@@ -809,7 +818,7 @@ fn apply<L: ReplicationLog>(
             dict.insert(
                 key.clone(),
                 Entry {
-                    value: value.clone(),
+                    value: std::mem::take(value),
                     expires_at: deadline(now, *expiry),
                 },
             );
@@ -1035,8 +1044,18 @@ mod tests {
             }
         }
 
-        fn run(&mut self, cmd: &Command, now: Instant) -> Reply {
-            apply(&mut self.dict, &mut self.log, &mut self.seq, 0, cmd, now)
+        /// By value, because [`apply`] takes what it stores: a command that has
+        /// been run has had its value moved out of it, so a caller cannot
+        /// usefully hold one across two runs.
+        fn run(&mut self, mut cmd: Command, now: Instant) -> Reply {
+            apply(
+                &mut self.dict,
+                &mut self.log,
+                &mut self.seq,
+                0,
+                &mut cmd,
+                now,
+            )
         }
     }
 
@@ -1067,20 +1086,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn set_with_ex_expires_lazily() {
         let mut shard = Shard::new();
-        assert_eq!(
-            shard.run(&set_ex(b"k", b"v", 30), Instant::now()),
-            Reply::Ok
-        );
+        assert_eq!(shard.run(set_ex(b"k", b"v", 30), Instant::now()), Reply::Ok);
 
         tokio::time::advance(Duration::from_secs(29)).await;
         assert_eq!(
-            shard.run(&get(b"k"), Instant::now()),
+            shard.run(get(b"k"), Instant::now()),
             Reply::Bulk(Some(b"v".to_vec())),
             "a key one second short of its deadline is still a key"
         );
 
         tokio::time::advance(Duration::from_secs(2)).await;
-        assert_eq!(shard.run(&get(b"k"), Instant::now()), Reply::Bulk(None));
+        assert_eq!(shard.run(get(b"k"), Instant::now()), Reply::Bulk(None));
         // The read is what removed it. A deadline that only hid the entry would
         // leave the keyspace growing with values nothing can ever reach again.
         assert_eq!(
@@ -1102,54 +1118,51 @@ mod tests {
 
         // XX on an absent key stores nothing and says so.
         assert_eq!(
-            shard.run(&conditional(b"first", Cond::Xx), Instant::now()),
+            shard.run(conditional(b"first", Cond::Xx), Instant::now()),
             Reply::Bulk(None)
         );
-        assert_eq!(shard.run(&get(b"k"), Instant::now()), Reply::Bulk(None));
+        assert_eq!(shard.run(get(b"k"), Instant::now()), Reply::Bulk(None));
 
         // NX on an absent key stores.
         assert_eq!(
-            shard.run(&conditional(b"first", Cond::Nx), Instant::now()),
+            shard.run(conditional(b"first", Cond::Nx), Instant::now()),
             Reply::Ok
         );
         assert_eq!(
-            shard.run(&get(b"k"), Instant::now()),
+            shard.run(get(b"k"), Instant::now()),
             Reply::Bulk(Some(b"first".to_vec()))
         );
 
         // NX on a present key refuses, and leaves the value it found alone.
         assert_eq!(
-            shard.run(&conditional(b"second", Cond::Nx), Instant::now()),
+            shard.run(conditional(b"second", Cond::Nx), Instant::now()),
             Reply::Bulk(None)
         );
         assert_eq!(
-            shard.run(&get(b"k"), Instant::now()),
+            shard.run(get(b"k"), Instant::now()),
             Reply::Bulk(Some(b"first".to_vec())),
             "a refused NX overwrote the value anyway"
         );
 
         // XX on a present key replaces it.
         assert_eq!(
-            shard.run(&conditional(b"second", Cond::Xx), Instant::now()),
+            shard.run(conditional(b"second", Cond::Xx), Instant::now()),
             Reply::Ok
         );
         assert_eq!(
-            shard.run(&get(b"k"), Instant::now()),
+            shard.run(get(b"k"), Instant::now()),
             Reply::Bulk(Some(b"second".to_vec()))
         );
 
         // And a plain SET clears the deadline the key it overwrote carried —
         // Redis's semantics, and the reason a rewritten key is not silently
         // still on its predecessor's clock.
-        assert_eq!(
-            shard.run(&set_ex(b"t", b"v", 30), Instant::now()),
-            Reply::Ok
-        );
+        assert_eq!(shard.run(set_ex(b"t", b"v", 30), Instant::now()), Reply::Ok);
         tokio::time::advance(Duration::from_secs(29)).await;
-        assert_eq!(shard.run(&set(b"t", b"w"), Instant::now()), Reply::Ok);
+        assert_eq!(shard.run(set(b"t", b"w"), Instant::now()), Reply::Ok);
         tokio::time::advance(Duration::from_hours(1)).await;
         assert_eq!(
-            shard.run(&get(b"t"), Instant::now()),
+            shard.run(get(b"t"), Instant::now()),
             Reply::Bulk(Some(b"w".to_vec())),
             "a plain SET left the old deadline in place"
         );
@@ -1165,46 +1178,46 @@ mod tests {
         };
 
         assert_eq!(
-            shard.run(&ttl(b"k"), Instant::now()),
+            shard.run(ttl(b"k"), Instant::now()),
             Reply::Integer(-2),
             "TTL of a key that does not exist"
         );
         assert_eq!(
-            shard.run(&expire(b"k", 10), Instant::now()),
+            shard.run(expire(b"k", 10), Instant::now()),
             Reply::Integer(0),
             "EXPIRE of a key that does not exist"
         );
 
-        assert_eq!(shard.run(&set(b"k", b"v"), Instant::now()), Reply::Ok);
+        assert_eq!(shard.run(set(b"k", b"v"), Instant::now()), Reply::Ok);
         assert_eq!(
-            shard.run(&ttl(b"k"), Instant::now()),
+            shard.run(ttl(b"k"), Instant::now()),
             Reply::Integer(-1),
             "TTL of a key with no deadline"
         );
 
         assert_eq!(
-            shard.run(&expire(b"k", 100), Instant::now()),
+            shard.run(expire(b"k", 100), Instant::now()),
             Reply::Integer(1)
         );
-        assert_eq!(shard.run(&ttl(b"k"), Instant::now()), Reply::Integer(100));
+        assert_eq!(shard.run(ttl(b"k"), Instant::now()), Reply::Integer(100));
         // Rounded to nearest, byte-for-byte what Redis replies. Half a second
         // gone still reads 100 under either rounding rule, so it is the next
         // assertion and not this one that pins which rule is in force.
         tokio::time::advance(Duration::from_millis(500)).await;
-        assert_eq!(shard.run(&ttl(b"k"), Instant::now()), Reply::Integer(100));
+        assert_eq!(shard.run(ttl(b"k"), Instant::now()), Reply::Integer(100));
         // 99.4 seconds left: Redis says 99, and rounding up would say 100.
         tokio::time::advance(Duration::from_millis(100)).await;
         assert_eq!(
-            shard.run(&ttl(b"k"), Instant::now()),
+            shard.run(ttl(b"k"), Instant::now()),
             Reply::Integer(99),
             "TTL must round to nearest, as Redis does, not up"
         );
         // And the other side of the same rule: under half a second left reads
         // as 0 while the key is still very much alive.
         tokio::time::advance(Duration::from_millis(99_100)).await;
-        assert_eq!(shard.run(&ttl(b"k"), Instant::now()), Reply::Integer(0));
+        assert_eq!(shard.run(ttl(b"k"), Instant::now()), Reply::Integer(0));
         assert_eq!(
-            shard.run(&get(b"k"), Instant::now()),
+            shard.run(get(b"k"), Instant::now()),
             Reply::Bulk(Some(b"v".to_vec())),
             "a key reading TTL 0 is still alive"
         );
@@ -1212,10 +1225,10 @@ mod tests {
         // A non-positive expiry deletes the key, and still reports that the
         // deadline was applied rather than that nothing was there.
         assert_eq!(
-            shard.run(&expire(b"k", 0), Instant::now()),
+            shard.run(expire(b"k", 0), Instant::now()),
             Reply::Integer(1)
         );
-        assert_eq!(shard.run(&get(b"k"), Instant::now()), Reply::Bulk(None));
+        assert_eq!(shard.run(get(b"k"), Instant::now()), Reply::Bulk(None));
         assert_eq!(shard.dict.len(), 0);
     }
 
@@ -1226,15 +1239,15 @@ mod tests {
         // entry that is still in the dict and already gone, which is the state
         // a handler that skipped the liveness check would answer from.
         for key in [&b"get"[..], b"exists", b"ttl", b"del", b"incrby"] {
-            assert_eq!(shard.run(&set_ex(key, b"1", 10), Instant::now()), Reply::Ok);
+            assert_eq!(shard.run(set_ex(key, b"1", 10), Instant::now()), Reply::Ok);
         }
         tokio::time::advance(Duration::from_secs(11)).await;
         let now = Instant::now();
 
-        assert_eq!(shard.run(&get(b"get"), now), Reply::Bulk(None));
+        assert_eq!(shard.run(get(b"get"), now), Reply::Bulk(None));
         assert_eq!(
             shard.run(
-                &Command::Exists {
+                Command::Exists {
                     key: b"exists".to_vec()
                 },
                 now
@@ -1243,7 +1256,7 @@ mod tests {
         );
         assert_eq!(
             shard.run(
-                &Command::Ttl {
+                Command::Ttl {
                     key: b"ttl".to_vec()
                 },
                 now
@@ -1252,7 +1265,7 @@ mod tests {
         );
         assert_eq!(
             shard.run(
-                &Command::Del {
+                Command::Del {
                     key: b"del".to_vec()
                 },
                 now
@@ -1261,7 +1274,7 @@ mod tests {
         );
         assert_eq!(
             shard.run(
-                &Command::IncrBy {
+                Command::IncrBy {
                     key: b"incrby".to_vec(),
                     delta: 7
                 },
@@ -1301,23 +1314,30 @@ mod tests {
         let mut seq = 0;
         let mut shard_log = log.clone();
 
-        let set = set_ex(b"k", b"v", 30);
-        assert_eq!(
-            apply(&mut dict, &mut shard_log, &mut seq, 3, &set, Instant::now()),
-            Reply::Ok
-        );
-        tokio::time::advance(Duration::from_secs(31)).await;
-
-        // A read appends nothing of its own, so the second record below is the
-        // expiry's and nothing else.
-        let read = get(b"k");
+        let mut set = set_ex(b"k", b"v", 30);
         assert_eq!(
             apply(
                 &mut dict,
                 &mut shard_log,
                 &mut seq,
                 3,
-                &read,
+                &mut set,
+                Instant::now()
+            ),
+            Reply::Ok
+        );
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        // A read appends nothing of its own, so the second record below is the
+        // expiry's and nothing else.
+        let mut read = get(b"k");
+        assert_eq!(
+            apply(
+                &mut dict,
+                &mut shard_log,
+                &mut seq,
+                3,
+                &mut read,
                 Instant::now()
             ),
             Reply::Bulk(None)
@@ -1619,11 +1639,46 @@ mod tests {
         let mut seq = 0;
         let now = Instant::now();
 
-        let stored = apply(&mut dict, &mut log, &mut seq, 0, &set(b"k", b"v"), now);
+        let stored = apply(&mut dict, &mut log, &mut seq, 0, &mut set(b"k", b"v"), now);
         assert_eq!(stored, Reply::Ok);
         assert_eq!(
-            apply(&mut dict, &mut log, &mut seq, 0, &get(b"k"), now),
+            apply(&mut dict, &mut log, &mut seq, 0, &mut get(b"k"), now),
             Reply::Bulk(Some(b"v".to_vec()))
+        );
+    }
+
+    /// A handler takes the command's value, and leaves everything the trace
+    /// reads.
+    ///
+    /// `apply` moves a `Set`'s value into the dict instead of copying it, and
+    /// the executor hands that same command to the [`TraceSink`] afterwards.
+    /// So the division is load-bearing rather than incidental: a handler may
+    /// take what the trace does not fold, and nothing else. Taking the key
+    /// would move every recorded trace hash while every test that only reads
+    /// the keyspace back stayed green — which is the one failure this pins.
+    #[test]
+    fn a_handler_takes_the_value_and_leaves_what_the_trace_reads() {
+        let mut dict = Dict::with_seed(DictSeed { k0: 4, k1: 6 });
+        let mut log = NoopLog;
+        let mut seq = 0;
+        let mut cmd = set(b"k", b"v");
+
+        assert_eq!(
+            apply(&mut dict, &mut log, &mut seq, 0, &mut cmd, Instant::now()),
+            Reply::Ok
+        );
+        assert_eq!(cmd.key(), b"k", "the trace folds the key after the handler");
+        assert_eq!(cmd.kind(), set(b"k", b"v").kind());
+        assert_eq!(
+            dict.get(b"k").map(|entry| entry.value.clone()),
+            Some(b"v".to_vec())
+        );
+        // The other half of the same fact: the dict holds the only copy of the
+        // value, because the command no longer has one. A `SET` that copied it
+        // would leave both, which is the cost this arrangement exists to avoid.
+        assert!(
+            matches!(&cmd, Command::Set { value, .. } if value.is_empty()),
+            "the value was copied into the dict rather than moved"
         );
     }
 
@@ -1633,20 +1688,21 @@ mod tests {
         let mut log = NoopLog;
         let mut seq = 0;
         let now = Instant::now();
-        let mut run = |cmd: &Command, seq: &mut u64| apply(&mut dict, &mut log, seq, 3, cmd, now);
+        let mut run =
+            |mut cmd: Command, seq: &mut u64| apply(&mut dict, &mut log, seq, 3, &mut cmd, now);
 
         // A read moves nothing.
-        run(&Command::Get { key: b"a".to_vec() }, &mut seq);
+        run(Command::Get { key: b"a".to_vec() }, &mut seq);
         assert_eq!(seq, 0);
 
         // A write does.
-        run(&set(b"a", b"1"), &mut seq);
+        run(set(b"a", b"1"), &mut seq);
         assert_eq!(seq, 1);
 
         // A delete that removes nothing writes no record: replaying it would
         // be a no-op, so the log should not carry it.
         run(
-            &Command::Del {
+            Command::Del {
                 key: b"absent".to_vec(),
             },
             &mut seq,
@@ -1655,7 +1711,7 @@ mod tests {
 
         // A rejected IncrBy likewise.
         run(
-            &Command::IncrBy {
+            Command::IncrBy {
                 key: b"a".to_vec(),
                 delta: 1,
             },
@@ -1663,10 +1719,10 @@ mod tests {
         );
         assert_eq!(seq, 2, "'1' is a valid integer, so this one does count");
 
-        run(&set(b"txt", b"abc"), &mut seq);
+        run(set(b"txt", b"abc"), &mut seq);
         assert_eq!(seq, 3);
         run(
-            &Command::IncrBy {
+            Command::IncrBy {
                 key: b"txt".to_vec(),
                 delta: 1,
             },
@@ -1678,7 +1734,7 @@ mod tests {
         );
 
         // And a delete that does remove something.
-        run(&Command::Del { key: b"a".to_vec() }, &mut seq);
+        run(Command::Del { key: b"a".to_vec() }, &mut seq);
         assert_eq!(seq, 4);
     }
 
