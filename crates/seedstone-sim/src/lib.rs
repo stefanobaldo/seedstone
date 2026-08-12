@@ -334,11 +334,14 @@ impl TraceSink for HashSink {
         let mut h = lock(&self.0);
         let mut acc = *h;
         acc = mix(acc, u64::from(shard));
-        // `seq` is the shard's replication position *at which the command
-        // ran*, not a counter of commands: a read reports the position it saw
-        // without consuming it, so the same `seq` recurs. That is exactly what
-        // we want folded — a schedule that reorders a write against a read
-        // changes which position the read observed.
+        // `seq` is the replication position where the command's effects
+        // *began*, not a counter of commands and not an index into the log: a
+        // read consumes no position, so the same `seq` recurs, and a write
+        // that first had to evict an expired key reports the eviction's
+        // position rather than its own. That is exactly what we want folded —
+        // a schedule that reorders a write against a read changes which
+        // position the read observed. `TraceSink::record` carries the full
+        // definition.
         acc = mix(acc, seq);
         acc = mix(acc, u64::from(cmd.kind()));
         acc = fold_bytes(acc, cmd.key());

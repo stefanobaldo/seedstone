@@ -1965,8 +1965,11 @@ mod tests {
         );
     }
 
-    /// One observed call: the shard, the replication position it ran at, the
-    /// command's kind tag, and the reply.
+    /// One observed call: the shard, the replication position where the
+    /// command's effects began, the command's kind tag, and the reply.
+    ///
+    /// Not "the position it ran at" and not "the record it wrote" — see
+    /// [`TraceSink::record`], whose doc is the definition this restates.
     type Observed = (u16, u64, u8, Reply);
 
     #[derive(Clone, Default)]
