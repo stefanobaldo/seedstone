@@ -6,7 +6,7 @@
 //! seed on that line goes straight into `replay`.
 //!
 //! ```text
-//! sweep --seeds N [--workload-seed W] [--mini] [--plant] [--hashes]
+//! sweep --seeds N [--workload-seed W] [--mini] [--plant NAME] [--hashes]
 //! ```
 //!
 //! `--hashes` prints every seed's trace hash, passing or not, which is what
@@ -15,7 +15,7 @@
 //! only reproducible at the position a run happens to occupy is not
 //! reproducible at all.
 //!
-//! Exits 1 if any seed violated the lost-update invariant.
+//! Exits 1 if any seed violated any invariant.
 
 use seedstone_sim::{Plant, run_sim};
 use std::process::ExitCode;
