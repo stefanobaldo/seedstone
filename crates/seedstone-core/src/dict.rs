@@ -98,6 +98,19 @@ pub struct Dict {
     /// already been drained into `new`; meaningless when `new` is `None`.
     rehash_index: usize,
     len: usize,
+    /// Whether any entry in either table may carry a deadline.
+    ///
+    /// Deliberately conservative: it is set by every operation that can put a
+    /// deadline into the dict and cleared only where no entry can be carrying
+    /// one — when the dict empties. A dict that held a deadline and then lost
+    /// it keeps saying `true` until it drains, so the flag can be wrong in one
+    /// direction only, the direction that costs a lookup rather than the one
+    /// that misses an expiry.
+    ///
+    /// The point of it is [`Dict::may_hold_deadlines`]: a keyspace with no
+    /// deadlines anywhere — which is nearly every keyspace — must not pay a
+    /// hash per command for the expiries it does not have.
+    may_hold_deadlines: bool,
 }
 
 impl Dict {
@@ -110,6 +123,7 @@ impl Dict {
             new: None,
             rehash_index: 0,
             len: 0,
+            may_hold_deadlines: false,
         }
     }
 
@@ -127,18 +141,48 @@ impl Dict {
         find(self.new.as_ref()?, hash, key)
     }
 
-    /// Returns the entry stored under `key` for modification in place.
+    /// Whether any entry may carry a deadline.
     ///
-    /// For a change that leaves the key where it is — a new deadline on a key
-    /// that already exists, which is the whole of what `EXPIRE` does. Like
-    /// [`get`](Dict::get) it does not advance a rehash in flight: nothing was
-    /// added, and the migration is paid for by the writes that grow the table.
-    pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
+    /// A `false` is a guarantee — no entry in this dict has one, so nothing
+    /// can be expired and a caller may skip its liveness check entirely, which
+    /// is what keeps a keyspace without expiries from paying a hash per
+    /// command for them. A `true` is only "maybe": see the field.
+    #[must_use]
+    pub const fn may_hold_deadlines(&self) -> bool {
+        self.may_hold_deadlines
+    }
+
+    /// Replaces the deadline on `key`, leaving its value where it is.
+    /// Returns whether the key was there.
+    ///
+    /// This is the *only* way to change a deadline on an entry the dict is
+    /// already holding, and that is the point: handing out a `&mut Entry`
+    /// instead would put [`may_hold_deadlines`](Dict::may_hold_deadlines) in
+    /// the hands of every caller that ever borrows one, and a flag maintained
+    /// by convention is a flag that goes wrong the first time someone forgets.
+    /// With this, the two places a deadline can enter a dict are both inside
+    /// this type.
+    ///
+    /// Like [`get`](Dict::get) it does not advance a rehash in flight: nothing
+    /// was added, and the migration is paid for by the writes that grow the
+    /// table.
+    pub fn set_deadline(&mut self, key: &[u8], expires_at: Option<Instant>) -> bool {
+        self.may_hold_deadlines |= expires_at.is_some();
         let hash = hash_key(self.seed, key);
         if let Some(entry) = find_mut(&mut self.old, hash, key) {
-            return Some(entry);
+            entry.expires_at = expires_at;
+            return true;
         }
-        find_mut(self.new.as_mut()?, hash, key)
+        let Some(new) = self.new.as_mut() else {
+            return false;
+        };
+        match find_mut(new, hash, key) {
+            Some(entry) => {
+                entry.expires_at = expires_at;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Stores `entry` under `key`, replacing any entry already there.
@@ -164,6 +208,12 @@ impl Dict {
         } else if self.len >= self.old.len() {
             self.start_rehash();
         }
+
+        // One of the two ways a deadline enters a dict; the other is
+        // [`set_deadline`](Dict::set_deadline). Both are in this file, which is
+        // what makes the flag's accounting complete rather than a rule callers
+        // have to follow.
+        self.may_hold_deadlines |= entry.expires_at.is_some();
 
         let hash = hash_key(self.seed, &key);
         if let Some(existing) = find_mut(&mut self.old, hash, &key) {
@@ -198,6 +248,13 @@ impl Dict {
         });
         if removed.is_some() {
             self.len -= 1;
+            // The one place the flag can honestly go back down: a dict holding
+            // nothing holds no deadlines. Everything short of empty stays
+            // "maybe", because finding out would cost a scan of the keyspace
+            // to save a lookup.
+            if self.len == 0 {
+                self.may_hold_deadlines = false;
+            }
         }
         removed
     }
@@ -571,6 +628,88 @@ mod tests {
             }),
             "the two seeds put every key in the same bucket"
         );
+    }
+
+    /// The deadline flag's accounting, over every operation that can move it.
+    ///
+    /// A shard skips its whole liveness check when this reads `false`, so a
+    /// `false` that should have been `true` is an expiry that never happens.
+    /// Both ways in are covered here, and both are inside this type — a caller
+    /// cannot reach an `Entry` mutably, so there is no third way to check.
+    #[tokio::test(start_paused = true)]
+    async fn a_dict_knows_when_no_entry_can_be_carrying_a_deadline() {
+        let mut d = Dict::with_seed(seed());
+        assert!(!d.may_hold_deadlines(), "a fresh dict holds nothing");
+
+        // Entries without deadlines leave it alone: this is the state nearly
+        // every keyspace stays in, and the one the fast path is for.
+        d.insert(b"plain".to_vec(), entry(b"v"));
+        d.insert(b"other".to_vec(), entry(b"v"));
+        assert!(!d.may_hold_deadlines());
+
+        // Way in the first: an inserted entry that carries one.
+        d.insert(
+            b"dated".to_vec(),
+            Entry {
+                value: b"v".to_vec(),
+                expires_at: Some(Instant::now()),
+            },
+        );
+        assert!(d.may_hold_deadlines());
+
+        // Removing the dated entry does not clear it — the flag is allowed to
+        // be wrong only in the direction that costs a lookup.
+        assert!(d.remove(b"dated").is_some());
+        assert!(d.may_hold_deadlines());
+
+        // Emptying the dict does clear it: nothing left to carry one.
+        assert!(d.remove(b"plain").is_some());
+        assert!(d.remove(b"other").is_some());
+        assert!(d.is_empty());
+        assert!(!d.may_hold_deadlines());
+
+        // Way in the second: a deadline put on a key already stored.
+        d.insert(b"plain".to_vec(), entry(b"v"));
+        assert!(!d.may_hold_deadlines());
+        assert!(d.set_deadline(b"plain", Some(Instant::now())));
+        assert!(d.may_hold_deadlines());
+        assert!(
+            d.get(b"plain").and_then(|e| e.expires_at).is_some(),
+            "set_deadline did not reach the entry"
+        );
+
+        // Clearing a deadline leaves the flag up, for the same reason removing
+        // the entry did.
+        assert!(d.set_deadline(b"plain", None));
+        assert!(d.get(b"plain").expect("still stored").expires_at.is_none());
+        assert!(d.may_hold_deadlines());
+
+        // And a deadline aimed at a key that is not there reports the miss.
+        assert!(!d.set_deadline(b"absent", Some(Instant::now())));
+    }
+
+    /// `set_deadline` has to reach an entry wherever the rehash left it, the
+    /// old table included — the same both-tables rule every other lookup
+    /// follows. A version that only looked in the surviving table would leave
+    /// half the keyspace unable to take a deadline mid-rehash.
+    #[tokio::test(start_paused = true)]
+    async fn set_deadline_finds_a_key_in_either_table() {
+        let mut d = Dict::with_seed(seed());
+        let inserted = fill_until_rehashing(&mut d);
+        assert!(d.is_rehashing());
+
+        // Key 0 predates the growth, so it can only be in the old table; the
+        // last key inserted went straight into the new one.
+        let newest = (inserted - 1).to_string().into_bytes();
+        assert!(d.set_deadline(b"0", Some(Instant::now())));
+        assert!(d.set_deadline(&newest, Some(Instant::now())));
+        assert!(d.get(b"0").expect("key 0").expires_at.is_some());
+        assert!(d.get(&newest).expect("newest key").expires_at.is_some());
+
+        // And the deadlines survive the migration that follows.
+        drain_rehash(&mut d);
+        assert!(d.get(b"0").expect("key 0").expires_at.is_some());
+        assert!(d.get(&newest).expect("newest key").expires_at.is_some());
     }
 
     #[test]

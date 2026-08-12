@@ -267,8 +267,18 @@ pub trait TraceSink: Clone + Send + 'static {
     /// Called once per completed command, after the reply is computed and
     /// before it is sent.
     ///
-    /// `seq` is the shard's replication position *at which the command ran* —
-    /// for a mutation, exactly the `seq` of the record it appended.
+    /// `seq` is the shard's replication position at which the command's
+    /// effects *begin*: the position of the first record it appended, or —
+    /// for a command that appended none — the position it observed without
+    /// consuming.
+    ///
+    /// **Not "the record this command wrote".** A command may consume more
+    /// than one position: a write that first had to remove a key whose
+    /// deadline had passed appends the eviction's record here and its own
+    /// after it, so the position reported is the eviction's. What the field
+    /// carries is where in the shard's order the command's run started, which
+    /// is what makes a schedule that reordered two commands visible; reading
+    /// it as an index into the log would be wrong.
     fn record(&self, shard: u16, seq: u64, cmd: &Command, reply: &Reply);
 }
 
@@ -773,11 +783,9 @@ fn apply<L: ReplicationLog>(
                 // delete — the client asked for the key to be gone by a time
                 // that has passed, and it is.
                 dict.remove(key);
-            } else if let Some(entry) = dict.get_mut(key) {
-                // Present a moment ago, and a handler cannot be suspended, so
-                // nothing can have removed it in between.
+            } else {
                 let span = u64::try_from(*seconds).expect("a positive i64 is a u64");
-                entry.expires_at = deadline(now, Some(Expiry::Ex(span)));
+                dict.set_deadline(key, deadline(now, Some(Expiry::Ex(span))));
             }
             Reply::Integer(1)
         }
@@ -818,6 +826,14 @@ fn evict_if_expired<L: ReplicationLog>(
     key: &[u8],
     now: Instant,
 ) -> Result<(), Reply> {
+    // A keyspace with no deadlines in it — which is nearly every keyspace —
+    // leaves here without hashing anything, so standing in front of every
+    // command costs it a predictable branch and not a second lookup. The
+    // guarantee is unaffected: the dict answers `false` only when no entry it
+    // holds can be expired.
+    if !dict.may_hold_deadlines() {
+        return Ok(());
+    }
     let Some(expires_at) = dict.get(key).and_then(|entry| entry.expires_at) else {
         return Ok(());
     };
@@ -846,19 +862,20 @@ fn deadline(now: Instant, expiry: Option<Expiry>) -> Option<Instant> {
     now.checked_add(span)
 }
 
-/// How many seconds are left before `deadline`, rounded up.
+/// How many seconds are left before `expires_at`, rounded to nearest.
 ///
-/// Up rather than to nearest so that a key which is still alive never reads as
-/// `0`, which is the value a client tests for. Saturating rather than
-/// truncating on the way to `i64`: a remaining span that does not fit is
-/// further off than any client will wait, and reporting the largest number
-/// there is says that better than a wrapped one.
+/// `(milliseconds + 500) / 1000`, which is what Redis replies and therefore
+/// what a client comparing two servers sees: a key with 99.4 seconds left
+/// reads `99`, not `100`. That means a key with under half a second left reads
+/// `0` while still being alive, which is Redis's behaviour too and not a
+/// rounding accident.
+///
+/// Saturating rather than truncating on the way to `i64`: a remaining span
+/// that does not fit is further off than any client will wait, and reporting
+/// the largest number there is says that better than a wrapped one.
 fn remaining_seconds(expires_at: Instant, now: Instant) -> i64 {
-    let left = expires_at.saturating_duration_since(now);
-    let seconds = left
-        .as_secs()
-        .saturating_add(u64::from(left.subsec_nanos() > 0));
-    i64::try_from(seconds).unwrap_or(i64::MAX)
+    let millis = expires_at.saturating_duration_since(now).as_millis();
+    i64::try_from(millis.saturating_add(500) / 1000).unwrap_or(i64::MAX)
 }
 
 /// Appends one record for a mutation about to happen, advancing `seq`.
@@ -1087,10 +1104,27 @@ mod tests {
             Reply::Integer(1)
         );
         assert_eq!(shard.run(&ttl(b"k"), Instant::now()), Reply::Integer(100));
-        // Rounded up, so a key with any time left never reads as zero — which
-        // is a value a client tests for.
+        // Rounded to nearest, byte-for-byte what Redis replies. Half a second
+        // gone still reads 100 under either rounding rule, so it is the next
+        // assertion and not this one that pins which rule is in force.
         tokio::time::advance(Duration::from_millis(500)).await;
         assert_eq!(shard.run(&ttl(b"k"), Instant::now()), Reply::Integer(100));
+        // 99.4 seconds left: Redis says 99, and rounding up would say 100.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(
+            shard.run(&ttl(b"k"), Instant::now()),
+            Reply::Integer(99),
+            "TTL must round to nearest, as Redis does, not up"
+        );
+        // And the other side of the same rule: under half a second left reads
+        // as 0 while the key is still very much alive.
+        tokio::time::advance(Duration::from_millis(99_100)).await;
+        assert_eq!(shard.run(&ttl(b"k"), Instant::now()), Reply::Integer(0));
+        assert_eq!(
+            shard.run(&get(b"k"), Instant::now()),
+            Reply::Bulk(Some(b"v".to_vec())),
+            "a key reading TTL 0 is still alive"
+        );
 
         // A non-positive expiry deletes the key, and still reports that the
         // deadline was applied rather than that nothing was there.
@@ -1231,6 +1265,48 @@ mod tests {
                 (0, 1, 1, Reply::Bulk(None)),
                 // So the next write is at 2, not at 1: the gap is the expiry.
                 (0, 2, 2, Reply::Ok),
+            ]
+        );
+    }
+
+    /// What the sink's `seq` means when one command consumes two positions.
+    ///
+    /// A read that evicts appends one record, so it cannot tell the two
+    /// candidate contracts apart. A *write* over an expired key appends the
+    /// eviction's record and then its own, and the position reported is the
+    /// first — where the command's effects began, not where its own record
+    /// landed. Both write paths are exercised, because they append in
+    /// different arms.
+    #[tokio::test(start_paused = true)]
+    async fn a_command_is_traced_where_its_effects_begin_not_where_its_record_landed() {
+        let sink = Recorder::default();
+        let pool = ShardPool::spawn(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone());
+
+        pool.dispatch(set_ex(b"written", b"v", 1)).await;
+        pool.dispatch(set_ex(b"counted", b"1", 1)).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        pool.dispatch(set(b"written", b"again")).await;
+        pool.dispatch(Command::IncrBy {
+            key: b"counted".to_vec(),
+            delta: 7,
+        })
+        .await;
+        pool.dispatch(get(b"written")).await;
+
+        let seen = sink.0.lock().expect("recorder mutex").clone();
+        assert_eq!(
+            seen,
+            vec![
+                (0, 0, 2, Reply::Ok),
+                (0, 1, 2, Reply::Ok),
+                // Eviction at 2, the write's own record at 3, traced at 2.
+                (0, 2, 2, Reply::Ok),
+                // Eviction at 4, the increment's own record at 5, traced at 4.
+                // A counter that had expired starts from zero.
+                (0, 4, 4, Reply::Integer(7)),
+                // Which leaves the next command at 6: four positions for two
+                // commands is exactly what the contract says can happen.
+                (0, 6, 1, Reply::Bulk(Some(b"again".to_vec()))),
             ]
         );
     }
