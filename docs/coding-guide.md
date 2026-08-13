@@ -22,7 +22,7 @@ reason the linked code documents in place.
   atomic by construction. The signature is the enforcement.
 - **Some gates grep source text.** Cruder than an AST and accepted: the
   failure mode of a stale grep is a false red, never a silent green.
-- **Entropy enters in `main` only**, behind one site-local `allow` with its
+- **Entropy enters in `main` only**, behind a site-local `allow` carrying its
   reason. The core receives seeds; it never draws them.
 
 ## Lint policy
@@ -32,9 +32,14 @@ reason the linked code documents in place.
   `#[allow(clippy::…, reason = "…")]` — the reason is mandatory.
 - Workspace-level allows exist only for lints that are noise as a class;
   each would carry a comment in `Cargo.toml` and an entry here. **There are
-  none.** Every deviation in the tree today is site-local, and the list is
-  one entry long: `ShardPool::spawn` takes its trace sink by value so a
-  caller can move one in, though every shard gets a clone.
+  none.** Every deviation in the tree is site-local, and there are four:
+  `slot.rs` narrowing a quotient it has just bounded, `shard.rs` taking its
+  trace sink and log factory by value so a caller can move them in,
+  `main.rs` drawing the hash seed from the OS — the composition root is the
+  one place entropy may enter — and one `unreachable_code` in a test whose
+  loop can only end by returning. Each carries its `reason`, and the count
+  belongs here because a guide that undercounts its own exceptions is how a
+  fifth one arrives unremarked.
 - `clippy.toml` carries the two settings a lint reads rather than a lint
   being switched off. `doc-valid-idents` lists the proper nouns
   `doc_markdown` would otherwise demand backticks around — `SeedStone`,
