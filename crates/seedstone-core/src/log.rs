@@ -1,5 +1,6 @@
 //! The replication log: the on-disk record format, the trait every mutating
-//! command passes through, and the no-op that stands in until Phase 3.
+//! command passes through, and the no-op that stands in until persistence
+//! arrives.
 //!
 //! # Why the format tolerates holes
 //!
@@ -7,14 +8,14 @@
 //! after a crash is not a *prefix* of what was written — it is what was
 //! written with arbitrary holes punched in it. A reader that stops at the
 //! first bad checksum would therefore discard every intact record that
-//! happened to sit after the hole, silently. Measured on the DST spike: 20/20
-//! crashed logs were torn rather than truncated, and 8/20 salvaged nothing at
-//! all under prefix-scan recovery.
+//! happened to sit after the hole, silently. Measured against that fault
+//! model: 20/20 crashed logs were torn rather than truncated, and 8/20
+//! salvaged nothing at all under prefix-scan recovery.
 //!
 //! Hence [`Decoded::Corrupt`], which reports how far to step forward rather
 //! than ending the read. Damage costs the records inside the hole and nothing
-//! else. The no-op log writes no bytes, but the record types are the Phase 3
-//! types: the format is right from birth.
+//! else. The no-op log writes no bytes, but the record types are the ones a
+//! real log will write: the format is right from birth.
 //!
 //! # Record layout
 //!
@@ -324,7 +325,7 @@ pub fn decode_record(buf: &[u8]) -> Decoded<'_> {
 ///
 /// The seam exists from day one even though nothing yet writes bytes, so that
 /// the call sits in the flow of every mutating command from the beginning
-/// rather than being threaded through later. Phase 3 replaces the
+/// rather than being threaded through later. A real log replaces the
 /// implementation, not the callers: `ShardPool::spawn_with_log` takes a
 /// per-shard factory, so a real log arrives as an argument at one call site.
 ///

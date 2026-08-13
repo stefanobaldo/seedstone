@@ -730,8 +730,8 @@ async fn run_executor<T: TraceSink, L: ReplicationLog>(
                     // rather than a policy — a real log picks its own, and may
                     // want group commit across shards instead. The error has
                     // nowhere to go until this project has somewhere to report
-                    // to; a log that cannot sync is a Phase 3 problem with a
-                    // Phase 3 answer.
+                    // to; a log that cannot sync is a problem for the release
+                    // that gives it bytes to write, and an answer from there too.
                     let _ = state.log.sync();
                 }
             }
@@ -997,8 +997,8 @@ fn remaining_seconds(expires_at: Instant, now: Instant) -> i64 {
 
 /// Appends one record for a mutation about to happen, advancing `seq`.
 ///
-/// The payload is empty: Phase 1 records that a mutation occurred and where
-/// it sits in the shard's order, not what it was. Returns the `Reply` to send
+/// The payload is empty: today the log records that a mutation occurred and
+/// where it sits in the shard's order, not what it was. Returns the `Reply` to send
 /// instead when the write fails — the mutation must not proceed.
 fn append<L: ReplicationLog>(log: &mut L, seq: &mut u64, shard: u16) -> Result<(), Reply> {
     let record = Record {
