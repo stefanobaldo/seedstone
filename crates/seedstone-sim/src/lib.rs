@@ -287,8 +287,8 @@ pub struct SimConfig {
 }
 
 impl SimConfig {
-    /// The sweep configuration: the shape the DST spike proved
-    /// schedule-sensitive.
+    /// The sweep configuration: the shape measured to be schedule-sensitive,
+    /// which is what makes a seed sweep find anything.
     #[must_use]
     pub const fn standard(workload_seed: u64, sim_seed: u64) -> Self {
         Self {
