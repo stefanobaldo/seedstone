@@ -1,2 +1,6 @@
 /target
 /fixtures/determinism/*/target
+# The end-to-end gate runs a Python client, and the interpreter leaves bytecode
+# beside the test it just ran. (`pytest` ignores its own cache directory from
+# the inside, so it needs no entry here.)
+__pycache__/
