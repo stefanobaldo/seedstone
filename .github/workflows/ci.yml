@@ -103,3 +103,88 @@ jobs:
       - name: DST sweep
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 75 --workload-seed 1
+
+  # Every gate in the job above is this project judging itself: our tests, our
+  # simulator, our reading of the protocol. This one is three programs nobody
+  # here wrote, connecting the way they connect to Redis and accepting or
+  # rejecting the answers on their own terms. It is the only place where being
+  # wrong about the protocol shows up as a failure rather than as agreement.
+  #
+  # A separate job, not more steps above: it needs a Python and a Go toolchain
+  # the rest of the workflow has no use for, and its failures are a different
+  # kind of news.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Same pinning policy as the job above, and the same three actions are
+      # pinned to the same SHAs there — see that job's comment for why a tag
+      # is not a pin. All five run on Node 24.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # First, so that a pull request touching nothing but prose does not pay
+      # for two toolchains and a release build to prove it. The filter itself
+      # is duplicated rather than shared: a `paths-filter` output cannot cross
+      # a job boundary without making this job depend on that one, which would
+      # serialise the two for nothing.
+      - name: detect code changes
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: relevant
+        if: github.event_name == 'pull_request'
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '!**/*.md'
+              - '!LICENSE*'
+              - '!.gitignore'
+              - '!docs/**/*.md'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: e2e/python/requirements.txt
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        with:
+          go-version: '1.23'
+          cache-dependency-path: e2e/go/go.sum
+      - name: build the server
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: cargo build --release -p seedstone --locked
+      - name: install the clients
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # redis-cli and redis-benchmark, without a redis-server nobody asked
+          # for: this gate must fail if *our* binary is wrong, and a server
+          # installed beside it is a way to accidentally test that one.
+          sudo apt-get install -y redis-tools
+          pip install -r e2e/python/requirements.txt
+      # The script starts and stops its own server; the two steps below start
+      # their own, because a suite that inherits a keyspace from the previous
+      # one passes for reasons it did not establish.
+      - name: redis-cli and redis-benchmark
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: bash e2e/redis-cli.sh target/release/seedstone
+      - name: redis-py
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          target/release/seedstone --bind 127.0.0.1:6390 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for _ in $(seq 50); do redis-cli -p 6390 ping >/dev/null 2>&1 && break; sleep 0.1; done
+          python -m pytest e2e/python -q
+      - name: go-redis
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          target/release/seedstone --bind 127.0.0.1:6390 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for _ in $(seq 50); do redis-cli -p 6390 ping >/dev/null 2>&1 && break; sleep 0.1; done
+          cd e2e/go && go test ./...
