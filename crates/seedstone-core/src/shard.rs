@@ -1490,33 +1490,29 @@ mod tests {
     /// where an expiry took one, so a run in which a key expired cannot hash
     /// like a run in which it did not.
     ///
-    /// The read and the write that follows it go in one batch, for the reason
-    /// spelled out on
-    /// [`a_command_is_traced_where_its_effects_begin_not_where_its_record_landed`]:
-    /// the active sweep is a standing claim on the same expired key, and a
-    /// batch is applied as a unit with no `await` inside it, so nothing lands
-    /// between the two and the *lazy* path is what these assertions read.
+    /// The pool is spawned with a policy that never sweeps, so the only thing
+    /// that can remove this key is the command that meets it — which is the
+    /// path these assertions are about. The tick is deliberately fired several
+    /// times in between: under the honest policy that firing would reclaim the
+    /// key and the trace would carry the sweep's own removal instead of the
+    /// gap, so the loop is what proves the dependence is gone rather than
+    /// merely unobserved.
     ///
-    /// What the batch buys is that guarantee by construction rather than by
-    /// scheduling. The separate-dispatch form it replaced was not failing, but
-    /// its ordering rested on several properties no test states: the tick's
-    /// `MissedTickBehavior::Delay`, which makes one two-second jump ready the
-    /// interval *once* rather than firing the twenty ticks it spans;
-    /// `dispatch_many` scattering its envelopes synchronously at call time;
-    /// and the executor's `biased` `select!`, which lets a queued envelope
-    /// beat an already-ready tick. Provoking the sweep at all took two changes
-    /// together — a second key, so the lazy eviction no longer empties the
-    /// dict and clears the flag the sweep needs, *and* explicit yields to let
-    /// the tick arm run — after which the trace carries the sweep's own
-    /// removal instead of the gap this test is about. The batch removes the
-    /// dependence on every one of those properties.
+    /// The read and the write still go in one batch. That is now a matter of
+    /// clarity alone — the policy, not the batching, is what keeps the sweep
+    /// out of these positions.
     #[tokio::test(start_paused = true)]
     async fn the_sink_sees_the_position_an_expiry_consumed() {
         let sink = Recorder::default();
-        let pool = ShardPool::spawn(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone());
+        let pool =
+            ShardPool::spawn_with_expiry(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone(), NoSweep);
 
         pool.dispatch(set_ex(b"k", b"v", 1)).await;
         tokio::time::advance(Duration::from_secs(2)).await;
+        for _ in 0..4 {
+            tokio::time::advance(HOUSEKEEPING_TICK).await;
+            tokio::task::yield_now().await;
+        }
         pool.dispatch_many(vec![get(b"k"), set(b"k", b"again")])
             .await;
 
@@ -1542,23 +1538,30 @@ mod tests {
     /// landed. Both write paths are exercised, because they append in
     /// different arms.
     ///
-    /// The two writes go in one batch on purpose. What they are about to meet
-    /// is a *lazily* expired key, and the housekeeping sweep is a standing
-    /// claim on it: the tick's `MissedTickBehavior::Delay` means one
-    /// two-second jump readies the interval once rather than firing the twenty
-    /// ticks it spans, but once is enough — a key the sweep reclaimed between
-    /// the two dispatches would be met by the second command as an absence
-    /// rather than as an expiry. A batch is
-    /// applied as a unit with no `await` inside it, so nothing lands in
-    /// between and the lazy path is what the assertions below are reading.
+    /// The pool is spawned with a policy that never sweeps, so the only thing
+    /// that can remove these keys is the command that meets them — which is
+    /// the path these assertions are about. The tick is deliberately fired
+    /// several times in between: under the honest policy that firing would
+    /// reclaim them and the trace would carry the sweep's own removals instead
+    /// of the gaps, so the loop is what proves the dependence is gone rather
+    /// than merely unobserved.
+    ///
+    /// The two writes still go in one batch. That is now a matter of clarity
+    /// alone — the policy, not the batching, is what keeps the sweep out of
+    /// these positions.
     #[tokio::test(start_paused = true)]
     async fn a_command_is_traced_where_its_effects_begin_not_where_its_record_landed() {
         let sink = Recorder::default();
-        let pool = ShardPool::spawn(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone());
+        let pool =
+            ShardPool::spawn_with_expiry(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone(), NoSweep);
 
         pool.dispatch(set_ex(b"written", b"v", 1)).await;
         pool.dispatch(set_ex(b"counted", b"1", 1)).await;
         tokio::time::advance(Duration::from_secs(2)).await;
+        for _ in 0..4 {
+            tokio::time::advance(HOUSEKEEPING_TICK).await;
+            tokio::task::yield_now().await;
+        }
         pool.dispatch_many(vec![
             set(b"written", b"again"),
             Command::IncrBy {
@@ -2324,6 +2327,26 @@ mod tests {
     impl ExpiryPolicy for NeverDue {
         fn due_on_read(&self, _expires_at: Option<Instant>, _now: Instant) -> bool {
             false
+        }
+        fn due_on_sweep(&self, _expires_at: Option<Instant>, _now: Instant) -> bool {
+            false
+        }
+        fn takes_undated(&self) -> bool {
+            false
+        }
+    }
+
+    /// Honest in front of a command, inert on the housekeeping tick.
+    ///
+    /// What the two trace tests below need is a keyspace where only the lazy
+    /// path can remove anything, so that what they assert about positions is
+    /// a property of the code and not of when the tick happened to fire.
+    #[derive(Clone, Copy)]
+    struct NoSweep;
+
+    impl ExpiryPolicy for NoSweep {
+        fn due_on_read(&self, expires_at: Option<Instant>, now: Instant) -> bool {
+            Deadlines.due_on_read(expires_at, now)
         }
         fn due_on_sweep(&self, _expires_at: Option<Instant>, _now: Instant) -> bool {
             false
