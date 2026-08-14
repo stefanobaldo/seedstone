@@ -92,7 +92,6 @@
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use seedstone_core::dict::DictSeed;
-use seedstone_core::service::{NodeInfo, serve_connection};
 // The two error texts are imported, not copied. The planted router has to be
 // indistinguishable from the honest one except in its atomicity, and these
 // strings enter the trace hash — a private copy that drifted would make a
@@ -101,6 +100,7 @@ use seedstone_core::shard::{
     Command, Expiry, HOUSEKEEPING_TICK, Reply, ReplyError, Router, ShardPool, TraceSink, parse_i64,
 };
 use seedstone_resp::{Decoder, DecoderLimits, Frame, encode};
+use seedstone_service::{NodeInfo, serve_connection};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

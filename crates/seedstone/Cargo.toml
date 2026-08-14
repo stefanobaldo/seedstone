@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 seedstone-core = { path = "../seedstone-core" }
 seedstone-resp = { path = "../seedstone-resp" }
+seedstone-service = { path = "../seedstone-service" }
 # The `net` feature exists here and nowhere else: this crate is the only one
 # that touches an operating-system socket, and the CI step asserting that the
 # library crates compile without simulator features keeps meaning what it says

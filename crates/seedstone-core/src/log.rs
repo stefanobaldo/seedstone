@@ -189,7 +189,7 @@ fn crc32_iso_hdlc(data: &[u8]) -> u32 {
 /// The body — the ten fixed bytes plus the payload — must not exceed 64 MiB.
 ///
 /// Three things discharge that obligation today, none of them here. The RESP
-/// codec caps a single payload at [`seedstone_resp::MAX_BULK_LEN`] (16 MiB); a
+/// codec caps a single payload at `MAX_BULK_LEN` (in `seedstone-resp`, 16 MiB); a
 /// command carries at most two payloads of that size, a key and a value, since
 /// the options it may also carry are small literals and short numbers
 /// (`SET k v EX 30` adds tens of bytes, not a third payload); and a record
@@ -202,7 +202,7 @@ fn crc32_iso_hdlc(data: &[u8]) -> u32 {
 /// **All three are assumptions here, not enforcements.** They live in the
 /// command layer, and a command carrying a third unbounded payload — or a
 /// record built from a whole multi-key request — breaks the arithmetic without
-/// touching this file. [`seedstone_resp::MAX_BULK_LEN`]'s own documentation
+/// touching this file. `MAX_BULK_LEN`'s own documentation, in `seedstone-resp`,
 /// states the same from the other side; whoever adds such a command owns
 /// re-deriving both.
 ///
