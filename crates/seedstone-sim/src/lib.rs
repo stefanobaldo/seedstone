@@ -62,9 +62,14 @@
 //! client records the deadline it asked for, sampled from its own clock
 //! *before* the request left, and holds every later read of that key against
 //! it: a value returned well after the deadline is a **stale read**, an
-//! absence well before it is a **spurious death**. "Well" is [`SLACK`] — the
-//! band inside which the client cannot tell what the server's clock said, so
-//! it refuses to judge. Both counters must be zero, and both must have
+//! absence well before it is a **spurious death**. "Well" is a band inside
+//! which the client cannot tell what the server's clock said, so it declines
+//! to judge — and there are two of them, asymmetric, because the two sides do
+//! not owe the same thing. [`STALE_SLACK`] pays for one message's travel: the
+//! deadline the server computed lands that much after the instant the client
+//! recorded. [`LIVE_SLACK`] pays nothing, and is zero — that side judges from
+//! the reply, which the handler produced before it, against a deadline the
+//! server set no earlier than the client's own. Both counters must be zero, and both must have
 //! actually decided something: [`SimOutcome`] carries the check counts beside
 //! the violation counts, because an invariant that never ran is not a
 //! passing one.
@@ -102,8 +107,7 @@ use seedstone_core::dict::DictSeed;
 // strings enter the trace hash — a private copy that drifted would make a
 // planted trace differ for a reason unrelated to the race.
 use seedstone_core::shard::{
-    Command, Deadlines, ExpiryPolicy, HOUSEKEEPING_TICK, Reply, ReplyError, Router, ShardPool,
-    TraceSink, parse_i64,
+    Command, Deadlines, ExpiryPolicy, Reply, ReplyError, Router, ShardPool, TraceSink, parse_i64,
 };
 use seedstone_resp::{Decoder, DecoderLimits, Frame, encode};
 use seedstone_service::{NodeInfo, serve_connection};
@@ -133,44 +137,74 @@ const VERIFIER_POLL: Duration = Duration::from_millis(10);
 
 /// The least simulated time a message spends on the wire.
 ///
-/// turmoil's own default, spelled out here rather than inherited: [`SLACK`]
-/// is derived from the pair, and a bound derived from a dependency's
-/// undocumented default goes quietly wrong the day the dependency changes it.
+/// turmoil's own default, spelled out here rather than inherited:
+/// [`STALE_SLACK`] is derived from the pair, and a bound derived from a
+/// dependency's undocumented default goes quietly wrong the day the dependency
+/// changes it. Zero is also what lets [`LIVE_SLACK`] be zero — a request
+/// cannot reach the server before the client sent it.
 const MIN_MESSAGE_LATENCY: Duration = Duration::from_millis(0);
 
 /// The most simulated time a message spends on the wire.
 ///
 /// See [`MIN_MESSAGE_LATENCY`]. This one is also the width of the client's
-/// ignorance about the server's clock, which is what [`SLACK`] pays for.
+/// ignorance about when its request was actually handled, which is what
+/// [`STALE_SLACK`] pays for.
 const MAX_MESSAGE_LATENCY: Duration = Duration::from_millis(100);
 
-/// How far outside a deadline a client insists on being before it will call
-/// the server wrong.
+/// How far past a deadline a reply must land before the client will call the
+/// server wrong.
 ///
-/// A client samples its clock before it sends and after it reads, and the
-/// server's handler ran somewhere in between. The two expiration invariants
-/// are stated so that only the safe end of that interval is ever used — "the
-/// key was certainly due" from a *send* taken after the deadline, "certainly
-/// alive" from a *reply* taken before it — which leaves one thing unpaid for:
-/// the deadline itself. The server computed it from its own clock when the
-/// handler ran, so it lands up to one message's latency later than the
-/// instant the client recorded. One [`MAX_MESSAGE_LATENCY`] covers that
-/// exactly.
+/// The client samples its clock *before* it sends, and the server computed the
+/// deadline from its own clock when the handler ran — up to one message
+/// latency later, in simulated time, than the instant the client recorded. So
+/// a request sent after `deadline + STALE_SLACK` met a server whose own
+/// deadline had certainly passed. One [`MAX_MESSAGE_LATENCY`] covers that
+/// exactly, and the housekeeping tick buys nothing here: a read meets the lazy
+/// path, which does not wait for the sweep.
 ///
-/// The band is twice that plus a [`HOUSEKEEPING_TICK`] regardless, because
-/// the two errors are not symmetric: a band too wide costs coverage, a band
-/// too tight reports violations the server never committed — and a harness
-/// that cries wolf is worth less than one that stays quiet. What the extra
-/// buys concretely is the reclamation lag (the sweep only removes on a tick)
-/// and the microseconds of clock skew between two simulated hosts, whose
-/// paused clocks start at whatever the wall clock said when turmoil built
-/// each runtime.
-const SLACK: Duration = Duration::from_millis(300);
+/// See [`LIVE_SLACK`] for the other half, and for why neither band carries a
+/// term for the difference between two simulated hosts' clocks.
+const STALE_SLACK: Duration = Duration::from_millis(100);
 
 const _: () = assert!(
-    SLACK.as_millis() == 2 * MAX_MESSAGE_LATENCY.as_millis() + HOUSEKEEPING_TICK.as_millis(),
-    "SLACK is derived from the network's latency and the shard's housekeeping \
-     cadence: change either and this band has to be re-derived, not re-typed"
+    STALE_SLACK.as_millis() >= MAX_MESSAGE_LATENCY.as_millis(),
+    "the staleness band pays for one message's travel: the server's deadline \
+     lands that much after the instant the client recorded"
+);
+
+/// How far inside a deadline a reply must land before the client will call a
+/// missing key a spurious death.
+///
+/// Nothing is owed on this side, which is why it is zero. The judgement is
+/// made from the instant the reply was *received*, which is after the handler
+/// ran, and the server's deadline is never earlier than the one the client
+/// recorded — so a reply received before the recorded deadline was produced
+/// before the real one.
+///
+/// # Why there is no term for the hosts' clocks
+///
+/// Each simulated host's paused clock starts at whatever the wall clock said
+/// when turmoil built its runtime, so two hosts read different absolute values
+/// at the same simulated moment — by hundreds of microseconds, and it is a
+/// property of the machine rather than of the run. That offset reaches neither
+/// band, because neither band reads across it: every instant a client compares
+/// is a reading of its own clock, and the server's deadline is compared, on the
+/// server, against the server's. What links the two is elapsed simulated time,
+/// and the offset cancels out of every difference taken.
+///
+/// What would not cancel is *drift* — one host's clock advancing by more
+/// simulated time than another's over the same stretch. That is the property
+/// both bands actually rest on, and it is asserted rather than assumed:
+/// `tests/host_clocks.rs` holds every host in the workload's own topology to
+/// the same advance.
+const LIVE_SLACK: Duration = Duration::ZERO;
+
+const _: () = assert!(
+    LIVE_SLACK.is_zero(),
+    "the liveness side judges from a reply the handler produced before it, \
+     against a deadline the server set no earlier than the client recorded it: \
+     nothing is owed. A non-zero band here means the derivation above stopped \
+     being true — not that a run wanted more room"
 );
 
 /// The longest a client naps between bursts, in milliseconds.
@@ -1270,9 +1304,13 @@ impl Model {
     /// an upper bound, so each half takes the end that makes it conservative:
     /// a value is called stale only when even the *earliest* the read could
     /// have run was past the deadline, and an absence spurious only when even
-    /// the *latest* it could have run was before it. Inside the band the
+    /// the *latest* it could have run was before it. Between the two the
     /// client says nothing — which is not a pass, and is why what was decided
     /// is counted beside what was violated.
+    ///
+    /// The two ends take different bands, [`STALE_SLACK`] and [`LIVE_SLACK`],
+    /// because they are not owed the same thing; each constant carries its own
+    /// derivation.
     fn check_volatile(&self, slot: u32, reply: &Frame, sent: Instant, received: Instant) {
         let Some(deadline) = self.deadlines[slot as usize] else {
             return;
@@ -1286,12 +1324,12 @@ impl Model {
             _ => return,
         };
         let mut tally = lock(&self.shared.0);
-        if sent > deadline + SLACK {
+        if sent > deadline + STALE_SLACK {
             tally.dead_checks += 1;
             if present {
                 tally.stale_reads += 1;
             }
-        } else if received + SLACK < deadline {
+        } else if received + LIVE_SLACK < deadline {
             tally.alive_checks += 1;
             if !present {
                 tally.spurious_deaths += 1;
@@ -1313,11 +1351,14 @@ impl Model {
     /// fails the first.
     async fn settle(&mut self, conn: &mut Conn, depth: usize) -> turmoil::Result<()> {
         if let Some(last) = self.deadlines.iter().flatten().max() {
-            // A millisecond past the band, so a deadline waited out is
-            // decidedly behind us and the read below counts as a check —
-            // but never longer than [`SETTLE_CAP`], whose documentation says
-            // what the wait costs and what capping it gives up.
-            let until = (*last).min(Instant::now() + SETTLE_CAP) + SLACK + Duration::from_millis(1);
+            // A millisecond past the staleness band — this is a wait for
+            // deadlines to pass, so it is that side's band it has to clear —
+            // leaving a deadline waited out decidedly behind us and the read
+            // below counting as a check. Never longer than [`SETTLE_CAP`],
+            // whose documentation says what the wait costs and what capping it
+            // gives up.
+            let until =
+                (*last).min(Instant::now() + SETTLE_CAP) + STALE_SLACK + Duration::from_millis(1);
             tokio::time::sleep_until(until).await;
         }
 
@@ -1512,10 +1553,16 @@ mod tests {
         // system computes. So it pins *stability*, not correctness, and that is
         // the whole job. A mismatch here is not a bug report — it means the
         // trace's meaning changed, and the question to answer is whether that
-        // was intended. When it was (a new command kind, a new folded field),
+        // was intended. When it was — a new command kind, a new folded field,
+        // or a change to *when* the workload issues what it already issued —
         // update the constant in the same commit that caused it, and say so in
         // the message. Never update it to make a red suite green.
-        const MINI_1_42: u64 = 0xe3a9_2f89_c6c3_aa9b;
+        //
+        // The third of those is the easiest to mistake for the first, and
+        // `expected_sum` below is what tells them apart: it is a function of
+        // the commands alone, so a hash that moved while it held still means
+        // the same workload met a different schedule.
+        const MINI_1_42: u64 = 0xf35b_fb35_d7e8_a406;
 
         let outcome = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(
@@ -1535,7 +1582,7 @@ mod tests {
                 outcome.alive_checks,
                 outcome.plain_checks
             ),
-            (49, 9, 139),
+            (59, 29, 139),
             "the recorded workload decides a different number of checks"
         );
     }
