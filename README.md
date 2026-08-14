@@ -41,12 +41,19 @@ published and no compatibility claim beyond the commands listed above.
   signal handler and entropy draw in the workspace.
 - `seedstone-core` — the deterministic core: a keyspace dict with seeded
   hashing, incremental rehashing and a scan cursor stable across table growth;
-  a replication-log record format that tolerates holes; a runtime of
-  message-passing shards whose command handlers cannot await; and a RESP
-  service layer generic over its transport.
+  a replication-log record format that tolerates holes; and a runtime of
+  message-passing shards whose command handlers cannot await. The codec is not
+  among its dependencies, so a handler cannot reach for a wire frame — the
+  core's independence from the protocol is a property of the build rather than
+  a rule to remember.
 - `seedstone-resp` — a RESP2 codec: a resumable decoder that never revisits a
   byte it has consumed, an iterative encoder, and the wire and memory limits a
   server needs at its edge.
+- `seedstone-service` — the connection layer: RESP2 frames in, core commands
+  out, replies back. Netless by construction — nothing in it opens a socket —
+  and generic over its transport, which is what lets the binary hand it a real
+  connection and the harness hand it a simulated one, with the same code in
+  between.
 - `seedstone-sim` — a deterministic simulation harness: the real server and
   real clients over a simulated network and clock, folding every completed
   command into a trace hash that is a function of two seeds and nothing else.
@@ -54,10 +61,11 @@ published and no compatibility claim beyond the commands listed above.
 The project is built around deterministic simulation testing, so a concurrency
 bug is meant to be reproducible from a seed. CI sweeps a range of simulator
 seeds on every change that touches code, enforces the determinism rules that
-make that reproducibility possible — including a self-test that plants a
-genuine lost-update race and requires the sweep to find it and a second process
-to replay it byte for byte — and finishes by driving the release binary with
-`redis-cli`, `redis-benchmark`, redis-py and go-redis.
+make that reproducibility possible — including a self-test that plants genuine
+defects, a lost-update race and two broken expiry decisions inside the server
+itself, and requires the sweep to find each and a second process to replay it
+byte for byte — and finishes by driving the release binary with `redis-cli`,
+`redis-benchmark`, redis-py and go-redis.
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains the decisions and why
 they were made; [docs/coding-guide.md](docs/coding-guide.md) is what a reviewer
