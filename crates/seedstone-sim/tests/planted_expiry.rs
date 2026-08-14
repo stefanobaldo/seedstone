@@ -10,11 +10,12 @@
 //! The second half is not a formality: a counter that fired on every seed,
 //! planted or not, would satisfy the first half while measuring nothing.
 //!
-//! What these plants do *not* prove is where a real defect would live — see
-//! `Plant`, which says why they rewrite requests instead of breaking
-//! handlers. What they prove is that the observation a client is written
-//! against — a key alive past its deadline, a key dead before it — reaches
-//! the counter it is supposed to reach, and no other.
+//! Both defects are the server's own expiry decision — an `ExpiryPolicy`
+//! handed to the shard pool at spawn, which is the same thing a real one would
+//! be — so what each test joins is a broken decision to the counter that owns
+//! it, and not merely an observation to the counter that owns the observation.
+//! That the counter fires on the defect and stays silent on the other one is
+//! the whole claim.
 
 use seedstone_sim::{Plant, SimConfig, SimOutcome, run_sim};
 

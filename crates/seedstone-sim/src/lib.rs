@@ -82,12 +82,17 @@
 //!
 //! # The planted bugs
 //!
-//! [`SimConfig::planted`] swaps the honest router for [`PlantedRouter`], which
-//! serves one [`Plant`]: a lost update, a server that never expires anything,
-//! or one that expires everything at once. That is the harness testing
-//! itself — a simulation that has never failed has not been shown capable of
-//! failing — and each invariant above owns a plant that it, and only it, is
-//! required to catch.
+//! [`SimConfig::planted`] serves the workload through one [`Plant`]: a lost
+//! update, a server that never expires anything, or one whose sweep takes
+//! everything it walks. That is the harness testing itself — a simulation that
+//! has never failed has not been shown capable of failing — and each invariant
+//! above owns a plant that it, and only it, is required to catch.
+//!
+//! Where a plant lives is where the defect it stands for would live. The two
+//! expiry plants are the server's own [`ExpiryPolicy`], handed to the shard
+//! pool at spawn, so the invariant catches the broken decision itself; the
+//! lost update is a [`PlantedRouter`] above the shard, because a handler that
+//! cannot `await` cannot lose an update to itself.
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -97,7 +102,8 @@ use seedstone_core::dict::DictSeed;
 // strings enter the trace hash — a private copy that drifted would make a
 // planted trace differ for a reason unrelated to the race.
 use seedstone_core::shard::{
-    Command, Expiry, HOUSEKEEPING_TICK, Reply, ReplyError, Router, ShardPool, TraceSink, parse_i64,
+    Command, Deadlines, ExpiryPolicy, HOUSEKEEPING_TICK, Reply, ReplyError, Router, ShardPool,
+    TraceSink, parse_i64,
 };
 use seedstone_resp::{Decoder, DecoderLimits, Frame, encode};
 use seedstone_service::{NodeInfo, serve_connection};
@@ -330,34 +336,32 @@ impl SimConfig {
 ///
 /// Each one is the bug an invariant exists to find, and every invariant has
 /// one: a guarantee nobody has watched fail is a guarantee nobody has
-/// measured. They live *above* the shard, in [`PlantedRouter`], for two
-/// reasons. The first is that this is where a real one would live — a shard
-/// handler is a plain `fn` that cannot await, so a lost update cannot be
-/// planted inside it. The second is structural: a defect inside
-/// `seedstone-core` would have to be a cargo feature or a runtime flag, and
-/// `cargo build --workspace` unifies features, so the feature the simulator
-/// turned on would be compiled into the production binary. A test harness
-/// does not get to put broken code in the shipped server.
+/// measured.
 ///
-/// What that trades away is the cause: these rewrite requests rather than
-/// break handlers, so what they prove is that an invariant catches the
-/// *observation* — a key alive past its deadline, a key dead before it. The
-/// observation is the whole of what a client can see, and it is what the
-/// invariant is written against.
+/// Two of the three are defects *inside* the server — a policy handed to the
+/// shard pool at spawn, so what the invariant catches is the defect itself and
+/// not an imitation of what it would look like. See
+/// [`seedstone_core::shard::ExpiryPolicy`] for why that is expressible without
+/// putting broken code in the shipped binary.
+///
+/// [`Plant::LostUpdate`] stays above the shard, in [`PlantedRouter`], and that
+/// is not a compromise: a shard handler is a plain `fn` that cannot `await`,
+/// so a lost update cannot occur inside one. Above the shard is where a real
+/// one would live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plant {
     /// `INCRBY` served as a read-modify-write pair instead of one atomic
     /// message, so a concurrent increment can be overwritten. Caught by the
     /// counter sum.
     LostUpdate,
-    /// Every deadline dropped on the way in: the server answers as though it
-    /// had accepted one and then keeps the key forever. What a broken
-    /// liveness check looks like from a client. Caught by `stale_reads`.
+    /// A liveness check and a sweep that never find anything due: the deadline
+    /// is accepted, stored, and never acted on by either half of expiration.
+    /// Caught by `stale_reads`.
     ServeExpired,
-    /// Every write given a one-millisecond deadline, whatever the client
-    /// asked for and whether or not it asked at all. What an active sweep
-    /// that stopped checking `expires_at` looks like from a client. Caught by
-    /// `spurious_deaths` and by the plain keys' model.
+    /// A sweep that takes everything it walks, undated entries included, while
+    /// the read path stays honest. What an active sweep that stopped checking
+    /// `expires_at` is. Caught by `spurious_deaths` and by the plain keys'
+    /// model.
     SweepEatsAll,
 }
 
@@ -622,13 +626,54 @@ fn fold_reply(h: u64, reply: &Reply) -> u64 {
     }
 }
 
+/// A server whose liveness check and sweep both stopped firing.
+///
+/// The deadline is accepted, stored and never acted on. `stale_reads` owns it.
+#[derive(Clone, Copy)]
+struct ServeExpired;
+
+impl ExpiryPolicy for ServeExpired {
+    fn due_on_read(&self, _expires_at: Option<Instant>, _now: Instant) -> bool {
+        false
+    }
+    fn due_on_sweep(&self, _expires_at: Option<Instant>, _now: Instant) -> bool {
+        false
+    }
+    fn takes_undated(&self) -> bool {
+        false
+    }
+}
+
+/// A sweep that stopped asking whether an entry had a deadline at all.
+///
+/// Everything it reaches is due, undated keys included — which is why it must
+/// answer `takes_undated` yes, or the dict it is walking would never be
+/// walked. The read path stays honest: this defect is the sweep's alone, and a
+/// plant that broke both would not tell the two invariants apart.
+#[derive(Clone, Copy)]
+struct SweepEatsAll;
+
+impl ExpiryPolicy for SweepEatsAll {
+    fn due_on_read(&self, expires_at: Option<Instant>, now: Instant) -> bool {
+        Deadlines.due_on_read(expires_at, now)
+    }
+    fn due_on_sweep(&self, _expires_at: Option<Instant>, _now: Instant) -> bool {
+        true
+    }
+    fn takes_undated(&self) -> bool {
+        true
+    }
+}
+
 /// A router that serves the workload through one deliberate defect.
 ///
 /// This is the harness's self-test: a simulator that never fails proves
-/// nothing, so the branch ships bugs the sweep is required to find. See
-/// [`Plant`] for what each is and why they live here rather than in the
-/// server. Everything the chosen plant does not touch passes straight
-/// through, so an honest run and a planted one differ in exactly one thing.
+/// nothing, so the branch ships bugs the sweep is required to find. One plant
+/// lives here — [`Plant::LostUpdate`], which is a defect between two messages
+/// and so has nowhere else to be; see [`Plant`] for why the other two are the
+/// server's own expiry policy instead. Everything the chosen plant does not
+/// touch passes straight through, so an honest run and a planted one differ in
+/// exactly one thing.
 #[derive(Clone)]
 pub struct PlantedRouter {
     /// The honest pool underneath.
@@ -654,53 +699,10 @@ impl Router for PlantedRouter {
     async fn dispatch(&self, cmd: Command) -> Reply {
         match self.plant {
             Plant::LostUpdate => self.lose_updates(cmd).await,
-            Plant::ServeExpired => self.pool.dispatch(never_expire(cmd)).await,
-            Plant::SweepEatsAll => self.pool.dispatch(expire_at_once(cmd)).await,
+            // The two expiry plants are the server's own policy now, so a
+            // router carrying one has nothing of its own to do.
+            Plant::ServeExpired | Plant::SweepEatsAll => self.pool.dispatch(cmd).await,
         }
-    }
-}
-
-/// Strips the deadline out of every command that would have set one.
-///
-/// A `SET` keeps its value and loses its expiry; an `EXPIRE` becomes the
-/// `EXISTS` it would have answered like, so the client is told the deadline
-/// was accepted while nothing takes one. The result is a server that expires
-/// nothing, which is what a client sees when a liveness check is missing.
-fn never_expire(cmd: Command) -> Command {
-    match cmd {
-        Command::Set {
-            key, value, cond, ..
-        } => Command::Set {
-            key,
-            value,
-            expiry: None,
-            cond,
-        },
-        // `EXPIRE` on a live key answers 1 and on a missing one 0 — exactly
-        // `EXISTS`'s two answers, for exactly the same keys.
-        Command::Expire { key, .. } => Command::Exists { key },
-        other => other,
-    }
-}
-
-/// Gives every write a deadline one millisecond away, whatever it asked for.
-///
-/// Including the writes that asked for none: that is the point, since the
-/// defect being imitated is a sweep that stopped distinguishing an entry with
-/// a deadline from one without. `EXPIRE` is left alone — it is already a
-/// request to die, and rewriting it would only hide which half of the
-/// keyspace this reaches.
-fn expire_at_once(cmd: Command) -> Command {
-    match cmd {
-        Command::Set {
-            key, value, cond, ..
-        } => Command::Set {
-            key,
-            value,
-            expiry: Some(Expiry::Px(1)),
-            cond,
-        },
-        other => other,
     }
 }
 
@@ -771,7 +773,17 @@ async fn server(
     sink: HashSink,
     planted: Option<Plant>,
 ) -> turmoil::Result {
-    let pool = ShardPool::spawn(shards, executors, seed, sink);
+    let pool = match planted {
+        Some(Plant::ServeExpired) => {
+            ShardPool::spawn_with_expiry(shards, executors, seed, sink, ServeExpired)
+        }
+        Some(Plant::SweepEatsAll) => {
+            ShardPool::spawn_with_expiry(shards, executors, seed, sink, SweepEatsAll)
+        }
+        // The honest pool, and the lost-update plant's too: that defect lives
+        // above the shard, where a real one would.
+        None | Some(Plant::LostUpdate) => ShardPool::spawn(shards, executors, seed, sink),
+    };
     let listener = turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await?;
     // One per host, as it is in production: it describes the node, not the
     // connection. No workload here asks a host about itself, so nothing reads
@@ -779,12 +791,12 @@ async fn server(
     let node = NodeInfo::for_tests();
     loop {
         let (stream, _peer) = listener.accept().await?;
-        // The choice is per connection only because that is where the router
-        // is handed over; it is the same choice every time.
-        if let Some(plant) = planted {
+        // Only one plant is a router now. The other two are inside the server,
+        // which is where the defects they imitate would be.
+        if planted == Some(Plant::LostUpdate) {
             tokio::spawn(serve_connection(
                 stream,
-                PlantedRouter::new(pool.clone(), plant),
+                PlantedRouter::new(pool.clone(), Plant::LostUpdate),
                 node.clone(),
             ));
         } else {
