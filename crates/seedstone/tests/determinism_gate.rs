@@ -302,11 +302,32 @@ fn lock_versions(lock: &Path, watched: &[&str]) -> Vec<(String, String)> {
 
 /// The `src` directory of every crate in the workspace.
 fn crate_source_dirs(root: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
-        .expect("the workspace has a crates/ directory")
-        .map(|entry| entry.expect("readable crates/ entry").path().join("src"))
-        .filter(|src| src.is_dir())
-        .collect();
+    let mut dirs = Vec::new();
+    for entry in
+        std::fs::read_dir(root.join("crates")).expect("the workspace has a crates/ directory")
+    {
+        let member = entry.expect("readable crates/ entry").path();
+        // The workspace is `members = ["crates/*"]`, so a member is exactly a
+        // directory here carrying a manifest. Anything else under `crates/` is
+        // not a crate and has no sources to scan.
+        if !member.join("Cargo.toml").is_file() {
+            continue;
+        }
+        let src = member.join("src");
+        // Insisted on rather than filtered for. Skipping a member whose sources
+        // are not under `src` would leave the floor below still satisfied by
+        // the members that were found — and the crate that was skipped is
+        // precisely the one free to hold an unbiased `select!`. One `path = "…"`
+        // in a manifest is all that stands between this gate and asserting less
+        // than it reports.
+        assert!(
+            src.is_dir(),
+            "{}: a workspace member whose sources are not under src/ would be \
+             scanned by nothing, in silence",
+            member.display()
+        );
+        dirs.push(src);
+    }
     // `read_dir` order is filesystem-defined; a gate that reports a different
     // file first on a different machine is a gate nobody trusts.
     dirs.sort();
