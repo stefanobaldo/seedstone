@@ -1,9 +1,14 @@
-//! The connection layer: RESP2 frames in, [`Command`]s out, replies back.
+//! SeedStone's connection layer: RESP2 frames in, [`Command`]s out, replies back.
 //!
-//! [`serve_connection`] is generic over its transport and over its
-//! [`Router`], which is what lets the simulator run the real connection code
-//! over simulated TCP against a deliberately racy router. Nothing here knows
-//! whether it is talking to a socket or to a `duplex` pipe in a test.
+//! Netless by construction. Nothing here opens a socket — [`serve_connection`]
+//! is generic over its transport, which is what lets the production binary
+//! hand it a `tokio::net::TcpStream` and the simulator hand it a simulated
+//! one, with the same code in between.
+//!
+//! [`serve_connection`] is generic over its [`Router`] too, which is what lets
+//! the simulator run the real connection code against a deliberately racy one.
+//! Nothing here knows whether it is talking to a socket or to a `duplex` pipe
+//! in a test.
 //!
 //! # What this layer is responsible for
 //!
@@ -34,7 +39,7 @@
 //!   against that is a debug assertion, which is not there in release. This is
 //!   the enforcement point that is.
 
-use crate::shard::{Command, Cond, Expiry, Reply, ReplyError, Router, parse_i64};
+use seedstone_core::shard::{Command, Cond, Expiry, Reply, ReplyError, Router, parse_i64};
 use seedstone_resp::{Decoder, DecoderLimits, Frame, ParseError, encode};
 use std::mem::take;
 use std::sync::Arc;
@@ -1265,8 +1270,8 @@ fn wrong_arity(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dict::DictSeed;
-    use crate::shard::{NoTrace, ShardPool};
+    use seedstone_core::dict::DictSeed;
+    use seedstone_core::shard::{NoTrace, ShardPool};
     use seedstone_resp::{MAX_ARRAY_LEN, MAX_BULK_LEN, parse};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

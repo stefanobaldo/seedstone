@@ -3,7 +3,7 @@
 //!
 //! Everything here is what the deterministic core deliberately does not have —
 //! a real socket, a signal handler, a bound on how many peers may be attached
-//! at once. The core is reached through [`seedstone_core::service::serve_connection`],
+//! at once. The connection layer is reached through [`seedstone_service::serve_connection`],
 //! which is generic over its transport, so the bytes a [`tokio::net::TcpStream`]
 //! carries take exactly the path the simulator's virtual ones do.
 
@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use seedstone_core::dict::DictSeed;
-use seedstone_core::service::{NodeInfo, serve_connection};
 use seedstone_core::shard::{NoTrace, ShardPool};
 use seedstone_resp::{Frame, encode};
+use seedstone_service::{NodeInfo, serve_connection};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;

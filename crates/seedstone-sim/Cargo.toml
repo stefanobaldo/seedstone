@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 seedstone-core = { path = "../seedstone-core" }
 seedstone-resp = { path = "../seedstone-resp" }
+seedstone-service = { path = "../seedstone-service" }
 turmoil.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true

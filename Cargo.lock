@@ -194,6 +194,7 @@ dependencies = [
  "getrandom",
  "seedstone-core",
  "seedstone-resp",
+ "seedstone-service",
  "tokio",
 ]
 
@@ -201,7 +202,6 @@ dependencies = [
 name = "seedstone-core"
 version = "0.0.0"
 dependencies = [
- "seedstone-resp",
  "siphasher",
  "tokio",
 ]
@@ -211,6 +211,15 @@ name = "seedstone-resp"
 version = "0.0.0"
 
 [[package]]
+name = "seedstone-service"
+version = "0.0.0"
+dependencies = [
+ "seedstone-core",
+ "seedstone-resp",
+ "tokio",
+]
+
+[[package]]
 name = "seedstone-sim"
 version = "0.0.0"
 dependencies = [
@@ -218,6 +227,7 @@ dependencies = [
  "rand_chacha",
  "seedstone-core",
  "seedstone-resp",
+ "seedstone-service",
  "tokio",
  "turmoil",
 ]

@@ -48,7 +48,7 @@ jobs:
       # the features the simulator turns on leak into the production crates and
       # hide what they would actually fail to compile on their own.
       - name: production crates compile without simulator features
-        run: cargo clippy -p seedstone -p seedstone-core -p seedstone-resp --all-targets -- -D warnings
+        run: cargo clippy -p seedstone -p seedstone-core -p seedstone-resp -p seedstone-service --all-targets -- -D warnings
       - run: cargo test --workspace
       # Linkage, a different axis from the feature unification the step above
       # covers: neither subsumes the other, and both are load-bearing.
@@ -62,14 +62,15 @@ jobs:
           tree=$(cargo tree -p seedstone --edges normal,build)
           echo "$tree"
           # The positive control. The negative assertion alone is vacuous if the
-          # graph is empty, and it would be: `seedstone` depends on
-          # `seedstone-core` only so this gate has something to search. Drop that
-          # dependency as an obvious cleanup and the grep below finds nothing
-          # forever, silently.
-          if ! grep -q seedstone-core <<<"$tree"; then
-            echo "the production graph does not even reach seedstone-core: this gate is asserting nothing" >&2
-            exit 1
-          fi
+          # graph is empty: assert first that the production binary really does
+          # reach both library crates it is built out of, so a future
+          # reorganisation cannot leave the grep below searching nothing.
+          for crate in seedstone-core seedstone-service; do
+            if ! grep -q "$crate" <<<"$tree"; then
+              echo "the production graph does not reach $crate: this gate is asserting nothing" >&2
+              exit 1
+            fi
+          done
           if grep -q turmoil <<<"$tree"; then
             echo "turmoil reached the production dependency graph" >&2
             exit 1
