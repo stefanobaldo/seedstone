@@ -705,22 +705,26 @@ impl ExpiryPolicy for SweepEatsAll {
 /// nothing, so the branch ships bugs the sweep is required to find. One plant
 /// lives here — [`Plant::LostUpdate`], which is a defect between two messages
 /// and so has nowhere else to be; see [`Plant`] for why the other two are the
-/// server's own expiry policy instead. Everything the chosen plant does not
-/// touch passes straight through, so an honest run and a planted one differ in
+/// server's own expiry policy instead. Everything that plant does not touch
+/// passes straight through, so an honest run and a planted one differ in
 /// exactly one thing.
+///
+/// Which plant is not a parameter, and that is the point: it was one while all
+/// three lived here, and leaving it would mean `new(pool, Plant::ServeExpired)`
+/// compiled into a run with nothing planted in it at all. A self-test that can
+/// be asked for a defect and quietly hand back an honest server is the exact
+/// failure it exists to prevent.
 #[derive(Clone)]
 pub struct PlantedRouter {
     /// The honest pool underneath.
     pool: ShardPool,
-    /// The one thing this router does wrong.
-    plant: Plant,
 }
 
 impl PlantedRouter {
-    /// Wraps `pool` so that `plant`'s defect is what the workload meets.
+    /// Wraps `pool` so that a lost update is what the workload meets.
     #[must_use]
-    pub const fn new(pool: ShardPool, plant: Plant) -> Self {
-        Self { pool, plant }
+    pub const fn new(pool: ShardPool) -> Self {
+        Self { pool }
     }
 }
 
@@ -731,12 +735,7 @@ impl Router for PlantedRouter {
     // desugared form for a reason that does not apply here — it sends on the
     // inbox before the future is awaited.
     async fn dispatch(&self, cmd: Command) -> Reply {
-        match self.plant {
-            Plant::LostUpdate => self.lose_updates(cmd).await,
-            // The two expiry plants are the server's own policy now, so a
-            // router carrying one has nothing of its own to do.
-            Plant::ServeExpired | Plant::SweepEatsAll => self.pool.dispatch(cmd).await,
-        }
+        self.lose_updates(cmd).await
     }
 }
 
@@ -830,7 +829,7 @@ async fn server(
         if planted == Some(Plant::LostUpdate) {
             tokio::spawn(serve_connection(
                 stream,
-                PlantedRouter::new(pool.clone(), Plant::LostUpdate),
+                PlantedRouter::new(pool.clone()),
                 node.clone(),
             ));
         } else {
