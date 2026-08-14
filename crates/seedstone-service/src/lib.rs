@@ -32,6 +32,14 @@
 //!   connection attached. The cap is *set* here and *enforced* by the
 //!   [`Decoder`] this layer hands it to — see [`MAX_REQUEST_BYTES`] for why
 //!   the two are not the same place.
+//!
+//! - **Giving the buffers back.** A connection sizes its three buffers to what
+//!   it is doing ([`resize_connection_buffers`]) and returns them to the floor
+//!   when it stops. It stops in two distinguishable ways — still talking in
+//!   small requests, which the reads themselves report, and gone silent, which
+//!   only a clock can report — so there are two signals and one shed
+//!   ([`IDLE_SHED_AFTER`]).
+//!
 //! - **No response splitting.** Every error frame this module emits passes
 //!   through [`safe_error`] first. A `Frame::Error` is terminated by the first
 //!   `\r\n` after its type byte, so text carrying either byte would let a peer
@@ -44,6 +52,7 @@ use seedstone_resp::{Decoder, DecoderLimits, Frame, ParseError, encode};
 use std::mem::take;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
 
@@ -119,13 +128,12 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 /// shedding sit one step apart — which is why the policy lives here and the
 /// codec merely exposes the lever.
 ///
-/// **The verdict is read from the reads, so a connection that stops entirely
-/// keeps what it holds.** Nothing wakes a connection task that is parked on a
-/// read, so a peer that goes silent mid-conversation is never re-measured; it
-/// is a peer that goes *quiet* — still talking, in small requests — that
-/// hands its capacity back. Closing that gap needs an idle signal this layer
-/// does not have, which is a clock, and a clock is not this buffer's decision
-/// to make.
+/// **The quiet verdict is read from the reads, so it reaches only a peer that
+/// is still talking** — in small requests. Nothing wakes a connection task
+/// parked on a read, so a peer that goes silent mid-conversation produces no
+/// evidence at all and is never re-measured by that route. The second route is
+/// [`IDLE_SHED_AFTER`], a timer the connection arms while it holds more than
+/// this floor; both routes end in the same place, `shed_connection_buffers`.
 const READ_FLOOR: usize = 2 * 1024;
 
 /// The largest single `read` a connection grows to.
@@ -145,6 +153,30 @@ const READ_CEILING: usize = 64 * 1024;
 /// to persist makes shedding a statement about a connection that stopped
 /// rather than about one read that was small.
 const READ_QUIET_READS: u32 = 4;
+
+/// The granularity at which a connection holding more than the floor is asked
+/// whether anything is still arriving.
+///
+/// The quiet-read hysteresis in [`resize_connection_buffers`] reads its
+/// verdict from the shape of the reads, so it cannot reach a peer that has
+/// stopped producing them: nothing wakes a task parked on `read`. This is the
+/// only signal that can, and the interval is a compromise between holding a
+/// working set across a pause in a conversation and holding it for a
+/// connection that will never speak again.
+///
+/// **It is a granularity, not a deadline.** The timer is armed by the growth
+/// that first took the connection above its floor, which is in the middle of
+/// the burst that grew it, so a firing that finds reads since the arming
+/// re-arms rather than sheds. A connection therefore gives its buffers back
+/// somewhere between one and two intervals after its last read, and the
+/// alternative — resetting the timer on every read — is the cost this
+/// deliberately does not pay on the hot path.
+///
+/// It costs nothing while a connection is busy and nothing once it has shed:
+/// the timer is armed only while the buffers are above the floor, and it
+/// disarms itself after shedding. A server at its connection limit with every
+/// peer silent therefore holds no timers at all.
+pub const IDLE_SHED_AFTER: Duration = Duration::from_secs(2);
 
 /// The reply buffer capacity a connection sheds back to after each write.
 ///
@@ -379,10 +411,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     R: Router,
 {
-    serve_connection_limited(stream, router, node, MAX_REQUEST_BYTES).await;
+    serve_connection_limited(stream, router, node, MAX_REQUEST_BYTES, IDLE_SHED_AFTER).await;
 }
 
-/// [`serve_connection`] with the accumulation ceiling as a parameter.
+/// [`serve_connection`] with the accumulation ceiling and the idle interval as
+/// parameters.
 ///
 /// The ceiling exists so that it can be exercised. Reaching 64 MiB through a
 /// pipe is linear work now rather than quadratic, but it is still 64 MiB
@@ -390,11 +423,16 @@ where
 /// identically — so a test on the real constant would be the slowest thing in
 /// the suite by a wide margin, and this layer's stated primary defence would
 /// go on having no coverage at all.
+///
+/// [`IDLE_SHED_AFTER`] is here for the same reason in the other direction: a
+/// test that must watch the interval elapse says how long it is rather than
+/// waiting out the production one.
 async fn serve_connection_limited<S, R>(
     mut stream: S,
     router: R,
     node: NodeInfo,
     max_request_bytes: usize,
+    idle_shed: Duration,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
     R: Router,
@@ -414,6 +452,16 @@ async fn serve_connection_limited<S, R>(
     // capacity survives a chunk boundary instead of being rebuilt per drain.
     let mut slots: Vec<Slot> = Vec::new();
     let mut batch: Vec<Command> = Vec::new();
+
+    let idle = tokio::time::sleep(idle_shed);
+    tokio::pin!(idle);
+    // The timer is armed only while there is something to give back, and what
+    // it compares on firing is whether any read arrived since it was armed —
+    // so a busy connection never registers a timer more than once per
+    // interval, and never resets one on the read path.
+    let mut armed = false;
+    let mut reads: u64 = 0;
+    let mut reads_when_armed: u64 = 0;
 
     loop {
         // Drain every complete frame the decoder already holds before asking
@@ -493,20 +541,54 @@ async fn serve_connection_limited<S, R>(
             return;
         }
 
-        match stream.read(&mut read_buf).await {
-            // EOF, or a transport that failed. Either way the connection is
-            // over and there is nobody left to tell.
-            Ok(0) | Err(_) => return,
-            Ok(got) => {
-                decoder.feed(&read_buf[..got]);
-                resize_connection_buffers(
-                    &mut read_buf,
-                    &mut decoder,
-                    &mut out,
-                    &mut quiet_reads,
-                    got,
-                );
+        let got = tokio::select! {
+            // `biased` for the reason the shard loop states: unbiased arm
+            // choice draws on the runtime's RNG, which is entropy no seed
+            // replays. It is also the right priority — bytes a peer has
+            // already sent outrank a decision about memory it is not using.
+            biased;
+
+            result = stream.read(&mut read_buf) => match result {
+                // EOF, or a transport that failed. Either way the connection
+                // is over and there is nobody left to tell.
+                Ok(0) | Err(_) => return,
+                Ok(got) => got,
+            },
+
+            () = &mut idle, if armed => {
+                if reads == reads_when_armed {
+                    shed_connection_buffers(&mut read_buf, &mut decoder, &mut out);
+                    quiet_reads = 0;
+                    armed = false;
+                } else {
+                    reads_when_armed = reads;
+                    idle.as_mut().reset(Instant::now() + idle_shed);
+                }
+                // Nothing was read, so there is nothing to decode. The drain
+                // at the top of the loop finds the decoder dry, writes
+                // nothing, and comes back here.
+                continue;
             }
+        };
+        reads += 1;
+        decoder.feed(&read_buf[..got]);
+        resize_connection_buffers(&mut read_buf, &mut decoder, &mut out, &mut quiet_reads, got);
+        // The read buffer standing above its floor is the evidence that this
+        // connection grew, and it is the whole of the arming condition: the
+        // timer exists to reclaim what that buffer's presence implies, so a
+        // connection at the floor has nothing for it to do. Arming and
+        // disarming are therefore one decision made from one comparison,
+        // rather than an arm here and a disarm on the timer's own path only —
+        // which would leave a timer running on every connection the
+        // quiet-read hysteresis had already emptied.
+        match (armed, read_buf.len() > READ_FLOOR) {
+            (false, true) => {
+                armed = true;
+                reads_when_armed = reads;
+                idle.as_mut().reset(Instant::now() + idle_shed);
+            }
+            (true, false) => armed = false,
+            _ => {}
         }
     }
 }
@@ -561,11 +643,26 @@ fn resize_connection_buffers(
     *quiet += 1;
     if *quiet >= READ_QUIET_READS {
         *quiet = 0;
-        read_buf.truncate(READ_FLOOR);
-        read_buf.shrink_to(READ_FLOOR);
-        decoder.shed_to(READ_FLOOR);
-        out.shrink_to(READ_FLOOR);
+        shed_connection_buffers(read_buf, decoder, out);
     }
+}
+
+/// Returns every buffer to the floor.
+///
+/// The three are shed together because they are evidence of the same thing:
+/// this connection is not doing what it grew for. The decoder's and the reply
+/// buffer's own floors are a quarter of a megabyte each, which is right for a
+/// connection between requests and far too much for one that has stopped.
+///
+/// It does not touch the quiet-read counter, because the two callers reach it
+/// having decided different things: [`resize_connection_buffers`] gets here by
+/// filling that window and clears it as part of its own verdict, and the idle
+/// timer gets here without consulting it at all. Whoever sheds resets it.
+fn shed_connection_buffers(read_buf: &mut Vec<u8>, decoder: &mut Decoder, out: &mut Vec<u8>) {
+    read_buf.truncate(READ_FLOOR);
+    read_buf.shrink_to(READ_FLOOR);
+    decoder.shed_to(READ_FLOOR);
+    out.shrink_to(READ_FLOOR);
 }
 
 /// Closes one chunk: dispatches its batch and appends every slot's frame to
@@ -2596,6 +2693,7 @@ mod tests {
             pool,
             NodeInfo::for_tests(),
             CEILING,
+            IDLE_SHED_AFTER,
         ));
         let (mut r, mut w) = tokio::io::split(client);
 
@@ -2655,6 +2753,7 @@ mod tests {
             pool,
             NodeInfo::for_tests(),
             CEILING,
+            IDLE_SHED_AFTER,
         ));
         let (mut r, mut w) = tokio::io::split(client);
 
@@ -2707,6 +2806,7 @@ mod tests {
             pool,
             NodeInfo::for_tests(),
             CEILING,
+            IDLE_SHED_AFTER,
         ));
         let (mut r, mut w) = tokio::io::split(client);
 
@@ -2875,6 +2975,291 @@ mod tests {
             "the reply buffer kept {} bytes",
             out.capacity()
         );
+    }
+
+    /// Serves one request, then never speaks again, recording the size of
+    /// every buffer it is offered.
+    ///
+    /// The record is what makes the idle shed observable from outside without
+    /// a test hook: the connection's buffers are locals of its future, and the
+    /// only thing it ever shows anyone is how much room it asks to read into.
+    struct GoesSilent {
+        request: Vec<u8>,
+        offered: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl AsyncRead for GoesSilent {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.offered.lock().expect("offered").push(buf.remaining());
+            if self.request.is_empty() {
+                // Parked, exactly as a peer that has gone quiet leaves it. No
+                // waker is registered, which is the whole point: only the
+                // timer can move this connection now.
+                return std::task::Poll::Pending;
+            }
+            let take = self.request.len().min(buf.remaining());
+            let chunk: Vec<u8> = self.request.drain(..take).collect();
+            buf.put_slice(&chunk);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A sink: accept everything, remember nothing. The replies are not what
+    /// [`GoesSilent`] is for.
+    impl AsyncWrite for GoesSilent {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Yields until the connection has nothing left to do, and answers how
+    /// many reads it has asked for by then.
+    ///
+    /// Every poll of the transport is recorded, so "settled" is a record whose
+    /// length stops changing. The yields also keep the runtime's queue
+    /// non-empty, which is what stops the paused clock auto-advancing
+    /// underneath the measurement.
+    async fn settle(offered: &Arc<std::sync::Mutex<Vec<usize>>>) -> usize {
+        let mut len = usize::MAX;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            let now = offered.lock().expect("offered").len();
+            if now == len {
+                return now;
+            }
+            len = now;
+        }
+        panic!("the connection never settled");
+    }
+
+    /// A peer that stops mid-conversation is re-measured by the clock.
+    ///
+    /// The quiet-read hysteresis cannot see this connection: its verdict is
+    /// read from the shape of the reads, and this peer has stopped producing
+    /// reads at all. Nothing wakes a task parked on `read`, so without a timer
+    /// the buffers this connection grew are held for as long as it stays
+    /// attached — which, at the connection limit's default, is the largest
+    /// single amount of memory a server can be made to hold while doing
+    /// nothing.
+    ///
+    /// After the idle interval the connection must ask for a floor-sized read
+    /// again, which is the assertion the current hysteresis cannot make.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_goes_silent_gives_its_buffers_back() {
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let value = vec![b'x'; 512 * 1024];
+        let mut request = Vec::new();
+        encode(
+            &Frame::Array(vec![
+                Frame::Bulk(b"SET".to_vec()),
+                Frame::Bulk(b"k".to_vec()),
+                Frame::Bulk(value),
+            ]),
+            &mut request,
+        );
+
+        let stream = GoesSilent {
+            request,
+            offered: Arc::clone(&offered),
+        };
+        let pool = ShardPool::spawn(4, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let idle = Duration::from_secs(2);
+        let served = tokio::spawn(serve_connection_limited(
+            stream,
+            pool,
+            NodeInfo::for_tests(),
+            MAX_REQUEST_BYTES,
+            idle,
+        ));
+
+        // Let the request be served and the connection park on a read that
+        // will never complete.
+        let before = settle(&offered).await;
+        let grew = *offered
+            .lock()
+            .expect("offered")
+            .iter()
+            .max()
+            .expect("a read");
+        assert!(
+            grew > READ_FLOOR,
+            "the connection never grew, so this test would pass vacuously"
+        );
+
+        // Two intervals, not one, and that is the arming discipline rather
+        // than slack. The timer is armed by the first growth, in the middle of
+        // the burst that grew it, so its first firing finds a read counter
+        // that moved since — the peer *was* talking — and re-arms instead of
+        // shedding. The second firing is the one that finds nothing arrived.
+        for _ in 0..2 {
+            tokio::time::advance(idle + Duration::from_millis(1)).await;
+            settle(&offered).await;
+        }
+
+        let offered = offered.lock().expect("offered").clone();
+        assert!(
+            offered.len() > before,
+            "the idle timer never fired: the connection was not re-measured"
+        );
+        // The timer's own wake re-polls the read arm before the timer arm —
+        // `biased` puts it there — so the connection is offered its grown
+        // buffer one last time on the way to shedding it. What the shed has to
+        // change is the read it asks for *next*, which is the last recorded.
+        assert_eq!(
+            offered.last().copied(),
+            Some(READ_FLOOR),
+            "after the idle interval the connection must be back at the floor"
+        );
+        served.abort();
+    }
+
+    /// Delivers a scripted run of requests and then stops for good.
+    ///
+    /// A chunk longer than the buffer it is offered is split, so the same
+    /// script drives a connection through the growth the first chunk forces
+    /// and the quiet window the rest of them make.
+    struct TalksThenStops {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        offered: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl AsyncRead for TalksThenStops {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.offered.lock().expect("offered").push(buf.remaining());
+            let Some(mut chunk) = self.chunks.pop_front() else {
+                return std::task::Poll::Pending;
+            };
+            if chunk.len() > buf.remaining() {
+                let rest = chunk.split_off(buf.remaining());
+                self.chunks.push_front(rest);
+            }
+            buf.put_slice(&chunk);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A sink, for the same reason [`GoesSilent`]'s is one.
+    impl AsyncWrite for TalksThenStops {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<Result<usize, std::io::Error>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), std::io::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A connection the reads already emptied costs no timer.
+    ///
+    /// This is the half of [`IDLE_SHED_AFTER`]'s claim that the silent-peer
+    /// test cannot make. A peer that grows a connection and then goes *quiet*
+    /// rather than silent is shed by the hysteresis, without the clock — and
+    /// if arming were not undone by that route, every such connection would go
+    /// on holding a timer that fires once an interval forever, to reclaim
+    /// buffers that are already at the floor.
+    ///
+    /// A disarmed connection is one nothing can wake: the transport parks
+    /// without registering a waker, so a firing timer is the only thing that
+    /// could produce another read. Advancing the clock and finding no new read
+    /// is therefore the assertion, and it fails if the timer is left armed.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_the_reads_already_emptied_holds_no_timer() {
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut chunks = std::collections::VecDeque::new();
+
+        // One request large enough to take the buffers to the ceiling...
+        let mut big = Vec::new();
+        encode(
+            &Frame::Array(vec![
+                Frame::Bulk(b"SET".to_vec()),
+                Frame::Bulk(b"k".to_vec()),
+                Frame::Bulk(vec![b'x'; 512 * 1024]),
+            ]),
+            &mut big,
+        );
+        chunks.push_back(big);
+        // ...then a run of small ones, each its own read, which is exactly the
+        // evidence [`READ_QUIET_READS`] accumulates. Twice the window, so the
+        // shed is comfortably inside the script rather than on its last read.
+        for _ in 0..2 * READ_QUIET_READS {
+            let mut ping = Vec::new();
+            encode(&req(&["PING"]), &mut ping);
+            chunks.push_back(ping);
+        }
+
+        let stream = TalksThenStops {
+            chunks,
+            offered: Arc::clone(&offered),
+        };
+        let pool = ShardPool::spawn(4, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let idle = Duration::from_secs(2);
+        let served = tokio::spawn(serve_connection_limited(
+            stream,
+            pool,
+            NodeInfo::for_tests(),
+            MAX_REQUEST_BYTES,
+            idle,
+        ));
+
+        let before = settle(&offered).await;
+        let script = offered.lock().expect("offered").clone();
+        assert!(
+            script.iter().copied().max() > Some(READ_FLOOR),
+            "the connection never grew, so this test would pass vacuously"
+        );
+        assert_eq!(
+            script.last().copied(),
+            Some(READ_FLOOR),
+            "the quiet window never shed, so there is no disarming to check"
+        );
+
+        // Well past the two intervals the silent-peer case needs.
+        for _ in 0..3 {
+            tokio::time::advance(idle + Duration::from_millis(1)).await;
+            settle(&offered).await;
+        }
+        assert_eq!(
+            offered.lock().expect("offered").len(),
+            before,
+            "a timer fired for a connection that had nothing left to give back"
+        );
+        served.abort();
     }
 
     /// Shedding never costs a byte of a frame still arriving.
