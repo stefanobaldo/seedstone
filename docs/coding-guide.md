@@ -34,7 +34,8 @@ reason the linked code documents in place.
   each would carry a comment in `Cargo.toml` and an entry here. **There are
   none.** Every deviation in the tree is site-local, and there are four:
   `slot.rs` narrowing a quotient it has just bounded, `shard.rs` taking its
-  trace sink and log factory by value so a caller can move them in,
+  trace sink, log factory and expiry policy by value so a caller can move
+  them in,
   `main.rs` drawing the hash seed from the OS — the composition root is the
   one place entropy may enter — and one `unreachable_code` in a test whose
   loop can only end by returning. Each carries its `reason`, and the count
