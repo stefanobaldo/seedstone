@@ -80,6 +80,16 @@ with no benefit.
   over the log's own operations is enough.
 - **The trace is ours by definition.** A production server compares its
   execution against nothing; the trace exists so a simulated one can.
+- **The expiry decision is ours, and it is the one seam built to be broken.**
+  Both halves of expiration — the check in front of every command and the
+  housekeeping sweep — ask a policy chosen when the shard pool is spawned.
+  Production links exactly one, an honest zero-sized implementation; the harness
+  supplies defective ones, so what an expiration invariant catches is the defect
+  itself rather than an imitation of what it would look like from outside. A
+  cargo feature could not do this job: a workspace-wide build unifies features,
+  so the harness's would be compiled into the shipped binary. A type parameter
+  puts the broken implementations in a crate the binary does not depend on,
+  where they are unlinkable rather than merely unused.
 
 **Entropy enters in exactly one place.** The hash seed is drawn in `main`, the
 composition root, and injected downward; nothing below it reads randomness or
@@ -103,6 +113,20 @@ entropy is drawn. Below it, the connection loop is generic over its transport;
 commands that concern the connection rather than the keyspace are answered
 there, and keyed commands are routed to the executor that owns their shard.
 Multi-key commands fan out from the same layer.
+
+That layer is its own crate, and the dependency arrow is the reason. It depends
+on the core and on the codec; the core depends on neither. An adapter the core
+depends on is not at the edge — and with the arrow pointing this way, a second
+protocol frontend is a sibling crate rather than a second adapter living inside
+the deterministic core.
+
+A connection sizes its buffers to what it is doing and gives the capacity back
+when it stops. Two signals say that it has: the shape of its reads, and — for a
+peer that stops producing reads at all, which the first cannot see, because
+nothing wakes a task parked on one — a timer armed only while the connection
+holds more than its floor, and disarmed by whichever signal empties it. A server
+whose peers have all gone quiet therefore holds neither the buffers nor the
+timers.
 
 The codec is a resumable decoder rather than a parser over a complete buffer: a
 frame arriving in arbitrary chunks is decoded once, without revisiting bytes
