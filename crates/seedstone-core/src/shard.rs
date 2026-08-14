@@ -332,6 +332,56 @@ impl TraceSink for NoTrace {
     fn record(&self, _shard: u16, _seq: u64, _cmd: &Command, _reply: &Reply) {}
 }
 
+/// Whether a deadline has come due.
+///
+/// Expiry is decided in two places — in front of every command
+/// ([`evict_if_expired`]) and on the housekeeping tick ([`sweep_expired`]) —
+/// and both ask this. Production has exactly one implementation, [`Deadlines`],
+/// and the parameter exists so that the simulator can supply others: a plant
+/// that answers wrongly *is* the defect an invariant claims to catch, where a
+/// rewritten request only reproduces what that defect would look like from
+/// outside. A cargo feature could not do this job — `cargo build --workspace`
+/// unifies features, so the simulator's would be compiled into the shipped
+/// binary — and a runtime flag would be worse.
+pub trait ExpiryPolicy: Clone + Send + 'static {
+    /// Is a key carrying `expires_at` due at `now`, for a command looking at it?
+    fn due_on_read(&self, expires_at: Option<Instant>, now: Instant) -> bool;
+
+    /// Is a key carrying `expires_at` due at `now`, for the active sweep?
+    fn due_on_sweep(&self, expires_at: Option<Instant>, now: Instant) -> bool;
+
+    /// May a key with no deadline at all be taken?
+    ///
+    /// `false` for any honest policy, and answering it opens both fast paths:
+    /// a dict that has never held a deadline is neither walked by the sweep
+    /// nor looked up in front of a command. A policy that takes undated keys
+    /// has to answer `true` or it would observe nothing.
+    fn takes_undated(&self) -> bool;
+}
+
+/// The honest policy: a key is due once `now` has *reached* its deadline, and
+/// a key with no deadline is never due.
+///
+/// A zero-sized type, so the calls above monomorphise and inline into the
+/// comparisons they replaced. It is the default of [`ShardPool::spawn`] and
+/// [`ShardPool::spawn_with_log`], and the only implementation this crate ships.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Deadlines;
+
+impl ExpiryPolicy for Deadlines {
+    fn due_on_read(&self, expires_at: Option<Instant>, now: Instant) -> bool {
+        expires_at.is_some_and(|at| at <= now)
+    }
+
+    fn due_on_sweep(&self, expires_at: Option<Instant>, now: Instant) -> bool {
+        expires_at.is_some_and(|at| at <= now)
+    }
+
+    fn takes_undated(&self) -> bool {
+        false
+    }
+}
+
 /// Anything that can answer a [`Command`].
 ///
 /// The service layer is generic over this so a test, the simulator, or a
@@ -415,7 +465,7 @@ impl ShardPool {
     /// If `shards` is zero — there would be nowhere to route a key — or if
     /// `executors` is not in `1..=shards`.
     pub fn spawn<T: TraceSink>(shards: u16, executors: u16, seed: DictSeed, trace: T) -> Self {
-        Self::spawn_with_log(shards, executors, seed, trace, |_shard| NoopLog)
+        Self::spawn_full(shards, executors, seed, trace, |_shard| NoopLog, Deadlines)
     }
 
     /// [`spawn`](ShardPool::spawn) with the replication log supplied per shard.
@@ -436,12 +486,6 @@ impl ShardPool {
     ///
     /// If `shards` is zero — there would be nowhere to route a key — or if
     /// `executors` is not in `1..=shards`.
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "every executor gets a clone of the sink and the original is dropped, \
-                  but taking both it and the log factory by value is what lets a \
-                  caller move them in rather than keep them alive alongside the pool"
-    )]
     pub fn spawn_with_log<T, L, F>(
         shards: u16,
         executors: u16,
@@ -453,6 +497,54 @@ impl ShardPool {
         T: TraceSink,
         L: ReplicationLog,
         F: Fn(u16) -> L,
+    {
+        Self::spawn_full(shards, executors, seed, trace, make_log, Deadlines)
+    }
+
+    /// [`spawn`](ShardPool::spawn) with the expiry decision supplied.
+    ///
+    /// Callers are the simulator and this crate's own tests; no production
+    /// path names it. See [`ExpiryPolicy`] for why the seam exists.
+    ///
+    /// # Panics
+    ///
+    /// If `shards` is zero, or if `executors` is not in `1..=shards`.
+    pub fn spawn_with_expiry<T, P>(
+        shards: u16,
+        executors: u16,
+        seed: DictSeed,
+        trace: T,
+        expiry: P,
+    ) -> Self
+    where
+        T: TraceSink,
+        P: ExpiryPolicy,
+    {
+        Self::spawn_full(shards, executors, seed, trace, |_shard| NoopLog, expiry)
+    }
+
+    /// The one constructor with every seam exposed; the three public ones are
+    /// its defaults.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "every executor gets a clone of the sink and of the policy and the \
+                  originals are dropped, but taking them and the log factory by value \
+                  is what lets a caller move them in rather than keep them alive \
+                  alongside the pool"
+    )]
+    fn spawn_full<T, L, F, P>(
+        shards: u16,
+        executors: u16,
+        seed: DictSeed,
+        trace: T,
+        make_log: F,
+        expiry: P,
+    ) -> Self
+    where
+        T: TraceSink,
+        L: ReplicationLog,
+        F: Fn(u16) -> L,
+        P: ExpiryPolicy,
     {
         assert!(
             shards > 0,
@@ -488,14 +580,19 @@ impl ShardPool {
                 }
                 _ => {
                     if let Some((first_shard, states)) = pending.take() {
-                        inboxes.push(spawn_executor(first_shard, states, trace.clone()));
+                        inboxes.push(spawn_executor(
+                            first_shard,
+                            states,
+                            trace.clone(),
+                            expiry.clone(),
+                        ));
                     }
                     pending = Some((shard, vec![state]));
                 }
             }
         }
         if let Some((first_shard, states)) = pending {
-            inboxes.push(spawn_executor(first_shard, states, trace));
+            inboxes.push(spawn_executor(first_shard, states, trace, expiry));
         }
 
         Self {
@@ -519,13 +616,14 @@ impl ShardPool {
 }
 
 /// Spawns one executor task and returns the inbox that reaches it.
-fn spawn_executor<T: TraceSink, L: ReplicationLog>(
+fn spawn_executor<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
     first_shard: u16,
     states: Vec<ShardState<L>>,
     trace: T,
+    expiry: P,
 ) -> mpsc::UnboundedSender<Envelope> {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_executor(first_shard, states, trace, rx));
+    tokio::spawn(run_executor(first_shard, states, trace, expiry, rx));
     tx
 }
 
@@ -636,10 +734,11 @@ struct ShardState<L> {
 ///
 /// Returns when the inbox closes, which happens once the last [`ShardPool`]
 /// handle is dropped.
-async fn run_executor<T: TraceSink, L: ReplicationLog>(
+async fn run_executor<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
     first_shard: u16,
     mut states: Vec<ShardState<L>>,
     trace: T,
+    expiry: P,
     mut inbox: mpsc::UnboundedReceiver<Envelope>,
 ) {
     let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
@@ -694,8 +793,15 @@ async fn run_executor<T: TraceSink, L: ReplicationLog>(
                 for (shard, cmd) in &mut cmds {
                     let state = &mut states[usize::from(*shard - first_shard)];
                     let at = state.seq;
-                    let answer =
-                        apply(&mut state.dict, &mut state.log, &mut state.seq, *shard, cmd, now);
+                    let answer = apply(
+                        &mut state.dict,
+                        &mut state.log,
+                        &mut state.seq,
+                        *shard,
+                        cmd,
+                        now,
+                        &expiry,
+                    );
                     trace.record(*shard, at, cmd, &answer);
                     replies.push(answer);
                 }
@@ -719,7 +825,7 @@ async fn run_executor<T: TraceSink, L: ReplicationLog>(
                     // fit the `u16` a shard id is.
                     let shard = first_shard
                         + u16::try_from(offset).expect("a shard range is shorter than u16::MAX");
-                    sweep_expired(state, shard, &trace, now);
+                    sweep_expired(state, shard, &trace, now, &expiry);
                     // The durability point, and the only place in a shard that
                     // can afford to be one: `append` runs inside a handler that
                     // cannot `await`, so it must stay cheap, while this arm is
@@ -756,15 +862,17 @@ async fn run_executor<T: TraceSink, L: ReplicationLog>(
 /// cursor where it was: the entries keep their deadlines, and the same buckets
 /// are swept again on the next tick. Skipping them would mean waiting a whole
 /// cycle to retry a key the log has already refused to let go.
-fn sweep_expired<T: TraceSink, L: ReplicationLog>(
+fn sweep_expired<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
     state: &mut ShardState<L>,
     shard: u16,
     trace: &T,
     now: Instant,
+    expiry: &P,
 ) {
-    let (next, dead) = state
-        .dict
-        .expire_step(state.expire_cursor, EXPIRE_BUCKETS_PER_TICK, now);
+    let (next, dead) =
+        state
+            .dict
+            .expire_step(state.expire_cursor, EXPIRE_BUCKETS_PER_TICK, now, expiry);
     for key in dead {
         let at = state.seq;
         if append(&mut state.log, &mut state.seq, shard).is_err() {
@@ -803,13 +911,14 @@ fn sweep_expired<T: TraceSink, L: ReplicationLog>(
 /// `now` is the instant the whole envelope is being served at, supplied by the
 /// executor: a handler must not read a clock of its own, or two commands of
 /// one batch could disagree about which keys are still alive.
-fn apply<L: ReplicationLog>(
+fn apply<L: ReplicationLog, P: ExpiryPolicy>(
     dict: &mut Dict,
     log: &mut L,
     seq: &mut u64,
     shard: u16,
     cmd: &mut Command,
     now: Instant,
+    expiry: &P,
 ) -> Reply {
     // Lazy expiry, once, before any arm has looked at the key. Here rather
     // than in each arm on purpose: it makes "an expired key is dead to every
@@ -817,7 +926,7 @@ fn apply<L: ReplicationLog>(
     // have to remember, and a command added later inherits it without knowing
     // it exists. Every command addresses exactly one key, which is what lets
     // one check stand in front of all of them.
-    if let Err(failed) = evict_if_expired(dict, log, seq, shard, cmd.key(), now) {
+    if let Err(failed) = evict_if_expired(dict, log, seq, shard, cmd.key(), now, expiry) {
         return failed;
     }
 
@@ -926,8 +1035,9 @@ fn apply<L: ReplicationLog>(
 /// folds the position each command ran at — sees the position the removal
 /// consumed. Neither has to know what a deadline is.
 ///
-/// The deadline is the first instant the entry is gone, so a key is expired
-/// when `now` has reached it and not only once it is past.
+/// Whether the deadline has come due is [`ExpiryPolicy`]'s to say, and under
+/// the honest [`Deadlines`] it comes due the instant `now` reaches it, not only
+/// once it is past.
 ///
 /// Returns the reply to send instead when the record could not be written. A
 /// removal that cannot be logged must not happen, for the same reason a `Del`
@@ -935,26 +1045,28 @@ fn apply<L: ReplicationLog>(
 /// moved past a log which does not describe it. The entry stays, and the
 /// command that met it is refused rather than answered from a value that
 /// should be gone.
-fn evict_if_expired<L: ReplicationLog>(
+fn evict_if_expired<L: ReplicationLog, P: ExpiryPolicy>(
     dict: &mut Dict,
     log: &mut L,
     seq: &mut u64,
     shard: u16,
     key: &[u8],
     now: Instant,
+    expiry: &P,
 ) -> Result<(), Reply> {
     // A keyspace with no deadlines in it — which is nearly every keyspace —
     // leaves here without hashing anything, so standing in front of every
     // command costs it a predictable branch and not a second lookup. The
     // guarantee is unaffected: the dict answers `false` only when no entry it
-    // holds can be expired.
-    if !dict.may_hold_deadlines() {
+    // holds can be expired. A policy that takes undated keys is the one case
+    // where that shortcut would hide the answer, so it says so.
+    if !dict.may_hold_deadlines() && !expiry.takes_undated() {
         return Ok(());
     }
-    let Some(expires_at) = dict.get(key).and_then(|entry| entry.expires_at) else {
+    let Some(entry) = dict.get(key) else {
         return Ok(());
     };
-    if expires_at > now {
+    if !expiry.due_on_read(entry.expires_at, now) {
         return Ok(());
     }
     append(log, seq, shard)?;
@@ -1080,6 +1192,7 @@ mod tests {
                 0,
                 &mut cmd,
                 now,
+                &Deadlines,
             )
         }
     }
@@ -1347,7 +1460,8 @@ mod tests {
                 &mut seq,
                 3,
                 &mut set,
-                Instant::now()
+                Instant::now(),
+                &Deadlines
             ),
             Reply::Ok
         );
@@ -1363,7 +1477,8 @@ mod tests {
                 &mut seq,
                 3,
                 &mut read,
-                Instant::now()
+                Instant::now(),
+                &Deadlines
             ),
             Reply::Bulk(None)
         );
@@ -1687,10 +1802,26 @@ mod tests {
         let mut seq = 0;
         let now = Instant::now();
 
-        let stored = apply(&mut dict, &mut log, &mut seq, 0, &mut set(b"k", b"v"), now);
+        let stored = apply(
+            &mut dict,
+            &mut log,
+            &mut seq,
+            0,
+            &mut set(b"k", b"v"),
+            now,
+            &Deadlines,
+        );
         assert_eq!(stored, Reply::Ok);
         assert_eq!(
-            apply(&mut dict, &mut log, &mut seq, 0, &mut get(b"k"), now),
+            apply(
+                &mut dict,
+                &mut log,
+                &mut seq,
+                0,
+                &mut get(b"k"),
+                now,
+                &Deadlines
+            ),
             Reply::Bulk(Some(b"v".to_vec()))
         );
     }
@@ -1712,7 +1843,15 @@ mod tests {
         let mut cmd = set(b"k", b"v");
 
         assert_eq!(
-            apply(&mut dict, &mut log, &mut seq, 0, &mut cmd, Instant::now()),
+            apply(
+                &mut dict,
+                &mut log,
+                &mut seq,
+                0,
+                &mut cmd,
+                Instant::now(),
+                &Deadlines
+            ),
             Reply::Ok
         );
         assert_eq!(cmd.key(), b"k", "the trace folds the key after the handler");
@@ -1736,8 +1875,9 @@ mod tests {
         let mut log = NoopLog;
         let mut seq = 0;
         let now = Instant::now();
-        let mut run =
-            |mut cmd: Command, seq: &mut u64| apply(&mut dict, &mut log, seq, 3, &mut cmd, now);
+        let mut run = |mut cmd: Command, seq: &mut u64| {
+            apply(&mut dict, &mut log, seq, 3, &mut cmd, now, &Deadlines)
+        };
 
         // A read moves nothing.
         run(Command::Get { key: b"a".to_vec() }, &mut seq);
@@ -2169,5 +2309,61 @@ mod tests {
     #[should_panic(expected = "executors must be in 1..=shards")]
     async fn a_pool_with_more_executors_than_shards_is_a_programming_error() {
         ShardPool::spawn(4, 5, DictSeed { k0: 0, k1: 0 }, NoTrace);
+    }
+
+    /// A policy that never finds anything due, which is what a server with no
+    /// liveness check and no working sweep looks like from the outside.
+    ///
+    /// It is defined here, in a test module, and in `seedstone-sim` for the
+    /// plants — never in a production path. That is the whole point of the
+    /// parameter: the defective policies are unlinkable from the binary
+    /// because they are not in a crate it depends on.
+    #[derive(Clone, Copy)]
+    struct NeverDue;
+
+    impl ExpiryPolicy for NeverDue {
+        fn due_on_read(&self, _expires_at: Option<Instant>, _now: Instant) -> bool {
+            false
+        }
+        fn due_on_sweep(&self, _expires_at: Option<Instant>, _now: Instant) -> bool {
+            false
+        }
+        fn takes_undated(&self) -> bool {
+            false
+        }
+    }
+
+    /// The defect O28 exists to be able to plant: the deadline is stored, the
+    /// clock passes it, and the key is still there — on both paths at once,
+    /// which is what makes it a missing expiry rather than a slow one.
+    #[tokio::test(start_paused = true)]
+    async fn a_pool_spawned_with_a_policy_expires_by_that_policy() {
+        let sink = Recorder::default();
+        let pool = ShardPool::spawn_with_expiry(1, 1, DictSeed { k0: 2, k1: 3 }, sink, NeverDue);
+        assert_eq!(pool.dispatch(set_ex(b"k", b"v", 1)).await, Reply::Ok);
+
+        // Past the deadline, and past enough housekeeping ticks for the sweep
+        // to have walked the whole table several times over.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        for _ in 0..8 {
+            tokio::time::advance(HOUSEKEEPING_TICK).await;
+        }
+
+        assert_eq!(
+            pool.dispatch(get(b"k")).await,
+            Reply::Bulk(Some(b"v".to_vec())),
+            "the policy said nothing was due, so the key must still answer"
+        );
+    }
+
+    /// The counterpart, and the reason the test above proves anything: the
+    /// honest policy is what `spawn` uses, and it does expire the key.
+    #[tokio::test(start_paused = true)]
+    async fn the_default_policy_is_the_honest_one() {
+        let sink = Recorder::default();
+        let pool = ShardPool::spawn(1, 1, DictSeed { k0: 2, k1: 3 }, sink);
+        assert_eq!(pool.dispatch(set_ex(b"k", b"v", 1)).await, Reply::Ok);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(pool.dispatch(get(b"k")).await, Reply::Bulk(None));
     }
 }

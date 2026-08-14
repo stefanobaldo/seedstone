@@ -17,6 +17,7 @@
 
 use std::hash::Hasher;
 
+use crate::shard::ExpiryPolicy;
 use siphasher::sip::SipHasher13;
 use tokio::time::Instant;
 
@@ -462,7 +463,10 @@ impl Dict {
     ///   comes back unchanged and nothing is reported. See
     ///   [`may_hold_deadlines`](Dict::may_hold_deadlines) — it is what keeps
     ///   this off the tick of the shards, nearly all of them, that have no
-    ///   expiries to reclaim.
+    ///   expiries to reclaim. The shortcut is `expiry`'s to waive: a policy
+    ///   answering
+    ///   [`takes_undated`](crate::shard::ExpiryPolicy::takes_undated) yes is
+    ///   looking for keys the flag says nothing about, so the walk happens.
     /// - **The report is a snapshot, and it stops being true the moment the
     ///   dict is written to.** Each key named was due at `now`; an insert
     ///   under that same key afterwards replaces the entry with a live one,
@@ -474,17 +478,20 @@ impl Dict {
     ///   keys come back owned and outlive the `&self` that produced them, so
     ///   it is a contract rather than a lifetime.
     ///
-    /// A key is expired once `now` has *reached* its deadline, which is the
-    /// same instant the lazy path uses: the two halves must not disagree about
-    /// which keys are alive.
+    /// Which keys are due is `expiry`'s to say, and it is asked the same
+    /// question the lazy path asks — under the honest
+    /// [`Deadlines`](crate::shard::Deadlines) a key is expired once `now` has
+    /// *reached* its deadline. The two halves consult one policy so they cannot
+    /// disagree about which keys are alive.
     #[must_use]
     pub fn expire_step(
         &self,
         cursor: u64,
         budget_buckets: usize,
         now: Instant,
+        expiry: &impl ExpiryPolicy,
     ) -> (u64, Vec<Vec<u8>>) {
-        if !self.may_hold_deadlines {
+        if !self.may_hold_deadlines && !expiry.takes_undated() {
             return (cursor, Vec::new());
         }
 
@@ -494,7 +501,7 @@ impl Dict {
             // Nothing mutates the table between these steps, so the buckets
             // they cover are disjoint and no key can be reported twice.
             next = self.scan(next, |key, entry| {
-                if entry.expires_at.is_some_and(|at| at <= now) {
+                if expiry.due_on_sweep(entry.expires_at, now) {
                     dead.push(key.to_vec());
                 }
             });
@@ -622,6 +629,9 @@ fn remove_from(table: &mut Table, hash: u64, key: &[u8]) -> Option<Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The honest policy, which is what every expiry test here is about: these
+    // tests are the dict's, and a defective policy is the simulator's business.
+    use crate::shard::Deadlines;
     use std::time::Duration;
 
     fn seed() -> DictSeed {
@@ -1323,7 +1333,7 @@ mod tests {
         let mut cursor = cursor;
         let mut steps = 0;
         loop {
-            let (next, mut batch) = d.expire_step(cursor, budget, now);
+            let (next, mut batch) = d.expire_step(cursor, budget, now, &Deadlines);
             dead.append(&mut batch);
             cursor = next;
             if cursor == 0 {
@@ -1415,14 +1425,17 @@ mod tests {
         // A walked cursor cannot come back where it started: a step always
         // moves it. Two starting points, because one of them could be the
         // cursor a completed cycle happens to return.
-        assert_eq!(d.expire_step(0, 4, now), (0, Vec::new()));
-        assert_eq!(d.expire_step(1 << 63, 4, now), (1 << 63, Vec::new()));
+        assert_eq!(d.expire_step(0, 4, now, &Deadlines), (0, Vec::new()));
+        assert_eq!(
+            d.expire_step(1 << 63, 4, now, &Deadlines),
+            (1 << 63, Vec::new())
+        );
 
         // And it is skipped work, not lost work: one dated entry and the walk
         // happens again.
         d.insert(b"dated".to_vec(), dated(b"v", now));
         assert_ne!(
-            d.expire_step(0, 4, now).0,
+            d.expire_step(0, 4, now, &Deadlines).0,
             0,
             "a dict holding a deadline was not walked"
         );
@@ -1454,7 +1467,7 @@ mod tests {
             });
         }
 
-        let (cursor, dead) = d.expire_step(0, 4, now);
+        let (cursor, dead) = d.expire_step(0, 4, now, &Deadlines);
         assert_eq!(cursor, expected_cursor, "the sweep overran its budget");
         assert_eq!(dead.iter().cloned().collect::<BTreeSet<_>>(), expected_dead);
         assert!(!dead.is_empty(), "four buckets of fifty keys held none");
