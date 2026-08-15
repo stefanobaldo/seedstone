@@ -202,11 +202,17 @@ jobs:
   # The floor is measured, not chosen. This job ran report-only first, on a
   # branch that touches nothing the server does at run time — which makes both
   # arms the same program, and every run of it a comparison of a build against
-  # itself. Six of those landed at 0.9880, 0.9790, 0.9953, 1.0051, 0.9927 and
-  # 1.0020. The widest sits 2.1% from equality, and the floor is three times
-  # that distance below it: 1 − 3 × 0.021 = 0.937, rounded down. Three times,
-  # because a gate set at the edge of the noise it has already seen is a gate
-  # that fires on nothing.
+  # itself. Six of those, in the shape shipped here, landed at 0.9982, 0.9967,
+  # 0.9942, 0.9874, 1.0021 and 1.0181 — the widest 1.8% from equality. Three
+  # times that distance, which is the rule, would put the floor at 0.94.
+  #
+  # It sits at 0.93. An earlier and noisier shape of the same cell produced a
+  # comparison 4% from equality, so the quiet set above is not the whole tail,
+  # and a margin fitted to the calmest evidence available is a gate that fires
+  # the first time the runner has a bad minute. The extra point costs almost
+  # nothing here: this instrument is for the regression that takes a large
+  # fraction of the throughput, and the difference between catching seven
+  # percent and catching six is not what it is for.
   #
   # What that buys, plainly: a change costing more than seven percent of the
   # throughput fails here. A three-percent one passes, and a green job is not
