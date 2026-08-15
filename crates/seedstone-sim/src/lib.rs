@@ -117,6 +117,12 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 
+// The one thing here that lives outside a simulation rather than inside one:
+// it starts runs, in parallel, and reaches into none of them.
+mod sweep;
+
+pub use sweep::sweep;
+
 /// The port the simulated server listens on. Redis's, for familiarity; in a
 /// simulation nothing else is competing for it.
 const PORT: u16 = 6379;
