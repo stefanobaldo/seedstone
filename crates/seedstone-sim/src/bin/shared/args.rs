@@ -21,7 +21,8 @@ use seedstone_sim::{Plant, SimConfig};
 pub struct Args {
     /// `--sim-seed S` — the single seed to replay. `replay` only.
     pub sim_seed: Option<u64>,
-    /// `--seeds N` — sweep `sim_seed` over `1..=N`. `sweep` only.
+    /// `--seeds N` — how many sim seeds the sweep runs, counting from
+    /// `--seed-start`. `sweep` only.
     pub seeds: Option<u64>,
     /// `--seed-start S` — the first sim seed of the range. `sweep` only; the
     /// nightly window is this flag.
@@ -47,6 +48,12 @@ pub struct Args {
     /// asked to reproduce them, and there is nothing to compare against
     /// without this.
     pub hashes: bool,
+    /// `--workers K` — how many OS threads run seeds at once. `sweep` only.
+    ///
+    /// Absent means one thread per available core. Nothing about the sweep's
+    /// output depends on it: seeds are reported in ascending order whatever
+    /// the count, so this buys wall clock and nothing else.
+    pub workers: Option<usize>,
 }
 
 /// The workload seed a sweep pins when none is given.
@@ -78,6 +85,7 @@ impl Args {
             mini: false,
             plant: None,
             hashes: false,
+            workers: None,
         };
 
         let mut argv = argv.into_iter();
@@ -90,6 +98,7 @@ impl Args {
                 "--mini" => parsed.mini = true,
                 "--plant" => parsed.plant = Some(plant(argv.next())?),
                 "--hashes" => parsed.hashes = true,
+                "--workers" => parsed.workers = Some(workers(&arg, argv.next())?),
                 other => return Err(format!("unknown argument `{other}`")),
             }
         }
@@ -129,6 +138,18 @@ fn plant(value: Option<String>) -> Result<Plant, String> {
             names()
         )
     })
+}
+
+/// Reads the thread count that follows `--workers`.
+///
+/// A count this machine cannot even index is refused rather than clamped:
+/// running a different configuration than the one asked for is the failure
+/// this parser exists to rule out, and that holds for the worker count as
+/// much as for the seeds.
+fn workers(flag: &str, value: Option<String>) -> Result<usize, String> {
+    let count = number(flag, value)?;
+    usize::try_from(count)
+        .map_err(|_| format!("{flag} needs a count this machine can hold, got `{count}`"))
 }
 
 /// Reads the value that follows a flag.
@@ -187,6 +208,22 @@ mod tests {
     fn an_unknown_or_missing_plant_is_refused() {
         assert!(parse(&["--seeds", "10", "--plant", "nonesuch"]).is_err());
         assert!(parse(&["--seeds", "10", "--plant"]).is_err());
+    }
+
+    #[test]
+    fn workers_parses_and_defaults_to_none() {
+        let args = parse(&["--seeds", "10"]).expect("a plain sweep parses");
+        assert_eq!(
+            args.workers, None,
+            "absent means the machine decides, not one thread"
+        );
+        let args = parse(&["--seeds", "10", "--workers", "4"]).expect("--workers parses");
+        assert_eq!(args.workers, Some(4));
+        assert_eq!(
+            args.seeds,
+            Some(10),
+            "the new flag must not swallow its neighbour"
+        );
     }
 
     #[test]

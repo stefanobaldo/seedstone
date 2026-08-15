@@ -7,11 +7,16 @@
 //!
 //! ```text
 //! sweep --seeds N [--seed-start S] [--workload-seed W] [--mini] [--plant NAME] [--hashes]
+//!       [--workers K]
 //! ```
 //!
 //! The range starts at seed 1 unless `--seed-start` says otherwise, which is
 //! how a scheduled run sweeps a window it has not swept before rather than the
 //! same opening seeds every night.
+//!
+//! Seeds run on `--workers` OS threads — one per available core unless asked
+//! otherwise — and are reported in ascending order regardless, so the output
+//! of a sweep is the same artifact at every worker count.
 //!
 //! `--hashes` prints every seed's trace hash, passing or not, which is what
 //! turns a sweep into something a fresh process can be held against: the
@@ -21,14 +26,14 @@
 //!
 //! Exits 1 if any seed violated any invariant.
 
-use seedstone_sim::{Plant, run_sim};
+use seedstone_sim::Plant;
 use std::process::ExitCode;
 
 #[path = "shared/args.rs"]
 mod args;
 
 const USAGE: &str = "usage: sweep --seeds N [--seed-start S] [--workload-seed W] [--mini] \
-                     [--plant NAME] [--hashes]";
+                     [--plant NAME] [--hashes] [--workers K]";
 
 fn main() -> ExitCode {
     let args = match args::Args::from_env() {
@@ -51,37 +56,46 @@ fn main() -> ExitCode {
     if first_seed == 0 {
         return fail("--seed-start must be at least 1");
     }
-    let Some(last_seed) = first_seed.checked_add(seeds - 1) else {
+    if first_seed.checked_add(seeds - 1).is_none() {
         return fail("--seed-start plus --seeds overflows the seed space");
-    };
-
-    let mut violations = 0u64;
-    for sim_seed in first_seed..=last_seed {
-        let outcome = run_sim(&args.config(sim_seed));
-        if args.hashes {
-            // One flat line per seed, printed whatever the outcome: a sample
-            // of these is fed back to `replay` from a fresh process, so the
-            // format is parsed by a script and must not depend on whether the
-            // seed passed.
-            println!("seed={} trace=0x{:016x}", sim_seed, outcome.trace_hash);
-        }
-        if !outcome.invariant_holds() {
-            violations += 1;
-            // Printed as it happens rather than collected: a sweep that is
-            // cancelled — by CI, by a person — has still reported what it
-            // found up to that point.
-            println!(
-                "FAIL seed={} trace=0x{:016x} expected={} actual={} stale={} spurious={} plain={}",
-                sim_seed,
-                outcome.trace_hash,
-                outcome.expected_sum,
-                outcome.actual_sum,
-                outcome.stale_reads,
-                outcome.spurious_deaths,
-                outcome.plain_mismatches
-            );
-        }
     }
+    let workers = match args.workers {
+        Some(0) => return fail("--workers must be at least 1"),
+        Some(k) => k,
+        None => std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+    };
+    let config_args = args.clone();
+    let hashes = args.hashes;
+    let violations = seedstone_sim::sweep(
+        first_seed,
+        seeds,
+        workers,
+        move |sim_seed| config_args.config(sim_seed),
+        |sim_seed, outcome| {
+            if hashes {
+                // One flat line per seed, printed whatever the outcome: a
+                // sample of these is fed back to `replay` from a fresh
+                // process, so the format is parsed by a script and must not
+                // depend on whether the seed passed.
+                println!("seed={} trace=0x{:016x}", sim_seed, outcome.trace_hash);
+            }
+            if !outcome.invariant_holds() {
+                // Printed as it happens rather than collected: a sweep that is
+                // cancelled — by CI, by a person — has still reported what it
+                // found up to that point.
+                println!(
+                    "FAIL seed={} trace=0x{:016x} expected={} actual={} stale={} spurious={} plain={}",
+                    sim_seed,
+                    outcome.trace_hash,
+                    outcome.expected_sum,
+                    outcome.actual_sum,
+                    outcome.stale_reads,
+                    outcome.spurious_deaths,
+                    outcome.plain_mismatches
+                );
+            }
+        },
+    );
 
     println!(
         "swept {} seeds start={} shape={} workload_seed={} planted={} violations={}",
@@ -128,6 +142,7 @@ mod tests {
             "--mini",
             "--plant",
             "--hashes",
+            "--workers",
         ] {
             assert!(super::USAGE.contains(flag), "usage does not name {flag}");
         }

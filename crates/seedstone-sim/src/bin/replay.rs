@@ -39,6 +39,9 @@ fn main() -> ExitCode {
             "--hashes selects which of a sweep's seeds print; replay always prints its own",
         );
     }
+    if args.workers.is_some() {
+        return fail("--workers spreads a sweep's seeds over threads; replay runs one seed");
+    }
     let Some(sim_seed) = args.sim_seed else {
         return fail("--sim-seed is required");
     };
