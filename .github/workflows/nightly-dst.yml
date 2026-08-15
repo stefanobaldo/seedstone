@@ -1,0 +1,145 @@
+# Nightly DST sweep — a rotating 10,000-seed window against `main`.
+#
+# A clean seed is a statement about one build, so the window only advances:
+# on new code a fresh range and an old range cost the same and are worth the
+# same. Coverage of the current build accumulates night over night; the
+# per-PR sample in `ci.yml` covers each change as it lands. Window k = days
+# since 2026-01-01 (UTC): sim seeds [k*10000+1, (k+1)*10000] at workload
+# seed k+1 — the sim window explores schedules, the workload seed explores
+# operation sequences, and every failure line names both, so `replay`
+# reproduces it from the log alone.
+#
+# The pull_request trigger exists to prove this file on the PR that changes
+# it, at smoke scale. Scheduled and dispatched runs sweep the full window.
+name: nightly-dst
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seed-start:
+        description: "first sim seed (default: tonight's window)"
+        required: false
+      seeds:
+        description: "how many seeds (default: 10000)"
+        required: false
+      workload-seed:
+        description: "workload seed (default: tonight's)"
+        required: false
+  pull_request:
+    paths:
+      - ".github/workflows/nightly-dst.yml"
+
+permissions:
+  contents: read
+
+# Never cancelled: a half-swept window is not a weaker statement about the
+# build, it is no statement at all, and nothing here races for a verdict.
+concurrency:
+  group: nightly-dst-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  window:
+    runs-on: ubuntu-latest
+    outputs:
+      seed-start: ${{ steps.compute.outputs.seed-start }}
+      seeds: ${{ steps.compute.outputs.seeds }}
+      workload-seed: ${{ steps.compute.outputs.workload-seed }}
+      shards: ${{ steps.compute.outputs.shards }}
+      shard-count: ${{ steps.compute.outputs.shard-count }}
+    steps:
+      # Dispatch inputs are free text, so they are validated here rather than
+      # left to fail as arithmetic three jobs later. The shard count is capped
+      # at the seed count for the same reason: sixteen shards over ten seeds
+      # would hand six of them an empty range and one of them the remainder,
+      # which is a sweep nobody asked for.
+      - id: compute
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            start=1
+            count=64
+            wseed=1
+            shards=2
+          else
+            k=$(( ( $(date -u +%s) - $(date -u -d 2026-01-01 +%s) ) / 86400 ))
+            start="${{ github.event.inputs.seed-start }}"
+            count="${{ github.event.inputs.seeds }}"
+            wseed="${{ github.event.inputs.workload-seed }}"
+            [ -n "$start" ] || start=$(( k * 10000 + 1 ))
+            [ -n "$count" ] || count=10000
+            [ -n "$wseed" ] || wseed=$(( k + 1 ))
+            for value in "$start" "$count" "$wseed"; do
+              case "$value" in
+                '' | *[!0-9]*)
+                  echo "every input is a decimal number; got '$value'" >&2
+                  exit 1
+                  ;;
+              esac
+              if [ "$value" -lt 1 ]; then
+                echo "every input is at least 1; got '$value'" >&2
+                exit 1
+              fi
+            done
+            shards=16
+            [ "$count" -ge "$shards" ] || shards=1
+          fi
+          list=$(seq 0 $(( shards - 1 )) | jq -Rsc 'split("\n") | map(select(length > 0))')
+          {
+            echo "seed-start=$start"
+            echo "seeds=$count"
+            echo "workload-seed=$wseed"
+            echo "shards=$list"
+            echo "shard-count=$shards"
+          } >> "$GITHUB_OUTPUT"
+
+  sweep:
+    needs: window
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      # One shard's failure is a seed to replay, not a reason to throw away
+      # the fifteen windows still being swept beside it.
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.window.outputs.shards) }}
+    steps:
+      # Pinned to commit SHAs, and to the same SHAs `ci.yml` pins — see that
+      # workflow's comment for why a tag is not a pin.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The last shard takes the remainder, so a window that does not divide
+      # evenly is still swept whole. Workers are left at the runner's core
+      # count: the shard owns the machine.
+      - name: sweep this shard's slice of the window
+        run: |
+          set -euo pipefail
+          base=${{ needs.window.outputs.seed-start }}
+          total=${{ needs.window.outputs.seeds }}
+          shards=${{ needs.window.outputs.shard-count }}
+          i=${{ matrix.shard }}
+          share=$(( total / shards ))
+          start=$(( base + i * share ))
+          count=$share
+          if [ "$i" -eq $(( shards - 1 )) ]; then
+            count=$(( total - i * share ))
+          fi
+          cargo run --release -p seedstone-sim --bin sweep -- \
+            --seeds "$count" --seed-start "$start" \
+            --workload-seed "${{ needs.window.outputs.workload-seed }}"
+
+  # Sixteen shard results are sixteen places to look; this job is the one
+  # place, and it names the window it is a verdict about.
+  verdict:
+    needs: [window, sweep]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: one status for the whole window
+        run: |
+          echo "window: start=${{ needs.window.outputs.seed-start }}" \
+               "seeds=${{ needs.window.outputs.seeds }}" \
+               "workload-seed=${{ needs.window.outputs.workload-seed }}"
+          [ "${{ needs.sweep.result }}" = "success" ]
