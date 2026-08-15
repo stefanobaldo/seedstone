@@ -2,12 +2,16 @@
 # with no update channel is how a workflow ends up years behind on a dependency
 # nobody remembers is there. This is the other half.
 #
-# Scoped to `github-actions` on purpose. Cargo dependencies are deliberately
-# left out for now — `turmoil` is pinned to an exact version precisely so that
-# a simulator upgrade is a deliberate act, since trace stability across
-# simulator versions is not guaranteed. Opening an automated channel on it
-# works against that. Revisit once a baseline benchmark exists to tell whether
-# a bump regressed anything.
+# Cargo was left out of it until there was a way to tell what a bump did.
+# There is now: a nightly sweep runs a ten-thousand-seed window of the
+# simulator against `main`, and every pull request is measured against the
+# commit it forks from on one runner. A dependency bump arrives as a change
+# like any other and is judged the same way.
+#
+# `turmoil` stays pinned to an exact version, which does not silence the
+# channel — it shapes it. The bump shows up as a diff to read and merge on
+# purpose, because trace stability across simulator versions is not guaranteed
+# and a simulator that changed under the suite is not a suite that passed.
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -16,3 +20,9 @@ updates:
       interval: monthly
     commit-message:
       prefix: ci
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
