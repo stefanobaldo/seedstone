@@ -199,10 +199,19 @@ jobs:
   # shared runner is not a number about this server; the ratio between two of
   # its builds, measured minutes apart on one machine, is.
   #
-  # Report-only for now: the floor is `0`, so the job prints ratios and cannot
-  # fail. It stays that way until this workflow's own runs have measured what
-  # ratio two identical builds produce here — a floor guessed instead of
-  # measured either passes everything or fails honest work.
+  # The floor is measured, not chosen. This job ran report-only first, on a
+  # branch that touches nothing the server does at run time — which makes both
+  # arms the same program, and every run of it a comparison of a build against
+  # itself. Six of those landed at 0.9880, 0.9790, 0.9953, 1.0051, 0.9927 and
+  # 1.0020. The widest sits 2.1% from equality, and the floor is three times
+  # that distance below it: 1 − 3 × 0.021 = 0.937, rounded down. Three times,
+  # because a gate set at the edge of the noise it has already seen is a gate
+  # that fires on nothing.
+  #
+  # What that buys, plainly: a change costing more than seven percent of the
+  # throughput fails here. A three-percent one passes, and a green job is not
+  # evidence that none happened — that question belongs to a machine nobody
+  # else is sharing.
   perf:
     # A merge-base is the whole premise, and a push to `main` has nothing to
     # compare itself against.
@@ -265,4 +274,4 @@ jobs:
           cd ../base && cargo build --release -p seedstone --locked
       - name: ratio gate
         if: steps.relevant.outputs.code == 'true'
-        run: bash scripts/perf_gate.sh ../base/target/release/seedstone target/release/seedstone 0
+        run: bash scripts/perf_gate.sh ../base/target/release/seedstone target/release/seedstone 0.93
