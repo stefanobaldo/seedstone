@@ -39,10 +39,10 @@ SHAPE=(-d 64 -P 64 -c 50 -r 100000)
 # whichever arm ran first would be a difference between the builds that is not
 # one.
 POPULATE=(-t set -n 1000000 "${SHAPE[@]}")
-# Ten million, not the two hundred thousand this started at: at the rates seen
-# here that was an eighty-millisecond window, and what an eighty-millisecond
-# window on a shared runner measures is which way the scheduler happened to
-# lean. Seconds of load are what makes the median of three mean anything.
+# Ten million, well past what this started at: with a smaller count the pass
+# returns before the runner's scheduler has averaged out, and the median of
+# three then reports which way it leaned rather than which build it was
+# handed. Sustained load is what makes the median mean anything.
 MEASURE=(-t get -n 10000000 "${SHAPE[@]}")
 # redis-benchmark writes `key:` followed by the random integer padded to
 # twelve digits. Any one of these being present says the population pass
@@ -86,14 +86,22 @@ bench() {
 }
 
 # Alternating pairs, so slow drift on the runner lands on both arms evenly.
+#
+# Five, not three. With three, a single pass that the runner sat on could
+# still move the median — one A/A comparison came back four percent from
+# equality with its arms spread eight percent internally, wider than anything
+# the calibration set had seen. Two more pairs cost seconds and buy a median
+# that an outlier has to work much harder to reach.
 base_runs=()
 head_runs=()
-for _ in 1 2 3; do
+for _ in 1 2 3 4 5; do
     base_runs+=("$(bench "$BASE_BIN")")
     head_runs+=("$(bench "$HEAD_BIN")")
 done
 
-median() { printf '%s\n' "$@" | sort -n | sed -n 2p; }
+# The middle of however many were handed in, so the count above can move
+# without this quietly reporting the wrong element.
+median() { printf '%s\n' "$@" | sort -n | sed -n "$(( ($# + 1) / 2 ))p"; }
 base=$(median "${base_runs[@]}")
 head=$(median "${head_runs[@]}")
 ratio=$(awk -v h="$head" -v b="$base" 'BEGIN { printf "%.4f", h / b }')
