@@ -192,3 +192,67 @@ jobs:
           trap 'kill "$server" 2>/dev/null || true' EXIT
           for _ in $(seq 50); do redis-cli -p 6390 ping >/dev/null 2>&1 && break; sleep 0.1; done
           cd e2e/go && go test ./...
+
+  # A performance gate that cannot say what "fast" is, and does not need to.
+  # It builds this pull request and the commit it forks from, runs both on the
+  # same runner in the same job, and judges the ratio. Absolute throughput on a
+  # shared runner is not a number about this server; the ratio between two of
+  # its builds, measured minutes apart on one machine, is.
+  #
+  # Report-only for now: the floor is `0`, so the job prints ratios and cannot
+  # fail. It stays that way until this workflow's own runs have measured what
+  # ratio two identical builds produce here — a floor guessed instead of
+  # measured either passes everything or fails honest work.
+  perf:
+    # A merge-base is the whole premise, and a push to `main` has nothing to
+    # compare itself against.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Same pinning policy as the jobs above. `fetch-depth: 0` because the
+      # comparison needs history: the merge-base is not in a shallow clone.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # First, like `e2e`'s: two release builds and a benchmark is a heavy way
+      # to prove a prose change did not slow anything down. Same allowlist of
+      # the irrelevant, for the reason the `ci` job states.
+      - name: detect code changes
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: relevant
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '!**/*.md'
+              - '!LICENSE*'
+              - '!.gitignore'
+              - '!docs/**/*.md'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.relevant.outputs.code == 'true'
+      - name: install the load generator
+        if: steps.relevant.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y redis-tools
+      - name: build this pull request
+        if: steps.relevant.outputs.code == 'true'
+        run: cargo build --release -p seedstone --locked
+      # A worktree rather than a second checkout: same object store, same
+      # toolchain, one clone. On a pull request `HEAD` is the merge commit, so
+      # the merge-base is the commit on `main` this change would land on — the
+      # honest "before" for an "after" that includes the merge.
+      - name: build the merge-base
+        if: steps.relevant.outputs.code == 'true'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --prune origin main
+          base=$(git merge-base HEAD FETCH_HEAD)
+          echo "comparing against $base"
+          git -c advice.detachedHead=false worktree add ../base "$base"
+          cd ../base && cargo build --release -p seedstone --locked
+      - name: ratio gate
+        if: steps.relevant.outputs.code == 'true'
+        run: bash scripts/perf_gate.sh ../base/target/release/seedstone target/release/seedstone 0
