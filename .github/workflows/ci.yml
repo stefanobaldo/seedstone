@@ -95,15 +95,18 @@ jobs:
               - '!docs/**/*.md'
       # Pushes to `main` always sweep; a pull request skips only when it
       # touched nothing but prose.
-      # Calibrated against this workflow's own first run: 100 seeds took 546 s of
-      # sweep on a GitHub runner, 5.5 s per seed, against 2.1 s per seed on the
-      # maintainer's machine. That fits the ~10 minute budget with nothing to
-      # spare, and runner speed varies. 75 seeds lands near 7 minutes and keeps
-      # the headroom. Raising detection power without paying for it in wall clock
-      # is a later subphase's problem, not a knob to turn here.
+      # Recalibrated against this workflow's own runs, now that the sweep runs
+      # its seeds in parallel: 75 seeds took 106 s here, 1.41 s per seed against
+      # the 5.5 s per seed the same step measured when the sweep was serial —
+      # the runner's four cores, spent on the one step that can use them. The
+      # budget is unchanged at ~7 minutes with headroom on a 20-minute job, so
+      # 420 s buys 296 seeds at that rate; 275 keeps the margin, because the
+      # same seeds cost up to 1.47 s each on the nightly workflow's runners and
+      # runner speed varies. Detection power past this belongs to the nightly
+      # window, which sweeps ten thousand seeds and is not waiting for anyone.
       - name: DST sweep
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
-        run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 75 --workload-seed 1
+        run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 275 --workload-seed 1
 
   # Every gate in the job above is this project judging itself: our tests, our
   # simulator, our reading of the protocol. This one is three programs nobody
