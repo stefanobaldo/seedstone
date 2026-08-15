@@ -231,12 +231,22 @@ jobs:
               - '!docs/**/*.md'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.relevant.outputs.code == 'true'
+      # Bounded and retried: `apt-get update` on a runner occasionally stops
+      # answering rather than failing, and an unbounded one turns a gate into
+      # a twenty-minute hang that ends red for a reason unrelated to the
+      # change under it. A gate that fails for its own reasons teaches people
+      # to re-run it without reading it.
       - name: install the load generator
         if: steps.relevant.outputs.code == 'true'
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y redis-tools
+          for attempt in 1 2 3; do
+            timeout 120 sudo apt-get update -qq && break
+            echo "apt-get update did not finish (attempt $attempt)" >&2
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep 5
+          done
+          timeout 300 sudo apt-get install -y -qq redis-tools
       - name: build this pull request
         if: steps.relevant.outputs.code == 'true'
         run: cargo build --release -p seedstone --locked
