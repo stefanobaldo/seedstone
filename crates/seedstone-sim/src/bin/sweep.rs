@@ -6,8 +6,12 @@
 //! seed on that line goes straight into `replay`.
 //!
 //! ```text
-//! sweep --seeds N [--workload-seed W] [--mini] [--plant NAME] [--hashes]
+//! sweep --seeds N [--seed-start S] [--workload-seed W] [--mini] [--plant NAME] [--hashes]
 //! ```
+//!
+//! The range starts at seed 1 unless `--seed-start` says otherwise, which is
+//! how a scheduled run sweeps a window it has not swept before rather than the
+//! same opening seeds every night.
 //!
 //! `--hashes` prints every seed's trace hash, passing or not, which is what
 //! turns a sweep into something a fresh process can be held against: the
@@ -23,7 +27,8 @@ use std::process::ExitCode;
 #[path = "shared/args.rs"]
 mod args;
 
-const USAGE: &str = "usage: sweep --seeds N [--workload-seed W] [--mini] [--plant NAME] [--hashes]";
+const USAGE: &str = "usage: sweep --seeds N [--seed-start S] [--workload-seed W] [--mini] \
+                     [--plant NAME] [--hashes]";
 
 fn main() -> ExitCode {
     let args = match args::Args::from_env() {
@@ -42,9 +47,16 @@ fn main() -> ExitCode {
     if seeds == 0 {
         return fail("--seeds must be at least 1");
     }
+    let first_seed = args.seed_start.unwrap_or(1);
+    if first_seed == 0 {
+        return fail("--seed-start must be at least 1");
+    }
+    let Some(last_seed) = first_seed.checked_add(seeds - 1) else {
+        return fail("--seed-start plus --seeds overflows the seed space");
+    };
 
     let mut violations = 0u64;
-    for sim_seed in 1..=seeds {
+    for sim_seed in first_seed..=last_seed {
         let outcome = run_sim(&args.config(sim_seed));
         if args.hashes {
             // One flat line per seed, printed whatever the outcome: a sample
@@ -72,8 +84,9 @@ fn main() -> ExitCode {
     }
 
     println!(
-        "swept {} seeds shape={} workload_seed={} planted={} violations={}",
+        "swept {} seeds start={} shape={} workload_seed={} planted={} violations={}",
         seeds,
+        first_seed,
         shape(&args),
         args.workload_seed,
         args.plant.map_or("none", Plant::name),
@@ -110,6 +123,7 @@ mod tests {
     fn the_usage_line_names_every_flag_sweep_accepts() {
         for flag in [
             "--seeds",
+            "--seed-start",
             "--workload-seed",
             "--mini",
             "--plant",

@@ -31,6 +31,9 @@ fn main() -> ExitCode {
     if args.seeds.is_some() {
         return fail("--seeds sweeps a range; replay runs one seed — see sweep");
     }
+    if args.seed_start.is_some() {
+        return fail("--seed-start sweeps a range; replay takes --sim-seed");
+    }
     if args.hashes {
         return fail(
             "--hashes selects which of a sweep's seeds print; replay always prints its own",

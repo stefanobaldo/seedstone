@@ -17,11 +17,15 @@
 use seedstone_sim::{Plant, SimConfig};
 
 /// Every option either binary accepts.
+#[derive(Clone)]
 pub struct Args {
     /// `--sim-seed S` — the single seed to replay. `replay` only.
     pub sim_seed: Option<u64>,
     /// `--seeds N` — sweep `sim_seed` over `1..=N`. `sweep` only.
     pub seeds: Option<u64>,
+    /// `--seed-start S` — the first sim seed of the range. `sweep` only; the
+    /// nightly window is this flag.
+    pub seed_start: Option<u64>,
     /// `--workload-seed W` — pinned across a sweep so a differing trace means
     /// a differing schedule and nothing else.
     pub workload_seed: u64,
@@ -69,6 +73,7 @@ impl Args {
         let mut parsed = Self {
             sim_seed: None,
             seeds: None,
+            seed_start: None,
             workload_seed: DEFAULT_WORKLOAD_SEED,
             mini: false,
             plant: None,
@@ -80,6 +85,7 @@ impl Args {
             match arg.as_str() {
                 "--sim-seed" => parsed.sim_seed = Some(number(&arg, argv.next())?),
                 "--seeds" => parsed.seeds = Some(number(&arg, argv.next())?),
+                "--seed-start" => parsed.seed_start = Some(number(&arg, argv.next())?),
                 "--workload-seed" => parsed.workload_seed = number(&arg, argv.next())?,
                 "--mini" => parsed.mini = true,
                 "--plant" => parsed.plant = Some(plant(argv.next())?),
@@ -181,5 +187,19 @@ mod tests {
     fn an_unknown_or_missing_plant_is_refused() {
         assert!(parse(&["--seeds", "10", "--plant", "nonesuch"]).is_err());
         assert!(parse(&["--seeds", "10", "--plant"]).is_err());
+    }
+
+    #[test]
+    fn seed_start_parses_and_defaults_to_none() {
+        let args = parse(&["--seeds", "10"]).expect("a plain sweep parses");
+        assert_eq!(args.seed_start, None);
+        let args =
+            parse(&["--seeds", "10", "--seed-start", "2250001"]).expect("--seed-start parses");
+        assert_eq!(args.seed_start, Some(2_250_001));
+        assert_eq!(
+            args.seeds,
+            Some(10),
+            "the new flag must not swallow its neighbour"
+        );
     }
 }
