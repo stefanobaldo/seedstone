@@ -99,8 +99,8 @@
 //! lost update is a [`PlantedRouter`] above the shard, because a handler that
 //! cannot `await` cannot lose an update to itself.
 
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
+use rand::rngs::ChaCha8Rng;
+use rand::{RngExt, SeedableRng};
 use seedstone_core::dict::DictSeed;
 // The two error texts are imported, not copied. The planted router has to be
 // indistinguishable from the honest one except in its atomicity, and these
