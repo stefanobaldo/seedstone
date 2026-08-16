@@ -2659,6 +2659,22 @@ mod tests {
         assert!(MAX_ARRAY_LEN.saturating_mul(size_of::<Frame>()) < MAX_REQUEST_BYTES);
     }
 
+    #[test]
+    fn the_log_ceiling_admits_the_largest_record_one_key_can_produce() {
+        // The replication log debug-asserts that no record body exceeds
+        // `MAX_BODY_LEN`, and a record describes exactly one key — so the
+        // largest body the command layer could ever hand it is a key and a
+        // value at the codec's bulk ceiling, plus framing. Today that assert
+        // is unreachable because every payload is empty; this test is what
+        // keeps 16 MiB-under-64 MiB a stated contract rather than a
+        // coincidence of two constants, so that raising `MAX_BULK_LEN` or
+        // shrinking `MAX_BODY_LEN` fails here, not in a release-build log
+        // whose reader refuses the record. A payload that stops describing
+        // one key re-opens this arithmetic, and inherits this test.
+        let largest_one_key_payload = 2 * MAX_BULK_LEN + 1024;
+        assert!(largest_one_key_payload < seedstone_core::log::MAX_BODY_LEN);
+    }
+
     /// A peer opens a frame and keeps feeding bytes without ever terminating
     /// it — the slow memory leak with a connection attached that the module
     /// doc names — and the server must answer and close rather than buffer
