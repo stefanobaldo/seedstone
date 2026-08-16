@@ -1,0 +1,9 @@
+[workspace]
+
+[package]
+name = "fixture-rand-make-rng"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+rand = { version = "0.10", features = ["chacha"] }

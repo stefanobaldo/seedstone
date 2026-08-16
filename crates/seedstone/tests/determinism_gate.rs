@@ -7,21 +7,19 @@ const FIXTURES: &[&str] = &[
     "system_time_now",
     "thread_spawn",
     "rand_rng",
-    "rand_thread_rng",
     "rand_random",
     "rand_random_range",
     "rand_random_bool",
     "rand_random_ratio",
     "rand_random_iter",
     "rand_fill",
-    "seedable_from_os_rng",
-    "seedable_try_from_os_rng",
+    "rand_make_rng",
     "getrandom_fill",
     "getrandom_fill_uninit",
     "getrandom_u32",
     "getrandom_u64",
     "thread_rng_type",
-    "os_rng_type",
+    "sys_rng_type",
     "hashmap_default",
     "hashset_default",
 ];
@@ -227,6 +225,16 @@ fn every_select_in_simulated_code_is_biased() {
 ///
 /// So this one compares versions rather than behaviour, and turns the drift into
 /// a red at the moment of the bump instead of a mystery some months later.
+///
+/// It failed to, once. The rand 0.10 bump (2026-08-16) sailed through the
+/// original comparison, which accepted a fixture's version if the workspace
+/// graph contained it *anywhere* — and `turmoil`, pinned exact, keeps the old
+/// rand family alive in the graph indefinitely. Fixtures pinning 0.9 matched
+/// turmoil's 0.9 and the gate stayed green while production compiled 0.10 and
+/// two prohibitions went dead. Hence the rule below: a fixture must pin the
+/// *newest* version the workspace resolves, because the newest is the one the
+/// workspace's own crates moved to — a pinned simulator dependency only ever
+/// holds the family back, never ahead.
 #[test]
 fn fixture_locks_agree_with_the_workspace_on_the_rand_family() {
     const WATCHED: [&str; 4] = ["rand", "rand_core", "rand_chacha", "getrandom"];
@@ -249,23 +257,22 @@ fn fixture_locks_agree_with_the_workspace_on_the_rand_family() {
             .join(fixture)
             .join("Cargo.lock");
         for (name, version) in lock_versions(&lock, &WATCHED) {
-            // The workspace may legitimately resolve a package the fixtures do
-            // not use, or resolve one twice at two versions. A fixture's version
-            // is fine as long as the workspace's graph contains it.
-            if !workspace.iter().any(|(n, _)| *n == name) {
+            // The workspace may legitimately not resolve a package a fixture
+            // uses at all; there is nothing to agree with then.
+            let Some(newest) = workspace
+                .iter()
+                .filter(|(n, _)| *n == name)
+                .map(|(_, v)| v)
+                .max_by_key(|v| version_key(v))
+            else {
                 continue;
-            }
+            };
             assert!(
-                workspace.contains(&(name.clone(), version.clone())),
-                "{} pins {name} {version} but the workspace resolves {:?}: regenerate \
-                 the fixture lockfiles so the gate proves the prohibitions against \
-                 what production actually compiles",
+                version == *newest,
+                "{} pins {name} {version} but the workspace's newest resolution \
+                 is {newest}: regenerate the fixture lockfiles so the gate proves \
+                 the prohibitions against what production actually compiles",
                 lock.display(),
-                workspace
-                    .iter()
-                    .filter(|(n, _)| *n == name)
-                    .map(|(_, v)| v)
-                    .collect::<Vec<_>>(),
             );
             compared += 1;
         }
@@ -274,6 +281,19 @@ fn fixture_locks_agree_with_the_workspace_on_the_rand_family() {
         compared > 0,
         "no fixture pinned any of {WATCHED:?}: this gate is looking at nothing"
     );
+}
+
+/// A `"major.minor.patch"` string as a sortable key.
+///
+/// Crude on purpose, like the scanner it serves: cargo writes bare semver
+/// triples into lockfiles, and a component that fails to parse is a panic —
+/// this file compares versions cargo wrote, not versions people typed.
+fn version_key(v: &str) -> (u64, u64, u64) {
+    let mut parts = v
+        .split('.')
+        .map(|p| p.parse().unwrap_or_else(|e| panic!("version {v}: {e}")));
+    let mut next = || parts.next().expect("a lockfile version has three parts");
+    (next(), next(), next())
 }
 
 /// `(name, version)` pairs for the watched packages of one `Cargo.lock`.
