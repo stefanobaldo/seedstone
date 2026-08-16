@@ -44,10 +44,16 @@ where
         first_seed >= 1,
         "seed 0 is not part of any sweep's vocabulary"
     );
-    assert!(seeds >= 1 && workers >= 1);
+    assert!(seeds >= 1, "a sweep of no seeds sweeps nothing");
+    assert!(workers >= 1, "a sweep with no workers never starts a run");
     let last_seed = first_seed
         .checked_add(seeds - 1)
         .expect("the range overflows the seed space");
+
+    // More workers than seeds is threads with nothing to draw; at large
+    // counts the surplus is what aborts the process, on a spawn failure
+    // rather than on anything the sweep was asked to do.
+    let workers = usize::try_from(seeds).map_or(workers, |seeds| workers.min(seeds));
 
     let next = Arc::new(AtomicU64::new(first_seed));
     let config_for = Arc::new(config_for);
@@ -68,7 +74,11 @@ where
         handles.push(std::thread::spawn(move || {
             loop {
                 let seed = next.fetch_add(1, Ordering::Relaxed);
-                if seed > last_seed {
+                // Below the range as well as above it: the counter wraps to
+                // zero once a sweep hands out `u64::MAX`, and a worker that
+                // only checked the upper bound would take the wrapped value
+                // as a seed it owed the caller and never stop.
+                if seed < first_seed || seed > last_seed {
                     break;
                 }
                 let outcome = run_sim(&config_for(seed));
