@@ -26,3 +26,12 @@ updates:
       interval: weekly
     commit-message:
       prefix: build
+    # The rand crates version together against a shared rand_core, so a
+    # per-crate bump is unbuildable by construction: the first round here
+    # arrived as three PRs of which two could not compile alone (#9, #10).
+    # One grouped PR is the only shape that can ever be green.
+    groups:
+      rand-family:
+        patterns:
+          - "rand*"
+          - "getrandom"
