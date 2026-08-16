@@ -1,9 +1,10 @@
 [workspace]
 
 [package]
-name = "fixture-rand-thread-rng"
+name = "fixture-sys-rng-type"
 version = "0.0.0"
 edition = "2024"
 
 [dependencies]
-rand = "0.9"
+rand = "0.10"
+rand_core = "0.10"

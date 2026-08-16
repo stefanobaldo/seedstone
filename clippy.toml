@@ -5,15 +5,19 @@ disallowed-methods = [
   # Entropy. Every one of these draws from the operating system or from a
   # thread-local generator seeded by it, so the run cannot be replayed.
   { path = "rand::rng", reason = "non-deterministic: use a seeded RNG" },
-  { path = "rand::thread_rng", reason = "non-deterministic: use a seeded RNG" },
   { path = "rand::random", reason = "non-deterministic: use a seeded RNG" },
   { path = "rand::random_range", reason = "non-deterministic: use a seeded RNG" },
   { path = "rand::random_bool", reason = "non-deterministic: use a seeded RNG" },
   { path = "rand::random_ratio", reason = "non-deterministic: use a seeded RNG" },
   { path = "rand::random_iter", reason = "non-deterministic: use a seeded RNG" },
   { path = "rand::fill", reason = "non-deterministic: use a seeded RNG" },
-  { path = "rand_core::SeedableRng::from_os_rng", reason = "non-deterministic: use a seeded RNG" },
-  { path = "rand_core::SeedableRng::try_from_os_rng", reason = "non-deterministic: use a seeded RNG" },
+  # `allow-invalid` here and on `SysRng` below: turmoil pins the previous rand
+  # family into the graph, and in a build unit that loads both, clippy can
+  # resolve `rand` to the old crate, where these two items do not exist — a
+  # spurious "does not refer" warning, not a dead entry. The entries stay
+  # honest through the determinism gate: each is proven live against a fixture
+  # whose lockfile must pin the newest version the workspace resolves.
+  { path = "rand::make_rng", reason = "non-deterministic: use a seeded RNG", allow-invalid = true },
   { path = "getrandom::fill", reason = "non-deterministic: use a seeded RNG" },
   { path = "getrandom::fill_uninit", reason = "non-deterministic: use a seeded RNG" },
   { path = "getrandom::u32", reason = "non-deterministic: use a seeded RNG" },
@@ -24,9 +28,15 @@ disallowed-methods = [
 # matches function and method paths, so a bare type needs this list.
 disallowed-types = [
   { path = "rand::rngs::ThreadRng", reason = "non-deterministic: use a seeded RNG" },
-  # Also covers the `rand::rngs::OsRng` re-export: both spellings resolve to
-  # the same item.
-  { path = "rand_core::OsRng", reason = "non-deterministic: use a seeded RNG" },
+  # The path is the `rand` re-export rather than the `getrandom::SysRng`
+  # origin on purpose: the origin is behind getrandom's `sys_rng` feature, so
+  # naming it would be an unresolvable — silently dead — entry in every crate
+  # that compiles getrandom without that feature, our own included. The two
+  # spellings resolve to the same item, so this entry denies both wherever
+  # `rand` is present; a crate reaching SysRng *without* rand still cannot
+  # draw from it usefully past the `getrandom::*` prohibitions above.
+  # `allow-invalid` for the same two-rand-versions reason as `make_rng` above.
+  { path = "rand::rngs::SysRng", reason = "non-deterministic: use a seeded RNG", allow-invalid = true },
   # Iteration order. The default hasher is seeded from the operating system, so
   # two runs of the same program walk the same collection in different orders.
   { path = "std::collections::HashMap", reason = "non-deterministic iteration order: use the keyspace dict or an explicitly seeded hasher" },

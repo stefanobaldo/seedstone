@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fixture-rand-fill"
+name = "fixture-rand-make-rng"
 version = "0.0.0"
 dependencies = [
  "rand",
