@@ -13,7 +13,6 @@ seedstone-resp = { path = "../seedstone-resp" }
 seedstone-service = { path = "../seedstone-service" }
 turmoil.workspace = true
 rand.workspace = true
-rand_chacha.workspace = true
 tokio.workspace = true
 
 [lints]
