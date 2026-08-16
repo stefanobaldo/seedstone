@@ -65,7 +65,13 @@ const BODY_FIXED_LEN: usize = 2 + 8;
 /// forever for bytes that will never arrive. 64 MiB is far above any command
 /// a shard will ever log and far below what a corrupt field typically claims.
 /// [`encode_record`] debug-asserts that it never produces a record above it.
-const MAX_BODY_LEN: usize = 64 * 1024 * 1024;
+///
+/// Public so the crate that will one day build record payloads out of
+/// wire-sized values can hold its arithmetic against this ceiling in a test,
+/// instead of the two constants merely happening to be ordered. Today every
+/// payload is empty; the day that changes, the debug-assert above becomes
+/// reachable, and the ordering stops being anyone's coincidence to preserve.
+pub const MAX_BODY_LEN: usize = 64 * 1024 * 1024;
 
 /// One entry in the log: a command applied to one shard, at one position in
 /// that shard's sequence.
