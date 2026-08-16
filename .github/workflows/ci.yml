@@ -158,15 +158,24 @@ jobs:
       - name: build the server
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: cargo build --release -p seedstone --locked
+      # Bounded and retried, for the reason the `perf` job's copy states: an
+      # unbounded `apt-get update` on a runner occasionally stops answering
+      # rather than failing, and burns the job's whole budget ending red for a
+      # reason unrelated to the change under it.
       - name: install the clients
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: |
           set -euo pipefail
-          sudo apt-get update
+          for attempt in 1 2 3; do
+            timeout 120 sudo apt-get update -qq && break
+            echo "apt-get update did not finish (attempt $attempt)" >&2
+            [ "$attempt" -lt 3 ] || exit 1
+            sleep 5
+          done
           # redis-cli and redis-benchmark, without a redis-server nobody asked
           # for: this gate must fail if *our* binary is wrong, and a server
           # installed beside it is a way to accidentally test that one.
-          sudo apt-get install -y redis-tools
+          timeout 300 sudo apt-get install -y -qq redis-tools
           pip install -r e2e/python/requirements.txt
       # The script starts and stops its own server; the two steps below start
       # their own, because a suite that inherits a keyspace from the previous
