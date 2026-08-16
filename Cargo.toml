@@ -21,6 +21,6 @@ disallowed_types = "deny"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "io-util"] }
 turmoil = "=0.7.2"
 siphasher = "1"
-getrandom = "0.3"
+getrandom = "0.4"
 rand = "0.9"
 rand_chacha = "0.9"
