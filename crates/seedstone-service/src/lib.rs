@@ -832,13 +832,30 @@ fn reply_to_frame(reply: Reply) -> Frame {
 /// has no transaction to unwind and each shard has already applied what it
 /// applied. So the error means "not everywhere", not "nowhere" — which is the
 /// same thing a fan-out's error means, and for the same reason.
+///
+/// Short of an error, the fold is decided by the command, and it is read off
+/// the command *before* it travels — the command itself is moved into the
+/// router. `DBSIZE` sums, which is what makes it the size of the keyspace
+/// rather than of a shard; every other keyspace-wide command asks each shard
+/// to do something and is answered `+OK` once they all have.
 async fn broadcast<R: Router>(router: &R, cmd: Command) -> Frame {
+    let sum = matches!(cmd, Command::DbSize);
+    let mut total: i64 = 0;
     for reply in router.dispatch_every(cmd).await {
-        if matches!(reply, Reply::Error(_)) {
-            return reply_to_frame(reply);
+        match reply {
+            // Saturating for the reason [`fan_out`] saturates: a keyspace
+            // larger than `i64::MAX` is not reachable, and wrapping into a
+            // negative count would be a worse answer than the ceiling.
+            Reply::Integer(n) => total = total.saturating_add(n),
+            Reply::Ok => {}
+            other => return reply_to_frame(other),
         }
     }
-    Frame::Simple("OK".into())
+    if sum {
+        Frame::Integer(total)
+    } else {
+        Frame::Simple("OK".into())
+    }
 }
 
 async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>) -> Frame {
@@ -996,6 +1013,10 @@ const COMMANDS: &[(&[u8], Handler)] = &[
         _ => Err(wrong_arity("incrby")),
     }),
     // Keyspace-wide: no key to route on, but every shard has to hear it.
+    (b"DBSIZE", |args, _| match args {
+        [] => Ok(Action::DispatchEvery(Command::DbSize)),
+        _ => Err(wrong_arity("dbsize")),
+    }),
     (b"FLUSHDB", |args, _| match args {
         // Redis takes ASYNC and SYNC here. This server has one behaviour and
         // saying so plainly beats accepting a word it would then ignore.
@@ -1599,6 +1620,48 @@ mod tests {
             Frame::Null,
         ];
         assert_eq!(frames, expected);
+    }
+
+    /// `DBSIZE` is the size of the keyspace, not of the shard the connection
+    /// happened to reach.
+    ///
+    /// Sixteen shards again, for the reason the flush test uses them: two keys
+    /// cannot land on more than two of them, so a count that came from one
+    /// shard would read zero or one where two is the answer.
+    #[tokio::test]
+    async fn dbsize_counts_live_keys_across_shards() {
+        let (mut r, mut w, _pool) = connected(16);
+        let requests: [&[&str]; 6] = [
+            &["DBSIZE"],
+            &["SET", "a", "1"],
+            &["SET", "b", "2"],
+            &["DBSIZE"],
+            &["DEL", "a"],
+            &["DBSIZE"],
+        ];
+        let mut out = Vec::new();
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        assert_eq!(frames[0], Frame::Integer(0));
+        assert_eq!(frames[3], Frame::Integer(2));
+        assert_eq!(frames[5], Frame::Integer(1));
+    }
+
+    #[tokio::test]
+    async fn dbsize_takes_no_arguments() {
+        let (mut r, mut w, _pool) = connected(4);
+        let mut out = Vec::new();
+        encode(&req(&["DBSIZE", "0"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 1).await;
+        assert_eq!(frames[0], Frame::Error(wrong_arity("dbsize")));
     }
 
     /// Redis takes `ASYNC` and `SYNC` here; this server takes neither, and an
