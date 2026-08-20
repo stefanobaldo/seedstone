@@ -1868,18 +1868,20 @@ mod tests {
         assert_eq!(frames[0], Frame::Array(Vec::new()));
     }
 
-    /// The claim the design rests on: a walk holds a shard for one step, not
-    /// for the cycle. An assertion on the result alone would not see it.
+    /// A walk long enough to take many steps loses no key and repeats none
+    /// across the step boundaries, and the command behind it still answers.
+    ///
+    /// **This is not the yielding proof**, and it must not be read as one: a
+    /// `KEYS` and a `GET` pipelined on one connection are served by one task
+    /// that awaits the whole walk before it looks at the next frame, so no
+    /// interleaving is possible here and none is asserted.
+    /// [`a_keys_walk_takes_many_envelopes_rather_than_one`] is the yielding
+    /// proof. What this holds is the seam the other one does not touch: 2000
+    /// keys on one shard is many times [`KEYS_STEP_BUCKETS`], and a step that
+    /// resumed at the wrong cursor would drop or duplicate keys across the
+    /// joins rather than fail outright.
     #[tokio::test]
-    async fn a_get_is_answered_while_a_keys_walk_is_in_flight() {
-        // Both are issued on the same connection, back to back, and the KEYS
-        // is over a keyspace large enough to take many steps. If the walk held
-        // its shard for the whole cycle, this would still pass on a multi-shard
-        // pool — so the pool here is one shard, where holding would serialise
-        // them.
-        //
-        // Correctness under interleaving, not timing: a timing assertion on a
-        // shared runner is a flake.
+    async fn a_multi_step_walk_neither_loses_a_key_nor_repeats_one() {
         let (mut r, mut w, _pool) = connected(1);
         let mut out = Vec::new();
         for i in 0..2000u32 {
@@ -1892,6 +1894,166 @@ mod tests {
         let frames = read_frames(&mut r, 2002).await;
         assert!(matches!(&frames[2000], Frame::Array(a) if a.len() == 2000));
         assert_eq!(frames[2001], Frame::Bulk(b"v".to_vec()));
+    }
+
+    /// The claim the design rests on: a walk occupies a shard for one step,
+    /// not for the cycle.
+    ///
+    /// Asserted by counting envelopes rather than by racing a `GET` against
+    /// the walk. An executor takes one envelope per pass of its loop, so a
+    /// walk split across many envelopes is a walk any other envelope on that
+    /// shard overtakes — the property — while a walk that answered in one
+    /// envelope would hold the shard for the whole cycle whatever a timing
+    /// assertion happened to observe. Counting is also deterministic, and a
+    /// timing assertion on a shared runner is a flake.
+    #[tokio::test]
+    async fn a_keys_walk_takes_many_envelopes_rather_than_one() {
+        /// Counts the steps each shard is asked for, and otherwise is its pool.
+        #[derive(Clone)]
+        struct CountSteps {
+            steps: std::sync::Arc<std::sync::Mutex<Vec<u16>>>,
+            inner: ShardPool,
+        }
+
+        impl Router for CountSteps {
+            async fn dispatch(&self, cmd: Command) -> Reply {
+                self.inner.dispatch(cmd).await
+            }
+
+            fn shards(&self) -> u16 {
+                self.inner.shards()
+            }
+
+            async fn dispatch_at(&self, shard: u16, cmd: Command) -> Reply {
+                if matches!(cmd, Command::ScanStep { .. }) {
+                    self.steps.lock().expect("steps mutex").push(shard);
+                }
+                self.inner.dispatch_at(shard, cmd).await
+            }
+
+            async fn dispatch_every(&self, cmd: Command) -> Vec<Reply> {
+                self.inner.dispatch_every(cmd).await
+            }
+        }
+
+        let router = CountSteps {
+            steps: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            inner: ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace),
+        };
+        let (client, server) = tokio::io::duplex(1024 * 1024);
+        tokio::spawn(serve_connection(
+            server,
+            router.clone(),
+            NodeInfo::for_tests(),
+        ));
+        let (mut r, mut w) = tokio::io::split(client);
+
+        let mut out = Vec::new();
+        for i in 0..2000u32 {
+            encode(&req(&["SET", &format!("k-{i}"), "v"]), &mut out);
+        }
+        encode(&req(&["KEYS", "k-*"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 2001).await;
+        assert!(matches!(&frames[2000], Frame::Array(a) if a.len() == 2000));
+
+        let steps = router.steps.lock().expect("steps mutex").len();
+        // 2000 keys over a table walked KEYS_STEP_BUCKETS at a time cannot be
+        // one envelope. The assertion is deliberately `> 1` and not an exact
+        // count: how many buckets 2000 keys occupy is the dict's business and
+        // may change, while "more than one envelope" is the property.
+        assert!(
+            steps > 1,
+            "a 2000-key walk took {steps} envelope(s); one means it held the shard for the cycle"
+        );
+    }
+
+    /// A step that reaches [`Router::dispatch`] instead of `dispatch_at` walks
+    /// the placeholder shard its route names.
+    ///
+    /// Pinned rather than assumed. `Command::ScanStep`'s route names shard `0`
+    /// because it does not know its own, so a caller that skipped `dispatch_at`
+    /// would get a real answer from the wrong shard rather than a refusal —
+    /// which is a plausible-looking partial answer, and the reason the route
+    /// wants to name no shard at all once a client's cursor can supply one.
+    #[tokio::test]
+    async fn a_scan_step_that_skips_dispatch_at_walks_the_placeholder_shard() {
+        let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        for i in 0..64u32 {
+            pool.dispatch(Command::Set {
+                key: format!("k-{i}").into_bytes(),
+                value: b"v".to_vec(),
+                expiry: None,
+                cond: None,
+            })
+            .await;
+        }
+        let direct = pool
+            .dispatch(Command::ScanStep {
+                cursor: 0,
+                count: usize::MAX,
+                pattern: None,
+            })
+            .await;
+        let at_zero = pool
+            .dispatch_at(
+                0,
+                Command::ScanStep {
+                    cursor: 0,
+                    count: usize::MAX,
+                    pattern: None,
+                },
+            )
+            .await;
+        assert_eq!(
+            direct, at_zero,
+            "an unrouted step must be shard 0's answer, not a refusal or another shard's"
+        );
+        let Reply::Scan { cursor, keys } = direct else {
+            panic!("expected Reply::Scan");
+        };
+        assert_eq!(cursor, 0, "an unbounded count must finish the cycle");
+        assert!(
+            keys.len() < 64,
+            "shard 0 of four held every key, which makes this test prove nothing"
+        );
+    }
+
+    /// [`join_all`]'s three claims, none of which its callers would fail
+    /// loudly on: it terminates on nothing, it gathers by input order rather
+    /// than completion order, and a future that parks is woken again.
+    #[tokio::test]
+    async fn join_all_terminates_on_an_empty_input() {
+        let joined: Vec<()> = join_all(Vec::<std::future::Ready<()>>::new()).await;
+        assert!(joined.is_empty());
+    }
+
+    #[tokio::test]
+    async fn join_all_gathers_by_input_order_not_completion_order() {
+        // Each future parks on a channel, and the channels are fired in
+        // reverse. Under completion order the result would come back
+        // reversed; under input order it does not.
+        let mut senders = Vec::new();
+        let mut futures = Vec::new();
+        for i in 0..8u32 {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            senders.push(tx);
+            futures.push(async move {
+                rx.await.expect("sender held until fired");
+                i
+            });
+        }
+        let joined = tokio::spawn(join_all(futures));
+        // Yield first, so every future has had a chance to park before any
+        // channel fires: a future that completed on its first poll would not
+        // exercise the waker path at all.
+        tokio::task::yield_now().await;
+        for tx in senders.into_iter().rev() {
+            tx.send(()).expect("the join is still awaiting");
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(joined.await.unwrap(), (0..8u32).collect::<Vec<_>>());
     }
 
     #[tokio::test]
