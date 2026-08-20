@@ -7,6 +7,7 @@
 //! Translating frames into commands is `seedstone-service`'s job.
 
 pub mod dict;
+pub mod glob;
 pub mod log;
 pub mod shard;
 pub mod slot;
