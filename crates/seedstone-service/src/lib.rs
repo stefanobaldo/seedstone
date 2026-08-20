@@ -841,24 +841,6 @@ fn reply_to_frame(reply: Reply) -> Frame {
     }
 }
 
-/// Runs one command per key and answers the request with their sum.
-///
-/// This is how a variadic `DEL` or `EXISTS` is served: the keys of one request
-/// are in general owned by different shards, so there is no single shard the
-/// request could be sent to, and it becomes one command per key.
-///
-/// **The set is not a transaction.** Each key's command is atomic on the shard
-/// that owns it — that is the shard runtime's guarantee and it is unaffected —
-/// but the commands run one after another, and another connection's work can
-/// land between any two of them. A peer that deletes three keys can therefore
-/// be observed halfway through. Redis in cluster mode makes the same trade, and
-/// it is the only one available here: the alternative is a lock spanning
-/// shards, which would put the multi-key path's cost in front of every
-/// single-key one.
-///
-/// A shard that answers with an error ends the fan-out and that error is the
-/// reply. A partial count reported as a total would be worse than a refusal:
-/// the peer cannot tell the two apart.
 /// Runs one keyspace-wide command on every shard and folds the answers into
 /// the single frame the peer sees.
 ///
@@ -925,6 +907,15 @@ async fn keys<R: Router>(router: &R, pattern: Vec<u8>) -> Frame {
                             Command::ScanStep {
                                 cursor,
                                 count: KEYS_STEP_BUCKETS,
+                                // Cloned per step, and it has to be: the
+                                // command is moved into the router and the
+                                // reply does not hand the pattern back, so
+                                // there is nothing to carry forward. Hoisting
+                                // it would need a shared, cheaply-cloned
+                                // pattern in the command, which is a wider
+                                // change than a keyspace walk's per-step
+                                // allocation is worth beside the keys it
+                                // returns in the same step.
                                 pattern: Some(pattern.clone()),
                             },
                         )
@@ -974,9 +965,9 @@ async fn keys<R: Router>(router: &R, pattern: Vec<u8>) -> Frame {
 /// non-determinism [`Router::dispatch_every`] gathers by index to avoid.
 /// Polling a fixed vector in index order cannot vary.
 ///
-/// Each future is polled at most once after it completes its final poll: a
-/// slot that already holds an output is skipped, so no future is polled again
-/// after returning `Ready`.
+/// No future is polled again after it returns `Ready`: the slot that holds its
+/// output is filled in the same step, and a filled slot is skipped on every
+/// later pass.
 async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
     let mut pending: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
     let mut done: Vec<Option<F::Output>> = Vec::new();
@@ -1006,6 +997,24 @@ async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
     .await
 }
 
+/// Runs one command per key and answers the request with their sum.
+///
+/// This is how a variadic `DEL` or `EXISTS` is served: the keys of one request
+/// are in general owned by different shards, so there is no single shard the
+/// request could be sent to, and it becomes one command per key.
+///
+/// **The set is not a transaction.** Each key's command is atomic on the shard
+/// that owns it — that is the shard runtime's guarantee and it is unaffected —
+/// but the commands run one after another, and another connection's work can
+/// land between any two of them. A peer that deletes three keys can therefore
+/// be observed halfway through. Redis in cluster mode makes the same trade, and
+/// it is the only one available here: the alternative is a lock spanning
+/// shards, which would put the multi-key path's cost in front of every
+/// single-key one.
+///
+/// A shard that answers with an error ends the fan-out and that error is the
+/// reply. A partial count reported as a total would be worse than a refusal:
+/// the peer cannot tell the two apart.
 async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>) -> Frame {
     let mut total: i64 = 0;
     for cmd in cmds {

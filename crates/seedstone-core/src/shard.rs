@@ -252,9 +252,13 @@ pub enum Command {
     ScanStep {
         /// Where in this shard's cycle to resume. `0` starts one.
         cursor: u64,
-        /// How many buckets to visit before answering. A bound on occupancy,
-        /// not a promise about how many keys come back: a step may answer with
-        /// none and a non-zero cursor.
+        /// How many cursor steps to take before answering. Each step covers
+        /// one bucket of the table, or — while a rehash is in flight — one of
+        /// the smaller table and the ones of the larger it expands into, which
+        /// is the same accounting [`Dict::expire_step`] uses.
+        ///
+        /// A bound on occupancy, not a promise about how many keys come back:
+        /// a step may answer with none and a non-zero cursor.
         count: usize,
         /// Return only keys matching this glob, filtered here rather than at
         /// the edge so the channel does not carry a keyspace to discard it.
@@ -303,12 +307,18 @@ impl Command {
             // The one route that is not self-sufficient. A step knows where it
             // is in *a* shard's table and not which shard's, so this names a
             // placeholder and the caller supplies the real one through
-            // [`Router::dispatch_at`]. Shard 0 rather than an out-of-range
-            // sentinel because every pool has one, so a step that reaches
-            // `dispatch` by mistake walks a real table instead of answering
-            // `ShardUnavailable` — a wrong answer is easier to see in a test
-            // than an unavailable one, which is indistinguishable from a shard
-            // that genuinely went away.
+            // [`Router::dispatch_at`].
+            //
+            // The placeholder is a real shard, so a step that reached
+            // `dispatch` by mistake would walk shard 0 and answer plausibly
+            // rather than fail. That is the failure shape
+            // [`Router::shards`] argues against, and it is accepted here only
+            // because nothing supplies an untrusted shard yet:
+            // `a_scan_step_that_skips_dispatch_at_walks_the_placeholder_shard`
+            // pins the behaviour so the choice is visible rather than assumed.
+            // The moment a client's cursor names the shard, this wants to be a
+            // route with no shard at all, which `shard_for` would turn into
+            // `ShardUnavailable`.
             Self::ScanStep { .. } => Route::Shard(0),
         }
     }
@@ -316,7 +326,8 @@ impl Command {
     /// A stable one-byte tag for this command's variant.
     ///
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
-    /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9, `ScanStep` = 10. These values are folded
+    /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9, `ScanStep` = 10. These
+    /// values are folded
     /// into the simulator's trace hash, so they are part of what a replay
     /// compares: changing one changes every recorded hash. A tag is therefore
     /// never reused and never renumbered.
@@ -1008,12 +1019,19 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
             // prohibitions cannot see it: they match paths, not macro
             // internals.
             //
-            // It is unobservable today — the losing arm only advances a
-            // rehash, which reaches no reply and no trace field — and stops
-            // being unobservable the moment anything rehash-sensitive becomes
-            // visible, which a `SCAN` command would do. Draining the inbox
-            // first is also the right priority on its own merits: work the
-            // shard was asked for outranks housekeeping.
+            // This used to be a precaution: the losing arm only advanced a
+            // rehash, which reached no reply and no trace field, so an
+            // unbiased choice was entropy nothing could observe. That stopped
+            // being true with [`Command::ScanStep`]. A step's answer — both
+            // its cursor and the keys it found — depends on whether a rehash
+            // is in flight and how far it has run, and the simulator folds
+            // both into the trace hash. So an unbiased arm choice would now
+            // change a walk's answer between two runs of one seed, which is
+            // the whole thing a seed is supposed to prevent. `biased` is
+            // load-bearing here, not decorative; do not remove it.
+            //
+            // Draining the inbox first is also the right priority on its own
+            // merits: work the shard was asked for outranks housekeeping.
             biased;
 
             envelope = inbox.recv() => {
@@ -2581,11 +2599,11 @@ mod tests {
                     Route::Shard(_) | Route::Every => Reply::Ok,
                 }
             }
-            /// This router hosts no shards, and answers `1` because a
-            /// caller walking `0..shards()` must still be handed a range it
-            /// can iterate.
+            /// This router hosts no shards and says so: `0..0` is a range,
+            /// and it is empty, which is the honest answer for something that
+            /// answers every command out of thin air.
             fn shards(&self) -> u16 {
-                1
+                0
             }
             /// This router hosts no shards, so there is none to address.
             async fn dispatch_at(&self, _shard: u16, cmd: Command) -> Reply {
