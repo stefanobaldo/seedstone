@@ -669,6 +669,17 @@ fn fold_reply(h: u64, reply: &Reply) -> u64 {
         Reply::Ok => mix(h, 3),
         Reply::Removed(removed) => mix(mix(h, 4), u64::from(*removed)),
         Reply::Integer(n) => mix(mix(h, 5), n.cast_unsigned()),
+        // Both fields, not just the cursor: two steps that resumed at the same
+        // place and returned different keys are different answers, and a walk
+        // that lost a key while its cursor kept advancing is exactly the
+        // regression a trace hash is here to make visible.
+        Reply::Scan { cursor, keys } => {
+            let mut acc = mix(mix(h, 7), *cursor);
+            for key in keys {
+                acc = fold_bytes(acc, key);
+            }
+            acc
+        }
         // Folds the wire text, not the variant tag: the recorded hashes
         // predate the enum and must not move for a change that renamed
         // nothing a client can see.
@@ -752,6 +763,12 @@ impl Router for PlantedRouter {
     // inbox before the future is awaited.
     async fn dispatch(&self, cmd: Command) -> Reply {
         self.lose_updates(cmd).await
+    }
+
+    /// Passed straight through: the plant is a defect between two messages of
+    /// one keyed command, and a shard-addressed step is neither.
+    async fn dispatch_at(&self, shard: u16, cmd: Command) -> Reply {
+        self.pool.dispatch_at(shard, cmd).await
     }
 
     /// Passed straight through: the plant is a defect between two messages of

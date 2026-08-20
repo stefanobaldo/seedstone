@@ -793,6 +793,14 @@ fn reply_to_frame(reply: Reply) -> Frame {
         Reply::Bulk(Some(value)) => Frame::Bulk(value),
         Reply::Removed(removed) => Frame::Integer(i64::from(removed)),
         Reply::Integer(n) => Frame::Integer(n),
+        // A scan step's reply never reaches a client under this name. It is
+        // the shard-side half of a walk the edge drives itself, and whoever
+        // drives one reads the cursor and the keys directly — a client that
+        // is handed a cursor has to be handed the packed one, which only the
+        // driver can build. Nothing routes a step here today; the arm is what
+        // keeps a routing mistake made later a bad reply on one connection
+        // rather than a panicked connection task.
+        Reply::Scan { .. } => Frame::Error("ERR internal reply could not be rendered".into()),
         // No `safe_error` here, and that is not an omission. A shard error is
         // a [`ReplyError`] variant, so its text is a literal in `shard.rs`
         // rather than anything a router composed — the type is what rules out
@@ -1860,6 +1868,10 @@ mod tests {
             unreachable!("a connection command reached the router")
         }
 
+        async fn dispatch_at(&self, _shard: u16, _cmd: Command) -> Reply {
+            unreachable!("a connection command reached the router")
+        }
+
         async fn dispatch_every(&self, _cmd: Command) -> Vec<Reply> {
             unreachable!("a connection command reached the router")
         }
@@ -1994,6 +2006,10 @@ mod tests {
     impl Router for BatchSizes {
         async fn dispatch(&self, cmd: Command) -> Reply {
             self.inner.dispatch(cmd).await
+        }
+
+        async fn dispatch_at(&self, shard: u16, cmd: Command) -> Reply {
+            self.inner.dispatch_at(shard, cmd).await
         }
 
         async fn dispatch_many(&self, cmds: Vec<Command>) -> Vec<Reply> {
