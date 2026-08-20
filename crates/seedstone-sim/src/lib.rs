@@ -107,7 +107,8 @@ use seedstone_core::dict::DictSeed;
 // strings enter the trace hash — a private copy that drifted would make a
 // planted trace differ for a reason unrelated to the race.
 use seedstone_core::shard::{
-    Command, Deadlines, ExpiryPolicy, Reply, ReplyError, Router, ShardPool, TraceSink, parse_i64,
+    Command, Deadlines, ExpiryPolicy, Reply, ReplyError, Route, Router, ShardPool, TraceSink,
+    parse_i64,
 };
 use seedstone_resp::{Decoder, DecoderLimits, Frame, encode};
 use seedstone_service::{NodeInfo, serve_connection};
@@ -630,7 +631,16 @@ impl TraceSink for HashSink {
         // definition.
         acc = mix(acc, seq);
         acc = mix(acc, u64::from(cmd.kind()));
-        acc = fold_bytes(acc, cmd.key());
+        acc = match cmd.route() {
+            // Byte-for-byte what this folded when a command could only name a
+            // key, so no recorded trace hash moves.
+            Route::Key(key) => fold_bytes(acc, key),
+            // A route with no key still has to reach the hash: two commands of
+            // one kind that went to different shards are different commands,
+            // and `shard` above only says where the answer came from.
+            Route::Shard(shard) => mix(mix(acc, 1), u64::from(shard)),
+            Route::Every => mix(acc, 2),
+        };
         acc = fold_reply(acc, reply);
         *h = acc;
     }
