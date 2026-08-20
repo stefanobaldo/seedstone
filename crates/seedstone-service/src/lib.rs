@@ -2044,16 +2044,16 @@ mod tests {
         }
     }
 
-    /// A step that reaches [`Router::dispatch`] instead of `dispatch_at` walks
-    /// the placeholder shard its route names.
+    /// A step that reaches [`Router::dispatch`] instead of `dispatch_at` is
+    /// refused, rather than answered by whichever shard its route stood in.
     ///
-    /// Pinned rather than assumed. `Command::ScanStep`'s route names shard `0`
-    /// because it does not know its own, so a caller that skipped `dispatch_at`
-    /// would get a real answer from the wrong shard rather than a refusal —
-    /// which is a plausible-looking partial answer, and the reason the route
-    /// wants to name no shard at all once a client's cursor can supply one.
+    /// This is the property `SCAN` needs and `KEYS` did not. A step's shard
+    /// comes out of an integer a peer chose, so a route that stood in a real
+    /// shard would turn a mis-routed step into a walk of the wrong table that
+    /// answers plausibly — a fraction of the keyspace with nothing on the wire
+    /// to say so. `Route::Unaddressed` makes that a refusal instead.
     #[tokio::test]
-    async fn a_scan_step_that_skips_dispatch_at_walks_the_placeholder_shard() {
+    async fn a_scan_step_that_skips_dispatch_at_is_refused_rather_than_misrouted() {
         let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
         for i in 0..64u32 {
             pool.dispatch(Command::Set {
@@ -2071,6 +2071,13 @@ mod tests {
                 pattern: None,
             })
             .await;
+        assert_eq!(
+            direct,
+            Reply::Error(ReplyError::ShardUnavailable),
+            "an unrouted step must be refused, not answered from a stand-in shard"
+        );
+        // The shard the route used to stand in for still answers when it is
+        // named, so the refusal is about the routing and not about the step.
         let at_zero = pool
             .dispatch_at(
                 0,
@@ -2081,11 +2088,7 @@ mod tests {
                 },
             )
             .await;
-        assert_eq!(
-            direct, at_zero,
-            "an unrouted step must be shard 0's answer, not a refusal or another shard's"
-        );
-        let Reply::Scan { cursor, keys } = direct else {
+        let Reply::Scan { cursor, keys } = at_zero else {
             panic!("expected Reply::Scan");
         };
         assert_eq!(cursor, 0, "an unbounded count must finish the cycle");

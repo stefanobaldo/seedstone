@@ -639,16 +639,16 @@ impl TraceSink for HashSink {
             // one kind that went to different shards are different commands,
             // and `shard` above only says where the answer came from.
             //
-            // For a `ScanStep` this folds a constant, because the variant's
-            // route is a placeholder and the shard that ran it arrives as
-            // `record`'s own argument, folded above. Its cursor, count and
-            // pattern reach the hash through no path on the command side at
-            // all — only `fold_reply` discriminates a step, and it does so by
-            // outcome. That is enough while nothing on the wire drives one;
-            // a walk that enters the simulated workload wants its inputs
-            // folded here.
             Route::Shard(shard) => mix(mix(acc, 1), u64::from(shard)),
             Route::Every => mix(acc, 2),
+            // A `ScanStep` folds a constant, because the variant names no
+            // shard of its own and the shard that ran it arrives as `record`'s
+            // own argument, folded above. Its cursor, count and pattern reach
+            // the hash through no path on the command side at all — only
+            // `fold_reply` discriminates a step, and it does so by outcome.
+            // That is enough while nothing in the workload drives one; a walk
+            // that enters the simulated workload wants its inputs folded here.
+            Route::Unaddressed => mix(acc, 3),
         };
         acc = fold_reply(acc, reply);
         *h = acc;
