@@ -284,6 +284,15 @@ pub enum Route<'a> {
     Shard(u16),
     /// Every shard, answered once each, gathered in shard order.
     Every,
+    /// No shard of its own: the caller names one through
+    /// [`Router::dispatch_at`].
+    ///
+    /// A router asked to route this on its own has no answer, and says so
+    /// with [`ReplyError::ShardUnavailable`] rather than picking a shard. The
+    /// alternative — standing in a plausible shard — is a command that
+    /// answers from the wrong table and looks like it worked, which is the
+    /// one failure shape a walk over a client-supplied cursor must not have.
+    Unaddressed,
 }
 
 impl Command {
@@ -305,21 +314,18 @@ impl Command {
             | Self::Exists { key } => Route::Key(key),
             Self::FlushDb | Self::DbSize => Route::Every,
             // The one route that is not self-sufficient. A step knows where it
-            // is in *a* shard's table and not which shard's, so this names a
-            // placeholder and the caller supplies the real one through
+            // is in *a* shard's table and not which shard's, so it names no
+            // shard and the caller supplies the real one through
             // [`Router::dispatch_at`].
             //
-            // The placeholder is a real shard, so a step that reached
-            // `dispatch` by mistake would walk shard 0 and answer plausibly
-            // rather than fail. That is the failure shape
-            // [`Router::shards`] argues against, and it is accepted here only
-            // because nothing supplies an untrusted shard yet:
-            // `a_scan_step_that_skips_dispatch_at_walks_the_placeholder_shard`
-            // pins the behaviour so the choice is visible rather than assumed.
-            // The moment a client's cursor names the shard, this wants to be a
-            // route with no shard at all, which `shard_for` would turn into
-            // `ShardUnavailable`.
-            Self::ScanStep { .. } => Route::Shard(0),
+            // This named shard `0` until a client's cursor could supply one.
+            // A placeholder is a real shard, so a step that reached `dispatch`
+            // by mistake walked shard 0 and answered plausibly instead of
+            // failing — a partial answer over a fraction of the keyspace, with
+            // nothing on the wire to distinguish it from a whole one. `SCAN`
+            // unpacks its shard out of an integer a peer chose, so that stopped
+            // being a hypothetical and the route stopped naming a shard.
+            Self::ScanStep { .. } => Route::Unaddressed,
         }
     }
 
@@ -761,16 +767,17 @@ impl ShardPool {
     /// The shard a keyed or shard-addressed command belongs to, or `None`
     /// where this pool has no single answer.
     ///
-    /// `None` covers two different things and answers both the same way,
-    /// because a caller on the one-reply path can do nothing else with
-    /// either: a shard named outside this pool's range, and
+    /// `None` covers three different things and answers all of them the same
+    /// way, because a caller on the one-reply path can do nothing else with
+    /// any of them: a shard named outside this pool's range,
     /// [`Route::Every`], which the broadcast path handles before this is
-    /// asked.
+    /// asked, and [`Route::Unaddressed`], whose shard is the caller's to name
+    /// through [`Router::dispatch_at`].
     fn shard_for(&self, cmd: &Command) -> Option<u16> {
         match cmd.route() {
             Route::Key(key) => Some(shard_of(key, self.shards)),
             Route::Shard(shard) if shard < self.shards => Some(shard),
-            Route::Shard(_) | Route::Every => None,
+            Route::Shard(_) | Route::Every | Route::Unaddressed => None,
         }
     }
 
@@ -2596,7 +2603,7 @@ mod tests {
             async fn dispatch(&self, cmd: Command) -> Reply {
                 match cmd.route() {
                     Route::Key(key) => Reply::Bulk(Some(key.to_vec())),
-                    Route::Shard(_) | Route::Every => Reply::Ok,
+                    Route::Shard(_) | Route::Every | Route::Unaddressed => Reply::Ok,
                 }
             }
             /// This router hosts no shards and says so: `0..0` is a range,
