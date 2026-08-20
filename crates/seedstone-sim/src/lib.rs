@@ -837,6 +837,8 @@ impl PlantedRouter {
                 // it is a second message.
                 expiry: None,
                 cond: None,
+                keep_ttl: false,
+                get: false,
             })
             .await
         {

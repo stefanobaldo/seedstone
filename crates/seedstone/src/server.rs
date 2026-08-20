@@ -196,6 +196,7 @@ impl Server {
             tcp_port: self.local_addr.port(),
             started: tokio::time::Instant::now(),
             connected: Arc::new(AtomicU64::new(0)),
+            now_unix_millis: wall_clock,
         };
         loop {
             tokio::select! {
@@ -267,6 +268,33 @@ async fn refuse(mut stream: TcpStream) {
     encode(&Frame::Error(MAX_CLIENTS_REACHED.to_owned()), &mut out);
     let _ = stream.write_all(&out).await;
     let _ = stream.flush().await;
+}
+
+/// The real wall clock, in Unix milliseconds.
+///
+/// One more thing this crate exists to supply and the deterministic core
+/// deliberately does not have, alongside the socket, the signal handler and
+/// the entropy the composition root draws. A node reached over TCP is a node
+/// whose clients say `EXAT`, and an absolute deadline can only be compared to
+/// the clock those clients set their own watches by.
+///
+/// A reading before 1970 is impossible on a machine whose clock is set at all,
+/// and the alternative to answering zero for one is a panic on a command a
+/// peer sent — so the epoch stands in, and every deadline a client names is
+/// then in the future, which is the conservative direction.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the prohibition keeps the wall clock out of a simulated run; \
+              this is the real node's clock, handed to the service layer as a \
+              dependency so a simulated one is handed its own and stays \
+              replayable"
+)]
+fn wall_clock() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 #[cfg(test)]
