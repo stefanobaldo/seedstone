@@ -228,15 +228,35 @@ pub enum Command {
     },
 }
 
+/// How a command reaches the shards that must run it.
+///
+/// Until this existed, every command named exactly one key and the hash of
+/// that key was the whole routing decision. `SCAN` names a shard instead —
+/// its cursor carries which — and `KEYS`, `DBSIZE` and `FLUSHDB` name no key
+/// at all and must reach every shard. The routing decision is therefore the
+/// command's to state, not something the router can derive from a key that
+/// may not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route<'a> {
+    /// The hash of this key decides the shard.
+    Key(&'a [u8]),
+    /// This shard, named outright. The caller is responsible for it being in
+    /// range; a router hands an out-of-range shard `ShardUnavailable` rather
+    /// than panicking.
+    Shard(u16),
+    /// Every shard, answered once each, gathered in shard order.
+    Every,
+}
+
 impl Command {
-    /// The key this command addresses — what [`shard_of`] routes on.
+    /// How this command reaches the shards that must run it.
     ///
-    /// Exactly one key, for every command there is and every command there
-    /// will be: a request naming several keys is split into one command per
-    /// key before it reaches a shard, because the shards that own them are not
-    /// in general the same shard.
+    /// A request naming several keys is still split into one command per key
+    /// before it reaches a shard, because the shards that own them are not in
+    /// general the same shard. What changed is that naming a key is no longer
+    /// the only way to be routed.
     #[must_use]
-    pub fn key(&self) -> &[u8] {
+    pub fn route(&self) -> Route<'_> {
         match self {
             Self::Get { key }
             | Self::Set { key, .. }
@@ -244,7 +264,7 @@ impl Command {
             | Self::IncrBy { key, .. }
             | Self::Expire { key, .. }
             | Self::Ttl { key }
-            | Self::Exists { key } => key,
+            | Self::Exists { key } => Route::Key(key),
         }
     }
 
@@ -613,6 +633,22 @@ impl ShardPool {
     pub const fn executors(&self) -> u16 {
         self.executors
     }
+
+    /// The shard a keyed or shard-addressed command belongs to, or `None`
+    /// where this pool has no single answer.
+    ///
+    /// `None` covers two different things and answers both the same way,
+    /// because a caller on the one-reply path can do nothing else with
+    /// either: a shard named outside this pool's range, and
+    /// [`Route::Every`], which the broadcast path handles before this is
+    /// asked.
+    fn shard_for(&self, cmd: &Command) -> Option<u16> {
+        match cmd.route() {
+            Route::Key(key) => Some(shard_of(key, self.shards)),
+            Route::Shard(shard) if shard < self.shards => Some(shard),
+            Route::Shard(_) | Route::Every => None,
+        }
+    }
 }
 
 /// Spawns one executor task and returns the inbox that reaches it.
@@ -629,18 +665,27 @@ fn spawn_executor<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
 
 impl Router for ShardPool {
     fn dispatch(&self, cmd: Command) -> impl Future<Output = Reply> + Send {
-        let shard = shard_of(cmd.key(), self.shards);
-        let executor = usize::from(executor_of(shard, self.shards, self.executors));
-        let (tx, rx) = oneshot::channel();
-        // Send before the future is awaited: the inbox is unbounded, so this
-        // never blocks and the caller cannot deadlock by holding the future.
-        let sent = self.inboxes[executor]
-            .send(Envelope {
-                cmds: vec![(shard, cmd)],
-                reply: tx,
-            })
-            .is_ok();
+        // A command with no single shard to go to is refused here rather than
+        // sent somewhere defensible-looking: there is no shard whose answer
+        // would be the right one.
+        let routed = self.shard_for(&cmd).map(|shard| {
+            let executor = usize::from(executor_of(shard, self.shards, self.executors));
+            let (tx, rx) = oneshot::channel();
+            // Send before the future is awaited: the inbox is unbounded, so
+            // this never blocks and the caller cannot deadlock by holding the
+            // future.
+            let sent = self.inboxes[executor]
+                .send(Envelope {
+                    cmds: vec![(shard, cmd)],
+                    reply: tx,
+                })
+                .is_ok();
+            (sent, rx)
+        });
         async move {
+            let Some((sent, rx)) = routed else {
+                return Reply::Error(ReplyError::ShardUnavailable);
+            };
             if !sent {
                 return Reply::Error(ReplyError::ShardUnavailable);
             }
@@ -661,12 +706,17 @@ impl Router for ShardPool {
         // between two runs of the same seed.
         let mut buckets: Vec<Vec<(u16, Command)>> = Vec::new();
         buckets.resize_with(executors, Vec::new);
-        // Where each command's reply will be found once the executors answer.
-        let mut positions = Vec::with_capacity(cmds.len());
+        // Where each command's reply will be found once the executors answer,
+        // or `None` for a command this pool has no shard for — which keeps its
+        // place in the batch and is answered without anything being sent.
+        let mut positions: Vec<Option<(usize, usize)>> = Vec::with_capacity(cmds.len());
         for cmd in cmds {
-            let shard = shard_of(cmd.key(), self.shards);
+            let Some(shard) = self.shard_for(&cmd) else {
+                positions.push(None);
+                continue;
+            };
             let executor = usize::from(executor_of(shard, self.shards, self.executors));
-            positions.push((executor, buckets[executor].len()));
+            positions.push(Some((executor, buckets[executor].len())));
             buckets[executor].push((shard, cmd));
         }
 
@@ -702,10 +752,11 @@ impl Router for ShardPool {
             }
             positions
                 .into_iter()
-                .map(|(executor, offset)| {
-                    answered[executor]
-                        .get_mut(offset)
-                        .and_then(Option::take)
+                .map(|position| {
+                    position
+                        .and_then(|(executor, offset)| {
+                            answered[executor].get_mut(offset).and_then(Option::take)
+                        })
                         .unwrap_or(Reply::Error(ReplyError::ShardUnavailable))
                 })
                 .collect()
@@ -878,12 +929,11 @@ fn sweep_expired<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
         if append(&mut state.log, &mut state.seq, shard).is_err() {
             return;
         }
-        // The command an expiry is indistinguishable from, built once and used
-        // for both the removal and the trace so the key is not cloned to say
-        // the same thing twice.
-        let cmd = Command::Del { key };
-        state.dict.remove(cmd.key());
-        trace.record(shard, at, &cmd, &Reply::Removed(true));
+        state.dict.remove(&key);
+        // The command an expiry is indistinguishable from. Built after the
+        // removal because it takes the key, which is what keeps the sweep from
+        // cloning it to say the same thing twice.
+        trace.record(shard, at, &Command::Del { key }, &Reply::Removed(true));
     }
     state.expire_cursor = next;
 }
@@ -922,11 +972,17 @@ fn apply<L: ReplicationLog, P: ExpiryPolicy>(
 ) -> Reply {
     // Lazy expiry, once, before any arm has looked at the key. Here rather
     // than in each arm on purpose: it makes "an expired key is dead to every
-    // command" a property of the dispatch instead of a rule seven handlers
-    // have to remember, and a command added later inherits it without knowing
-    // it exists. Every command addresses exactly one key, which is what lets
-    // one check stand in front of all of them.
-    if let Err(failed) = evict_if_expired(dict, log, seq, shard, cmd.key(), now, expiry) {
+    // command" a property of the dispatch instead of a rule the handlers have
+    // to remember, and a command added later inherits it without knowing it
+    // exists.
+    //
+    // A command that names no key has nothing for this to stand in front of.
+    // That is not a gap in the guarantee: such a command addresses the shard
+    // rather than an entry, so there is no single key whose deadline it could
+    // be meeting.
+    if let Route::Key(key) = cmd.route()
+        && let Err(failed) = evict_if_expired(dict, log, seq, shard, key, now, expiry)
+    {
         return failed;
     }
 
@@ -1219,6 +1275,40 @@ mod tests {
 
     fn get(key: &[u8]) -> Command {
         Command::Get { key: key.to_vec() }
+    }
+
+    /// Every variant answers `route()`, and the keyed ones answer with the
+    /// key they name.
+    ///
+    /// Written over a list built here rather than over the one variant that
+    /// happens to be convenient: `route()` is a `match` with no wildcard, so
+    /// a variant added later cannot compile without answering — but nothing
+    /// makes it answer *correctly*, and a keyed command routed to the wrong
+    /// key is a key served by the wrong shard.
+    #[test]
+    fn every_command_declares_how_it_is_routed() {
+        let keyed: [Command; 7] = [
+            Command::Get { key: b"k".to_vec() },
+            set(b"k", b"v"),
+            Command::Del { key: b"k".to_vec() },
+            Command::IncrBy {
+                key: b"k".to_vec(),
+                delta: 1,
+            },
+            Command::Expire {
+                key: b"k".to_vec(),
+                seconds: 1,
+            },
+            Command::Ttl { key: b"k".to_vec() },
+            Command::Exists { key: b"k".to_vec() },
+        ];
+        for cmd in keyed {
+            assert_eq!(
+                cmd.route(),
+                Route::Key(b"k"),
+                "{cmd:?} routes on the key it names"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1857,7 +1947,11 @@ mod tests {
             ),
             Reply::Ok
         );
-        assert_eq!(cmd.key(), b"k", "the trace folds the key after the handler");
+        assert_eq!(
+            cmd.route(),
+            Route::Key(b"k"),
+            "the trace folds the key after the handler"
+        );
         assert_eq!(cmd.kind(), set(b"k", b"v").kind());
         assert_eq!(
             dict.get(b"k").map(|entry| entry.value.clone()),
@@ -2105,7 +2199,10 @@ mod tests {
         struct Echo;
         impl Router for Echo {
             async fn dispatch(&self, cmd: Command) -> Reply {
-                Reply::Bulk(Some(cmd.key().to_vec()))
+                match cmd.route() {
+                    Route::Key(key) => Reply::Bulk(Some(key.to_vec())),
+                    Route::Shard(_) | Route::Every => Reply::Ok,
+                }
             }
         }
         let replies = Echo
