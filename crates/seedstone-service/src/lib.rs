@@ -1706,6 +1706,10 @@ mod tests {
         async fn dispatch(&self, _cmd: Command) -> Reply {
             unreachable!("a connection command reached the router")
         }
+
+        async fn dispatch_every(&self, _cmd: Command) -> Vec<Reply> {
+            unreachable!("a connection command reached the router")
+        }
     }
 
     #[tokio::test]
@@ -1842,6 +1846,10 @@ mod tests {
         async fn dispatch_many(&self, cmds: Vec<Command>) -> Vec<Reply> {
             self.sizes.lock().expect("sizes mutex").push(cmds.len());
             self.inner.dispatch_many(cmds).await
+        }
+
+        async fn dispatch_every(&self, cmd: Command) -> Vec<Reply> {
+            self.inner.dispatch_every(cmd).await
         }
     }
 
