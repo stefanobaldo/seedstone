@@ -1,0 +1,61 @@
+# Tests this lane expects to fail, and why. Format:
+#
+#     <pytest node id> | <category> | <reason>
+#
+# Categories:
+#   out-of-rule  the test needs a command this server deliberately does not
+#                answer. Permanent until the command arrives in a later
+#                milestone. The reason MUST name the command.
+#   not-yet      the surface is planned and not built yet. Temporary.
+#
+# Every row is a strict xfail: a listed test that starts passing turns this
+# lane red until its row is removed. Moving a row from not-yet to out-of-rule
+# to make CI green is a defect, not a fix — out-of-rule requires a named
+# command this server refuses on purpose.
+
+# --- out-of-rule ---------------------------------------------------------
+# Transactions. The backend writes and deletes several keys through a
+# transactional pipeline, so every one of these ends at EXEC.
+test_backend.py::DjangoRedisCacheTests::test_delete | out-of-rule | EXEC: the backend deletes through a transactional pipeline
+test_backend.py::DjangoRedisCacheTests::test_delete_many | out-of-rule | EXEC: the backend deletes through a transactional pipeline
+test_backend.py::DjangoRedisCacheTests::test_delete_many_generator | out-of-rule | EXEC: the backend deletes through a transactional pipeline
+test_backend.py::DjangoRedisCacheTests::test_set_many | out-of-rule | EXEC: the backend writes many keys through a transactional pipeline
+
+# Server-side scripting. The lock is released by a registered script, so a
+# lock this server grants is a lock nothing can hand back: the second of these
+# blocks on an acquisition that will never be released and ends at the
+# per-test bound rather than at an error.
+test_backend.py::DjangoRedisCacheTests::test_lock | out-of-rule | EVALSHA: the client releases its lock through a registered script
+test_backend.py::DjangoRedisCacheTests::test_lock_released_by_thread | out-of-rule | EVALSHA: the client releases its lock through a registered script, so the waiter here never acquires
+
+# --- not-yet -------------------------------------------------------------
+# SCAN, and the pattern deletion built on it.
+test_backend.py::DjangoRedisCacheTestEscapePrefix::test_delete_pattern | not-yet | SCAN
+test_backend.py::DjangoRedisCacheTestEscapePrefix::test_iter_keys | not-yet | SCAN
+test_backend.py::DjangoRedisCacheTestCustomKeyFunction::test_custom_key_function | not-yet | SCAN
+test_backend.py::DjangoRedisCacheTests::test_delete_pattern | not-yet | SCAN
+test_backend.py::DjangoRedisCacheTests::test_iter_keys | not-yet | SCAN
+
+# KEYS.
+test_backend.py::DjangoRedisCacheTestEscapePrefix::test_keys | not-yet | KEYS
+
+# MGET.
+test_backend.py::DjangoRedisCacheTests::test_get_many | not-yet | MGET
+test_backend.py::DjangoRedisCacheTests::test_get_many_unicode | not-yet | MGET
+
+# FLUSHDB. The suite resets the keyspace between tests and swallows the
+# failure when it cannot, so this one reads a value an earlier test left
+# behind rather than reporting the missing command.
+test_backend.py::DjangoRedisCacheTests::test_incr_ignore_check | not-yet | FLUSHDB
+
+# PERSIST.
+test_backend.py::DjangoRedisCacheTests::test_persist | not-yet | PERSIST
+test_backend.py::DjangoRedisCacheTests::test_touch_forever | not-yet | PERSIST
+test_backend.py::DjangoRedisCacheTests::test_touch_forever_nonexistent | not-yet | PERSIST
+
+# PEXPIRE.
+test_backend.py::DjangoRedisCacheTests::test_touch_default_timeout | not-yet | PEXPIRE
+test_backend.py::DjangoRedisCacheTests::test_touch_missed_key | not-yet | PEXPIRE
+test_backend.py::DjangoRedisCacheTests::test_touch_negative_timeout | not-yet | PEXPIRE
+test_backend.py::DjangoRedisCacheTests::test_touch_positive_timeout | not-yet | PEXPIRE
+test_backend.py::DjangoRedisCacheTests::test_touch_zero_timeout | not-yet | PEXPIRE
