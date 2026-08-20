@@ -195,6 +195,16 @@ pub enum Command {
         /// The condition the write is subject to, or `None` to write
         /// unconditionally.
         cond: Option<Cond>,
+        /// Whether the key keeps the deadline it already had, from `KEEPTTL`.
+        /// It overrides the clearing `expiry: None` would otherwise do; the
+        /// two never arrive together, because the service layer refuses a
+        /// `SET` that names both.
+        keep_ttl: bool,
+        /// Whether the reply is the value the write replaced rather than
+        /// `Ok`, from `GET`. The previous value is the answer even when
+        /// `cond` refuses the write — the question `GET` asks is what was
+        /// there, not what the write did.
+        get: bool,
     },
     /// Remove `key`.
     Del {
@@ -1213,26 +1223,23 @@ fn apply<L: ReplicationLog, P: ExpiryPolicy>(
             value,
             expiry,
             cond,
-        } => {
-            // A condition the keyspace does not meet is answered, not failed:
-            // the peer asked for a write that was allowed not to happen.
-            match cond {
-                Some(Cond::Nx) if dict.get(key).is_some() => return Reply::Bulk(None),
-                Some(Cond::Xx) if dict.get(key).is_none() => return Reply::Bulk(None),
-                _ => {}
-            }
-            if let Err(failed) = append(log, seq, shard) {
-                return failed;
-            }
-            dict.insert(
-                key.clone(),
-                Entry {
-                    value: std::mem::take(value),
-                    expires_at: deadline(now, *expiry),
-                },
-            );
-            Reply::Ok
-        }
+            keep_ttl,
+            get,
+        } => set(
+            dict,
+            log,
+            seq,
+            shard,
+            now,
+            SetArgs {
+                key,
+                value,
+                expiry: *expiry,
+                cond: *cond,
+                keep_ttl: *keep_ttl,
+                get: *get,
+            },
+        ),
 
         Command::Del { key } => {
             if dict.get(key).is_none() {
@@ -1335,6 +1342,95 @@ fn flush_db<L: ReplicationLog>(dict: &mut Dict, log: &mut L, seq: &mut u64, shar
     }
     dict.clear();
     Reply::Ok
+}
+
+/// A [`Command::Set`]'s pieces, as [`set`] receives them.
+///
+/// A bundle rather than six parameters because six is more than the ceiling
+/// this workspace sets on an argument list, and because they arrive together
+/// or not at all: they are one command, taken apart by the match that
+/// dispatched it. The key and the value stay borrowed from that command — the
+/// value mutably, so the handler can take the bytes rather than copy them.
+struct SetArgs<'a> {
+    /// The key to write.
+    key: &'a Vec<u8>,
+    /// The bytes to store, taken by the write that stores them.
+    value: &'a mut Vec<u8>,
+    /// How long the key should live.
+    expiry: Option<Expiry>,
+    /// The condition the write is subject to.
+    cond: Option<Cond>,
+    /// Whether the key keeps the deadline it already had.
+    keep_ttl: bool,
+    /// Whether the reply is the value the write replaced.
+    get: bool,
+}
+
+/// Stores a value, subject to everything `SET`'s options can say about it.
+///
+/// Its own function rather than an arm of [`apply`] because the option algebra
+/// is where the command's weight is: three of the four options are decided
+/// against the entry already standing there, and a dispatcher that inlined
+/// them would read as one command among ten rather than as the one command
+/// that has them.
+fn set<L: ReplicationLog>(
+    dict: &mut Dict,
+    log: &mut L,
+    seq: &mut u64,
+    shard: u16,
+    now: Instant,
+    args: SetArgs<'_>,
+) -> Reply {
+    let SetArgs {
+        key,
+        value,
+        expiry,
+        cond,
+        keep_ttl,
+        get,
+    } = args;
+
+    // Everything the entry standing there decides, decided in one look:
+    // whether the condition is met, what `GET` has to answer, and what
+    // deadline `KEEPTTL` would keep. The lazy expiry in front of the dispatch
+    // has already run, so an entry found here is a live one.
+    //
+    // The value is cloned only for a `GET`, since that reply is the one thing
+    // that still wants the old bytes after the write has taken their place.
+    let found = dict.get(key);
+    let existed = found.is_some();
+    let old = found.filter(|_| get).map(|entry| entry.value.clone());
+    let kept = found.and_then(|entry| entry.expires_at);
+
+    // A condition the keyspace does not meet is answered, not failed: the peer
+    // asked for a write that was allowed not to happen. What it is answered
+    // with is the value that survives — the one already there for a refused
+    // `NX`, and nothing at all for a refused `XX`, which by definition found
+    // no key. Without `GET` both are the same empty answer.
+    match cond {
+        Some(Cond::Nx) if existed => return Reply::Bulk(old),
+        Some(Cond::Xx) if !existed => return Reply::Bulk(None),
+        _ => {}
+    }
+    if let Err(failed) = append(log, seq, shard) {
+        return failed;
+    }
+    // `KEEPTTL` is the one way a write leaves a deadline where it found it.
+    // Without it the deadline is whatever the options name, and naming none
+    // clears the one the overwritten key was carrying — see [`Command::Set`].
+    let expires_at = if keep_ttl {
+        kept
+    } else {
+        deadline(now, expiry)
+    };
+    dict.insert(
+        key.clone(),
+        Entry {
+            value: std::mem::take(value),
+            expires_at,
+        },
+    );
+    if get { Reply::Bulk(old) } else { Reply::Ok }
 }
 
 /// Visits up to `count` buckets from `cursor` and reports the live keys among
@@ -1554,6 +1650,8 @@ mod tests {
             value: value.to_vec(),
             expiry: None,
             cond: None,
+            keep_ttl: false,
+            get: false,
         }
     }
 
@@ -1564,6 +1662,8 @@ mod tests {
             value: value.to_vec(),
             expiry: Some(Expiry::Ex(seconds)),
             cond: None,
+            keep_ttl: false,
+            get: false,
         }
     }
 
@@ -1636,6 +1736,8 @@ mod tests {
             value: value.to_vec(),
             expiry: None,
             cond: Some(cond),
+            keep_ttl: false,
+            get: false,
         };
 
         // XX on an absent key stores nothing and says so.
@@ -2503,6 +2605,8 @@ mod tests {
                 value: b"v".to_vec(),
                 expiry: None,
                 cond: None,
+                keep_ttl: false,
+                get: false,
             })
             .await;
         }
