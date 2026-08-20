@@ -765,6 +765,11 @@ impl Router for PlantedRouter {
         self.lose_updates(cmd).await
     }
 
+    /// The pool's own count: the plant wraps a pool, it does not resize one.
+    fn shards(&self) -> u16 {
+        self.pool.shards()
+    }
+
     /// Passed straight through: the plant is a defect between two messages of
     /// one keyed command, and a shard-addressed step is neither.
     async fn dispatch_at(&self, shard: u16, cmd: Command) -> Reply {

@@ -43,9 +43,6 @@ test_backend.py::DjangoRedisCacheTestCustomKeyFunction::test_custom_key_function
 test_backend.py::DjangoRedisCacheTests::test_delete_pattern | not-yet | SCAN
 test_backend.py::DjangoRedisCacheTests::test_iter_keys | not-yet | SCAN
 
-# KEYS.
-test_backend.py::DjangoRedisCacheTestEscapePrefix::test_keys | not-yet | KEYS
-
 # MGET.
 test_backend.py::DjangoRedisCacheTests::test_get_many | not-yet | MGET
 test_backend.py::DjangoRedisCacheTests::test_get_many_unicode | not-yet | MGET

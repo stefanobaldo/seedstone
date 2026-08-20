@@ -485,6 +485,22 @@ pub trait Router: Clone + Send + Sync + 'static {
     /// always get to learn which.
     fn dispatch(&self, cmd: Command) -> impl Future<Output = Reply> + Send;
 
+    /// How many shards [`dispatch_at`](Router::dispatch_at) will accept, so
+    /// that `0..shards()` is exactly the set of addressable shards.
+    ///
+    /// A keyspace-wide walk is driven from outside the router — one cursor
+    /// loop per shard — and the count is what says how many loops that is. It
+    /// lives here rather than beside the caller's other configuration because
+    /// a count kept anywhere else is a second source of truth for a number the
+    /// router already knows, and the failure when the two disagree is silent:
+    /// a walk that visits four shards of sixteen answers with a quarter of the
+    /// keyspace and no error.
+    ///
+    /// Deliberately without a default body, for the reason
+    /// [`dispatch_every`](Router::dispatch_every) has none. A default of `1`
+    /// would let a real router forget to answer and walk only shard `0`.
+    fn shards(&self) -> u16;
+
     /// Routes `cmd` to the named shard, whatever key it does or does not
     /// carry, and resolves to its reply.
     ///
@@ -810,6 +826,12 @@ impl Router for ShardPool {
         // would be the right one.
         let shard = self.shard_for(&cmd);
         one_reply(shard.and_then(|shard| self.send_one(shard, cmd)))
+    }
+
+    /// The count this pool was spawned with — see [`ShardPool::shards`], the
+    /// inherent accessor this restates for callers that hold a `Router`.
+    fn shards(&self) -> u16 {
+        self.shards
     }
 
     /// The shard comes from the caller instead of from the command, and the
@@ -2558,6 +2580,12 @@ mod tests {
                     Route::Key(key) => Reply::Bulk(Some(key.to_vec())),
                     Route::Shard(_) | Route::Every => Reply::Ok,
                 }
+            }
+            /// This router hosts no shards, and answers `1` because a
+            /// caller walking `0..shards()` must still be handed a range it
+            /// can iterate.
+            fn shards(&self) -> u16 {
+                1
             }
             /// This router hosts no shards, so there is none to address.
             async fn dispatch_at(&self, _shard: u16, cmd: Command) -> Reply {

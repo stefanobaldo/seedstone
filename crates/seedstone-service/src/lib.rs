@@ -49,9 +49,12 @@
 
 use seedstone_core::shard::{Command, Cond, Expiry, Reply, ReplyError, Router, parse_i64};
 use seedstone_resp::{Decoder, DecoderLimits, Frame, ParseError, encode};
+use std::future::{Future, poll_fn};
 use std::mem::take;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
@@ -234,6 +237,15 @@ const REPLY_HIGH_WATER: usize = REPLY_SHED;
 /// one.
 const CHUNK_COMMANDS: usize = 128;
 
+/// How many buckets one step of a `KEYS` walk visits before answering.
+///
+/// `KEYS` carries no `COUNT` on the wire, so the server picks the step. It is
+/// the unit of occupancy: larger holds a shard for longer per step and pays
+/// less per-envelope overhead, smaller yields sooner and pays more. Sized
+/// against the core's `EXPIRE_BUCKETS_PER_TICK`, which is the other bounded
+/// walk over the same table.
+const KEYS_STEP_BUCKETS: usize = 256;
+
 /// How much of a peer-supplied byte string an error message may quote.
 const QUOTE_LIMIT: usize = 32;
 
@@ -337,6 +349,22 @@ impl NodeInfo {
 enum Action {
     /// A keyed command: route it and reply with what the shard says.
     Dispatch(Command),
+    /// A request that cannot travel inside a chunk — see [`Unbatched`].
+    Unbatched(Unbatched),
+    /// Answer with this frame; the connection continues.
+    Reply(Frame),
+    /// Answer with this frame, then hang up.
+    ReplyThenClose(Frame),
+}
+
+/// A request that is answered on its own, after the chunk in front of it has
+/// been dispatched and before anything behind it is.
+///
+/// What the three have in common is that each needs every command the peer
+/// pipelined ahead of it to have already run. Holding them in one variant is
+/// what keeps that ordering requirement in one place instead of restated at
+/// three call sites, where the fourth would be the one that forgot.
+enum Unbatched {
     /// One request naming several keys, split into the one-key commands the
     /// shards that own them can run. The replies are summed into a single
     /// integer — see [`fan_out`], which also states what the split costs in
@@ -344,11 +372,23 @@ enum Action {
     FanOut(Vec<Command>),
     /// A request naming no key at all: it reaches every shard and the answers
     /// are folded into one reply — see [`broadcast`].
-    DispatchEvery(Command),
-    /// Answer with this frame; the connection continues.
-    Reply(Frame),
-    /// Answer with this frame, then hang up.
-    ReplyThenClose(Frame),
+    Every(Command),
+    /// A request naming a pattern rather than a key. The edge walks every
+    /// shard itself, a bounded step at a time, and gathers what matches — see
+    /// [`keys`]. It is not an [`Every`](Unbatched::Every) because one command
+    /// per shard is not one *step* per shard: a walk is a loop.
+    Keys(Vec<u8>),
+}
+
+impl Unbatched {
+    /// Runs the request and answers with the single frame it earns.
+    async fn answer<R: Router>(self, router: &R) -> Frame {
+        match self {
+            Self::FanOut(cmds) => fan_out(router, cmds).await,
+            Self::Every(cmd) => broadcast(router, cmd).await,
+            Self::Keys(pattern) => keys(router, pattern).await,
+        }
+    }
 }
 
 /// One decoded request's place in a chunk.
@@ -490,30 +530,20 @@ async fn serve_connection_limited<S, R>(
                             return;
                         }
                     }
-                    Action::FanOut(cmds) => {
-                        // The chunk closes *before* the fan-out runs, and that
+                    Action::Unbatched(request) => {
+                        // The chunk closes *before* the request runs, and that
                         // is an ordering requirement rather than tidiness: the
                         // commands already batched were written by the peer
-                        // ahead of this one, and dispatching these while those
+                        // ahead of this one, and dispatching this while those
                         // wait would run a `DEL k` before the `SET k v` the
-                        // peer pipelined in front of it.
+                        // peer pipelined in front of it, empty the keyspace in
+                        // front of the writes that filled it, or answer a
+                        // `KEYS` without the key a `SET` just wrote.
                         if !emit_chunk(&mut stream, &mut out, &router, &mut slots, &mut batch).await
                         {
                             return;
                         }
-                        slots.push(Slot::Ready(fan_out(&router, cmds).await));
-                    }
-                    Action::DispatchEvery(cmd) => {
-                        // The chunk closes first, for the reason a fan-out
-                        // closes it: a `FLUSHDB` the peer pipelined behind a
-                        // `SET` must run behind it, and a keyspace-wide
-                        // command dispatched while a batch waits would empty
-                        // the keyspace in front of the writes that filled it.
-                        if !emit_chunk(&mut stream, &mut out, &router, &mut slots, &mut batch).await
-                        {
-                            return;
-                        }
-                        slots.push(Slot::Ready(broadcast(&router, cmd).await));
+                        slots.push(Slot::Ready(request.answer(&router).await));
                     }
                     Action::Reply(frame) => slots.push(Slot::Ready(frame)),
                     Action::ReplyThenClose(frame) => {
@@ -866,6 +896,116 @@ async fn broadcast<R: Router>(router: &R, cmd: Command) -> Frame {
     }
 }
 
+/// Every key matching `pattern`, gathered from every shard.
+///
+/// One cursor loop per shard, run concurrently and joined. Each step is an
+/// ordinary envelope, so this occupies a shard for the length of one step
+/// rather than for the length of the walk, and the walks themselves overlap
+/// rather than queueing behind each other.
+///
+/// The result is accumulated here before any of it reaches the wire, which is
+/// the cost this shape accepts and the reason `SCAN` exists. Duplicates are
+/// removed: a table that doubles mid-walk can return a key twice, which is
+/// `SCAN`'s documented behaviour and would be surprising in a single answer.
+///
+/// The walk is `O(keyspace)` and competes for CPU with traffic while it runs.
+/// What it no longer does is stop the server for its duration, which is the
+/// difference worth having and not the same thing as being cheap.
+async fn keys<R: Router>(router: &R, pattern: Vec<u8>) -> Frame {
+    let walks: Vec<_> = (0..router.shards())
+        .map(|shard| {
+            let pattern = pattern.clone();
+            async move {
+                let mut found: Vec<Vec<u8>> = Vec::new();
+                let mut cursor = 0u64;
+                loop {
+                    let reply = router
+                        .dispatch_at(
+                            shard,
+                            Command::ScanStep {
+                                cursor,
+                                count: KEYS_STEP_BUCKETS,
+                                pattern: Some(pattern.clone()),
+                            },
+                        )
+                        .await;
+                    match reply {
+                        Reply::Scan { cursor: next, keys } => {
+                            found.extend(keys);
+                            cursor = next;
+                            if cursor == 0 {
+                                return Ok(found);
+                            }
+                        }
+                        Reply::Error(error) => return Err(error),
+                        // A router that answered something else did not run
+                        // the step, and there is no partial walk to report:
+                        // this is the shard failing to answer, spelled the way
+                        // the dispatch path already spells that.
+                        _ => return Err(ReplyError::ShardUnavailable),
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let mut all: Vec<Vec<u8>> = Vec::new();
+    for walk in join_all(walks).await {
+        match walk {
+            Ok(found) => all.extend(found),
+            // One shard that could not answer makes the whole reply wrong, and
+            // a short array is a wrong answer a client cannot detect. Say so
+            // instead.
+            Err(error) => return Frame::Error(error.wire_text().to_owned()),
+        }
+    }
+    all.sort_unstable();
+    all.dedup();
+    Frame::Array(all.into_iter().map(Frame::Bulk).collect())
+}
+
+/// Drives every future to completion concurrently, and gathers the outputs in
+/// the order the futures were given rather than the order they finished.
+///
+/// Hand-rolled because the workspace carries no futures crate and one walk
+/// does not justify adding one. It also deliberately does not spawn: a spawned
+/// task's completion order belongs to the runtime, so the order two shards'
+/// walks finished in could differ between two runs of one seed — the
+/// non-determinism [`Router::dispatch_every`] gathers by index to avoid.
+/// Polling a fixed vector in index order cannot vary.
+///
+/// Each future is polled at most once after it completes its final poll: a
+/// slot that already holds an output is skipped, so no future is polled again
+/// after returning `Ready`.
+async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut pending: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut done: Vec<Option<F::Output>> = Vec::new();
+    done.resize_with(pending.len(), || None);
+    let mut left = pending.len();
+
+    poll_fn(move |cx| {
+        for (slot, future) in done.iter_mut().zip(pending.iter_mut()) {
+            if slot.is_some() {
+                continue;
+            }
+            if let Poll::Ready(output) = future.as_mut().poll(cx) {
+                *slot = Some(output);
+                left -= 1;
+            }
+        }
+        if left == 0 {
+            Poll::Ready(
+                done.iter_mut()
+                    .map(|slot| slot.take().expect("every future has completed"))
+                    .collect(),
+            )
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>) -> Frame {
     let mut total: i64 = 0;
     for cmd in cmds {
@@ -1022,13 +1162,17 @@ const COMMANDS: &[(&[u8], Handler)] = &[
     }),
     // Keyspace-wide: no key to route on, but every shard has to hear it.
     (b"DBSIZE", |args, _| match args {
-        [] => Ok(Action::DispatchEvery(Command::DbSize)),
+        [] => Ok(Action::Unbatched(Unbatched::Every(Command::DbSize))),
         _ => Err(wrong_arity("dbsize")),
+    }),
+    (b"KEYS", |args, _| match args {
+        [pattern] => Ok(Action::Unbatched(Unbatched::Keys(take(pattern)))),
+        _ => Err(wrong_arity("keys")),
     }),
     (b"FLUSHDB", |args, _| match args {
         // Redis takes ASYNC and SYNC here. This server has one behaviour and
         // saying so plainly beats accepting a word it would then ignore.
-        [] => Ok(Action::DispatchEvery(Command::FlushDb)),
+        [] => Ok(Action::Unbatched(Unbatched::Every(Command::FlushDb))),
         _ => Err(wrong_arity("flushdb")),
     }),
     // From here down: the connection's own business, answered without a shard
@@ -1310,9 +1454,9 @@ fn per_key(
     match args {
         [] => Err(wrong_arity(name)),
         [key] => Ok(Action::Dispatch(command(take(key)))),
-        keys => Ok(Action::FanOut(
+        keys => Ok(Action::Unbatched(Unbatched::FanOut(
             keys.iter_mut().map(|key| command(take(key))).collect(),
-        )),
+        ))),
     }
 }
 
@@ -1672,6 +1816,89 @@ mod tests {
         assert_eq!(frames[0], Frame::Error(wrong_arity("dbsize")));
     }
 
+    #[tokio::test]
+    async fn keys_returns_every_matching_key_across_shards_without_repeating_one() {
+        let (mut r, mut w, _pool) = connected(16);
+        let mut out = Vec::new();
+        for i in 0..200u32 {
+            encode(&req(&["SET", &format!("wanted-{i}"), "v"]), &mut out);
+        }
+        for i in 0..50u32 {
+            encode(&req(&["SET", &format!("other-{i}"), "v"]), &mut out);
+        }
+        encode(&req(&["KEYS", "wanted-*"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 251).await;
+        let Frame::Array(items) = &frames[250] else {
+            panic!("KEYS must answer an array, got {:?}", frames[250]);
+        };
+        let mut names: Vec<Vec<u8>> = items
+            .iter()
+            .map(|f| match f {
+                Frame::Bulk(b) => b.clone(),
+                other => panic!("KEYS must answer bulk strings, got {other:?}"),
+            })
+            .collect();
+        let total = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 200, "every matching key must be returned");
+        assert_eq!(total, names.len(), "KEYS must not repeat a key");
+    }
+
+    #[tokio::test]
+    async fn keys_on_an_empty_keyspace_answers_an_empty_array() {
+        let (mut r, mut w, _pool) = connected(16);
+        let mut out = Vec::new();
+        encode(&req(&["KEYS", "*"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 1).await;
+        assert_eq!(frames[0], Frame::Array(Vec::new()));
+    }
+
+    /// The claim the design rests on: a walk holds a shard for one step, not
+    /// for the cycle. An assertion on the result alone would not see it.
+    #[tokio::test]
+    async fn a_get_is_answered_while_a_keys_walk_is_in_flight() {
+        // Both are issued on the same connection, back to back, and the KEYS
+        // is over a keyspace large enough to take many steps. If the walk held
+        // its shard for the whole cycle, this would still pass on a multi-shard
+        // pool — so the pool here is one shard, where holding would serialise
+        // them.
+        //
+        // Correctness under interleaving, not timing: a timing assertion on a
+        // shared runner is a flake.
+        let (mut r, mut w, _pool) = connected(1);
+        let mut out = Vec::new();
+        for i in 0..2000u32 {
+            encode(&req(&["SET", &format!("k-{i}"), "v"]), &mut out);
+        }
+        encode(&req(&["KEYS", "k-*"]), &mut out);
+        encode(&req(&["GET", "k-0"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 2002).await;
+        assert!(matches!(&frames[2000], Frame::Array(a) if a.len() == 2000));
+        assert_eq!(frames[2001], Frame::Bulk(b"v".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn keys_takes_exactly_one_pattern() {
+        let (mut r, mut w, _pool) = connected(4);
+        let mut out = Vec::new();
+        encode(&req(&["KEYS"]), &mut out);
+        encode(&req(&["KEYS", "a*", "b*"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 2).await;
+        assert_eq!(frames[0], Frame::Error(wrong_arity("keys")));
+        assert_eq!(frames[1], Frame::Error(wrong_arity("keys")));
+    }
+
     /// Redis takes `ASYNC` and `SYNC` here; this server takes neither, and an
     /// arity error is how it says so.
     #[tokio::test]
@@ -1868,6 +2095,10 @@ mod tests {
             unreachable!("a connection command reached the router")
         }
 
+        fn shards(&self) -> u16 {
+            1
+        }
+
         async fn dispatch_at(&self, _shard: u16, _cmd: Command) -> Reply {
             unreachable!("a connection command reached the router")
         }
@@ -2006,6 +2237,10 @@ mod tests {
     impl Router for BatchSizes {
         async fn dispatch(&self, cmd: Command) -> Reply {
             self.inner.dispatch(cmd).await
+        }
+
+        fn shards(&self) -> u16 {
+            self.inner.shards()
         }
 
         async fn dispatch_at(&self, shard: u16, cmd: Command) -> Reply {
@@ -3563,7 +3798,11 @@ mod tests {
         tokio::io::WriteHalf<tokio::io::DuplexStream>,
         ShardPool,
     ) {
-        let pool = ShardPool::spawn(shards, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        // Four executors, or one per shard where there are fewer than four:
+        // a pool may not have more executors than shards, and a test that
+        // wants a single shard wants it precisely to remove the parallelism
+        // that would hide what it is asserting.
+        let pool = ShardPool::spawn(shards, shards.min(4), DictSeed { k0: 1, k1: 2 }, NoTrace);
         let (client, server) = tokio::io::duplex(64 * 1024);
         tokio::spawn(serve_connection(
             server,
