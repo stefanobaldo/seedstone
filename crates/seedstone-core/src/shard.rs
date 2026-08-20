@@ -31,6 +31,7 @@
 //! them. The simulator plants exactly that race.
 
 use crate::dict::{Dict, DictSeed, Entry};
+use crate::glob;
 use crate::log::{NoopLog, Record, ReplicationLog};
 use crate::slot::{executor_of, shard_of};
 use std::future::Future;
@@ -237,6 +238,28 @@ pub enum Command {
     /// Keyspace-wide: one of these reaches every shard, and the edge sums the
     /// answers.
     DbSize,
+    /// One step of a keyspace walk on one shard.
+    ///
+    /// Never reaches a client under this name: `SCAN` unpacks its cursor into
+    /// a shard and one of these, and `KEYS` drives one loop of these per shard
+    /// concurrently. Splitting the walk into ordinary envelopes is what makes
+    /// it yield — between two steps any other command on the shard runs — and
+    /// it is why neither command needs a sliced loop inside the executor.
+    ///
+    /// The shard is the caller's to name, through
+    /// [`Router::dispatch_at`]: a step carries where it is in a shard's table,
+    /// not which shard's table it is.
+    ScanStep {
+        /// Where in this shard's cycle to resume. `0` starts one.
+        cursor: u64,
+        /// How many buckets to visit before answering. A bound on occupancy,
+        /// not a promise about how many keys come back: a step may answer with
+        /// none and a non-zero cursor.
+        count: usize,
+        /// Return only keys matching this glob, filtered here rather than at
+        /// the edge so the channel does not carry a keyspace to discard it.
+        pattern: Option<Vec<u8>>,
+    },
 }
 
 /// How a command reaches the shards that must run it.
@@ -277,13 +300,23 @@ impl Command {
             | Self::Ttl { key }
             | Self::Exists { key } => Route::Key(key),
             Self::FlushDb | Self::DbSize => Route::Every,
+            // The one route that is not self-sufficient. A step knows where it
+            // is in *a* shard's table and not which shard's, so this names a
+            // placeholder and the caller supplies the real one through
+            // [`Router::dispatch_at`]. Shard 0 rather than an out-of-range
+            // sentinel because every pool has one, so a step that reaches
+            // `dispatch` by mistake walks a real table instead of answering
+            // `ShardUnavailable` — a wrong answer is easier to see in a test
+            // than an unavailable one, which is indistinguishable from a shard
+            // that genuinely went away.
+            Self::ScanStep { .. } => Route::Shard(0),
         }
     }
 
     /// A stable one-byte tag for this command's variant.
     ///
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
-    /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9. These values are folded
+    /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9, `ScanStep` = 10. These values are folded
     /// into the simulator's trace hash, so they are part of what a replay
     /// compares: changing one changes every recorded hash. A tag is therefore
     /// never reused and never renumbered.
@@ -299,6 +332,7 @@ impl Command {
             Self::Exists { .. } => 7,
             Self::FlushDb => 8,
             Self::DbSize => 9,
+            Self::ScanStep { .. } => 10,
         }
     }
 }
@@ -317,6 +351,19 @@ pub enum Reply {
     Removed(bool),
     /// An integer result.
     Integer(i64),
+    /// One step of a keyspace walk: where to resume, and what this step found.
+    ///
+    /// A cursor of `0` ends the cycle. Any other value is where the next step
+    /// resumes, and it is opaque to whoever holds it — a position in a cycle,
+    /// not an offset into a table.
+    Scan {
+        /// Where the next step resumes, or `0` if the cycle is complete.
+        cursor: u64,
+        /// The keys this step visited that survived the pattern, in the order
+        /// the table gave them up. Possibly empty with a non-zero cursor: a
+        /// step's budget is buckets, and buckets can be empty.
+        keys: Vec<Vec<u8>>,
+    },
     /// The command failed. See [`ReplyError`] — a closed set of
     /// server-authored failures, none of whose texts can split a frame.
     Error(ReplyError),
@@ -437,6 +484,24 @@ pub trait Router: Clone + Send + Sync + 'static {
     /// command either has not started or has finished, but the caller does not
     /// always get to learn which.
     fn dispatch(&self, cmd: Command) -> impl Future<Output = Reply> + Send;
+
+    /// Routes `cmd` to the named shard, whatever key it does or does not
+    /// carry, and resolves to its reply.
+    ///
+    /// This is how a command whose [`Route`] cannot name its own shard is
+    /// addressed — today, [`Command::ScanStep`], which carries a position in a
+    /// table and not which table. Everything else should go through
+    /// [`dispatch`](Router::dispatch), which derives the shard from the key
+    /// rather than trusting a caller to.
+    ///
+    /// An out-of-range shard answers [`ReplyError::ShardUnavailable`] rather
+    /// than panicking: the shard in a resumed cursor is the client's to
+    /// supply, so it is untrusted input.
+    ///
+    /// # Cancellation
+    ///
+    /// [`dispatch`](Router::dispatch)'s warning applies unchanged.
+    fn dispatch_at(&self, shard: u16, cmd: Command) -> impl Future<Output = Reply> + Send;
 
     /// Routes a batch and resolves to one reply per command, in order.
     ///
@@ -681,6 +746,49 @@ impl ShardPool {
             Route::Shard(_) | Route::Every => None,
         }
     }
+
+    /// Sends `cmd` to the executor hosting `shard`, and hands back the channel
+    /// its reply will arrive on.
+    ///
+    /// `None` where this pool has no such shard or its executor is gone —
+    /// [`one_reply`] turns both into `ShardUnavailable`, because a caller on
+    /// the one-reply path can do nothing else with either.
+    ///
+    /// The send happens here rather than inside the future the caller awaits.
+    /// That is the behaviour [`Router::dispatch`]'s cancellation note
+    /// describes, and it is why this returns a receiver rather than a future.
+    fn send_one(&self, shard: u16, cmd: Command) -> Option<oneshot::Receiver<Vec<Reply>>> {
+        if shard >= self.shards {
+            return None;
+        }
+        let executor = usize::from(executor_of(shard, self.shards, self.executors));
+        let (tx, rx) = oneshot::channel();
+        // The inbox is unbounded, so this never blocks and the caller cannot
+        // deadlock by holding the future.
+        self.inboxes[executor]
+            .send(Envelope {
+                cmds: vec![(shard, cmd)],
+                reply: tx,
+            })
+            .is_ok()
+            .then_some(rx)
+    }
+}
+
+/// Resolves the reply channel of a one-command envelope.
+///
+/// A shard this pool does not have, an executor that would not take the
+/// envelope, and an answer that is not exactly one reply are all the same
+/// thing from here — the command did not run and nothing came back — so they
+/// answer alike.
+async fn one_reply(pending: Option<oneshot::Receiver<Vec<Reply>>>) -> Reply {
+    let Some(rx) = pending else {
+        return Reply::Error(ReplyError::ShardUnavailable);
+    };
+    match rx.await {
+        Ok(mut replies) if replies.len() == 1 => replies.pop().expect("checked non-empty"),
+        _ => Reply::Error(ReplyError::ShardUnavailable),
+    }
 }
 
 /// Spawns one executor task and returns the inbox that reaches it.
@@ -700,34 +808,15 @@ impl Router for ShardPool {
         // A command with no single shard to go to is refused here rather than
         // sent somewhere defensible-looking: there is no shard whose answer
         // would be the right one.
-        let routed = self.shard_for(&cmd).map(|shard| {
-            let executor = usize::from(executor_of(shard, self.shards, self.executors));
-            let (tx, rx) = oneshot::channel();
-            // Send before the future is awaited: the inbox is unbounded, so
-            // this never blocks and the caller cannot deadlock by holding the
-            // future.
-            let sent = self.inboxes[executor]
-                .send(Envelope {
-                    cmds: vec![(shard, cmd)],
-                    reply: tx,
-                })
-                .is_ok();
-            (sent, rx)
-        });
-        async move {
-            let Some((sent, rx)) = routed else {
-                return Reply::Error(ReplyError::ShardUnavailable);
-            };
-            if !sent {
-                return Reply::Error(ReplyError::ShardUnavailable);
-            }
-            match rx.await {
-                // A one-command batch is answered with one reply; anything
-                // else means the executor did not answer this envelope.
-                Ok(mut replies) if replies.len() == 1 => replies.pop().expect("checked non-empty"),
-                _ => Reply::Error(ReplyError::ShardUnavailable),
-            }
-        }
+        let shard = self.shard_for(&cmd);
+        one_reply(shard.and_then(|shard| self.send_one(shard, cmd)))
+    }
+
+    /// The shard comes from the caller instead of from the command, and the
+    /// range check that [`shard_for`](ShardPool::shard_for) would have applied
+    /// is kept: this argument reaches here from a cursor a client supplied.
+    fn dispatch_at(&self, shard: u16, cmd: Command) -> impl Future<Output = Reply> + Send {
+        one_reply(self.send_one(shard, cmd))
     }
 
     fn dispatch_many(&self, cmds: Vec<Command>) -> impl Future<Output = Vec<Reply>> + Send {
@@ -1163,26 +1252,7 @@ fn apply<L: ReplicationLog, P: ExpiryPolicy>(
 
         Command::Exists { key } => Reply::Integer(i64::from(dict.get(key).is_some())),
 
-        Command::FlushDb => {
-            // A shard with nothing in it has nothing to record, for the reason
-            // a `Del` of a missing key appends nothing: a record that replays
-            // to a no-op is a record the log is better without. So a flush of
-            // an empty keyspace costs one comparison and no position.
-            if dict.is_empty() {
-                return Reply::Ok;
-            }
-            // One record for the whole removal, not one per key. The log
-            // records that a mutation happened and where it sits in the
-            // shard's order — see `append` — and a flush is one mutation. It
-            // is also the only spelling under which a refusal can leave the
-            // keyspace alone: a record per key could fail partway and there
-            // would be no flush to undo.
-            if let Err(failed) = append(log, seq, shard) {
-                return failed;
-            }
-            dict.clear();
-            Reply::Ok
-        }
+        Command::FlushDb => flush_db(dict, log, seq, shard),
 
         // The count includes keys whose deadline has passed but which the
         // sweep has not reached, exactly as Redis's does. Making this walk the
@@ -1190,7 +1260,73 @@ fn apply<L: ReplicationLog, P: ExpiryPolicy>(
         // `O(keyspace)` one, to report a number that is stale the instant it
         // is computed.
         Command::DbSize => Reply::Integer(i64::try_from(dict.len()).unwrap_or(i64::MAX)),
+
+        Command::ScanStep {
+            cursor,
+            count,
+            pattern,
+        } => scan_step(dict, *cursor, *count, pattern.as_deref(), now, expiry),
     }
+}
+
+/// Empties one shard's keyspace.
+fn flush_db<L: ReplicationLog>(dict: &mut Dict, log: &mut L, seq: &mut u64, shard: u16) -> Reply {
+    // A shard with nothing in it has nothing to record, for the reason a `Del`
+    // of a missing key appends nothing: a record that replays to a no-op is a
+    // record the log is better without. So a flush of an empty keyspace costs
+    // one comparison and no position.
+    if dict.is_empty() {
+        return Reply::Ok;
+    }
+    // One record for the whole removal, not one per key. The log records that
+    // a mutation happened and where it sits in the shard's order — see
+    // `append` — and a flush is one mutation. It is also the only spelling
+    // under which a refusal can leave the keyspace alone: a record per key
+    // could fail partway and there would be no flush to undo.
+    if let Err(failed) = append(log, seq, shard) {
+        return failed;
+    }
+    dict.clear();
+    Reply::Ok
+}
+
+/// Visits up to `count` buckets from `cursor` and reports the live keys among
+/// them that match `pattern`.
+///
+/// Reads the dict and nothing else: a walk observes the keyspace, so this
+/// takes `&Dict`, appends no log record and consumes no replication position.
+/// That is what makes a step safe to interleave with anything — the shard is
+/// occupied for the length of one step and its state is unchanged by it.
+fn scan_step<P: ExpiryPolicy>(
+    dict: &Dict,
+    cursor: u64,
+    count: usize,
+    pattern: Option<&[u8]>,
+    now: Instant,
+    expiry: &P,
+) -> Reply {
+    let mut keys = Vec::new();
+    let mut next = cursor;
+    // At least one bucket, whatever the caller asked for: a step that visited
+    // none would hand back the cursor it was given, and a caller looping until
+    // the cursor returns to zero would never leave.
+    for _ in 0..count.max(1) {
+        next = dict.scan(next, |key, entry| {
+            // A key whose deadline has passed is not in the keyspace, even
+            // though the sweep has not reached it. Reporting it would make a
+            // walk contradict the `GET` that follows it.
+            if expiry.due_on_read(entry.expires_at, now) {
+                return;
+            }
+            if pattern.is_none_or(|p| glob::matches(p, key)) {
+                keys.push(key.to_vec());
+            }
+        });
+        if next == 0 {
+            break;
+        }
+    }
+    Reply::Scan { cursor: next, keys }
 }
 
 /// Removes `key` if its deadline has passed, appending the deletion to the log
@@ -2329,6 +2465,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_scan_step_returns_at_most_a_countful_and_a_resumable_cursor() {
+        let pool = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 1 }, NoTrace);
+        for i in 0..50u32 {
+            pool.dispatch(set(format!("k{i}").as_bytes(), b"v")).await;
+        }
+
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut cursor = 0u64;
+        let mut calls = 0;
+        loop {
+            let reply = pool
+                .dispatch_at(
+                    0,
+                    Command::ScanStep {
+                        cursor,
+                        count: 10,
+                        pattern: None,
+                    },
+                )
+                .await;
+            let Reply::Scan { cursor: next, keys } = reply else {
+                panic!("a scan step must answer Reply::Scan, got {reply:?}");
+            };
+            seen.extend(keys);
+            cursor = next;
+            calls += 1;
+            // A guard rather than an acceptance criterion — the criteria are
+            // the two assertions below. Without it, a cursor that never closes
+            // its cycle would wedge the suite instead of reporting itself.
+            assert!(calls < 200, "a 50-key scan did not terminate");
+            if cursor == 0 {
+                break;
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 50, "every key must be seen at least once");
+        assert!(
+            calls > 1,
+            "COUNT 10 over 50 keys must take more than one call"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scan_step_filters_by_pattern_inside_the_shard() {
+        let pool = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 1 }, NoTrace);
+        for name in ["alpha", "album", "beta"] {
+            pool.dispatch(set(name.as_bytes(), b"v")).await;
+        }
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let Reply::Scan { cursor: next, keys } = pool
+                .dispatch_at(
+                    0,
+                    Command::ScanStep {
+                        cursor,
+                        count: 100,
+                        pattern: Some(b"al*".to_vec()),
+                    },
+                )
+                .await
+            else {
+                panic!("expected Reply::Scan");
+            };
+            seen.extend(keys);
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+        seen.sort();
+        assert_eq!(seen, vec![b"album".to_vec(), b"alpha".to_vec()]);
+    }
+
+    #[tokio::test]
     async fn an_empty_batch_answers_immediately_with_nothing() {
         let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 1 }, NoTrace);
         assert_eq!(pool.dispatch_many(Vec::new()).await, Vec::new());
@@ -2346,6 +2558,10 @@ mod tests {
                     Route::Key(key) => Reply::Bulk(Some(key.to_vec())),
                     Route::Shard(_) | Route::Every => Reply::Ok,
                 }
+            }
+            /// This router hosts no shards, so there is none to address.
+            async fn dispatch_at(&self, _shard: u16, cmd: Command) -> Reply {
+                self.dispatch(cmd).await
             }
             /// This router hosts no shards, so a broadcast reaches nothing.
             async fn dispatch_every(&self, _cmd: Command) -> Vec<Reply> {
