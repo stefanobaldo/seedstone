@@ -36,13 +36,6 @@ test_backend.py::DjangoRedisCacheTests::test_lock_released_by_thread | out-of-ru
 test_backend.py::DjangoRedisCacheTests::test_incr_ignore_check | out-of-rule | EVAL: the client increments through a script, and its recovery path cannot create a key that is missing
 
 # --- not-yet -------------------------------------------------------------
-# SCAN, and the pattern deletion built on it.
-test_backend.py::DjangoRedisCacheTestEscapePrefix::test_delete_pattern | not-yet | SCAN
-test_backend.py::DjangoRedisCacheTestEscapePrefix::test_iter_keys | not-yet | SCAN
-test_backend.py::DjangoRedisCacheTestCustomKeyFunction::test_custom_key_function | not-yet | SCAN
-test_backend.py::DjangoRedisCacheTests::test_delete_pattern | not-yet | SCAN
-test_backend.py::DjangoRedisCacheTests::test_iter_keys | not-yet | SCAN
-
 # MGET.
 test_backend.py::DjangoRedisCacheTests::test_get_many | not-yet | MGET
 test_backend.py::DjangoRedisCacheTests::test_get_many_unicode | not-yet | MGET
