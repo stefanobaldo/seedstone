@@ -28,6 +28,13 @@ test_backend.py::DjangoRedisCacheTests::test_set_many | out-of-rule | EXEC: the 
 test_backend.py::DjangoRedisCacheTests::test_lock | out-of-rule | EVALSHA: the client releases its lock through a registered script
 test_backend.py::DjangoRedisCacheTests::test_lock_released_by_thread | out-of-rule | EVALSHA: the client releases its lock through a registered script, so the waiter here never acquires
 
+# Server-side scripting, the other half. `incr(ignore_key_check=True)` is a
+# script, and the client's recovery path for a server that refuses one asks
+# the key for its TTL: a key that was never created reports -2, which the
+# client turns into a ValueError. The `incr` tests that pass reach that same
+# recovery path and survive it only because their key already exists.
+test_backend.py::DjangoRedisCacheTests::test_incr_ignore_check | out-of-rule | EVAL: the client increments through a script, and its recovery path cannot create a key that is missing
+
 # --- not-yet -------------------------------------------------------------
 # SCAN, and the pattern deletion built on it.
 test_backend.py::DjangoRedisCacheTestEscapePrefix::test_delete_pattern | not-yet | SCAN
@@ -42,11 +49,6 @@ test_backend.py::DjangoRedisCacheTestEscapePrefix::test_keys | not-yet | KEYS
 # MGET.
 test_backend.py::DjangoRedisCacheTests::test_get_many | not-yet | MGET
 test_backend.py::DjangoRedisCacheTests::test_get_many_unicode | not-yet | MGET
-
-# FLUSHDB. The suite resets the keyspace between tests and swallows the
-# failure when it cannot, so this one reads a value an earlier test left
-# behind rather than reporting the missing command.
-test_backend.py::DjangoRedisCacheTests::test_incr_ignore_check | not-yet | FLUSHDB
 
 # PERSIST.
 test_backend.py::DjangoRedisCacheTests::test_persist | not-yet | PERSIST
