@@ -226,6 +226,12 @@ pub enum Command {
         /// The key to ask about.
         key: Vec<u8>,
     },
+    /// Remove every key the shard holds.
+    ///
+    /// Keyspace-wide: one of these reaches every shard, and each empties its
+    /// own dict, which is the whole of the operation because nothing is
+    /// shared between them.
+    FlushDb,
     /// Report how many keys the shard holds.
     ///
     /// Keyspace-wide: one of these reaches every shard, and the edge sums the
@@ -270,18 +276,17 @@ impl Command {
             | Self::Expire { key, .. }
             | Self::Ttl { key }
             | Self::Exists { key } => Route::Key(key),
-            Self::DbSize => Route::Every,
+            Self::FlushDb | Self::DbSize => Route::Every,
         }
     }
 
     /// A stable one-byte tag for this command's variant.
     ///
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
-    /// `Exists` = 7, `DbSize` = 9. These values are folded into the
-    /// simulator's trace hash, so they are part of what a replay compares:
-    /// changing one changes every recorded hash. A tag is therefore never
-    /// reused and never renumbered — 8 belongs to a command that is not here
-    /// yet.
+    /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9. These values are folded
+    /// into the simulator's trace hash, so they are part of what a replay
+    /// compares: changing one changes every recorded hash. A tag is therefore
+    /// never reused and never renumbered.
     #[must_use]
     pub const fn kind(&self) -> u8 {
         match self {
@@ -292,6 +297,7 @@ impl Command {
             Self::Expire { .. } => 5,
             Self::Ttl { .. } => 6,
             Self::Exists { .. } => 7,
+            Self::FlushDb => 8,
             Self::DbSize => 9,
         }
     }
@@ -1156,6 +1162,27 @@ fn apply<L: ReplicationLog, P: ExpiryPolicy>(
         },
 
         Command::Exists { key } => Reply::Integer(i64::from(dict.get(key).is_some())),
+
+        Command::FlushDb => {
+            // A shard with nothing in it has nothing to record, for the reason
+            // a `Del` of a missing key appends nothing: a record that replays
+            // to a no-op is a record the log is better without. So a flush of
+            // an empty keyspace costs one comparison and no position.
+            if dict.is_empty() {
+                return Reply::Ok;
+            }
+            // One record for the whole removal, not one per key. The log
+            // records that a mutation happened and where it sits in the
+            // shard's order — see `append` — and a flush is one mutation. It
+            // is also the only spelling under which a refusal can leave the
+            // keyspace alone: a record per key could fail partway and there
+            // would be no flush to undo.
+            if let Err(failed) = append(log, seq, shard) {
+                return failed;
+            }
+            dict.clear();
+            Reply::Ok
+        }
 
         // The count includes keys whose deadline has passed but which the
         // sweep has not reached, exactly as Redis's does. Making this walk the
