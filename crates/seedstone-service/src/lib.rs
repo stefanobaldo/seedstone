@@ -237,14 +237,22 @@ const REPLY_HIGH_WATER: usize = REPLY_SHED;
 /// one.
 const CHUNK_COMMANDS: usize = 128;
 
-/// How many buckets one step of a `KEYS` walk visits before answering.
+/// How many buckets one step of a keyspace walk visits before answering.
 ///
-/// `KEYS` carries no `COUNT` on the wire, so the server picks the step. It is
-/// the unit of occupancy: larger holds a shard for longer per step and pays
-/// less per-envelope overhead, smaller yields sooner and pays more. Sized
+/// It is the unit of occupancy: larger holds a shard for longer per step and
+/// pays less per-envelope overhead, smaller yields sooner and pays more. Sized
 /// against the core's `EXPIRE_BUCKETS_PER_TICK`, which is the other bounded
 /// walk over the same table.
-const KEYS_STEP_BUCKETS: usize = 256;
+///
+/// It serves the two walking commands differently, and deliberately with one
+/// number. `KEYS` carries no `COUNT` on the wire, so this *is* its step.
+/// `SCAN` takes a `COUNT` from a client, and this is the ceiling that request
+/// is clamped to — because occupancy is the server's to bound whoever asked,
+/// and a `COUNT` honoured literally would let one call walk an entire cycle
+/// and hold the shard for it. A clamped walk still returns every key; it takes
+/// the round trips this step size implies rather than the ones the client
+/// asked for.
+const WALK_STEP_BUCKETS: usize = 256;
 
 /// How much of a peer-supplied byte string an error message may quote.
 const QUOTE_LIMIT: usize = 32;
@@ -262,6 +270,19 @@ pub const NOPROTO: &str = "NOPROTO unsupported protocol version";
 /// fault: the same text for an unknown option, for a repeated one, and for one
 /// whose argument is missing.
 pub const SYNTAX_ERROR: &str = "ERR syntax error";
+
+/// What `SCAN` visits when the client does not say. Redis's default, and the
+/// number the deployed clients this gate exercises leave unset.
+const SCAN_DEFAULT_COUNT: usize = 10;
+
+/// What a peer resuming a walk from something this server never issued is
+/// told.
+///
+/// It covers both ways that happens: a cursor that is not the canonical
+/// decimal this server prints, and one whose high bits name a shard this node
+/// does not have. Redis has only the second failure and spells it
+/// `ERR invalid cursor`; a client that can act on either can act on both.
+pub const INVALID_CURSOR: &str = "ERR invalid cursor";
 
 /// The largest span, in seconds, an expiry option may name.
 ///
@@ -360,10 +381,10 @@ enum Action {
 /// A request that is answered on its own, after the chunk in front of it has
 /// been dispatched and before anything behind it is.
 ///
-/// What the three have in common is that each needs every command the peer
+/// What they have in common is that each needs every command the peer
 /// pipelined ahead of it to have already run. Holding them in one variant is
 /// what keeps that ordering requirement in one place instead of restated at
-/// three call sites, where the fourth would be the one that forgot.
+/// each call site, where the next one would be the one that forgot.
 enum Unbatched {
     /// One request naming several keys, split into the one-key commands the
     /// shards that own them can run. The replies are summed into a single
@@ -378,6 +399,19 @@ enum Unbatched {
     /// [`keys`]. It is not an [`Every`](Unbatched::Every) because one command
     /// per shard is not one *step* per shard: a walk is a loop.
     Keys(Vec<u8>),
+    /// One step of a client-driven walk: the cursor says which shard and
+    /// where in it, and the answer says where to resume — see [`scan`]. It is
+    /// the only one of these that reaches a single shard, and it is here
+    /// rather than beside the keyed commands because the shard it reaches is
+    /// unpacked at the edge instead of hashed from a key.
+    Scan {
+        /// The packed cursor the client sent, untrusted.
+        cursor: u64,
+        /// `MATCH`, filtered on the shard rather than here.
+        pattern: Option<Vec<u8>>,
+        /// `COUNT`, already bounded by [`WALK_STEP_BUCKETS`].
+        count: usize,
+    },
 }
 
 impl Unbatched {
@@ -387,6 +421,11 @@ impl Unbatched {
             Self::FanOut(cmds) => fan_out(router, cmds).await,
             Self::Every(cmd) => broadcast(router, cmd).await,
             Self::Keys(pattern) => keys(router, pattern).await,
+            Self::Scan {
+                cursor,
+                pattern,
+                count,
+            } => scan(router, cursor, pattern, count).await,
         }
     }
 }
@@ -906,7 +945,7 @@ async fn keys<R: Router>(router: &R, pattern: Vec<u8>) -> Frame {
                             shard,
                             Command::ScanStep {
                                 cursor,
-                                count: KEYS_STEP_BUCKETS,
+                                count: WALK_STEP_BUCKETS,
                                 // Cloned per step, and it has to be: the
                                 // command is moved into the router and the
                                 // reply does not hand the pattern back, so
@@ -985,6 +1024,68 @@ fn unpack_cursor(cursor: u64) -> (u16, u64) {
     let shard = u16::try_from(cursor >> CURSOR_INTERNAL_BITS)
         .expect("shifting 48 of 64 bits out leaves 16, which is a u16");
     (shard, cursor & CURSOR_INTERNAL_MASK)
+}
+
+/// One `SCAN` call: one shard, one step, and the cursor the client resumes at.
+///
+/// A shard that finishes hands back the next shard's start rather than 0, so
+/// the client walks the whole keyspace without ever being told there is more
+/// than one. Only the last shard finishing produces 0.
+///
+/// One call costs what a `GET` costs: no fan-out, no barrier, one envelope to
+/// one shard. That is the difference from [`keys`], and the reason a client
+/// with a large keyspace should be walking it with this.
+///
+/// The step may legitimately answer no keys with a non-zero cursor — a stretch
+/// of empty buckets, or a `MATCH` that excluded everything. Redis behaves the
+/// same way and clients handle it; a server that looped until it had keys
+/// would be answering an unbounded call.
+async fn scan<R: Router>(router: &R, cursor: u64, pattern: Option<Vec<u8>>, count: usize) -> Frame {
+    let shards = router.shards();
+    let (shard, internal) = unpack_cursor(cursor);
+    // The shard came out of an integer the peer chose, so this is where it
+    // stops being trusted. `dispatch_at` would refuse it too; refusing it here
+    // is what makes the refusal say `invalid cursor` rather than name a shard
+    // to a client that has no idea this server has any.
+    if shard >= shards {
+        return Frame::Error(INVALID_CURSOR.to_owned());
+    }
+    let reply = router
+        .dispatch_at(
+            shard,
+            Command::ScanStep {
+                cursor: internal,
+                count,
+                pattern,
+            },
+        )
+        .await;
+    let (next, keys) = match reply {
+        Reply::Scan { cursor: next, keys } if next != 0 => (pack_cursor(shard, next), keys),
+        // This shard is spent: hand back the next one's start, or 0 if it was
+        // the last. `shard + 1` cannot overflow — `shard` is below `shards`,
+        // which is a `u16`, so it is at most `u16::MAX - 1` here.
+        Reply::Scan { keys, .. } => {
+            let next = shard + 1;
+            let cursor = if next < shards {
+                pack_cursor(next, 0)
+            } else {
+                0
+            };
+            (cursor, keys)
+        }
+        Reply::Error(error) => return Frame::Error(error.wire_text().to_owned()),
+        // A router that answered something else did not run the step, which is
+        // the shard failing to answer — spelled the way [`keys`] spells it.
+        _ => return Frame::Error(ReplyError::ShardUnavailable.wire_text().to_owned()),
+    };
+    Frame::Array(vec![
+        // A bulk string, not an integer: that is what Redis sends and what
+        // clients parse. A client that fed an integer back would be sending a
+        // cursor this server never issued.
+        Frame::Bulk(next.to_string().into_bytes()),
+        Frame::Array(keys.into_iter().map(Frame::Bulk).collect()),
+    ])
 }
 
 /// Drives every future to completion concurrently, and gathers the outputs in
@@ -1209,6 +1310,18 @@ const COMMANDS: &[(&[u8], Handler)] = &[
     (b"KEYS", |args, _| match args {
         [pattern] => Ok(Action::Unbatched(Unbatched::Keys(take(pattern)))),
         _ => Err(wrong_arity("keys")),
+    }),
+    (b"SCAN", |args, _| match args {
+        [cursor, options @ ..] => {
+            let cursor = parse_u64(cursor).ok_or_else(|| INVALID_CURSOR.to_owned())?;
+            let (pattern, count) = scan_options(options)?;
+            Ok(Action::Unbatched(Unbatched::Scan {
+                cursor,
+                pattern,
+                count,
+            }))
+        }
+        _ => Err(wrong_arity("scan")),
     }),
     (b"FLUSHDB", |args, _| match args {
         // Redis takes ASYNC and SYNC here. This server has one behaviour and
@@ -1535,6 +1648,56 @@ fn set_options(mut rest: &[Vec<u8>]) -> Result<(Option<Expiry>, Option<Cond>), S
         }
     }
     Ok((expiry, cond))
+}
+
+/// `SCAN`'s options: `MATCH <glob>` and `COUNT <n>`, in either order.
+///
+/// A repeated option takes the last occurrence, as Redis does — the same rule
+/// `SET` follows. `COUNT` must be positive: Redis answers a syntax error for
+/// zero and for a negative, which is a different failure from a `COUNT` that
+/// is not a number at all, and clients distinguish them. What it asks for is
+/// then bounded by [`WALK_STEP_BUCKETS`], which states why.
+fn scan_options(mut rest: &[Vec<u8>]) -> Result<(Option<Vec<u8>>, usize), String> {
+    let mut pattern = None;
+    let mut count = SCAN_DEFAULT_COUNT;
+    while let Some((option, tail)) = rest.split_first() {
+        let (value, after) = tail.split_first().ok_or_else(|| SYNTAX_ERROR.to_owned())?;
+        if option.eq_ignore_ascii_case(b"MATCH") {
+            pattern = Some(value.clone());
+        } else if option.eq_ignore_ascii_case(b"COUNT") {
+            let n =
+                parse_i64(value).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
+            if n <= 0 {
+                return Err(SYNTAX_ERROR.to_owned());
+            }
+            count = usize::try_from(n)
+                .unwrap_or(WALK_STEP_BUCKETS)
+                .min(WALK_STEP_BUCKETS);
+        } else {
+            return Err(SYNTAX_ERROR.to_owned());
+        }
+        rest = after;
+    }
+    Ok((pattern, count))
+}
+
+/// Parses the canonical decimal spelling of a `u64`.
+///
+/// A cursor is not a number a person typed: it is one this server issued and
+/// the client handed straight back, and this server issues what
+/// `u64::to_string` prints. So that spelling is the only one accepted — no
+/// sign, no whitespace, no leading zeros — and anything else is a cursor this
+/// server did not issue, which is what [`INVALID_CURSOR`] says.
+fn parse_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if bytes[0] == b'0' && bytes.len() > 1 {
+        return None;
+    }
+    // Verified ASCII above, so this is valid UTF-8; checked rather than
+    // asserted, so a bug in the validation is a `None` and never a panic.
+    std::str::from_utf8(bytes).ok()?.parse::<u64>().ok()
 }
 
 /// What an expiry option decides about the span that follows it.
@@ -1991,7 +2154,7 @@ mod tests {
         assert!(matches!(&frames[2000], Frame::Array(a) if a.len() == 2000));
 
         let steps = router.steps.lock().expect("steps mutex").len();
-        // 2000 keys over a table walked KEYS_STEP_BUCKETS at a time cannot be
+        // 2000 keys over a table walked WALK_STEP_BUCKETS at a time cannot be
         // one envelope. The assertion is deliberately `> 1` and not an exact
         // count: how many buckets 2000 keys occupy is the dict's business and
         // may change, while "more than one envelope" is the property.
@@ -2042,6 +2205,202 @@ mod tests {
             let (_shard, internal) = unpack_cursor(raw);
             assert!(internal < (1 << CURSOR_INTERNAL_BITS));
         }
+    }
+
+    /// A walk driven the way a client drives it: from `0`, following the
+    /// cursor the server hands back, until it is `0` again.
+    #[tokio::test]
+    async fn a_full_scan_returns_every_key_and_ends_at_zero() {
+        const SHARDS: u16 = 4;
+        let (mut r, mut w, _pool) = connected(SHARDS);
+        let mut out = Vec::new();
+        for i in 0..300u32 {
+            encode(&req(&["SET", &format!("s-{i}"), "v"]), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let _ = read_frames(&mut r, 300).await;
+
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut cursor = String::from("0");
+        let mut calls = 0;
+        loop {
+            let mut out = Vec::new();
+            encode(&req(&["SCAN", &cursor, "COUNT", "16"]), &mut out);
+            w.write_all(&out).await.unwrap();
+            w.flush().await.unwrap();
+            let frames = read_frames(&mut r, 1).await;
+            let Frame::Array(pair) = &frames[0] else {
+                panic!("SCAN must answer a two-element array, got {:?}", frames[0]);
+            };
+            assert_eq!(pair.len(), 2);
+            let Frame::Bulk(next) = &pair[0] else {
+                panic!("the cursor must be a bulk string");
+            };
+            let Frame::Array(keys) = &pair[1] else {
+                panic!("the keys must be an array");
+            };
+            for key in keys {
+                let Frame::Bulk(k) = key else {
+                    panic!("keys are bulk strings")
+                };
+                seen.push(k.clone());
+            }
+            cursor = String::from_utf8(next.clone()).unwrap();
+            calls += 1;
+            assert!(calls < 500, "the walk did not terminate");
+            if cursor == "0" {
+                break;
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 300);
+        // Every shard costs at least one call, so a walk that took exactly
+        // one per shard would prove only that the fan-out ran. Anything above
+        // that is a shard resumed mid-table, which is the part that needs the
+        // cursor to mean something.
+        assert!(
+            calls > usize::from(SHARDS),
+            "{calls} calls over {SHARDS} shards: no shard was ever resumed mid-table"
+        );
+    }
+
+    /// `MATCH` filters, and it filters on the shard rather than at the edge —
+    /// what this asserts is only that the client sees the filtered set.
+    #[tokio::test]
+    async fn a_scan_with_match_returns_only_the_keys_that_match() {
+        let (mut r, mut w, _pool) = connected(8);
+        let mut out = Vec::new();
+        for i in 0..40u32 {
+            encode(&req(&["SET", &format!("wanted-{i}"), "v"]), &mut out);
+            encode(&req(&["SET", &format!("other-{i}"), "v"]), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let _ = read_frames(&mut r, 80).await;
+
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut cursor = String::from("0");
+        loop {
+            let mut out = Vec::new();
+            encode(&req(&["SCAN", &cursor, "MATCH", "wanted-*"]), &mut out);
+            w.write_all(&out).await.unwrap();
+            w.flush().await.unwrap();
+            let frames = read_frames(&mut r, 1).await;
+            let Frame::Array(pair) = &frames[0] else {
+                panic!("SCAN must answer a two-element array, got {:?}", frames[0]);
+            };
+            let (Frame::Bulk(next), Frame::Array(keys)) = (&pair[0], &pair[1]) else {
+                panic!("SCAN answers a bulk cursor and an array of keys");
+            };
+            for key in keys {
+                let Frame::Bulk(k) = key else {
+                    panic!("keys are bulk strings")
+                };
+                assert!(
+                    k.starts_with(b"wanted-"),
+                    "MATCH let through {}",
+                    String::from_utf8_lossy(k)
+                );
+                seen.push(k.clone());
+            }
+            cursor = String::from_utf8(next.clone()).unwrap();
+            if cursor == "0" {
+                break;
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 40, "MATCH lost a key it should have returned");
+    }
+
+    #[tokio::test]
+    async fn scan_rejects_what_it_cannot_read_and_answers_what_it_can() {
+        let (mut r, mut w, _pool) = connected(16);
+        let requests: [&[&str]; 7] = [
+            &["SCAN"],
+            &["SCAN", "notanumber"],
+            &["SCAN", "0", "COUNT", "0"],
+            &["SCAN", "0", "COUNT", "-1"],
+            &["SCAN", "0", "COUNT", "notanumber"],
+            &["SCAN", "0", "NOSUCHOPTION", "x"],
+            &["SCAN", "0", "MATCH"],
+        ];
+        let mut out = Vec::new();
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        assert!(matches!(&frames[0], Frame::Error(e) if e.contains("wrong number of arguments")));
+        assert!(matches!(&frames[1], Frame::Error(e) if e.contains("invalid cursor")));
+        assert!(matches!(&frames[2], Frame::Error(e) if e.contains("syntax error")));
+        assert!(matches!(&frames[3], Frame::Error(e) if e.contains("syntax error")));
+        assert!(matches!(&frames[4], Frame::Error(e) if e.contains("not an integer")));
+        assert!(matches!(&frames[5], Frame::Error(e) if e.contains("syntax error")));
+        assert!(matches!(&frames[6], Frame::Error(e) if e.contains("syntax error")));
+    }
+
+    #[tokio::test]
+    async fn a_cursor_naming_a_shard_that_does_not_exist_is_refused_not_ignored() {
+        let (mut r, mut w, _pool) = connected(16);
+        let mut out = Vec::new();
+        // Shard 60000 of a pool that has far fewer.
+        encode(
+            &req(&["SCAN", &pack_cursor(60000, 0).to_string()]),
+            &mut out,
+        );
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 1).await;
+        assert!(matches!(&frames[0], Frame::Error(e) if e.contains("invalid cursor")));
+    }
+
+    /// The two rules `scan_options` carries that the wire tests cannot see:
+    /// a repeated option is its last occurrence, and a `COUNT` from the wire
+    /// is a request for work that this server bounds.
+    ///
+    /// The bound is the point. `COUNT` is a client's hint everywhere else and
+    /// a shard's occupancy here: a step honoured literally at `u64::MAX` walks
+    /// a whole cycle inside one envelope and holds the shard for it, which is
+    /// the one thing the step primitive exists to prevent. A clamped walk
+    /// still returns every key — it just takes the round trips the server's
+    /// step size implies rather than the ones the client asked for.
+    #[test]
+    fn scan_options_take_the_last_occurrence_and_bound_the_step() {
+        let opts = |parts: &[&str]| -> (Option<Vec<u8>>, usize) {
+            let owned: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+            scan_options(&owned).expect("these options parse")
+        };
+
+        assert_eq!(opts(&[]), (None, SCAN_DEFAULT_COUNT));
+        assert_eq!(opts(&["COUNT", "7"]).1, 7);
+        assert_eq!(
+            opts(&["MATCH", "a*", "MATCH", "b*"]).0,
+            Some(b"b*".to_vec()),
+            "a repeated option is its last occurrence, as SET's are"
+        );
+
+        assert_eq!(
+            opts(&["COUNT", &i64::MAX.to_string()]).1,
+            WALK_STEP_BUCKETS,
+            "a COUNT past the step ceiling must be clamped to it"
+        );
+        assert_eq!(
+            opts(&["COUNT", &WALK_STEP_BUCKETS.to_string()]).1,
+            WALK_STEP_BUCKETS
+        );
+        // Past what an i64 spells is not a large COUNT, it is not a number —
+        // the same answer Redis gives, and a different one from a COUNT of
+        // zero.
+        let owned = vec![b"COUNT".to_vec(), u64::MAX.to_string().into_bytes()];
+        assert_eq!(
+            scan_options(&owned),
+            Err(ReplyError::NotAnInteger.wire_text().to_owned())
+        );
     }
 
     /// A step that reaches [`Router::dispatch`] instead of `dispatch_at` is
