@@ -1170,6 +1170,54 @@ mod tests {
     }
 
     #[test]
+    fn a_cursor_cycle_visits_every_bucket_exactly_once_and_ends_at_zero() {
+        // Every mask width small enough to enumerate, which is not the same as
+        // every width a dict reaches: a table starts at `INITIAL_BUCKETS` and
+        // only ever doubles, so the first few widths here are unreachable and
+        // there is no ceiling at the last one. That mismatch is the point. The
+        // claim is about the arithmetic, and the arithmetic does not know how
+        // big the table is beyond its mask.
+        //
+        // What it does not claim: a cursor that counted plainly in binary order
+        // satisfies every assertion below, because over a mask that never
+        // changes plain counting also lands on each bucket once and wraps to 0.
+        // The property the reverse increment exists for is ordering under a
+        // mask that grows mid-cycle, and that is
+        // `a_cycle_under_continuous_growth_converges_instead_of_chasing_the_table`.
+        for power in 0..12u32 {
+            let buckets = 1usize << power;
+            let mask = u64::try_from(buckets).expect("a bucket count is a usize") - 1;
+            let mut seen = vec![0u32; buckets];
+            let mut cursor = 0u64;
+            let mut steps = 0usize;
+            loop {
+                let index =
+                    usize::try_from(cursor & mask).expect("a masked cursor fits a bucket index");
+                seen[index] += 1;
+                cursor = reverse_increment(cursor, mask);
+                steps += 1;
+                // A guard rather than an acceptance criterion — the criterion
+                // is the `assert_eq!` below. Without it, an increment whose
+                // cycle never closes would spin here rather than report itself.
+                assert!(
+                    steps <= buckets,
+                    "a cycle over {buckets} buckets took {steps} steps without closing"
+                );
+                if cursor == 0 {
+                    break;
+                }
+            }
+            assert_eq!(steps, buckets, "cycle length for {buckets} buckets");
+            for (bucket, &visits) in seen.iter().enumerate() {
+                assert_eq!(
+                    visits, 1,
+                    "bucket {bucket} of {buckets} was visited {visits} times"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_cycle_spanning_the_end_of_a_rehash_still_sees_every_stable_key() {
         use std::collections::BTreeSet;
 
