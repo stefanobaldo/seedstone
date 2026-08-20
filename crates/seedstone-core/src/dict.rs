@@ -277,6 +277,26 @@ impl Dict {
         removed
     }
 
+    /// Drops every entry, leaving the dict as [`with_seed`](Dict::with_seed)
+    /// built it.
+    ///
+    /// The seed survives and nothing else does: the same key placed again
+    /// lands in the same bucket it always did, which is what keeps a replayed
+    /// run identical across a flush. The table goes back to
+    /// [`INITIAL_BUCKETS`] rather than keeping the capacity it had earned, and
+    /// an in-flight rehash is abandoned — a dict that has just been emptied
+    /// costing close to nothing is the whole point of the operation, and the
+    /// growth path is there to earn the capacity back.
+    ///
+    /// A scan cursor held elsewhere is not invalidated by this. It is a
+    /// position in a cycle, not a pointer: a walk resuming from one after a
+    /// flush starts partway through a table that is empty, which
+    /// [`scan`](Dict::scan) ends immediately, exactly as it does for any other
+    /// emptied keyspace.
+    pub fn clear(&mut self) {
+        *self = Self::with_seed(self.seed);
+    }
+
     /// Number of entries, counting both tables while a rehash is in flight.
     #[must_use]
     pub const fn len(&self) -> usize {

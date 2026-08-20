@@ -342,6 +342,9 @@ enum Action {
     /// integer — see [`fan_out`], which also states what the split costs in
     /// atomicity.
     FanOut(Vec<Command>),
+    /// A request naming no key at all: it reaches every shard and the answers
+    /// are folded into one reply — see [`broadcast`].
+    DispatchEvery(Command),
     /// Answer with this frame; the connection continues.
     Reply(Frame),
     /// Answer with this frame, then hang up.
@@ -499,6 +502,18 @@ async fn serve_connection_limited<S, R>(
                             return;
                         }
                         slots.push(Slot::Ready(fan_out(&router, cmds).await));
+                    }
+                    Action::DispatchEvery(cmd) => {
+                        // The chunk closes first, for the reason a fan-out
+                        // closes it: a `FLUSHDB` the peer pipelined behind a
+                        // `SET` must run behind it, and a keyspace-wide
+                        // command dispatched while a batch waits would empty
+                        // the keyspace in front of the writes that filled it.
+                        if !emit_chunk(&mut stream, &mut out, &router, &mut slots, &mut batch).await
+                        {
+                            return;
+                        }
+                        slots.push(Slot::Ready(broadcast(&router, cmd).await));
                     }
                     Action::Reply(frame) => slots.push(Slot::Ready(frame)),
                     Action::ReplyThenClose(frame) => {
@@ -806,6 +821,26 @@ fn reply_to_frame(reply: Reply) -> Frame {
 /// A shard that answers with an error ends the fan-out and that error is the
 /// reply. A partial count reported as a total would be worse than a refusal:
 /// the peer cannot tell the two apart.
+/// Runs one keyspace-wide command on every shard and folds the answers into
+/// the single frame the peer sees.
+///
+/// **An error from any shard wins.** A keyspace-wide command that reached most
+/// of the keyspace has not done what it was asked, and answering from the part
+/// that worked would tell the peer something less true than the failure does.
+///
+/// The shards that succeeded are not rolled back, and cannot be: this layer
+/// has no transaction to unwind and each shard has already applied what it
+/// applied. So the error means "not everywhere", not "nowhere" — which is the
+/// same thing a fan-out's error means, and for the same reason.
+async fn broadcast<R: Router>(router: &R, cmd: Command) -> Frame {
+    for reply in router.dispatch_every(cmd).await {
+        if matches!(reply, Reply::Error(_)) {
+            return reply_to_frame(reply);
+        }
+    }
+    Frame::Simple("OK".into())
+}
+
 async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>) -> Frame {
     let mut total: i64 = 0;
     for cmd in cmds {
@@ -959,6 +994,13 @@ const COMMANDS: &[(&[u8], Handler)] = &[
             }))
         }
         _ => Err(wrong_arity("incrby")),
+    }),
+    // Keyspace-wide: no key to route on, but every shard has to hear it.
+    (b"FLUSHDB", |args, _| match args {
+        // Redis takes ASYNC and SYNC here. This server has one behaviour and
+        // saying so plainly beats accepting a word it would then ignore.
+        [] => Ok(Action::DispatchEvery(Command::FlushDb)),
+        _ => Err(wrong_arity("flushdb")),
     }),
     // From here down: the connection's own business, answered without a shard
     // ever hearing of it, because there is no key to route on.
@@ -1523,6 +1565,54 @@ mod tests {
         for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
             assert_eq!(got, want, "request {i}: {:?}", requests[i]);
         }
+    }
+
+    /// `FLUSHDB` reaches every shard, and the keyspace is empty afterwards.
+    ///
+    /// Sixteen shards against two keys on purpose: the keys land on at most
+    /// two of them, so a `FLUSHDB` that emptied only the shard it happened to
+    /// be routed to would still answer `+OK` and would still be caught here by
+    /// one of the two `GET`s.
+    #[tokio::test]
+    async fn flushdb_empties_every_shard_and_answers_ok() {
+        let (mut r, mut w, _pool) = connected(16);
+        let requests: [&[&str]; 5] = [
+            &["SET", "a", "1"],
+            &["SET", "b", "2"],
+            &["FLUSHDB"],
+            &["GET", "a"],
+            &["GET", "b"],
+        ];
+        let mut out = Vec::new();
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        let expected: [Frame; 5] = [
+            Frame::Simple("OK".into()),
+            Frame::Simple("OK".into()),
+            Frame::Simple("OK".into()),
+            Frame::Null,
+            Frame::Null,
+        ];
+        assert_eq!(frames, expected);
+    }
+
+    /// Redis takes `ASYNC` and `SYNC` here; this server takes neither, and an
+    /// arity error is how it says so.
+    #[tokio::test]
+    async fn flushdb_takes_no_arguments() {
+        let (mut r, mut w, _pool) = connected(4);
+        let mut out = Vec::new();
+        encode(&req(&["FLUSHDB", "ASYNC"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 1).await;
+        assert_eq!(frames[0], Frame::Error(wrong_arity("flushdb")));
     }
 
     /// `DEL` and `EXISTS` name any number of keys, and answer with one integer
