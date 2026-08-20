@@ -226,6 +226,11 @@ pub enum Command {
         /// The key to ask about.
         key: Vec<u8>,
     },
+    /// Report how many keys the shard holds.
+    ///
+    /// Keyspace-wide: one of these reaches every shard, and the edge sums the
+    /// answers.
+    DbSize,
 }
 
 /// How a command reaches the shards that must run it.
@@ -265,15 +270,18 @@ impl Command {
             | Self::Expire { key, .. }
             | Self::Ttl { key }
             | Self::Exists { key } => Route::Key(key),
+            Self::DbSize => Route::Every,
         }
     }
 
     /// A stable one-byte tag for this command's variant.
     ///
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
-    /// `Exists` = 7. These values are folded into the simulator's trace hash,
-    /// so they are part of what a replay compares: changing one changes every
-    /// recorded hash.
+    /// `Exists` = 7, `DbSize` = 9. These values are folded into the
+    /// simulator's trace hash, so they are part of what a replay compares:
+    /// changing one changes every recorded hash. A tag is therefore never
+    /// reused and never renumbered — 8 belongs to a command that is not here
+    /// yet.
     #[must_use]
     pub const fn kind(&self) -> u8 {
         match self {
@@ -284,6 +292,7 @@ impl Command {
             Self::Expire { .. } => 5,
             Self::Ttl { .. } => 6,
             Self::Exists { .. } => 7,
+            Self::DbSize => 9,
         }
     }
 }
@@ -444,6 +453,23 @@ pub trait Router: Clone + Send + Sync + 'static {
             replies
         }
     }
+
+    /// Routes `cmd` to every shard and resolves to one reply per shard, in
+    /// shard order.
+    ///
+    /// The order is fixed rather than arrival order, for the reason
+    /// [`dispatch_many`](Router::dispatch_many) gathers by index: an order
+    /// that varied between two runs of one seed would be non-determinism
+    /// introduced by the router itself.
+    ///
+    /// Deliberately without a default body — every implementor must answer
+    /// it. A router that silently did not broadcast would answer a
+    /// keyspace-wide command from one shard and look correct.
+    ///
+    /// # Cancellation
+    ///
+    /// [`dispatch`](Router::dispatch)'s warning applies to every shard.
+    fn dispatch_every(&self, cmd: Command) -> impl Future<Output = Vec<Reply>> + Send;
 }
 
 /// A set of executor tasks, the virtual shards they host, and the inboxes
@@ -760,6 +786,57 @@ impl Router for ShardPool {
                         .unwrap_or(Reply::Error(ReplyError::ShardUnavailable))
                 })
                 .collect()
+        }
+    }
+
+    fn dispatch_every(&self, cmd: Command) -> impl Future<Output = Vec<Reply>> + Send {
+        let shards = self.shards;
+        let executors = usize::from(self.executors);
+        // One bucket per executor, each carrying that executor's shards in
+        // ascending order, so a bucket's replies come back in shard order and
+        // the gather below is a concatenation rather than a sort.
+        let mut buckets: Vec<Vec<(u16, Command)>> = Vec::new();
+        buckets.resize_with(executors, Vec::new);
+        for shard in 0..shards {
+            let executor = usize::from(executor_of(shard, shards, self.executors));
+            buckets[executor].push((shard, cmd.clone()));
+        }
+
+        // Scattered at call time, for the reason `dispatch_many` scatters at
+        // call time: an executor starts on its shards while the others are
+        // still being sent.
+        let mut pending: Vec<Option<oneshot::Receiver<Vec<Reply>>>> =
+            std::iter::repeat_with(|| None).take(executors).collect();
+        for (executor, cmds) in buckets.into_iter().enumerate() {
+            if cmds.is_empty() {
+                continue;
+            }
+            let (tx, rx) = oneshot::channel();
+            if self.inboxes[executor]
+                .send(Envelope { cmds, reply: tx })
+                .is_ok()
+            {
+                pending[executor] = Some(rx);
+            }
+        }
+
+        async move {
+            let mut replies = Vec::with_capacity(usize::from(shards));
+            for rx in pending.into_iter().flatten() {
+                match rx.await {
+                    Ok(answers) => replies.extend(answers),
+                    Err(_) => replies.push(Reply::Error(ReplyError::ShardUnavailable)),
+                }
+            }
+            // Executors own contiguous ascending shard ranges, so concatenating
+            // their answers in executor order is shard order. A short answer
+            // means an executor died mid-flight; pad rather than return a
+            // length the caller cannot interpret.
+            replies.resize(
+                usize::from(shards),
+                Reply::Error(ReplyError::ShardUnavailable),
+            );
+            replies
         }
     }
 }
@@ -1079,6 +1156,13 @@ fn apply<L: ReplicationLog, P: ExpiryPolicy>(
         },
 
         Command::Exists { key } => Reply::Integer(i64::from(dict.get(key).is_some())),
+
+        // The count includes keys whose deadline has passed but which the
+        // sweep has not reached, exactly as Redis's does. Making this walk the
+        // dict to exclude them would turn an `O(1)` call into an
+        // `O(keyspace)` one, to report a number that is stale the instant it
+        // is computed.
+        Command::DbSize => Reply::Integer(i64::try_from(dict.len()).unwrap_or(i64::MAX)),
     }
 }
 
@@ -2185,6 +2269,38 @@ mod tests {
         }
     }
 
+    /// A key that hashes to `shard`, found by search — the seed is fixed, so
+    /// the search is deterministic and the test does not depend on which key
+    /// it finds.
+    ///
+    /// The search is bounded rather than open-ended: an unbounded one would
+    /// hang forever on the day `shard_of` stopped reaching some shard, which
+    /// is precisely the bug a caller is using this to rule out.
+    fn key_landing_on(shard: u16, shards: u16) -> Vec<u8> {
+        (0u32..10_000)
+            .map(|n| format!("probe-{n}").into_bytes())
+            .find(|k| shard_of(k, shards) == shard)
+            .expect("ten thousand probes reach every shard of a small pool")
+    }
+
+    #[tokio::test]
+    async fn a_broadcast_is_answered_once_per_shard_in_shard_order() {
+        let pool = ShardPool::spawn(8, 4, DictSeed { k0: 1, k1: 1 }, NoTrace);
+        for i in 0..8u16 {
+            let key = key_landing_on(i, 8);
+            pool.dispatch(Command::Set {
+                key,
+                value: b"v".to_vec(),
+                expiry: None,
+                cond: None,
+            })
+            .await;
+        }
+        let replies = pool.dispatch_every(Command::DbSize).await;
+        assert_eq!(replies.len(), 8);
+        assert!(replies.iter().all(|r| *r == Reply::Integer(1)));
+    }
+
     #[tokio::test]
     async fn an_empty_batch_answers_immediately_with_nothing() {
         let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 1 }, NoTrace);
@@ -2203,6 +2319,10 @@ mod tests {
                     Route::Key(key) => Reply::Bulk(Some(key.to_vec())),
                     Route::Shard(_) | Route::Every => Reply::Ok,
                 }
+            }
+            /// This router hosts no shards, so a broadcast reaches nothing.
+            async fn dispatch_every(&self, _cmd: Command) -> Vec<Reply> {
+                Vec::new()
             }
         }
         let replies = Echo

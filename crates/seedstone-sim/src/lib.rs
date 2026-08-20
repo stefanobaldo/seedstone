@@ -753,6 +753,12 @@ impl Router for PlantedRouter {
     async fn dispatch(&self, cmd: Command) -> Reply {
         self.lose_updates(cmd).await
     }
+
+    /// Passed straight through: the plant is a defect between two messages of
+    /// one keyed command, and a broadcast is neither.
+    async fn dispatch_every(&self, cmd: Command) -> Vec<Reply> {
+        self.pool.dispatch_every(cmd).await
+    }
 }
 
 impl PlantedRouter {
