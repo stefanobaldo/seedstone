@@ -101,7 +101,7 @@
 
 use rand::rngs::ChaCha8Rng;
 use rand::{RngExt, SeedableRng};
-use seedstone_core::dict::DictSeed;
+use seedstone_core::dict::{DictSeed, WalkOrder};
 // The two error texts are imported, not copied. The planted router has to be
 // indistinguishable from the honest one except in its atomicity, and these
 // strings enter the trace hash — a private copy that drifted would make a
@@ -798,6 +798,8 @@ fn fold_reply(h: u64, reply: &Reply) -> u64 {
 #[derive(Clone, Copy)]
 struct ServeExpired;
 
+impl WalkOrder for ServeExpired {}
+
 impl ExpiryPolicy for ServeExpired {
     fn due_on_read(&self, _expires_at: Option<Instant>, _now: Instant) -> bool {
         false
@@ -818,6 +820,8 @@ impl ExpiryPolicy for ServeExpired {
 /// plant that broke both would not tell the two invariants apart.
 #[derive(Clone, Copy)]
 struct SweepEatsAll;
+
+impl WalkOrder for SweepEatsAll {}
 
 impl ExpiryPolicy for SweepEatsAll {
     fn due_on_read(&self, expires_at: Option<Instant>, now: Instant) -> bool {
@@ -959,10 +963,10 @@ async fn server(
 ) -> turmoil::Result {
     let pool = match planted {
         Some(Plant::ServeExpired) => {
-            ShardPool::spawn_with_expiry(shards, executors, seed, sink, ServeExpired)
+            ShardPool::spawn_with_policy(shards, executors, seed, sink, ServeExpired)
         }
         Some(Plant::SweepEatsAll) => {
-            ShardPool::spawn_with_expiry(shards, executors, seed, sink, SweepEatsAll)
+            ShardPool::spawn_with_policy(shards, executors, seed, sink, SweepEatsAll)
         }
         // The honest pool, and the lost-update plant's too: that defect lives
         // above the shard, where a real one would.

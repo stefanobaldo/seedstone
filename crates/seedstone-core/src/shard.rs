@@ -30,7 +30,7 @@
 //! *above* the shard, in code that sends two messages with an `await` between
 //! them. The simulator plants exactly that race.
 
-use crate::dict::{Dict, DictSeed, Entry};
+use crate::dict::{Dict, DictSeed, Entry, WalkOrder};
 use crate::glob;
 use crate::log::{NoopLog, Record, ReplicationLog};
 use crate::slot::{executor_of, shard_of};
@@ -564,6 +564,26 @@ impl ExpiryPolicy for Deadlines {
     }
 }
 
+impl WalkOrder for Deadlines {}
+
+/// Every decision a shard executor consults that production has exactly one
+/// answer for.
+///
+/// Two so far — when a deadline comes due, and how a walk's cursor advances —
+/// and they travel together because they are held by the same thing for the
+/// same span: one value, handed to [`ShardPool::spawn_with_policy`] and kept
+/// for the life of the executor. Splitting them into two parameters would
+/// double a generic that already reaches from the pool's constructor to the
+/// dict, and buy nothing: a caller supplying one always has an answer for the
+/// other, and the honest answer is a unit struct.
+///
+/// Blanket-implemented, so nothing implements this directly: a type that
+/// answers both questions is a shard policy, and there is no second thing to
+/// remember to do.
+pub trait ShardPolicy: ExpiryPolicy + WalkOrder {}
+
+impl<T: ExpiryPolicy + WalkOrder> ShardPolicy for T {}
+
 /// Anything that can answer a [`Command`].
 ///
 /// The service layer is generic over this so a test, the simulator, or a
@@ -734,26 +754,27 @@ impl ShardPool {
         Self::spawn_full(shards, executors, seed, trace, make_log, Deadlines)
     }
 
-    /// [`spawn`](ShardPool::spawn) with the expiry decision supplied.
+    /// [`spawn`](ShardPool::spawn) with the executor's own decisions supplied.
     ///
     /// Callers are the simulator and this crate's own tests; no production
-    /// path names it. See [`ExpiryPolicy`] for why the seam exists.
+    /// path names it. See [`ShardPolicy`] for what the value decides and
+    /// [`ExpiryPolicy`] for why the seam exists at all.
     ///
     /// # Panics
     ///
     /// If `shards` is zero, or if `executors` is not in `1..=shards`.
-    pub fn spawn_with_expiry<T, P>(
+    pub fn spawn_with_policy<T, P>(
         shards: u16,
         executors: u16,
         seed: DictSeed,
         trace: T,
-        expiry: P,
+        policy: P,
     ) -> Self
     where
         T: TraceSink,
-        P: ExpiryPolicy,
+        P: ShardPolicy,
     {
-        Self::spawn_full(shards, executors, seed, trace, |_shard| NoopLog, expiry)
+        Self::spawn_full(shards, executors, seed, trace, |_shard| NoopLog, policy)
     }
 
     /// The one constructor with every seam exposed; the three public ones are
@@ -771,13 +792,13 @@ impl ShardPool {
         seed: DictSeed,
         trace: T,
         make_log: F,
-        expiry: P,
+        policy: P,
     ) -> Self
     where
         T: TraceSink,
         L: ReplicationLog,
         F: Fn(u16) -> L,
-        P: ExpiryPolicy,
+        P: ShardPolicy,
     {
         assert!(
             shards > 0,
@@ -817,7 +838,7 @@ impl ShardPool {
                             first_shard,
                             states,
                             trace.clone(),
-                            expiry.clone(),
+                            policy.clone(),
                         ));
                     }
                     pending = Some((shard, vec![state]));
@@ -825,7 +846,7 @@ impl ShardPool {
             }
         }
         if let Some((first_shard, states)) = pending {
-            inboxes.push(spawn_executor(first_shard, states, trace, expiry));
+            inboxes.push(spawn_executor(first_shard, states, trace, policy));
         }
 
         Self {
@@ -909,14 +930,14 @@ async fn one_reply(pending: Option<oneshot::Receiver<Vec<Reply>>>) -> Reply {
 }
 
 /// Spawns one executor task and returns the inbox that reaches it.
-fn spawn_executor<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
+fn spawn_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
     first_shard: u16,
     states: Vec<ShardState<L>>,
     trace: T,
-    expiry: P,
+    policy: P,
 ) -> mpsc::UnboundedSender<Envelope> {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_executor(first_shard, states, trace, expiry, rx));
+    tokio::spawn(run_executor(first_shard, states, trace, policy, rx));
     tx
 }
 
@@ -1092,11 +1113,11 @@ struct ShardState<L> {
 ///
 /// Returns when the inbox closes, which happens once the last [`ShardPool`]
 /// handle is dropped.
-async fn run_executor<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
+async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
     first_shard: u16,
     mut states: Vec<ShardState<L>>,
     trace: T,
-    expiry: P,
+    policy: P,
     mut inbox: mpsc::UnboundedReceiver<Envelope>,
 ) {
     let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
@@ -1165,7 +1186,7 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
                         *shard,
                         cmd,
                         now,
-                        &expiry,
+                        &policy,
                     );
                     trace.record(*shard, at, cmd, &answer);
                     replies.push(answer);
@@ -1190,7 +1211,7 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
                     // fit the `u16` a shard id is.
                     let shard = first_shard
                         + u16::try_from(offset).expect("a shard range is shorter than u16::MAX");
-                    sweep_expired(state, shard, &trace, now, &expiry);
+                    sweep_expired(state, shard, &trace, now, &policy);
                     // The durability point, and the only place in a shard that
                     // can afford to be one: `append` runs inside a handler that
                     // cannot `await`, so it must stay cheap, while this arm is
@@ -1294,14 +1315,14 @@ fn sweep_expired<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
 /// a pass rather than a search. The helpers that belong to no single arm —
 /// [`evict_if_expired`], [`deadline`], [`remaining_seconds`], [`append`] —
 /// follow those handlers as their own group.
-fn apply<L: ReplicationLog, P: ExpiryPolicy>(
+fn apply<L: ReplicationLog, P: ShardPolicy>(
     dict: &mut Dict,
     log: &mut L,
     seq: &mut u64,
     shard: u16,
     cmd: &mut Command,
     now: Instant,
-    expiry: &P,
+    policy: &P,
 ) -> Reply {
     // Lazy expiry, once, before any arm has looked at the key. Here rather
     // than in each arm on purpose: it makes "an expired key is dead to every
@@ -1314,7 +1335,7 @@ fn apply<L: ReplicationLog, P: ExpiryPolicy>(
     // rather than an entry, so there is no single key whose deadline it could
     // be meeting.
     if let Route::Key(key) = cmd.route()
-        && let Err(failed) = evict_if_expired(dict, log, seq, shard, key, now, expiry)
+        && let Err(failed) = evict_if_expired(dict, log, seq, shard, key, now, policy)
     {
         return failed;
     }
@@ -1431,7 +1452,7 @@ fn apply<L: ReplicationLog, P: ExpiryPolicy>(
             cursor,
             count,
             pattern,
-        } => scan_step(dict, *cursor, *count, pattern.as_deref(), now, expiry),
+        } => scan_step(dict, *cursor, *count, pattern.as_deref(), now, policy),
     }
 }
 
@@ -1640,13 +1661,13 @@ fn flush_db<L: ReplicationLog>(dict: &mut Dict, log: &mut L, seq: &mut u64, shar
 /// takes `&Dict`, appends no log record and consumes no replication position.
 /// That is what makes a step safe to interleave with anything — the shard is
 /// occupied for the length of one step and its state is unchanged by it.
-fn scan_step<P: ExpiryPolicy>(
+fn scan_step<P: ShardPolicy>(
     dict: &Dict,
     cursor: u64,
     count: usize,
     pattern: Option<&[u8]>,
     now: Instant,
-    expiry: &P,
+    policy: &P,
 ) -> Reply {
     let mut keys = Vec::new();
     let mut next = cursor;
@@ -1654,11 +1675,11 @@ fn scan_step<P: ExpiryPolicy>(
     // none would hand back the cursor it was given, and a caller looping until
     // the cursor returns to zero would never leave.
     for _ in 0..count.max(1) {
-        next = dict.scan(next, |key, entry| {
+        next = dict.scan_in_order(next, policy, |key, entry| {
             // A key whose deadline has passed is not in the keyspace, even
             // though the sweep has not reached it. Reporting it would make a
             // walk contradict the `GET` that follows it.
-            if expiry.due_on_read(entry.expires_at, now) {
+            if policy.due_on_read(entry.expires_at, now) {
                 return;
             }
             if pattern.is_none_or(|p| glob::matches(p, key)) {
@@ -2351,7 +2372,7 @@ mod tests {
     async fn the_sink_sees_the_position_an_expiry_consumed() {
         let sink = Recorder::default();
         let pool =
-            ShardPool::spawn_with_expiry(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone(), NoSweep);
+            ShardPool::spawn_with_policy(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone(), NoSweep);
 
         pool.dispatch(set_ex(b"k", b"v", 1)).await;
         tokio::time::advance(Duration::from_secs(2)).await;
@@ -2399,7 +2420,7 @@ mod tests {
     async fn a_command_is_traced_where_its_effects_begin_not_where_its_record_landed() {
         let sink = Recorder::default();
         let pool =
-            ShardPool::spawn_with_expiry(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone(), NoSweep);
+            ShardPool::spawn_with_policy(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone(), NoSweep);
 
         pool.dispatch(set_ex(b"written", b"v", 1)).await;
         pool.dispatch(set_ex(b"counted", b"1", 1)).await;
@@ -3301,6 +3322,8 @@ mod tests {
     #[derive(Clone, Copy)]
     struct NeverDue;
 
+    impl WalkOrder for NeverDue {}
+
     impl ExpiryPolicy for NeverDue {
         fn due_on_read(&self, _expires_at: Option<Instant>, _now: Instant) -> bool {
             false
@@ -3321,6 +3344,8 @@ mod tests {
     #[derive(Clone, Copy)]
     struct NoSweep;
 
+    impl WalkOrder for NoSweep {}
+
     impl ExpiryPolicy for NoSweep {
         fn due_on_read(&self, expires_at: Option<Instant>, now: Instant) -> bool {
             Deadlines.due_on_read(expires_at, now)
@@ -3339,7 +3364,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_pool_spawned_with_a_policy_expires_by_that_policy() {
         let sink = Recorder::default();
-        let pool = ShardPool::spawn_with_expiry(1, 1, DictSeed { k0: 2, k1: 3 }, sink, NeverDue);
+        let pool = ShardPool::spawn_with_policy(1, 1, DictSeed { k0: 2, k1: 3 }, sink, NeverDue);
         assert_eq!(pool.dispatch(set_ex(b"k", b"v", 1)).await, Reply::Ok);
 
         // Past the deadline, and past enough housekeeping ticks for the sweep

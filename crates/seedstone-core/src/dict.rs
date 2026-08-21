@@ -415,7 +415,22 @@ impl Dict {
     /// and then every bucket of the larger table that bucket expands into,
     /// which is exactly the cursors sharing its low bits. The loop ends when
     /// the increment carries back into the bits the smaller mask covers.
-    pub fn scan<F: FnMut(&[u8], &Entry)>(&self, cursor: u64, mut visit: F) -> u64 {
+    pub fn scan<F: FnMut(&[u8], &Entry)>(&self, cursor: u64, visit: F) -> u64 {
+        self.scan_in_order(cursor, &ReverseBinary, visit)
+    }
+
+    /// [`scan`](Dict::scan), with the cursor's advance supplied.
+    ///
+    /// Every guarantee above is a property of [`ReverseBinary`], which is what
+    /// [`scan`](Dict::scan) passes and the only order this crate ships. See
+    /// [`WalkOrder`] for why the parameter exists at all; a caller that wants
+    /// the guarantees wants [`scan`](Dict::scan).
+    pub fn scan_in_order<O: WalkOrder, F: FnMut(&[u8], &Entry)>(
+        &self,
+        cursor: u64,
+        order: &O,
+        mut visit: F,
+    ) -> u64 {
         // Nothing to hand back and nothing to come back for. Redis does the
         // same, and it is what lets a caller sweep an empty keyspace in one
         // call instead of one per bucket. It cannot weaken the guarantee: if
@@ -427,7 +442,7 @@ impl Dict {
 
         let Some(new) = self.new.as_ref() else {
             visit_bucket(&self.old, cursor, &mut visit);
-            return reverse_increment(cursor, mask_of(&self.old));
+            return order.advance(cursor, mask_of(&self.old));
         };
 
         // `new` is allocated at exactly twice `old`, so `old` is always the
@@ -448,7 +463,7 @@ impl Dict {
         visit_bucket(&self.old, v, &mut visit);
         loop {
             visit_bucket(new, v, &mut visit);
-            v = reverse_increment(v, large);
+            v = order.advance(v, large);
             if v & (small ^ large) == 0 {
                 return v;
             }
@@ -608,6 +623,55 @@ fn visit_bucket<F: FnMut(&[u8], &Entry)>(table: &Table, cursor: u64, visit: &mut
 const fn reverse_increment(cursor: u64, mask: u64) -> u64 {
     let widened = cursor | !mask;
     widened.reverse_bits().wrapping_add(1).reverse_bits()
+}
+
+/// The order a keyspace walk's cursor advances in.
+///
+/// Production has exactly one answer, [`ReverseBinary`], and the parameter
+/// exists for the reason [`ExpiryPolicy`](crate::shard::ExpiryPolicy)'s does:
+/// so the simulator can serve its own workload through a cursor that is
+/// genuinely wrong, rather than through an imitation of what a wrong one would
+/// look like from outside. The advance is the whole of the walk's liveness
+/// argument — [`Dict::scan`] says why — so a defect planted here is the defect
+/// itself.
+///
+/// It is a trait rather than a function pointer so the honest order
+/// monomorphises and inlines back into the arithmetic it replaced, and it
+/// carries `Clone + Send + 'static` because a shard executor holds one for the
+/// life of the process.
+pub trait WalkOrder: Clone + Send + 'static {
+    /// The cursor a step starting at `cursor` hands back, under a table of
+    /// `mask + 1` buckets.
+    ///
+    /// A cycle must start at `0` and end by returning `0`, and every bucket
+    /// under `mask` must be reached before it does. Nothing checks that: it is
+    /// what [`Dict::scan`]'s contract rests on, and it is what an implementor
+    /// is claiming.
+    ///
+    /// Defaulted to the honest order, which is the opposite of what
+    /// [`ExpiryPolicy`](crate::shard::ExpiryPolicy) does with its three
+    /// questions — and deliberately. There, every answer is a real decision a
+    /// policy has to take a position on. Here there is exactly one correct
+    /// answer and a defect is the only reason to write another, so the default
+    /// is what keeps a policy that has no opinion about walks from having to
+    /// state one, and leaves the override readable as what it is.
+    fn advance(&self, cursor: u64, mask: u64) -> u64 {
+        ReverseBinary.advance(cursor, mask)
+    }
+}
+
+/// The honest order: reverse binary, as [`Dict::scan`] describes.
+///
+/// A zero-sized type, so a dict walked through it costs exactly what a dict
+/// walking itself did. The only implementation this crate ships, and the one
+/// [`Dict::scan`] uses.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReverseBinary;
+
+impl WalkOrder for ReverseBinary {
+    fn advance(&self, cursor: u64, mask: u64) -> u64 {
+        reverse_increment(cursor, mask)
+    }
 }
 
 /// Whether a chain element is `key`'s, given the hash `key` was looked up with.
