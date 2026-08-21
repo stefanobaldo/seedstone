@@ -110,10 +110,11 @@ jobs:
 
   # Every gate in the job above is this project judging itself: our tests, our
   # simulator, our reading of the protocol. This one is four programs nobody
-  # here wrote — three clients, and behind them a cache backend's own test
-  # suite — connecting the way they connect to Redis and accepting or
-  # rejecting the answers on their own terms. It is the only place where being
-  # wrong about the protocol shows up as a failure rather than as agreement.
+  # here wrote — `redis-cli`, `redis-benchmark`, a Python client and a Go
+  # client — and, behind them, a cache backend's own test suite: all of them
+  # connecting the way they connect to Redis and accepting or rejecting the
+  # answers on their own terms. It is the only place where being wrong about
+  # the protocol shows up as a failure rather than as agreement.
   #
   # A separate job, not more steps above: it needs a Python and a Go toolchain
   # the rest of the workflow has no use for, and its failures are a different

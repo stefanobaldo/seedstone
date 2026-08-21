@@ -327,12 +327,14 @@ pub enum Command {
 /// else. `SCAN` was the one command that would have named a shard outright;
 /// its shard comes out of a cursor a peer chose, so it reaches the router
 /// through [`Router::dispatch_at`] — an argument the caller has already
-/// checked — rather than out of the command. The variant is kept anyway,
-/// because it is folded into the simulator's trace hash under a tag of its
-/// own: removing it would move the tags beside it and every recorded trace
-/// hash with them. It costs two live arms — one in the shard pool's
-/// `shard_for`, one in the simulator's route fold — and it is the shape a
-/// genuinely shard-addressed command would arrive in.
+/// checked — rather than out of the command. The variant is kept anyway, and
+/// the reason is its tag in the simulator's route fold. Those tags are
+/// hand-written literals, so deleting the variant moves nothing by itself; it
+/// leaves a spent number in the middle of a short list, which is an invitation
+/// to close the gap, and a renumbering there changes every recorded trace
+/// hash. The variant is what keeps the number visibly taken. It costs two live
+/// arms — one in the shard pool's `shard_for`, one in the fold — and it is the
+/// shape a genuinely shard-addressed command would arrive in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route<'a> {
     /// The hash of this key decides the shard.
@@ -1274,15 +1276,24 @@ fn sweep_expired<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
 /// executor: a handler must not read a clock of its own, or two commands of
 /// one batch could disagree about which keys are still alive.
 ///
-/// **Every non-trivial arm is a named free function directly below, in match
-/// order.** An arm stays inline only while it is a line or two that reads as
-/// the command it serves; anything with a decision in it is extracted, and the
-/// extraction lands in the order the match dispatches so that reading the two
-/// side by side is one pass rather than a search. The helpers that belong to
-/// no single arm — [`evict_if_expired`], [`deadline`], [`remaining_seconds`],
-/// [`append`] — follow the arm handlers as their own group. This is what keeps
-/// the dispatcher a dispatcher as commands are added, rather than something
-/// the length lint eventually has to say out loud.
+/// **An arm whose logic is extracted gets a named free function directly
+/// below, in match order.** Plenty of arms are not extracted and carry real
+/// decisions anyway — `Del`, `IncrBy`, `Ttl` and `Persist` all do, `IncrBy`
+/// over some twenty lines — because a handler that says no more than the arm
+/// already says buys a name and a signature for nothing. What earns an
+/// extraction is one of three things: logic two arms share, as `Expire` and
+/// `PExpire` share [`set_expiry`]; an argument list the dispatcher would
+/// otherwise have to assemble inline, as `Set` does through [`SetArgs`]; or an
+/// arm long enough that leaving it here costs the reader the dispatcher, which
+/// is the judgement `clippy::too_many_lines` eventually makes on our behalf
+/// and which `IncrBy` is the nearest to.
+///
+/// The ordering is the half with no judgement in it, and it is what the next
+/// extraction has to respect: every extracted handler sits below in the order
+/// the match dispatches, so following a command from its arm to its handler is
+/// a pass rather than a search. The helpers that belong to no single arm —
+/// [`evict_if_expired`], [`deadline`], [`remaining_seconds`], [`append`] —
+/// follow those handlers as their own group.
 fn apply<L: ReplicationLog, P: ExpiryPolicy>(
     dict: &mut Dict,
     log: &mut L,
