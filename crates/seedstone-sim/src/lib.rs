@@ -400,10 +400,11 @@ impl SimConfig {
     /// One shard rather than a thousand, and that is the whole point: a
     /// complete `SCAN` cycle costs at least one round trip per shard *and*
     /// each shard after the first meets a table that everything written since
-    /// the walk began has been growing. Widening this to two shards took the
-    /// same walk from ninety steps to seventeen hundred, all of it in the
-    /// second shard, for no property the first one does not already show —
-    /// the cursor under test belongs to one dict.
+    /// the walk began has been growing. Every shard added is another table for
+    /// the cycle to cross, and none of them shows a property the first one
+    /// does not — the cursor under test belongs to one dict. What the cycle
+    /// costs in this shape is stated once, beside the bound that governs it:
+    /// see [`WALK_CYCLE_STEP_BOUND`].
     ///
     /// What a shape this narrow gives up is placement, and it gives it up
     /// knowingly: nothing here is about which shard a key lands in. What it
@@ -1466,6 +1467,12 @@ const WALK_STEP_COUNT: usize = 1;
 /// seeds of the shape that drives a cycle: 151 to 217 steps, a tight enough
 /// cluster that five times the widest of them is room a converging cursor
 /// cannot use and a cursor that has stopped converging reaches on every seed.
+///
+/// That range is one client's cycle, and it is the half of them that names a
+/// [`WALK_STEP_COUNT`] of one — a bucket at a time, which is the only rate at
+/// which a cursor can be caught between steps. The half that names no `COUNT`
+/// takes the server's default and finishes the same cycle in a handful of
+/// steps, so it is not what the bound is sized for.
 const WALK_CYCLE_STEP_BOUND: u64 = 1024;
 
 /// Where the counter family's share of a hundred rolls ends and the plain

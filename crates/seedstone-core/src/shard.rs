@@ -1071,15 +1071,16 @@ impl Router for ShardPool {
             // their answers in executor order is shard order — while every
             // executor answers. An executor whose channel errored contributes
             // one `ShardUnavailable` instead of one per shard it owned, and
-            // the `resize` below pads at the tail, so a death mid-flight
-            // shortens one run and shifts every reply behind it: the vector is
-            // still the right length and every entry is still a reply this
-            // pool produced, but index `i` is no longer shard `i`. Nothing
-            // relies on the correspondence today — `broadcast` sums or folds
-            // and no caller indexes by shard — and a live pool cannot get
-            // there, so this is stated rather than defended against. A caller
-            // that does want to read replies positionally has to make the
-            // padding per-executor first.
+            // one whose send failed is not in `pending` at all and contributes
+            // nothing; either way the `resize` below pads at the tail, so a
+            // death mid-flight shortens one run and shifts every reply behind
+            // it: the vector is still the right length and every entry is
+            // still a reply this pool produced, but index `i` is no longer
+            // shard `i`. Nothing relies on the correspondence today —
+            // `broadcast` sums or folds and no caller indexes by shard — and
+            // a live pool cannot get there, so this is stated rather than
+            // defended against. A caller that does want to read replies
+            // positionally has to make the padding per-executor first.
             //
             // A short answer means an executor died mid-flight; pad rather
             // than return a length the caller cannot interpret.
@@ -3375,9 +3376,10 @@ mod tests {
         }
     }
 
-    /// The defect this seam exists to be able to plant: the deadline is stored, the
-    /// clock passes it, and the key is still there — on both paths at once,
-    /// which is what makes it a missing expiry rather than a slow one.
+    /// The defect this seam exists to be able to plant: the deadline is
+    /// stored, the clock passes it, and the key is still there — on both paths
+    /// at once, which is what makes it a missing expiry rather than a slow
+    /// one.
     #[tokio::test(start_paused = true)]
     async fn a_pool_spawned_with_a_policy_expires_by_that_policy() {
         let sink = Recorder::default();
