@@ -655,8 +655,14 @@ pub trait WalkOrder: Clone + Send + 'static {
     /// answer and a defect is the only reason to write another, so the default
     /// is what keeps a policy that has no opinion about walks from having to
     /// state one, and leaves the override readable as what it is.
+    ///
+    /// It calls `reverse_increment` directly rather than deferring to
+    /// [`ReverseBinary`]. Routing the default through the one override that
+    /// would stop it recursing makes deleting that override — the obvious
+    /// tidy-up, since it is the default anyway — an unbounded recursion at
+    /// runtime rather than a change with no effect.
     fn advance(&self, cursor: u64, mask: u64) -> u64 {
-        ReverseBinary.advance(cursor, mask)
+        reverse_increment(cursor, mask)
     }
 }
 
