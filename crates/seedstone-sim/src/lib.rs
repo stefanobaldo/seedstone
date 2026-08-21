@@ -539,6 +539,36 @@ impl Plant {
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|plant| plant.name() == name)
     }
+
+    /// Where this plant is observable, when the shapes a sweep walks cannot
+    /// catch it — `None` when they can.
+    ///
+    /// A plant exists so a self-test's detection power can be measured, and a
+    /// plant the swept shape cannot catch turns that measurement into a number
+    /// about something else: the sweep serves the defect, finds nothing, and
+    /// reports no violations. Nothing in that zero says the defect was absent,
+    /// and the summary printed at the end of a run is the only place a
+    /// command-line reader will ever learn the difference — so the knowledge
+    /// lives here, beside the plant that has it, and the binary asks.
+    ///
+    /// Matched without a wildcard on purpose: a plant added later must be
+    /// classified by whoever adds it, and until they do this does not compile.
+    #[must_use]
+    pub const fn unobservable_on_swept_shapes(self) -> Option<&'static str> {
+        match self {
+            // Caught where they are swept. The counter sum and both
+            // expiration invariants decide on every shape this repository
+            // sweeps, and `tests/standard_catches.rs` pins that for the one
+            // the gate runs.
+            Self::LostUpdate | Self::ServeExpired | Self::SweepEatsAll => None,
+            // Needs a cursor observed *between* steps of a table that is
+            // growing under it, and a swept shard holds about four keys, where
+            // one step covers the whole table — see this plant's own note.
+            Self::ScanMissesRehash => {
+                Some("SimConfig::narrow, walked by crates/seedstone-sim/tests/planted_walk.rs")
+            }
+        }
+    }
 }
 
 /// What one run produced.
@@ -2879,6 +2909,63 @@ mod tests {
             ),
             (54, 25, 149, 32),
             "the recorded workload decides a different number of checks"
+        );
+    }
+
+    /// Every plant, asked whether the shapes `sweep` walks can catch it.
+    ///
+    /// Walked over [`Plant::ALL`] and matched without a wildcard, so a plant
+    /// added later cannot inherit an answer nobody decided: this stops
+    /// compiling until someone says where the new defect is observable.
+    #[test]
+    fn every_plant_answers_whether_the_swept_shapes_catch_it() {
+        for plant in Plant::ALL {
+            let place = plant.unobservable_on_swept_shapes();
+            match plant {
+                Plant::LostUpdate | Plant::ServeExpired | Plant::SweepEatsAll => assert_eq!(
+                    place,
+                    None,
+                    "{} is caught where it is swept, so it has no elsewhere to name",
+                    plant.name()
+                ),
+                Plant::ScanMissesRehash => {
+                    let place =
+                        place.expect("the swept shapes cannot observe an upward scan cursor");
+                    assert!(
+                        place.contains("planted_walk.rs"),
+                        "a reader sent somewhere must be sent to a file: {place}"
+                    );
+                }
+            }
+        }
+        // The place is a string, so nothing but this stops it outliving the
+        // file it names — and a warning pointing at a path that is not there
+        // is worse than no warning.
+        assert!(
+            std::path::Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/planted_walk.rs"
+            ))
+            .exists(),
+            "the place a plant points at no longer exists"
+        );
+    }
+
+    /// Which plants a sweep's violation count is evidence about, pinned as a
+    /// set rather than one by one: the interesting claim is that exactly one
+    /// plant is outside what the swept shapes reach, and a second one
+    /// appearing is a change in what those shapes measure.
+    #[test]
+    fn the_scan_cursor_is_the_only_plant_the_swept_shapes_cannot_catch() {
+        let unobservable: Vec<&str> = Plant::ALL
+            .into_iter()
+            .filter(|plant| plant.unobservable_on_swept_shapes().is_some())
+            .map(Plant::name)
+            .collect();
+        assert_eq!(
+            unobservable,
+            ["scan-misses-rehash"],
+            "the plants a swept violation count says nothing about have changed"
         );
     }
 }
