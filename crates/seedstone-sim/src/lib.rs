@@ -1022,14 +1022,35 @@ enum Check {
     /// opposite rule: a key named twice counts twice, because each name is
     /// its own command.
     PlainExists { slots: Vec<u32> },
+    /// An `MGET` of one to three owned plain keys: an array, one element per
+    /// name, in the order the names were written.
+    ///
+    /// The one command here whose reply *shape* is a function of how many
+    /// replies the fan-out gathered, which is why the model checks the array's
+    /// length as strictly as its contents.
+    PlainMGet { slots: Vec<u32> },
     /// A `GET` of an owned plain key, held against the model.
     PlainGet { slot: u32 },
+    /// A `TYPE` of an owned plain key: `string` where the model holds a
+    /// value, `none` where it holds none.
+    PlainType { slot: u32 },
+    /// A `STRLEN` of an owned plain key: the length of what the model holds,
+    /// or zero.
+    PlainStrLen { slot: u32 },
     /// A `SET` of an owned volatile key: the model adopts `deadline` if it
     /// took.
     VolatileSet { slot: u32, deadline: Instant },
-    /// An `EXPIRE` of an owned volatile key: the model adopts `deadline` only
-    /// if the server says there was a key there to take it.
+    /// An `EXPIRE` or a `PEXPIRE` of an owned volatile key: the model adopts
+    /// `deadline` only if the server says there was a key there to take it.
+    ///
+    /// One check for both commands because the two differ only in the unit
+    /// their argument is written in, and the model holds an instant either
+    /// way.
     VolatileExpire { slot: u32, deadline: Instant },
+    /// A `PERSIST` of an owned volatile key: whatever it answers, the key
+    /// carries no deadline afterwards, so the model stops predicting its
+    /// death.
+    VolatilePersist { slot: u32 },
     /// A `GET` of an owned volatile key — the two expiration invariants.
     VolatileGet { slot: u32 },
 }
@@ -1094,6 +1115,33 @@ const DEADLINES: [Deadline; 6] = [
 /// and the only source of keys certain to be *alive* late in the workload.
 const EXPIRE_SECONDS: u64 = 1;
 
+/// Where the counter family's share of a hundred rolls ends and the plain
+/// family's begins.
+///
+/// The two boundaries are named because they are the only numbers in the draw
+/// that two functions have to agree on: [`Model::compose`] routes on them and
+/// the family helpers match on the same roll rather than drawing again, so a
+/// helper whose lowest arm disagreed with the boundary above it would leave a
+/// band of rolls nothing composed.
+const COUNTER_OPS: u32 = 18;
+
+/// Where the plain family's share ends and the volatile family's begins. See
+/// [`COUNTER_OPS`].
+const PLAIN_END: u32 = 54;
+
+/// The span `PEXPIRE` asks for, in milliseconds.
+///
+/// Short on purpose, and that is the whole reason both commands are in the
+/// workload rather than one standing for the other. `EXPIRE`'s argument has no
+/// unit finer than a second, so every key it touches outlives the run and only
+/// the *alive* half of the expiration invariant ever decides one. This one
+/// dies well inside a run — comfortably past [`STALE_SLACK`], so a read taken
+/// afterwards is decidedly late — and is therefore the only path other than
+/// `SET … PX` that can produce a stale read at all. Redis also gives the two
+/// commands different ceilings, measured rather than assumed, so they are not
+/// one command in two units.
+const PEXPIRE_MILLIS: u64 = 150;
+
 /// One client's picture of the keys it owns, and the invariants it holds the
 /// server to over them.
 struct Model {
@@ -1153,8 +1201,12 @@ impl Model {
     /// own operation counter, which goes into written values so a value that
     /// turns up under the wrong key is visible as such.
     fn compose(&self, rng: &mut ChaCha8Rng, sent: Instant, seq: u32) -> (Frame, Check) {
-        match rng.random_range(0..100u32) {
-            0..20 => {
+        // Drawn here rather than inside each family so the roll is one draw
+        // whichever family it lands in: a helper that rolled again would make
+        // the stream a function of how the arms happen to be grouped.
+        let roll = rng.random_range(0..100u32);
+        match roll {
+            0..COUNTER_OPS => {
                 let key = rng.random_range(0..self.counter_keys);
                 let delta = rng.random_range(-10..=10i64);
                 (
@@ -1162,7 +1214,16 @@ impl Model {
                     Check::Counter(delta),
                 )
             }
-            20..32 => {
+            COUNTER_OPS..PLAIN_END => self.compose_plain(roll, rng, seq),
+            _ => self.compose_volatile(roll, rng, sent, seq),
+        }
+    }
+
+    /// An operation on a plain key: no deadline ever, and a model that knows
+    /// the exact bytes.
+    fn compose_plain(&self, roll: u32, rng: &mut ChaCha8Rng, seq: u32) -> (Frame, Check) {
+        match roll {
+            COUNTER_OPS..29 => {
                 let slot = self.plain.pick(rng);
                 let value = format!("{seq}@{}", self.plain.key(slot));
                 let frame = command(&["SET", &plain_key(self.plain.key(slot)), &value]);
@@ -1174,25 +1235,59 @@ impl Model {
                     },
                 )
             }
-            32..42 => {
+            29..38 => {
                 let slot = self.plain.pick(rng);
                 (
                     command(&["GET", &plain_key(self.plain.key(slot))]),
                     Check::PlainGet { slot },
                 )
             }
-            42..46 => {
+            38..42 => {
                 let slots = self.several(rng);
                 (self.plain_command("DEL", &slots), Check::PlainDel { slots })
             }
-            46..50 => {
+            42..46 => {
                 let slots = self.several(rng);
                 (
                     self.plain_command("EXISTS", &slots),
                     Check::PlainExists { slots },
                 )
             }
-            50..68 => {
+            46..50 => {
+                let slots = self.several(rng);
+                (
+                    self.plain_command("MGET", &slots),
+                    Check::PlainMGet { slots },
+                )
+            }
+            50..52 => {
+                let slot = self.plain.pick(rng);
+                (
+                    command(&["TYPE", &plain_key(self.plain.key(slot))]),
+                    Check::PlainType { slot },
+                )
+            }
+            _ => {
+                let slot = self.plain.pick(rng);
+                (
+                    command(&["STRLEN", &plain_key(self.plain.key(slot))]),
+                    Check::PlainStrLen { slot },
+                )
+            }
+        }
+    }
+
+    /// An operation on a volatile key: always a deadline, and a model that
+    /// knows when — not what.
+    fn compose_volatile(
+        &self,
+        roll: u32,
+        rng: &mut ChaCha8Rng,
+        sent: Instant,
+        seq: u32,
+    ) -> (Frame, Check) {
+        match roll {
+            PLAIN_END..70 => {
                 let slot = self.volatile.pick(rng);
                 let deadline = &DEADLINES[rng.random_range(0..DEADLINES.len())];
                 let frame = command(&[
@@ -1210,14 +1305,14 @@ impl Model {
                     },
                 )
             }
-            68..82 => {
+            70..82 => {
                 let slot = self.volatile.pick(rng);
                 (
                     command(&["GET", &volatile_key(self.volatile.key(slot))]),
                     Check::VolatileGet { slot },
                 )
             }
-            82..92 => {
+            82..90 => {
                 let slot = self.volatile.pick(rng);
                 let frame = command(&[
                     "EXPIRE",
@@ -1230,6 +1325,28 @@ impl Model {
                         slot,
                         deadline: sent + Duration::from_secs(EXPIRE_SECONDS),
                     },
+                )
+            }
+            90..94 => {
+                let slot = self.volatile.pick(rng);
+                let frame = command(&[
+                    "PEXPIRE",
+                    &volatile_key(self.volatile.key(slot)),
+                    &PEXPIRE_MILLIS.to_string(),
+                ]);
+                (
+                    frame,
+                    Check::VolatileExpire {
+                        slot,
+                        deadline: sent + Duration::from_millis(PEXPIRE_MILLIS),
+                    },
+                )
+            }
+            94..97 => {
+                let slot = self.volatile.pick(rng);
+                (
+                    command(&["PERSIST", &volatile_key(self.volatile.key(slot))]),
+                    Check::VolatilePersist { slot },
                 )
             }
             _ => {
@@ -1271,7 +1388,22 @@ impl Model {
                 }
                 Check::PlainDel { slots } => self.check_plain_fan_out(slots, reply, true),
                 Check::PlainExists { slots } => self.check_plain_fan_out(slots, reply, false),
+                Check::PlainMGet { slots } => self.check_plain_mget(slots, reply),
                 Check::PlainGet { slot } => self.check_plain(*slot, reply),
+                Check::PlainType { slot } => self.check_plain_shape(
+                    *slot,
+                    reply,
+                    &Frame::Simple("none".into()),
+                    &Frame::Simple("string".into()),
+                ),
+                Check::PlainStrLen { slot } => {
+                    let held = match &self.plain_state[*slot as usize] {
+                        Known::Value(value) => value.len(),
+                        _ => 0,
+                    };
+                    let held = i64::try_from(held).expect("a written value fits an i64 length");
+                    self.check_plain_shape(*slot, reply, &Frame::Integer(0), &Frame::Integer(held));
+                }
                 Check::VolatileSet { slot, deadline } => {
                     self.deadlines[*slot as usize] = match reply {
                         Frame::Simple(text) if text == "OK" => Some(*deadline),
@@ -1287,6 +1419,13 @@ impl Model {
                         _ => None,
                     };
                 }
+                // Whatever it answered, the key carries no deadline
+                // afterwards: `1` removed one, and `0` says there was none to
+                // remove or no key to remove it from. So the model predicts no
+                // death for it until its owner writes it with one again — and
+                // it asserts nothing about the key in the meantime, because
+                // the volatile family's model holds deadlines and not values.
+                Check::VolatilePersist { slot } => self.deadlines[*slot as usize] = None,
                 Check::VolatileGet { slot } => self.check_volatile(*slot, reply, sent, received),
             }
         }
@@ -1333,6 +1472,65 @@ impl Model {
                     Known::Nothing
                 };
             }
+        }
+    }
+
+    /// Holds an `MGET` of one to three plain keys against the model.
+    ///
+    /// The length is checked as strictly as the contents, and that is the
+    /// half worth stating: `MGET` is the only command here whose reply
+    /// *shape* is a function of how many replies the fan-out gathered, so a
+    /// gather that dropped one answers a shorter array rather than a wrong
+    /// one. A real client pairs the array with the keys it sent — django's
+    /// `get_many` zips them — and a short array quietly becomes a run of
+    /// cache misses instead of an error anybody notices. Nothing else in this
+    /// harness can see that, because every other fan-out folds down to a
+    /// single integer.
+    ///
+    /// A repeated key is not special here as it is for `DEL` and `EXISTS`:
+    /// each name is its own read, and reads do not consume anything.
+    fn check_plain_mget(&self, slots: &[u32], reply: &Frame) {
+        let agrees = match reply {
+            Frame::Array(values) if values.len() == slots.len() => {
+                slots.iter().zip(values).all(|(slot, value)| {
+                    match (&self.plain_state[*slot as usize], value) {
+                        // Unpredictable on its own, and the element beside it
+                        // still is: one unknown key does not excuse the rest
+                        // of the array.
+                        (Known::Nothing, _) => true,
+                        (Known::Absent, value) => matches!(value, Frame::Null),
+                        (Known::Value(expected), Frame::Bulk(got)) => got == expected,
+                        (Known::Value(_), _) => false,
+                    }
+                })
+            }
+            _ => false,
+        };
+        let mut tally = lock(&self.shared.0);
+        tally.plain_checks += 1;
+        if !agrees {
+            tally.plain_mismatches += 1;
+        }
+    }
+
+    /// Holds a reply about a plain key's *shape* — its type or its length —
+    /// against the model.
+    ///
+    /// One helper for `TYPE` and `STRLEN` because they ask the same question
+    /// in two vocabularies: presence, and what presence implies. Each
+    /// caller supplies the answer it expects for an absent key and the one it
+    /// expects for the value the model holds, which is the whole of the
+    /// difference between them.
+    fn check_plain_shape(&self, slot: u32, reply: &Frame, absent: &Frame, present: &Frame) {
+        let agrees = match &self.plain_state[slot as usize] {
+            Known::Nothing => return,
+            Known::Absent => reply == absent,
+            Known::Value(_) => reply == present,
+        };
+        let mut tally = lock(&self.shared.0);
+        tally.plain_checks += 1;
+        if !agrees {
+            tally.plain_mismatches += 1;
         }
     }
 
@@ -1433,6 +1631,17 @@ impl Model {
             frames.push(command(&["GET", &plain_key(self.plain.key(slot))]));
             checks.push(Check::PlainGet { slot });
         }
+        // The one keyspace-wide command a client here may send, and the only
+        // one in the workload that reaches every shard from a single request.
+        // What it answers is the whole simulation's keyspace, which no client
+        // owns and none can predict, so it carries no claim — it is here
+        // because the broadcast path is otherwise driven only by the service
+        // layer's own tests, never by a client competing with fifteen others
+        // for the same executors. Sent once per client rather than drawn into
+        // the burst schedule: at one envelope per shard it would otherwise
+        // decide a run's cost by itself.
+        frames.push(command(&["DBSIZE"]));
+        checks.push(Check::Ignored);
 
         for (burst, checks) in frames.chunks(depth).zip(checks.chunks(depth)) {
             let sent = Instant::now();
@@ -1623,7 +1832,14 @@ mod tests {
         // `expected_sum` below is what tells them apart: it is a function of
         // the commands alone, so a hash that moved while it held still means
         // the same workload met a different schedule.
-        const MINI_1_42: u64 = 0xf35b_fb35_d7e8_a406;
+        // Repinned when the workload grew to the rest of the one-key surface:
+        // `MGET`, `PEXPIRE`, `PERSIST`, `TYPE` and `STRLEN` entered the burst
+        // schedule and `DBSIZE` the settle, and the draw that chooses between
+        // the arms was re-sliced to make room for them. The trace folds every
+        // command's kind and every reply, so added commands change it by
+        // construction. A change here with no workload change beside it is a
+        // regression, not a repin.
+        const MINI_1_42: u64 = 0x547b_0be7_5b25_43ee;
 
         let outcome = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(
@@ -1636,14 +1852,14 @@ mod tests {
         // pinned for a second reason — they are what says the expiration
         // invariants ran, and a workload that quietly stopped reaching them
         // would otherwise keep passing.
-        assert_eq!(outcome.expected_sum, 264, "the recorded workload moved");
+        assert_eq!(outcome.expected_sum, 63, "the recorded workload moved");
         assert_eq!(
             (
                 outcome.dead_checks,
                 outcome.alive_checks,
                 outcome.plain_checks
             ),
-            (59, 29, 139),
+            (54, 25, 147),
             "the recorded workload decides a different number of checks"
         );
     }
