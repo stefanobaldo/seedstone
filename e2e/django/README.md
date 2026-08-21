@@ -9,9 +9,9 @@ accepts or rejects the answers on its own terms.
 The suite is not vendored. `run.sh` fetches the published source archive,
 verifies it against a digest pinned in the script, extracts its `tests/`
 directory and runs it inside a container against a freshly started server.
-That keeps a couple of thousand lines of someone else's tests out of this
-repository without giving up a reproducible run: the archive either matches the
-digest or the lane stops.
+That keeps a third party's 1,200 lines of tests out of this repository without
+giving up a reproducible run: the archive either matches the digest or the lane
+stops.
 
 ## The client pair is pinned deliberately
 
