@@ -227,9 +227,26 @@ pub enum Command {
         /// How many seconds from now; zero or negative deletes the key.
         seconds: i64,
     },
+    /// Give `key` a deadline `millis` from now, or delete it if that deadline
+    /// is not in the future.
+    ///
+    /// [`Expire`](Self::Expire) in a smaller unit, and nothing else: the span
+    /// is not multiplied on its way to a deadline, which is the whole of the
+    /// difference between the two.
+    PExpire {
+        /// The key to put a deadline on.
+        key: Vec<u8>,
+        /// How many milliseconds from now; zero or negative deletes the key.
+        millis: i64,
+    },
     /// Report how long `key` has left.
     Ttl {
         /// The key to ask about.
+        key: Vec<u8>,
+    },
+    /// Take `key`'s deadline away, leaving the key itself where it is.
+    Persist {
+        /// The key to make permanent.
         key: Vec<u8>,
     },
     /// Report whether `key` exists.
@@ -320,7 +337,9 @@ impl Command {
             | Self::Del { key }
             | Self::IncrBy { key, .. }
             | Self::Expire { key, .. }
+            | Self::PExpire { key, .. }
             | Self::Ttl { key }
+            | Self::Persist { key }
             | Self::Exists { key } => Route::Key(key),
             Self::FlushDb | Self::DbSize => Route::Every,
             // The one route that is not self-sufficient. A step knows where it
@@ -342,8 +361,8 @@ impl Command {
     /// A stable one-byte tag for this command's variant.
     ///
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
-    /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9, `ScanStep` = 10. These
-    /// values are folded
+    /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9, `ScanStep` = 10,
+    /// `PExpire` = 11, `Persist` = 12. These values are folded
     /// into the simulator's trace hash, so they are part of what a replay
     /// compares: changing one changes every recorded hash. A tag is therefore
     /// never reused and never renumbered.
@@ -360,6 +379,8 @@ impl Command {
             Self::FlushDb => 8,
             Self::DbSize => 9,
             Self::ScanStep { .. } => 10,
+            Self::PExpire { .. } => 11,
+            Self::Persist { .. } => 12,
         }
     }
 }
@@ -1279,23 +1300,13 @@ fn apply<L: ReplicationLog, P: ExpiryPolicy>(
         }
 
         Command::Expire { key, seconds } => {
-            if dict.get(key).is_none() {
-                return Reply::Integer(0);
-            }
-            if let Err(failed) = append(log, seq, shard) {
-                return failed;
-            }
-            if *seconds <= 0 {
-                // A deadline that is not in the future is a deletion, and
-                // Redis reports it as an applied expiry rather than as a
-                // delete — the client asked for the key to be gone by a time
-                // that has passed, and it is.
-                dict.remove(key);
-            } else {
-                let span = u64::try_from(*seconds).expect("a positive i64 is a u64");
-                dict.set_deadline(key, deadline(now, Some(Expiry::Ex(span))));
-            }
-            Reply::Integer(1)
+            let at = span_deadline(now, *seconds, Expiry::Ex);
+            set_expiry(dict, log, seq, shard, key, at)
+        }
+
+        Command::PExpire { key, millis } => {
+            let at = span_deadline(now, *millis, Expiry::Px);
+            set_expiry(dict, log, seq, shard, key, at)
         }
 
         Command::Ttl { key } => match dict.get(key).map(|entry| entry.expires_at) {
@@ -1303,6 +1314,20 @@ fn apply<L: ReplicationLog, P: ExpiryPolicy>(
             Some(None) => Reply::Integer(-1),
             Some(Some(at)) => Reply::Integer(remaining_seconds(at, now)),
         },
+
+        Command::Persist { key } => {
+            // Two keys answer `0` here for two different reasons: one is not
+            // there, and one is but carries no deadline. Neither answer is a
+            // change, so neither reaches the log.
+            if dict.get(key).is_none_or(|entry| entry.expires_at.is_none()) {
+                return Reply::Integer(0);
+            }
+            if let Err(failed) = append(log, seq, shard) {
+                return failed;
+            }
+            dict.set_deadline(key, None);
+            Reply::Integer(1)
+        }
 
         Command::Exists { key } => Reply::Integer(i64::from(dict.get(key).is_some())),
 
@@ -1520,6 +1545,66 @@ fn evict_if_expired<L: ReplicationLog, P: ExpiryPolicy>(
     Ok(())
 }
 
+/// What `EXPIRE`'s or `PEXPIRE`'s span turned out to mean, once its unit is
+/// out of the way.
+///
+/// The two commands differ in exactly one thing — the unit the span is written
+/// in — so they reach one handler through this rather than being two arms that
+/// would have to be kept identical by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deadline {
+    /// Put this deadline on the key. The `None` inside is a span the clock
+    /// cannot represent, which [`deadline`] turns into no deadline at all.
+    At(Option<Instant>),
+    /// The deadline is not in the future, so the key is to be removed.
+    Passed,
+}
+
+/// Reads a span in the unit its command was written in as the deadline it names.
+///
+/// `unit` is the [`Expiry`] constructor for that unit, so the only thing a
+/// caller supplies beyond the number is what the number counts.
+fn span_deadline(now: Instant, span: i64, unit: fn(u64) -> Expiry) -> Deadline {
+    if span <= 0 {
+        return Deadline::Passed;
+    }
+    let span = u64::try_from(span).expect("a positive i64 is a u64");
+    Deadline::At(deadline(now, Some(unit(span))))
+}
+
+/// Puts the deadline a command named on its key, answering whether there was a
+/// key to receive one.
+fn set_expiry<L: ReplicationLog>(
+    dict: &mut Dict,
+    log: &mut L,
+    seq: &mut u64,
+    shard: u16,
+    key: &[u8],
+    at: Deadline,
+) -> Reply {
+    // Answered before the log is touched. A key that is not there receives no
+    // deadline, and a record that replays to nothing is a record the log is
+    // better without — the same rule a `Del` of a missing key follows.
+    if dict.get(key).is_none() {
+        return Reply::Integer(0);
+    }
+    if let Err(failed) = append(log, seq, shard) {
+        return failed;
+    }
+    match at {
+        // A deadline that is not in the future is a deletion, and Redis
+        // reports it as an applied expiry rather than as a delete — the client
+        // asked for the key to be gone by a time that has passed, and it is.
+        Deadline::Passed => {
+            dict.remove(key);
+        }
+        Deadline::At(at) => {
+            dict.set_deadline(key, at);
+        }
+    }
+    Reply::Integer(1)
+}
+
 /// The instant an expiry option lands on, or `None` for a key with no
 /// deadline.
 ///
@@ -1681,7 +1766,7 @@ mod tests {
     /// key is a key served by the wrong shard.
     #[test]
     fn every_command_declares_how_it_is_routed() {
-        let keyed: [Command; 7] = [
+        let keyed: [Command; 9] = [
             Command::Get { key: b"k".to_vec() },
             set(b"k", b"v"),
             Command::Del { key: b"k".to_vec() },
@@ -1693,7 +1778,12 @@ mod tests {
                 key: b"k".to_vec(),
                 seconds: 1,
             },
+            Command::PExpire {
+                key: b"k".to_vec(),
+                millis: 1,
+            },
             Command::Ttl { key: b"k".to_vec() },
+            Command::Persist { key: b"k".to_vec() },
             Command::Exists { key: b"k".to_vec() },
         ];
         for cmd in keyed {
@@ -1970,6 +2060,81 @@ mod tests {
         );
         assert_eq!(*log.0.lock().expect("log mutex"), vec![(3, 0), (3, 1)]);
         assert_eq!(seq, 2, "the expiry did not consume a replication position");
+    }
+
+    /// `PEXPIRE` and `PERSIST` reach the log exactly when they change
+    /// something.
+    ///
+    /// The replication position is what makes that observable: [`append`]
+    /// advances `seq` only when a record was written, so a `seq` that stood
+    /// still is a mutation that never happened. Both commands answer `0` for
+    /// the cases where there is nothing to change, and answering it *before*
+    /// the append is what these assertions pin — an implementation that logged
+    /// first would give the same `0` on the wire and leave behind a record that
+    /// replays to nothing.
+    #[tokio::test(start_paused = true)]
+    async fn pexpire_and_persist_reach_the_log_only_when_they_change_something() {
+        let mut shard = Shard::new();
+        let ttl = |key: &[u8]| Command::Ttl { key: key.to_vec() };
+        let persist = |key: &[u8]| Command::Persist { key: key.to_vec() };
+        let pexpire = |key: &[u8], millis: i64| Command::PExpire {
+            key: key.to_vec(),
+            millis,
+        };
+
+        assert_eq!(
+            shard.run(pexpire(b"k", 1000), Instant::now()),
+            Reply::Integer(0),
+            "PEXPIRE of a key that does not exist"
+        );
+        assert_eq!(
+            shard.run(persist(b"k"), Instant::now()),
+            Reply::Integer(0),
+            "PERSIST of a key that does not exist"
+        );
+        assert_eq!(shard.seq, 0, "neither wrote a record");
+
+        assert_eq!(shard.run(set(b"k", b"v"), Instant::now()), Reply::Ok);
+        assert_eq!(shard.seq, 1, "the write that created it did");
+
+        assert_eq!(
+            shard.run(persist(b"k"), Instant::now()),
+            Reply::Integer(0),
+            "PERSIST of a key that is there but carries no deadline"
+        );
+        assert_eq!(shard.seq, 1, "and it wrote no record either");
+
+        assert_eq!(
+            shard.run(pexpire(b"k", 30_000), Instant::now()),
+            Reply::Integer(1)
+        );
+        assert_eq!(shard.seq, 2);
+        assert_eq!(
+            shard.run(ttl(b"k"), Instant::now()),
+            Reply::Integer(30),
+            "thirty thousand milliseconds is thirty seconds"
+        );
+
+        assert_eq!(shard.run(persist(b"k"), Instant::now()), Reply::Integer(1));
+        assert_eq!(shard.seq, 3);
+        assert_eq!(
+            shard.run(ttl(b"k"), Instant::now()),
+            Reply::Integer(-1),
+            "the key outlived the deadline it was carrying"
+        );
+
+        // A span that is not in the future is a deletion, answered as an
+        // expiry that was applied.
+        assert_eq!(
+            shard.run(pexpire(b"k", 0), Instant::now()),
+            Reply::Integer(1)
+        );
+        assert_eq!(shard.seq, 4);
+        assert_eq!(
+            shard.run(ttl(b"k"), Instant::now()),
+            Reply::Integer(-2),
+            "the key is gone, not merely left without a deadline"
+        );
     }
 
     /// The sink's side of the same fact: a position disappears from the trace
