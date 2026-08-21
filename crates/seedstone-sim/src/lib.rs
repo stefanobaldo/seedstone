@@ -639,6 +639,8 @@ impl TraceSink for HashSink {
             // one kind that went to different shards are different commands,
             // and `shard` above only says where the answer came from.
             //
+            // Nothing produces `Route::Shard` today — the arm is here for its
+            // tag, which no other route may take.
             Route::Shard(shard) => mix(mix(acc, 1), u64::from(shard)),
             Route::Every => mix(acc, 2),
             // A `ScanStep` folds a constant, because the variant names no

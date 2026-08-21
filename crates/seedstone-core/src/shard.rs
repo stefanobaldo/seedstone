@@ -317,18 +317,31 @@ pub enum Command {
 /// How a command reaches the shards that must run it.
 ///
 /// Until this existed, every command named exactly one key and the hash of
-/// that key was the whole routing decision. `SCAN` names a shard instead —
-/// its cursor carries which — and `KEYS`, `DBSIZE` and `FLUSHDB` name no key
-/// at all and must reach every shard. The routing decision is therefore the
-/// command's to state, not something the router can derive from a key that
-/// may not exist.
+/// that key was the whole routing decision. A walk step names no key and no
+/// shard of its own, and `KEYS`, `DBSIZE` and `FLUSHDB` name no key at all and
+/// must reach every shard. The routing decision is therefore the command's to
+/// state, not something the router can derive from a key that may not exist.
+///
+/// **Nothing in the workspace produces [`Route::Shard`] today.**
+/// [`Command::route`] answers `Key`, `Every` or `Unaddressed` and nothing
+/// else. `SCAN` was the one command that would have named a shard outright;
+/// its shard comes out of a cursor a peer chose, so it reaches the router
+/// through [`Router::dispatch_at`] — an argument the caller has already
+/// checked — rather than out of the command. The variant is kept anyway,
+/// because it is folded into the simulator's trace hash under a tag of its
+/// own: removing it would move the tags beside it and every recorded trace
+/// hash with them. It costs two live arms — one in the shard pool's
+/// `shard_for`, one in the simulator's route fold — and it is the shape a
+/// genuinely shard-addressed command would arrive in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route<'a> {
     /// The hash of this key decides the shard.
     Key(&'a [u8]),
-    /// This shard, named outright. The caller is responsible for it being in
-    /// range; a router hands an out-of-range shard `ShardUnavailable` rather
-    /// than panicking.
+    /// This shard, named outright. No command answers with this today — see
+    /// the note on the enum — so nothing is currently held to the range it
+    /// would have to name; a router handed one out of range answers
+    /// `ShardUnavailable` rather than panicking, which is the same refusal
+    /// [`Route::Unaddressed`] gets.
     Shard(u16),
     /// Every shard, answered once each, gathered in shard order.
     Every,
@@ -386,10 +399,9 @@ impl Command {
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
     /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9, `ScanStep` = 10,
     /// `PExpire` = 11, `Persist` = 12, `Type` = 13, `StrLen` = 14. These
-    /// values are folded
-    /// into the simulator's trace hash, so they are part of what a replay
-    /// compares: changing one changes every recorded hash. A tag is therefore
-    /// never reused and never renumbered.
+    /// values are folded into the simulator's trace hash, so they are part of
+    /// what a replay compares: changing one changes every recorded hash. A tag
+    /// is therefore never reused and never renumbered.
     #[must_use]
     pub const fn kind(&self) -> u8 {
         match self {
@@ -1033,9 +1045,21 @@ impl Router for ShardPool {
                 }
             }
             // Executors own contiguous ascending shard ranges, so concatenating
-            // their answers in executor order is shard order. A short answer
-            // means an executor died mid-flight; pad rather than return a
-            // length the caller cannot interpret.
+            // their answers in executor order is shard order — while every
+            // executor answers. An executor whose channel errored contributes
+            // one `ShardUnavailable` instead of one per shard it owned, and
+            // the `resize` below pads at the tail, so a death mid-flight
+            // shortens one run and shifts every reply behind it: the vector is
+            // still the right length and every entry is still a reply this
+            // pool produced, but index `i` is no longer shard `i`. Nothing
+            // relies on the correspondence today — `broadcast` sums or folds
+            // and no caller indexes by shard — and a live pool cannot get
+            // there, so this is stated rather than defended against. A caller
+            // that does want to read replies positionally has to make the
+            // padding per-executor first.
+            //
+            // A short answer means an executor died mid-flight; pad rather
+            // than return a length the caller cannot interpret.
             replies.resize(
                 usize::from(shards),
                 Reply::Error(ReplyError::ShardUnavailable),
