@@ -40,12 +40,22 @@
 //!   only a clock can report — so there are two signals and one shed
 //!   ([`IDLE_SHED_AFTER`]).
 //!
-//! - **No response splitting.** Every error frame this module emits passes
-//!   through [`safe_error`] first. A `Frame::Error` is terminated by the first
-//!   `\r\n` after its type byte, so text carrying either byte would let a peer
-//!   dictate frames the server never meant to send — and the codec's guard
-//!   against that is a debug assertion, which is not there in release. This is
-//!   the enforcement point that is.
+//! - **No response splitting.** Every error frame this module builds from
+//!   peer-supplied text passes through [`safe_error`] first. A `Frame::Error`
+//!   is terminated by the first `\r\n` after its type byte, so text carrying
+//!   either byte would let a peer dictate frames the server never meant to
+//!   send — and the codec's guard against that is a debug assertion, which is
+//!   not there in release. This is the enforcement point that is.
+//!
+//!   The frames that skip it are safe by construction, and it is their *type*
+//!   that makes them so: each is either a `&'static str` constant declared in
+//!   this file or a [`ReplyError::wire_text`], and neither can carry a
+//!   terminator a peer chose because neither is built from anything a peer
+//!   sent. Scrubbing a literal would not make it safer, only hide which frames
+//!   the guard is actually for. Two tests hold that claim rather than leaving
+//!   it as an assertion — `every_shard_error_is_frame_safe` for the
+//!   [`ReplyError`] set, and `every_error_constant_is_frame_safe` for the
+//!   constants.
 
 use seedstone_core::shard::{Command, Cond, Expiry, Reply, ReplyError, Router, parse_i64};
 use seedstone_resp::{Decoder, DecoderLimits, Frame, ParseError, encode};
@@ -4481,6 +4491,43 @@ mod tests {
                     !code.is_empty() && code.chars().all(|c| c.is_ascii_uppercase())
                 }),
                 "{error:?} does not open with an error code: {text:?}"
+            );
+        }
+    }
+
+    /// The error texts this module keeps as constants are frame-safe too.
+    ///
+    /// [`every_shard_error_is_frame_safe`] holds the [`ReplyError`] set to the
+    /// property the frame format needs; these four reach the wire the same way
+    /// and by the same argument — a `&'static str` nobody composed from
+    /// peer-supplied bytes — but nothing held them to it. The module
+    /// documentation now names their type as the reason they may skip
+    /// [`safe_error`], so the type's claim is checked here rather than
+    /// asserted there.
+    ///
+    /// It bites: a `\r` or `\n` added to any of these four, or a lowercase
+    /// error code, fails this test. It cannot bite for a constant added later
+    /// and not listed — there is no exhaustiveness to lean on for free
+    /// constants, which is exactly why the list is short and lives beside the
+    /// declarations it names.
+    #[test]
+    fn every_error_constant_is_frame_safe() {
+        for (name, text) in [
+            ("INVALID_CURSOR", INVALID_CURSOR),
+            ("UNRENDERABLE_REPLY", UNRENDERABLE_REPLY),
+            ("SYNTAX_ERROR", SYNTAX_ERROR),
+            ("NOPROTO", NOPROTO),
+        ] {
+            assert!(
+                !text.contains(['\r', '\n']),
+                "{name} carries a frame terminator: {text:?}"
+            );
+            assert!(!text.is_empty(), "{name} has no text");
+            assert!(
+                text.split(' ').next().is_some_and(|code| {
+                    !code.is_empty() && code.chars().all(|c| c.is_ascii_uppercase())
+                }),
+                "{name} does not open with an error code: {text:?}"
             );
         }
     }
