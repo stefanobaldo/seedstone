@@ -95,15 +95,22 @@ jobs:
               - '!docs/**/*.md'
       # Pushes to `main` always sweep; a pull request skips only when it
       # touched nothing but prose.
-      # Recalibrated against this workflow's own runs, now that the sweep runs
-      # its seeds in parallel: 75 seeds took 106 s here, 1.41 s per seed against
-      # the 5.5 s per seed the same step measured when the sweep was serial —
-      # the runner's four cores, spent on the one step that can use them. The
-      # budget is unchanged at ~7 minutes with headroom on a 20-minute job, so
-      # 420 s buys 296 seeds at that rate; 275 keeps the margin, because the
-      # same seeds cost up to 1.47 s each on the nightly workflow's runners and
-      # runner speed varies. Detection power past this belongs to the nightly
-      # window, which sweeps ten thousand seeds and is not waiting for anyone.
+      # Recalibrated against this workflow's own runs. The rate below belongs to
+      # one workload — the one whose simulated clients each walk their own keys
+      # with `SCAN` under churn — and to no other: a rate whose workload goes
+      # unstated is exactly how this comment went stale once already. The most
+      # recent run here swept 275 seeds in 502 s, 1.83 s per seed, the seeds
+      # running in parallel across the runner's four cores. The budget this step
+      # was given is ~7 minutes, so 502 s is over it and still well inside the
+      # job's own 20-minute timeout; the count stays at 275 because buying that
+      # margin back is paid in seeds, and seeds are detection power. Do not
+      # recalibrate this from a developer machine: adding the walk took the same
+      # 275 seeds from 353 s to 487 s and 505 s on two runs of the same commit
+      # here, +38 %, and cost +8.2 % measured serially on a developer machine —
+      # the two disagree by more than the change itself, and four cores with
+      # less cache pay more for this workload than ten with more. Detection
+      # power past this belongs to the nightly window, which sweeps ten thousand
+      # seeds and is not waiting for anyone.
       - name: DST sweep
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 275 --workload-seed 1
