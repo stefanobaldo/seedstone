@@ -1245,7 +1245,37 @@ enum Check {
     /// acknowledged.
     Counter(i64),
     /// A `SET` of an owned plain key: the model adopts `value` if it took.
+    ///
+    /// Also what a `KEEPTTL` is checked as. On a family no deadline is ever
+    /// put on, the option has nothing to keep and the reply is a plain `SET`'s
+    /// — which is the point: what it reaches is the option's parse path and
+    /// the branch that finds no deadline to preserve. The branch that
+    /// *preserves* one is not reachable from any client here, and the reason
+    /// is the volatile model rather than the draw: it holds deadlines and not
+    /// values, so it cannot tell a `KEEPTTL` that kept a deadline from one
+    /// that met an expired key and created a new one with none. Emitting it
+    /// there would mean giving the key up, which is coverage bought by losing
+    /// an invariant.
     PlainSet { slot: u32, value: Vec<u8> },
+    /// A `SET … NX` or `SET … XX` of an owned plain key.
+    ///
+    /// The strongest thing the plain model can be asked, because the answer is
+    /// the model itself: `OK` where the condition held and a null where it did
+    /// not. The model knows presence exactly — nothing else writes these keys
+    /// — so both replies are predictions rather than observations.
+    PlainSetCond {
+        slot: u32,
+        value: Vec<u8>,
+        /// `true` for `XX`, which sets only where a value already is.
+        only_if_present: bool,
+    },
+    /// A `SET … GET` of an owned plain key: the reply is what the key held
+    /// *before* this command, and the key holds `value` after it.
+    ///
+    /// A `GET` and a `SET` in one round trip, and it is checked as both: the
+    /// reply is held against the model exactly as a `GET`'s would be, and the
+    /// model then adopts the value the command wrote.
+    PlainSetGet { slot: u32, value: Vec<u8> },
     /// A `DEL` of one to three owned plain keys — the variadic form, which
     /// the service layer fans out one command per key. How many it removes is
     /// the model's to predict: the *distinct* slots it believes hold a value,
@@ -1550,19 +1580,8 @@ impl Model {
     /// the exact bytes.
     fn compose_plain(&self, roll: u32, rng: &mut ChaCha8Rng, seq: u32) -> Op {
         match roll {
-            COUNTER_OPS..29 => {
-                let slot = self.plain.pick(rng);
-                let value = format!("{seq}@{}", self.plain.key(slot));
-                Op {
-                    frame: command(&["SET", &plain_key(self.plain.key(slot)), &value]),
-                    check: Check::PlainSet {
-                        slot,
-                        value: value.into_bytes(),
-                    },
-                    form: contract::FORM_SET,
-                }
-            }
-            29..38 => {
+            COUNTER_OPS..31 => self.compose_plain_set(roll, rng, seq),
+            31..38 => {
                 let slot = self.plain.pick(rng);
                 Op {
                     frame: command(&["GET", &plain_key(self.plain.key(slot))]),
@@ -1608,6 +1627,86 @@ impl Model {
                     frame: command(&["STRLEN", &plain_key(self.plain.key(slot))]),
                     check: Check::PlainStrLen { slot },
                     form: contract::FORM_STRLEN,
+                }
+            }
+        }
+    }
+
+    /// A `SET` of a plain key, in whichever of the algebra's forms the roll
+    /// landed on.
+    ///
+    /// Split out of [`Model::compose_plain`] rather than drawn separately, and
+    /// the roll is the one already made: a helper that rolled again would make
+    /// the stream a function of how the arms happen to be grouped, which is
+    /// the same rule [`Model::compose`] states for the families.
+    ///
+    /// What is *not* here is `EXAT` and `PXAT`, and it never will be — see
+    /// [`crate::contract`] for why a client with no wall clock cannot name an
+    /// absolute deadline.
+    fn compose_plain_set(&self, roll: u32, rng: &mut ChaCha8Rng, seq: u32) -> Op {
+        match roll {
+            COUNTER_OPS..24 => {
+                let slot = self.plain.pick(rng);
+                let value = format!("{seq}@{}", self.plain.key(slot));
+                Op {
+                    frame: command(&["SET", &plain_key(self.plain.key(slot)), &value]),
+                    check: Check::PlainSet {
+                        slot,
+                        value: value.into_bytes(),
+                    },
+                    form: contract::FORM_SET,
+                }
+            }
+            24..28 => {
+                // The two conditions are one arm, because they are one
+                // command with the sense of a single test flipped, and the
+                // model predicts both from the same fact. Splitting them
+                // would be two arms that had to agree about what presence
+                // means.
+                let only_if_present = roll >= 26;
+                let slot = self.plain.pick(rng);
+                let value = format!("{seq}@{}", self.plain.key(slot));
+                Op {
+                    frame: command(&[
+                        "SET",
+                        &plain_key(self.plain.key(slot)),
+                        &value,
+                        if only_if_present { "XX" } else { "NX" },
+                    ]),
+                    check: Check::PlainSetCond {
+                        slot,
+                        value: value.into_bytes(),
+                        only_if_present,
+                    },
+                    form: if only_if_present {
+                        contract::FORM_SET_XX
+                    } else {
+                        contract::FORM_SET_NX
+                    },
+                }
+            }
+            28..30 => {
+                let slot = self.plain.pick(rng);
+                let value = format!("{seq}@{}", self.plain.key(slot));
+                Op {
+                    frame: command(&["SET", &plain_key(self.plain.key(slot)), &value, "GET"]),
+                    check: Check::PlainSetGet {
+                        slot,
+                        value: value.into_bytes(),
+                    },
+                    form: contract::FORM_SET_GET,
+                }
+            }
+            _ => {
+                let slot = self.plain.pick(rng);
+                let value = format!("{seq}@{}", self.plain.key(slot));
+                Op {
+                    frame: command(&["SET", &plain_key(self.plain.key(slot)), &value, "KEEPTTL"]),
+                    check: Check::PlainSet {
+                        slot,
+                        value: value.into_bytes(),
+                    },
+                    form: contract::FORM_SET_KEEPTTL,
                 }
             }
         }
@@ -1720,6 +1819,54 @@ impl Model {
                 Check::PlainSet { slot, value } => {
                     self.plain_state[*slot as usize] = match reply {
                         Frame::Simple(text) if text == "OK" => Known::Value(value.clone()),
+                        _ => Known::Nothing,
+                    };
+                }
+                Check::PlainSetCond {
+                    slot,
+                    value,
+                    only_if_present,
+                } => {
+                    let held = self.plain_state[*slot as usize].clone();
+                    let took = matches!(reply, Frame::Simple(text) if text == "OK");
+                    // The two answers a condition can give. Anything else is
+                    // the server declining to run the command at all, which is
+                    // no statement about the key and leaves the model with
+                    // nothing to hold.
+                    let refused = matches!(reply, Frame::Null);
+                    let present = match held {
+                        Known::Nothing => None,
+                        Known::Absent => Some(false),
+                        Known::Value(_) => Some(true),
+                    };
+                    if let Some(present) = present
+                        && (took || refused)
+                    {
+                        let mut tally = lock(&self.shared.tally);
+                        tally.plain_checks += 1;
+                        if took != (present == *only_if_present) {
+                            tally.plain_mismatches += 1;
+                        }
+                    }
+                    self.plain_state[*slot as usize] = if took {
+                        Known::Value(value.clone())
+                    } else if refused {
+                        // The condition did not hold, so nothing was written
+                        // and the key is exactly what it was.
+                        held
+                    } else {
+                        Known::Nothing
+                    };
+                }
+                Check::PlainSetGet { slot, value } => {
+                    // The reply is the key's *previous* value, so it answers
+                    // the question a `GET` would have — held against the model
+                    // by the same code, so the two cannot disagree about what
+                    // agreement means.
+                    self.check_plain(*slot, reply);
+                    self.plain_state[*slot as usize] = match reply {
+                        // A value or its absence is the command having run.
+                        Frame::Bulk(_) | Frame::Null => Known::Value(value.clone()),
                         _ => Known::Nothing,
                     };
                 }
@@ -2680,11 +2827,16 @@ mod tests {
         // its outcome was. Then when that walk was put under churn: a client
         // now steps its own family with `SCAN` while writing and deleting
         // other keys of it, so `SCAN` is on the wire in every seed rather
-        // than only where a test asked for a full cycle. The trace folds every
-        // command's kind and every reply, so an added command changes it by
+        // than only where a test asked for a full cycle. And then when the
+        // `SET` algebra the client could reach went in: `NX`, `XX`, `GET` and
+        // `KEEPTTL` took four rolls in a hundred off the bare `SET` and the
+        // plain `GET`, so this moved and `plain_checks` rose by two — the
+        // conditions and the read-and-write decide one each where the rolls
+        // they took decided one each anyway. The trace folds every command's
+        // kind and every reply, so an added command changes it by
         // construction. A change here with no workload change beside it is a
         // regression, not a repin.
-        const MINI_1_42: u64 = 0xbe58_473a_df88_f506;
+        const MINI_1_42: u64 = 0x0400_9ca6_cd09_e14b;
 
         let outcome = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(
@@ -2705,7 +2857,7 @@ mod tests {
                 outcome.plain_checks,
                 outcome.walk_checks
             ),
-            (54, 25, 147, 32),
+            (54, 25, 149, 32),
             "the recorded workload decides a different number of checks"
         );
     }

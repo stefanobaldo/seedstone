@@ -50,7 +50,15 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
     (
         b"SET",
         Coverage::Emitted {
-            forms: &[FORM_SET, FORM_SET_EX, FORM_SET_PX],
+            forms: &[
+                FORM_SET,
+                FORM_SET_EX,
+                FORM_SET_PX,
+                FORM_SET_NX,
+                FORM_SET_XX,
+                FORM_SET_GET,
+                FORM_SET_KEEPTTL,
+            ],
         },
     ),
     (
@@ -192,10 +200,35 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
 // The form labels, named once and shared by the two halves. A literal spelled
 // twice is a literal that can disagree with itself, and the disagreement would
 // surface as the sweep accusing the contract of a claim it does not make.
+//
+// # The two `SET` options that will never be here
+//
+// `EXAT` and `PXAT` name an absolute deadline in seconds or milliseconds since
+// the epoch, and **no client in this harness can compute one**. The edge reads
+// a wall clock through an injected `now_unix_millis`, and every simulated run
+// freezes it — deliberately, so that nothing in a simulation can reach a real
+// clock and make a trace a function of when it ran. A client with no wall
+// clock has no absolute instant to name.
+//
+// That is a property of the harness rather than a gap in the workload, which
+// is why it is written here and not left as a line in a plan somewhere. It
+// will not change by anyone getting round to it: it changes only if simulated
+// runs are given a virtual wall clock the model can read, and that is a
+// different decision with the determinism argument to make again. Until then
+// the two options are covered by the service layer's own tests, against the
+// clock they inject there.
+//
+// `KEEPTTL` is here and is a weaker claim than it looks; [`crate`]'s
+// `Check::PlainSet` says which half of the option a client reaches and why the
+// other half is the volatile model's limit rather than the draw's.
 pub(crate) const FORM_GET: &str = "GET key";
 pub(crate) const FORM_SET: &str = "SET key value";
 pub(crate) const FORM_SET_EX: &str = "SET key value EX seconds";
 pub(crate) const FORM_SET_PX: &str = "SET key value PX millis";
+pub(crate) const FORM_SET_NX: &str = "SET key value NX";
+pub(crate) const FORM_SET_XX: &str = "SET key value XX";
+pub(crate) const FORM_SET_GET: &str = "SET key value GET";
+pub(crate) const FORM_SET_KEEPTTL: &str = "SET key value KEEPTTL";
 pub(crate) const FORM_MGET: &str = "MGET key [key ...]";
 pub(crate) const FORM_DEL: &str = "DEL key [key ...]";
 pub(crate) const FORM_EXISTS: &str = "EXISTS key [key ...]";
