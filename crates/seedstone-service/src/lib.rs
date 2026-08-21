@@ -287,7 +287,7 @@ pub const NOPROTO: &str = "NOPROTO unsupported protocol version";
 pub const SYNTAX_ERROR: &str = "ERR syntax error";
 
 /// What `SCAN` visits when the client does not say. Redis's default, and the
-/// number the deployed clients this gate exercises leave unset.
+/// number the clients this gate exercises leave unset.
 const SCAN_DEFAULT_COUNT: usize = 10;
 
 /// What a peer resuming a walk from something this server never issued is
@@ -331,6 +331,21 @@ const MAX_EXPIRE_SECONDS: i64 = i64::MAX / 1000;
 ///   them is a deadline the clock can still represent. Measured on this
 ///   platform rather than reasoned about: `Instant::checked_add` answers
 ///   `Some` for `Duration::from_millis(i64::MAX as u64)`.
+///
+/// Read beside [`MAX_EXPIRE_SECONDS`] those two paragraphs look like they
+/// disagree, because the spans they talk about are the same magnitude:
+/// `i64::MAX` milliseconds *is* `MAX_EXPIRE_SECONDS` seconds, to the second.
+/// They are about different bands. The immortality hole is not at that
+/// magnitude — it is strictly above it, on the seconds in
+/// `(MAX_EXPIRE_SECONDS, i64::MAX]`, where `Duration::from_secs` of the span
+/// makes `Instant::checked_add` answer `None` for any non-zero uptime: no
+/// deadline stored, the one the key already had cleared, and `1` reported as
+/// though the expiry had been set. `MAX_EXPIRE_SECONDS` is the ceiling that
+/// excludes exactly that band, which is what closes the hole. The largest
+/// millisecond span there is lands *on* the band's floor rather than inside
+/// it, three orders of magnitude short of its top, so no `PEXPIRE` argument
+/// reaches the hole at all. One paragraph is about the last span the clock can
+/// represent; the other is about the first it cannot.
 ///
 /// What is left is the ceiling the two share by being one command in two units
 /// — the longest deadline `EXPIRE` can name, written out in milliseconds. A
@@ -1083,6 +1098,26 @@ async fn broadcast<R: Router>(router: &R, cmd: Command) -> Frame {
 /// removed: a table that doubles mid-walk can return a key twice, which is
 /// `SCAN`'s documented behaviour and would be surprising in a single answer.
 ///
+/// **The answer is not a snapshot, and nothing on the wire says so.** No lock
+/// spans the walks and none spans a single shard's steps, so writes land
+/// between them; the sharp case is `FLUSHDB`, which empties every shard while
+/// the walks are in flight. `Dict::scan` short-circuits on an empty table and
+/// answers `0`, so every walk still running terminates at once and `KEYS`
+/// replies with whatever each had already gathered — a set that was the
+/// keyspace at no single instant. That is the same trade [`fan_out`] and
+/// [`broadcast`] make and the only one available at this layer, for the same
+/// reason: the alternative is a lock spanning shards, paid for by every
+/// single-key command.
+///
+/// Two things it does guarantee, and they are why the trade is acceptable.
+/// The path terminates: a shrinking table can only shorten a walk, never
+/// extend it, so there is no cursor loop that fails to end. And a cursor
+/// carried across a resize can only re-visit buckets, never skip them — the
+/// reverse-binary increment `Dict::scan` uses is correct across a shrink as
+/// well as a growth — so the failure mode is a key reported twice, which the
+/// dedup above removes, rather than a key that existed throughout and was
+/// missed.
+///
 /// The walk is `O(keyspace)` and competes for CPU with traffic while it runs.
 /// What it no longer does is stop the server for its duration, which is the
 /// difference worth having and not the same thing as being cheap.
@@ -1190,6 +1225,26 @@ fn unpack_cursor(cursor: u64) -> (u16, u64) {
 /// one shard. That is the difference from [`keys`], and the reason a client
 /// with a large keyspace should be walking it with this.
 ///
+/// **A full cycle costs at least one round trip per shard**, whatever the
+/// keyspace holds — 1024 of them at the shard count this server is built
+/// with. A spent shard hands back the *next* shard's start rather than
+/// continuing into it, so every shard costs a call even when it is empty, and
+/// a shard's table starts at eight buckets, well under [`WALK_STEP_BUCKETS`]:
+/// any shard holding fewer keys than one step covers finishes in exactly one
+/// call. Walking a thousand-key keyspace therefore costs about a thousand
+/// round trips, against the hundred or so Redis answers the same walk in at a
+/// default `COUNT`. It is a floor on *round trips*, not on work: the
+/// server-side cost is still proportional to the keyspace, and each call is
+/// still the cost of a `GET`. What it spends is the client's latency, once per
+/// shard, and a client that wraps `SCAN` in an iterator pays all of it.
+///
+/// The shape of the fix is to let one call continue into the next shard while
+/// its bucket budget is unspent, so an empty or nearly-empty shard costs a
+/// step rather than a round trip. It is deliberately not made here: it changes
+/// what a cursor means across a shard boundary, and the completeness and
+/// at-least-once reasoning this walk rests on is stated per shard. That is its
+/// own change, with its own argument to make.
+///
 /// The step may legitimately answer no keys with a non-zero cursor — a stretch
 /// of empty buckets, or a `MATCH` that excluded everything. Redis behaves the
 /// same way and clients handle it; a server that looped until it had keys
@@ -1254,7 +1309,11 @@ async fn scan<R: Router>(router: &R, cursor: u64, pattern: Option<Vec<u8>>, coun
 ///
 /// No future is polled again after it returns `Ready`: the slot that holds its
 /// output is filled in the same step, and a filled slot is skipped on every
-/// later pass.
+/// later pass. Every future that is *not* ready is polled again on every wake,
+/// though — there is no per-future waker to tell them apart — so a wake costs
+/// one poll per incomplete future, and a `KEYS` at a thousand shards does a
+/// thousand cheap polls per wake. That is the price of not spawning, and it is
+/// paid on a keyspace walk rather than on the request path.
 async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
     let mut pending: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
     let mut done: Vec<Option<F::Output>> = Vec::new();
@@ -2029,6 +2088,11 @@ fn scan_options(mut rest: &[Vec<u8>]) -> Result<(Option<Vec<u8>>, usize), String
             if n <= 0 {
                 return Err(SYNTAX_ERROR.to_owned());
             }
+            // One guard, not two. `n` is positive here, so the only way the
+            // conversion fails is a `usize` narrower than an `i64` meeting a
+            // number too large for it — which is a number the clamp would have
+            // brought down to the ceiling anyway, so the failure and the
+            // success take the same branch.
             count = usize::try_from(n)
                 .unwrap_or(WALK_STEP_BUCKETS)
                 .min(WALK_STEP_BUCKETS);
