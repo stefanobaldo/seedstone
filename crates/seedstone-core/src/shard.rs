@@ -1273,6 +1273,16 @@ fn sweep_expired<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
 /// `now` is the instant the whole envelope is being served at, supplied by the
 /// executor: a handler must not read a clock of its own, or two commands of
 /// one batch could disagree about which keys are still alive.
+///
+/// **Every non-trivial arm is a named free function directly below, in match
+/// order.** An arm stays inline only while it is a line or two that reads as
+/// the command it serves; anything with a decision in it is extracted, and the
+/// extraction lands in the order the match dispatches so that reading the two
+/// side by side is one pass rather than a search. The helpers that belong to
+/// no single arm — [`evict_if_expired`], [`deadline`], [`remaining_seconds`],
+/// [`append`] — follow the arm handlers as their own group. This is what keeps
+/// the dispatcher a dispatcher as commands are added, rather than something
+/// the length lint eventually has to say out loud.
 fn apply<L: ReplicationLog, P: ExpiryPolicy>(
     dict: &mut Dict,
     log: &mut L,
@@ -1414,55 +1424,6 @@ fn apply<L: ReplicationLog, P: ExpiryPolicy>(
     }
 }
 
-/// Empties one shard's keyspace.
-fn flush_db<L: ReplicationLog>(dict: &mut Dict, log: &mut L, seq: &mut u64, shard: u16) -> Reply {
-    // A shard with nothing in it has nothing to record, for the reason a `Del`
-    // of a missing key appends nothing: a record that replays to a no-op is a
-    // record the log is better without. So a flush of an empty keyspace costs
-    // one comparison and no position.
-    if dict.is_empty() {
-        return Reply::Ok;
-    }
-    // One record for the whole removal, not one per key. The log records that
-    // a mutation happened and where it sits in the shard's order — see
-    // `append` — and a flush is one mutation. It is also the only spelling
-    // under which a refusal can leave the keyspace alone: a record per key
-    // could fail partway and there would be no flush to undo.
-    if let Err(failed) = append(log, seq, shard) {
-        return failed;
-    }
-    dict.clear();
-    Reply::Ok
-}
-
-/// The name of the type `key` holds, or `none` if it holds nothing.
-///
-/// Presence is the whole question. This shard stores strings and nothing
-/// else, so every key that is there holds one and the answer is looked up
-/// rather than derived from the entry. A key whose deadline has passed is
-/// already gone by the time this runs — [`apply`] evicts before it
-/// dispatches — so it reads as absent without this having to ask.
-fn type_name(dict: &Dict, key: &[u8]) -> &'static str {
-    if dict.get(key).is_some() {
-        "string"
-    } else {
-        "none"
-    }
-}
-
-/// How many bytes `key`'s value holds, or `0` if there is no such key.
-///
-/// A missing key and a key holding an empty value both measure `0`, which is
-/// Redis's answer for each. Saturating for the reason [`Command::DbSize`]
-/// saturates: a value longer than `i64::MAX` cannot be held in the first
-/// place, and the ceiling is a better answer than a wrap into a negative
-/// length.
-fn value_len(dict: &Dict, key: &[u8]) -> i64 {
-    dict.get(key).map_or(0, |entry| {
-        i64::try_from(entry.value.len()).unwrap_or(i64::MAX)
-    })
-}
-
 /// A [`Command::Set`]'s pieces, as [`set`] receives them.
 ///
 /// A bundle rather than six parameters because six is more than the ceiling
@@ -1552,6 +1513,115 @@ fn set<L: ReplicationLog>(
     if get { Reply::Bulk(old) } else { Reply::Ok }
 }
 
+/// What `EXPIRE`'s or `PEXPIRE`'s span turned out to mean, once its unit is
+/// out of the way.
+///
+/// The two commands differ in exactly one thing — the unit the span is written
+/// in — so they reach one handler through this rather than being two arms that
+/// would have to be kept identical by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deadline {
+    /// Put this deadline on the key. The `None` inside is a span the clock
+    /// cannot represent, which [`deadline`] turns into no deadline at all.
+    At(Option<Instant>),
+    /// The deadline is not in the future, so the key is to be removed.
+    Passed,
+}
+
+/// Reads a span in the unit its command was written in as the deadline it names.
+///
+/// `unit` is the [`Expiry`] constructor for that unit, so the only thing a
+/// caller supplies beyond the number is what the number counts.
+fn span_deadline(now: Instant, span: i64, unit: fn(u64) -> Expiry) -> Deadline {
+    if span <= 0 {
+        return Deadline::Passed;
+    }
+    let span = u64::try_from(span).expect("a positive i64 is a u64");
+    Deadline::At(deadline(now, Some(unit(span))))
+}
+
+/// Applies what a span turned out to mean — a deadline, or a removal —
+/// answering whether there was a key to apply it to.
+fn set_expiry<L: ReplicationLog>(
+    dict: &mut Dict,
+    log: &mut L,
+    seq: &mut u64,
+    shard: u16,
+    key: &[u8],
+    at: Deadline,
+) -> Reply {
+    // Answered before the log is touched. A key that is not there receives no
+    // deadline, and a record that replays to nothing is a record the log is
+    // better without — the same rule a `Del` of a missing key follows.
+    if dict.get(key).is_none() {
+        return Reply::Integer(0);
+    }
+    if let Err(failed) = append(log, seq, shard) {
+        return failed;
+    }
+    match at {
+        // A deadline that is not in the future is a deletion, and Redis
+        // reports it as an applied expiry rather than as a delete — the client
+        // asked for the key to be gone by a time that has passed, and it is.
+        Deadline::Passed => {
+            dict.remove(key);
+        }
+        Deadline::At(at) => {
+            dict.set_deadline(key, at);
+        }
+    }
+    Reply::Integer(1)
+}
+
+/// The name of the type `key` holds, or `none` if it holds nothing.
+///
+/// Presence is the whole question. This shard stores strings and nothing
+/// else, so every key that is there holds one and the answer is looked up
+/// rather than derived from the entry. A key whose deadline has passed is
+/// already gone by the time this runs — [`apply`] evicts before it
+/// dispatches — so it reads as absent without this having to ask.
+fn type_name(dict: &Dict, key: &[u8]) -> &'static str {
+    if dict.get(key).is_some() {
+        "string"
+    } else {
+        "none"
+    }
+}
+
+/// How many bytes `key`'s value holds, or `0` if there is no such key.
+///
+/// A missing key and a key holding an empty value both measure `0`, which is
+/// Redis's answer for each. Saturating for the reason [`Command::DbSize`]
+/// saturates: a value longer than `i64::MAX` cannot be held in the first
+/// place, and the ceiling is a better answer than a wrap into a negative
+/// length.
+fn value_len(dict: &Dict, key: &[u8]) -> i64 {
+    dict.get(key).map_or(0, |entry| {
+        i64::try_from(entry.value.len()).unwrap_or(i64::MAX)
+    })
+}
+
+/// Empties one shard's keyspace.
+fn flush_db<L: ReplicationLog>(dict: &mut Dict, log: &mut L, seq: &mut u64, shard: u16) -> Reply {
+    // A shard with nothing in it has nothing to record, for the reason a `Del`
+    // of a missing key appends nothing: a record that replays to a no-op is a
+    // record the log is better without. So a flush of an empty keyspace costs
+    // one comparison and no position.
+    if dict.is_empty() {
+        return Reply::Ok;
+    }
+    // One record for the whole removal, not one per key. The log records that
+    // a mutation happened and where it sits in the shard's order — see
+    // `append` — and a flush is one mutation. It is also the only spelling
+    // under which a refusal can leave the keyspace alone: a record per key
+    // could fail partway and there would be no flush to undo.
+    if let Err(failed) = append(log, seq, shard) {
+        return failed;
+    }
+    dict.clear();
+    Reply::Ok
+}
+
 /// Visits up to `count` buckets from `cursor` and reports the live keys among
 /// them that match `pattern`.
 ///
@@ -1637,66 +1707,6 @@ fn evict_if_expired<L: ReplicationLog, P: ExpiryPolicy>(
     append(log, seq, shard)?;
     dict.remove(key);
     Ok(())
-}
-
-/// What `EXPIRE`'s or `PEXPIRE`'s span turned out to mean, once its unit is
-/// out of the way.
-///
-/// The two commands differ in exactly one thing — the unit the span is written
-/// in — so they reach one handler through this rather than being two arms that
-/// would have to be kept identical by hand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Deadline {
-    /// Put this deadline on the key. The `None` inside is a span the clock
-    /// cannot represent, which [`deadline`] turns into no deadline at all.
-    At(Option<Instant>),
-    /// The deadline is not in the future, so the key is to be removed.
-    Passed,
-}
-
-/// Reads a span in the unit its command was written in as the deadline it names.
-///
-/// `unit` is the [`Expiry`] constructor for that unit, so the only thing a
-/// caller supplies beyond the number is what the number counts.
-fn span_deadline(now: Instant, span: i64, unit: fn(u64) -> Expiry) -> Deadline {
-    if span <= 0 {
-        return Deadline::Passed;
-    }
-    let span = u64::try_from(span).expect("a positive i64 is a u64");
-    Deadline::At(deadline(now, Some(unit(span))))
-}
-
-/// Applies what a span turned out to mean — a deadline, or a removal —
-/// answering whether there was a key to apply it to.
-fn set_expiry<L: ReplicationLog>(
-    dict: &mut Dict,
-    log: &mut L,
-    seq: &mut u64,
-    shard: u16,
-    key: &[u8],
-    at: Deadline,
-) -> Reply {
-    // Answered before the log is touched. A key that is not there receives no
-    // deadline, and a record that replays to nothing is a record the log is
-    // better without — the same rule a `Del` of a missing key follows.
-    if dict.get(key).is_none() {
-        return Reply::Integer(0);
-    }
-    if let Err(failed) = append(log, seq, shard) {
-        return failed;
-    }
-    match at {
-        // A deadline that is not in the future is a deletion, and Redis
-        // reports it as an applied expiry rather than as a delete — the client
-        // asked for the key to be gone by a time that has passed, and it is.
-        Deadline::Passed => {
-            dict.remove(key);
-        }
-        Deadline::At(at) => {
-            dict.set_deadline(key, at);
-        }
-    }
-    Reply::Integer(1)
 }
 
 /// The instant an expiry option lands on, or `None` for a key with no
