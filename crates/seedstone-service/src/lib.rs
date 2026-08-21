@@ -1434,7 +1434,18 @@ async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>, fold: Fold) -> Frame
                 if slice.is_empty() {
                     break;
                 }
-                for reply in router.dispatch_many(slice).await {
+                // One reply per command, or this is not an answer to the
+                // request that was asked. A router that returned fewer would
+                // shorten the array with nothing on the wire to say so, and a
+                // client zipping its keys against the values it got back reads
+                // the missing tail as cache misses it cannot tell from real
+                // ones.
+                let expected = slice.len();
+                let replies = router.dispatch_many(slice).await;
+                if replies.len() != expected {
+                    return Frame::Error(UNRENDERABLE_REPLY.into());
+                }
+                for reply in replies {
                     match reply {
                         // A key that is not there is an entry all the same — the
                         // array's null, in its own slot, never a shorter array.
@@ -3923,6 +3934,69 @@ mod tests {
             *sizes.lock().expect("sizes mutex"),
             vec![CHUNK_COMMANDS, CHUNK_COMMANDS, KEYS - 2 * CHUNK_COMMANDS],
             "the fan-out must reach the router in slices of at most {CHUNK_COMMANDS}"
+        );
+    }
+
+    /// A router that hands back fewer replies than commands is refused, not
+    /// folded into a shorter array.
+    ///
+    /// Both routers in this workspace answer one reply per command, so this
+    /// holds a contract rather than fixing a bug — and it is worth holding
+    /// because the failure it prevents is silent. django-redis builds its
+    /// `get_many` as `dict(zip(keys, values))`, so a two-key `MGET` answered
+    /// with a one-entry array becomes a mapping of one key: the key that fell
+    /// off the end reads as an ordinary cache miss, the client refills it, and
+    /// nothing on the wire distinguishes that from a key that really was not
+    /// there. An error is the only answer a peer can act on.
+    #[tokio::test]
+    async fn a_short_reply_vector_is_refused_rather_than_shortening_the_array() {
+        /// Its pool, minus the last reply of every batch.
+        #[derive(Clone)]
+        struct ShortByOne {
+            inner: ShardPool,
+        }
+
+        impl Router for ShortByOne {
+            async fn dispatch(&self, cmd: Command) -> Reply {
+                self.inner.dispatch(cmd).await
+            }
+
+            fn shards(&self) -> u16 {
+                self.inner.shards()
+            }
+
+            async fn dispatch_at(&self, shard: u16, cmd: Command) -> Reply {
+                self.inner.dispatch_at(shard, cmd).await
+            }
+
+            async fn dispatch_many(&self, cmds: Vec<Command>) -> Vec<Reply> {
+                let mut replies = self.inner.dispatch_many(cmds).await;
+                replies.pop();
+                replies
+            }
+
+            async fn dispatch_every(&self, cmd: Command) -> Vec<Reply> {
+                self.inner.dispatch_every(cmd).await
+            }
+        }
+
+        let router = ShortByOne {
+            inner: ShardPool::spawn(4, 2, DictSeed { k0: 5, k1: 7 }, NoTrace),
+        };
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(serve_connection(server, router, NodeInfo::for_tests()));
+        let (mut r, mut w) = tokio::io::split(client);
+
+        let mut out = Vec::new();
+        encode(&req(&["MGET", "a", "b"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 1).await;
+        assert_eq!(
+            frames[0],
+            Frame::Error(UNRENDERABLE_REPLY.into()),
+            "a short reply vector reached the peer as an array"
         );
     }
 
