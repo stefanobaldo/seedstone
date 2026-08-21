@@ -1834,9 +1834,16 @@ mod tests {
     /// a variant added later cannot compile without answering — but nothing
     /// makes it answer *correctly*, and a keyed command routed to the wrong
     /// key is a key served by the wrong shard.
+    ///
+    /// The lists are length-annotated so that adding a variant to one of them
+    /// is a deliberate act rather than a line that slips in unnoticed, and
+    /// every variant is in exactly one of them: the keyed ones below, and the
+    /// three that name no key. `Type` and `StrLen` reached the enum without
+    /// reaching this list once already, which is the failure this guard exists
+    /// to catch and did not.
     #[test]
     fn every_command_declares_how_it_is_routed() {
-        let keyed: [Command; 9] = [
+        let keyed: [Command; 11] = [
             Command::Get { key: b"k".to_vec() },
             set(b"k", b"v"),
             Command::Del { key: b"k".to_vec() },
@@ -1855,6 +1862,8 @@ mod tests {
             Command::Ttl { key: b"k".to_vec() },
             Command::Persist { key: b"k".to_vec() },
             Command::Exists { key: b"k".to_vec() },
+            Command::Type { key: b"k".to_vec() },
+            Command::StrLen { key: b"k".to_vec() },
         ];
         for cmd in keyed {
             assert_eq!(
@@ -1862,6 +1871,22 @@ mod tests {
                 Route::Key(b"k"),
                 "{cmd:?} routes on the key it names"
             );
+        }
+
+        let keyless: [(Command, Route<'_>); 3] = [
+            (Command::FlushDb, Route::Every),
+            (Command::DbSize, Route::Every),
+            (
+                Command::ScanStep {
+                    cursor: 0,
+                    count: 1,
+                    pattern: None,
+                },
+                Route::Unaddressed,
+            ),
+        ];
+        for (cmd, route) in keyless {
+            assert_eq!(cmd.route(), route, "{cmd:?} routes as it declares");
         }
     }
 
