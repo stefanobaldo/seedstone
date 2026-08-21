@@ -112,6 +112,7 @@ use seedstone_core::shard::{
 };
 use seedstone_resp::{Decoder, DecoderLimits, Frame, encode};
 use seedstone_service::{NodeInfo, serve_connection};
+use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -331,6 +332,23 @@ pub struct SimConfig {
     pub workload_seed: u64,
     /// Seeds turmoil: the network's latencies and the order hosts run in.
     pub sim_seed: u64,
+    /// Whether the run ends with a complete `SCAN` cycle over the walk
+    /// family.
+    ///
+    /// Off in both shapes below, and the reason is what it costs against what
+    /// it measures. A complete cycle costs **at least one round trip per
+    /// shard** — a spent shard hands back the next one's start rather than
+    /// continuing into it — which is a thousand sequential round trips on the
+    /// deployed shard count, measured at four and a half times the rest of a
+    /// run. What it buys for that is an assertion taken after every client has
+    /// stopped, so no schedule is being exercised while it runs: sweeping it
+    /// over three hundred seeds proves exactly what one run proves, while
+    /// costing the sweep the seeds that were finding real interleavings.
+    ///
+    /// So it is a test's to ask for, not a sweep's, and the sweep keeps the
+    /// half that *is* schedule-sensitive: every client walks its own family
+    /// with `KEYS` while the others are still writing.
+    pub quiescent_walk: bool,
     /// Which deliberate defect, if any, to serve the workload through.
     pub planted: Option<Plant>,
 }
@@ -351,6 +369,7 @@ impl SimConfig {
             pipeline_depth: 8,
             workload_seed,
             sim_seed,
+            quiescent_walk: false,
             planted: None,
         }
     }
@@ -370,6 +389,7 @@ impl SimConfig {
             pipeline_depth: 8,
             workload_seed,
             sim_seed,
+            quiescent_walk: false,
             planted: None,
         }
     }
@@ -433,7 +453,7 @@ impl Plant {
 
 /// What one run produced.
 ///
-/// The three violation counts come paired with the number of replies their
+/// Every violation count comes paired with the number of replies its
 /// invariant actually *decided*. A zero violation count is evidence only
 /// beside a non-zero check count — this is the same discipline the counter
 /// sum is held to, where a workload that acknowledged no `INCRBY` satisfies
@@ -464,6 +484,11 @@ pub struct SimOutcome {
     /// Plain reads decided against a client's model — the denominator of
     /// [`SimOutcome::plain_mismatches`].
     pub plain_checks: u64,
+    /// Keyspace walks that did not return exactly the keys that were there.
+    pub walk_mismatches: u64,
+    /// Keyspace walks decided against an exactly known set — the denominator
+    /// of [`SimOutcome::walk_mismatches`].
+    pub walk_checks: u64,
 }
 
 impl SimOutcome {
@@ -471,16 +496,17 @@ impl SimOutcome {
     ///
     /// The counter sum first: `INCRBY` is order-independent, so a schedule
     /// cannot legitimately move it and any difference is an acknowledged
-    /// increment that did not survive. Then the three keyspace invariants,
-    /// each of which a schedule is equally powerless to excuse — a deadline
-    /// is a deadline, and a key nobody else can write is what its owner last
-    /// wrote.
+    /// increment that did not survive. Then the keyspace invariants, each of
+    /// which a schedule is equally powerless to excuse — a deadline is a
+    /// deadline, a key nobody else can write is what its owner last wrote,
+    /// and a walk over a set nobody is touching returns that set.
     #[must_use]
     pub const fn invariant_holds(&self) -> bool {
         self.expected_sum == self.actual_sum
             && self.stale_reads == 0
             && self.spurious_deaths == 0
             && self.plain_mismatches == 0
+            && self.walk_mismatches == 0
     }
 
     /// Whether the run's invariants decided anything at all.
@@ -496,6 +522,7 @@ impl SimOutcome {
             && self.dead_checks > 0
             && self.alive_checks > 0
             && self.plain_checks > 0
+            && self.walk_checks > 0
     }
 }
 
@@ -560,7 +587,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
 
     sim.run().expect("simulation failed");
 
-    let tally = *lock(&shared.0);
+    let tally = *lock(&shared.tally);
     SimOutcome {
         trace_hash: *lock(&trace),
         expected_sum: tally.expected,
@@ -571,6 +598,8 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         dead_checks: tally.dead_checks,
         alive_checks: tally.alive_checks,
         plain_checks: tally.plain_checks,
+        walk_mismatches: tally.walk_mismatches,
+        walk_checks: tally.walk_checks,
     }
 }
 
@@ -580,7 +609,19 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
 /// mutex is never actually contended; it is here because [`TraceSink`] and
 /// the futures turmoil holds must be `Send`.
 #[derive(Clone, Default)]
-struct Shared(Arc<Mutex<Tally>>);
+struct Shared {
+    /// The counters every host adds to.
+    tally: Arc<Mutex<Tally>>,
+    /// Every walk key whose write the server acknowledged, from every client.
+    ///
+    /// The verifier's walk asserts set equality over the whole family, and it
+    /// cannot derive the family from the configuration: a write the server
+    /// refused is a key that is legitimately absent, and a model that assumed
+    /// otherwise would report a violation the system never committed. So the
+    /// clients publish what they were told took, and the verifier holds the
+    /// server to exactly that.
+    walk: Arc<Mutex<BTreeSet<Vec<u8>>>>,
+}
 
 /// Everything the hosts count between them.
 #[derive(Debug, Clone, Copy, Default)]
@@ -599,6 +640,8 @@ struct Tally {
     dead_checks: u64,
     alive_checks: u64,
     plain_checks: u64,
+    walk_mismatches: u64,
+    walk_checks: u64,
 }
 
 /// Takes a lock that cannot be contended, and says so if it was poisoned.
@@ -645,17 +688,45 @@ impl TraceSink for HashSink {
             // tag, which no other route may take.
             Route::Shard(shard) => mix(mix(acc, 1), u64::from(shard)),
             Route::Every => mix(acc, 2),
-            // A `ScanStep` folds a constant, because the variant names no
-            // shard of its own and the shard that ran it arrives as `record`'s
-            // own argument, folded above. Its cursor, count and pattern reach
-            // the hash through no path on the command side at all — only
-            // `fold_reply` discriminates a step, and it does so by outcome.
-            // That is enough while nothing in the workload drives one; a walk
-            // that enters the simulated workload wants its inputs folded here.
+            // A `ScanStep` folds a constant here, because the variant names
+            // no shard of its own and the shard that ran it arrives as
+            // `record`'s own argument, folded above. What decides the step is
+            // its arguments, and those are folded below.
             Route::Unaddressed => mix(acc, 3),
         };
+        acc = fold_inputs(acc, cmd);
         acc = fold_reply(acc, reply);
         *h = acc;
+    }
+}
+
+/// Folds whatever of a command's arguments its route does not already reach.
+///
+/// Every command that names a key folds it through [`Route::Key`], and what
+/// the rest of its arguments did is visible in the reply the shard gave. A
+/// scan step is the exception on both counts: it names no key, and two steps
+/// with different cursors, counts or patterns can answer alike — an empty
+/// batch and a spent cursor look the same however they were asked for. So a
+/// walk driven from the workload would otherwise fold its outcome and none of
+/// its inputs, and a divergence in *which step was taken* would be invisible
+/// until it happened to change an answer.
+fn fold_inputs(h: u64, cmd: &Command) -> u64 {
+    match cmd {
+        Command::ScanStep {
+            cursor,
+            count,
+            pattern,
+        } => {
+            let h = mix(mix(h, *cursor), *count as u64);
+            pattern
+                .as_ref()
+                .map_or_else(|| mix(h, 0), |pattern| fold_bytes(mix(h, 1), pattern))
+        }
+        // Every other command's key is folded by its route, and its remaining
+        // arguments are decided by the reply. A command added later whose
+        // behaviour turns on an argument neither of those reaches belongs
+        // here, not in a comment saying it does not matter yet.
+        _ => h,
     }
 }
 
@@ -946,7 +1017,10 @@ async fn client(id: u16, cfg: SimConfig, shared: Shared) -> turmoil::Result {
     }
 
     model.settle(&mut conn, depth as usize).await?;
-    lock(&shared.0).done += 1;
+    // After the settle, so the walk keys are the only thing this client has
+    // written that nothing is still deciding the fate of.
+    model.walk(&mut conn, depth as usize).await?;
+    lock(&shared.tally).done += 1;
     Ok(())
 }
 
@@ -1115,6 +1189,28 @@ const DEADLINES: [Deadline; 6] = [
 /// and the only source of keys certain to be *alive* late in the workload.
 const EXPIRE_SECONDS: u64 = 1;
 
+/// How many walk keys a client writes once its mutations are over.
+///
+/// Small, and what that gives up is worth stating. What the walk asserts is
+/// that a set comes back exactly, and a systematically wrong matcher, an
+/// inverted filter or a broken dedup shows up whatever the set's size. What
+/// more keys would buy is *placement*: a fan-out that skipped a single shard
+/// is caught only if a walk key happened to live there, and eight per client
+/// covers a small fraction of the shards a deployed shape has. Covering them
+/// densely enough to make that certain would put more keys in the walk family
+/// than in every other family combined, which changes the shape the sweep is
+/// measuring in order to catch a defect the service layer's own tests already
+/// pin directly. Proving the invariant bites is a planted defect's job, not a
+/// key count's.
+const WALK_KEYS: u32 = 8;
+
+/// The `COUNT` the verifier's `SCAN` asks for on the steps that carry one.
+///
+/// Below the ceiling the server clamps to, so the number on the wire is the
+/// number the server uses — a `COUNT` above the clamp would exercise the clamp
+/// instead of the option.
+const WALK_SCAN_COUNT: usize = 32;
+
 /// Where the counter family's share of a hundred rolls ends and the plain
 /// family's begins.
 ///
@@ -1145,6 +1241,9 @@ const PEXPIRE_MILLIS: u64 = 150;
 /// One client's picture of the keys it owns, and the invariants it holds the
 /// server to over them.
 struct Model {
+    /// Which client this is. Its walk keys carry it in their names, so a glob
+    /// can isolate them from every other client's.
+    id: u16,
     /// How many counter keys there are. The one family this client does not
     /// own a slice of: they are shared, which is where the contention is.
     counter_keys: u32,
@@ -1166,6 +1265,7 @@ impl Model {
         let plain = KeyRange::new(id, cfg.plain_keys, cfg.clients);
         let volatile = KeyRange::new(id, cfg.volatile_keys, cfg.clients);
         Self {
+            id,
             counter_keys: cfg.counter_keys,
             plain_state: vec![Known::Nothing; plain.len as usize],
             deadlines: vec![None; volatile.len as usize],
@@ -1377,7 +1477,7 @@ impl Model {
                 // reads its reply the same way.
                 Check::Counter(delta) => {
                     if matches!(reply, Frame::Integer(_)) {
-                        lock(&self.shared.0).expected += delta;
+                        lock(&self.shared.tally).expected += delta;
                     }
                 }
                 Check::PlainSet { slot, value } => {
@@ -1456,7 +1556,7 @@ impl Model {
         }
 
         if predictable {
-            let mut tally = lock(&self.shared.0);
+            let mut tally = lock(&self.shared.tally);
             tally.plain_checks += 1;
             if *reply != Frame::Integer(counted) {
                 tally.plain_mismatches += 1;
@@ -1506,7 +1606,7 @@ impl Model {
             }
             _ => false,
         };
-        let mut tally = lock(&self.shared.0);
+        let mut tally = lock(&self.shared.tally);
         tally.plain_checks += 1;
         if !agrees {
             tally.plain_mismatches += 1;
@@ -1527,7 +1627,7 @@ impl Model {
             Known::Absent => reply == absent,
             Known::Value(_) => reply == present,
         };
-        let mut tally = lock(&self.shared.0);
+        let mut tally = lock(&self.shared.tally);
         tally.plain_checks += 1;
         if !agrees {
             tally.plain_mismatches += 1;
@@ -1549,7 +1649,7 @@ impl Model {
             (Known::Value(value), Frame::Bulk(got)) => got == value,
             (Known::Value(_), _) => false,
         };
-        let mut tally = lock(&self.shared.0);
+        let mut tally = lock(&self.shared.tally);
         tally.plain_checks += 1;
         if !agrees {
             tally.plain_mismatches += 1;
@@ -1582,7 +1682,7 @@ impl Model {
             Frame::Null => false,
             _ => return,
         };
-        let mut tally = lock(&self.shared.0);
+        let mut tally = lock(&self.shared.tally);
         if sent > deadline + STALE_SLACK {
             tally.dead_checks += 1;
             if present {
@@ -1650,6 +1750,84 @@ impl Model {
         }
         Ok(())
     }
+
+    /// Writes this client's walk keys, stops writing them, and holds `KEYS`
+    /// to returning exactly that set.
+    ///
+    /// The strongest assertion available for a keyspace walk, and the reason
+    /// it is available at all is that the set is quiescent: this client has
+    /// finished writing these keys and no other client can name one. The
+    /// keyspace *around* them is not quiescent — the other fifteen are still
+    /// working — and that is deliberate rather than tolerated. The pattern
+    /// isolates what this client owns, so growth elsewhere can rehash the
+    /// table under the walk without making the answer any less exactly
+    /// predictable, which is the one thing a reverse-increment cursor exists
+    /// to survive.
+    ///
+    /// Set equality is what is asserted, not the weaker at-least-once the
+    /// guarantee promises: `KEYS` deduplicates at the edge, so a repeat is a
+    /// finding here rather than an allowance. This is where a wrong matcher, a
+    /// shard missing from the fan-out, an inverted filter, a cursor that
+    /// stopped early or a broken dedup shows up with a legible message
+    /// instead of as an unreadable failing seed.
+    async fn walk(&self, conn: &mut Conn, depth: usize) -> turmoil::Result<()> {
+        let names: Vec<String> = (0..WALK_KEYS).map(|slot| walk_key(self.id, slot)).collect();
+        // The value is the key: nothing reads it back, and a value that names
+        // its own key is what makes a mis-shelved one legible if something
+        // ever does.
+        let writes: Vec<Frame> = names
+            .iter()
+            .map(|name| command(&["SET", name, name]))
+            .collect();
+
+        let mut written = BTreeSet::new();
+        for (batch, burst) in writes.chunks(depth).enumerate() {
+            for (offset, reply) in conn.request_many(burst).await?.into_iter().enumerate() {
+                // Only an acknowledged write is a key we may insist on. A
+                // refusal is a key that is legitimately absent, and demanding
+                // it back would manufacture a violation.
+                if reply == Frame::Simple("OK".into()) {
+                    written.insert(names[batch * depth + offset].clone().into_bytes());
+                }
+            }
+        }
+        lock(&self.shared.walk).extend(written.iter().cloned());
+
+        let reply = conn
+            .request_many(&[command(&["KEYS", &walk_pattern(self.id)])])
+            .await?;
+        {
+            let mut tally = lock(&self.shared.tally);
+            tally.walk_checks += 1;
+            // `Some((set, false))` is the only shape that can agree: anything
+            // else is a malformed reply or a key returned twice, and `KEYS`
+            // promises neither.
+            if listed_keys(&reply[0]) != Some((written, false)) {
+                tally.walk_mismatches += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The keys a reply lists, and whether any of them was listed twice.
+///
+/// `None` for anything that is not an array of bulk strings — an error frame
+/// included, because a walk that failed returned no keys rather than an empty
+/// keyspace.
+fn listed_keys(reply: &Frame) -> Option<(BTreeSet<Vec<u8>>, bool)> {
+    let Frame::Array(items) = reply else {
+        return None;
+    };
+    let mut keys = BTreeSet::new();
+    let mut repeated = false;
+    for item in items {
+        let Frame::Bulk(key) = item else {
+            return None;
+        };
+        repeated |= !keys.insert(key.clone());
+    }
+    Some((keys, repeated))
 }
 
 /// The last client: waits for the workload to drain, then reads every counter.
@@ -1658,7 +1836,7 @@ impl Model {
 /// *settled on*: a counter read while an increment is still in flight is not
 /// a lost update, it is an early read.
 async fn verifier(cfg: SimConfig, shared: Shared) -> turmoil::Result {
-    while lock(&shared.0).done < u32::from(cfg.clients) {
+    while lock(&shared.tally).done < u32::from(cfg.clients) {
         // Simulated time: this costs ticks, not wall clock.
         tokio::time::sleep(VERIFIER_POLL).await;
     }
@@ -1686,8 +1864,118 @@ async fn verifier(cfg: SimConfig, shared: Shared) -> turmoil::Result {
             };
         }
     }
-    lock(&shared.0).actual = total;
+    lock(&shared.tally).actual = total;
+
+    if cfg.quiescent_walk {
+        walk_the_whole_family(&mut conn, &cfg, &shared).await?;
+    }
     Ok(())
+}
+
+/// The quiescent walk over every walk key in the run, by both commands.
+///
+/// Here rather than in a client because every client has finished: nothing is
+/// mutating anything, so the model knows the *whole* keyspace this pattern
+/// selects and the assertion is set equality over all of it rather than over
+/// one client's slice.
+///
+/// A full `SCAN` cycle costs at least one round trip per shard, so it is run
+/// once for the run rather than once per client. N of them would buy nothing
+/// the one does not: the walk is over a set nobody is touching, so a second
+/// walker sees exactly what the first did.
+async fn walk_the_whole_family(
+    conn: &mut Conn,
+    cfg: &SimConfig,
+    shared: &Shared,
+) -> turmoil::Result<()> {
+    let expected = lock(&shared.walk).clone();
+
+    let reply = conn.request_many(&[command(&["KEYS", WALK_ALL])]).await?;
+    let keys_agrees = listed_keys(&reply[0]) == Some((expected.clone(), false));
+
+    // Every shard costs a step even when it holds nothing, because a spent
+    // shard hands back the next one's start rather than continuing into it;
+    // a shard costs a second step only once its table has grown past a step's
+    // bucket budget, which takes more keys than exist. So the shard count plus
+    // the keyspace is a bound the walk cannot legitimately reach, and reaching
+    // it is a cursor that stopped advancing.
+    let bound = u64::from(cfg.shards)
+        + u64::from(cfg.plain_keys)
+        + u64::from(cfg.volatile_keys)
+        + u64::from(cfg.counter_keys)
+        + u64::from(cfg.clients) * u64::from(WALK_KEYS);
+
+    let mut seen = BTreeSet::new();
+    let mut cursor = 0u64;
+    let mut steps = 0u64;
+    let mut scan_agrees = true;
+    loop {
+        // Both forms, alternating, so a run exercises the option and its
+        // absence and neither depends on a seed to be reached. The count is
+        // the client's to choose and the server clamps it; below the clamp,
+        // the number on the wire is the number that is used.
+        let cursor_text = cursor.to_string();
+        let count_text = WALK_SCAN_COUNT.to_string();
+        let step = if steps.is_multiple_of(2) {
+            command(&["SCAN", &cursor_text, "MATCH", WALK_ALL])
+        } else {
+            command(&[
+                "SCAN",
+                &cursor_text,
+                "MATCH",
+                WALK_ALL,
+                "COUNT",
+                &count_text,
+            ])
+        };
+        let reply = conn.request_many(&[step]).await?;
+        steps += 1;
+
+        let Frame::Array(parts) = &reply[0] else {
+            scan_agrees = false;
+            break;
+        };
+        let [Frame::Bulk(next), keys] = parts.as_slice() else {
+            scan_agrees = false;
+            break;
+        };
+        let (Some(next), Some((keys, _))) = (parse_u64(next), listed_keys(keys)) else {
+            scan_agrees = false;
+            break;
+        };
+        // Repeats are allowed here and nowhere else: `SCAN` may return a key
+        // twice, as Redis's does, so the union across steps is what the
+        // guarantee is about.
+        seen.extend(keys);
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+        if steps >= bound {
+            scan_agrees = false;
+            break;
+        }
+    }
+
+    {
+        let mut tally = lock(&shared.tally);
+        tally.walk_checks += 2;
+        if !keys_agrees {
+            tally.walk_mismatches += 1;
+        }
+        if !scan_agrees || seen != expected {
+            tally.walk_mismatches += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Reads a cursor the server issued back off the wire.
+///
+/// The server prints one with `u64::to_string`, so this is the exact inverse
+/// and nothing more: a cursor is not a number a person typed.
+fn parse_u64(bytes: &[u8]) -> Option<u64> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 /// The name of a counter key — touched only by `INCRBY`, shared by every
@@ -1707,6 +1995,28 @@ fn plain_key(index: u32) -> String {
 fn volatile_key(index: u32) -> String {
     format!("volatile-{index}")
 }
+
+/// The name of a walk key — written once, never expired, and named so a glob
+/// isolates one client's own.
+///
+/// The other families are indexed by a number split between clients, which no
+/// pattern can separate. A walk asserts over what one client owns, so its keys
+/// carry the owner in the name.
+fn walk_key(client: u16, slot: u32) -> String {
+    format!("walk-{client}-{slot}")
+}
+
+/// The glob that matches exactly one client's walk keys.
+fn walk_pattern(client: u16) -> String {
+    format!("walk-{client}-*")
+}
+
+/// The glob that matches every walk key in the run.
+///
+/// `walk-*` and not `*`: the point of the assertion is set equality, and the
+/// only set the harness knows exactly is this one. A walk over the whole
+/// keyspace would be racing the expiry sweep for its own denominator.
+const WALK_ALL: &str = "walk-*";
 
 /// Builds a RESP2 command frame: an array of bulk strings, as a real client
 /// sends.
@@ -1810,6 +2120,36 @@ mod tests {
         );
     }
 
+    /// The exact oracle: with nothing mutating, the model knows the whole
+    /// walk family, so the assertion is set equality rather than the weaker
+    /// at-least-once the concurrent case forces.
+    ///
+    /// This is the strongest claim available for `KEYS` and `SCAN`, and it is
+    /// where a wrong matcher, a shard missing from the fan-out, an inverted
+    /// filter, a cursor that stops early or a broken dedup shows up with a
+    /// legible message instead of as an unreadable failing seed. It is a test
+    /// rather than a sweep for the reason [`SimConfig::quiescent_walk`] gives.
+    #[test]
+    fn a_quiescent_walk_returns_exactly_the_keys_that_are_there() {
+        let mut cfg = SimConfig::mini(1, 42);
+        cfg.quiescent_walk = true;
+        let outcome = run_sim(&cfg);
+        assert!(outcome.invariant_holds(), "{outcome:?}");
+        assert!(
+            outcome.invariants_were_exercised(),
+            "a run that never reached the quiescent phase proves nothing: {outcome:?}"
+        );
+        // Named rather than left to `invariants_were_exercised`, which is
+        // satisfied by the per-client walks alone: what this test is about is
+        // the two assertions the cycle adds, and a run that skipped them would
+        // otherwise pass here for the wrong reason.
+        assert_eq!(
+            outcome.walk_checks,
+            u64::from(cfg.clients) + 2,
+            "one walk per client, plus the quiescent pair: {outcome:?}"
+        );
+    }
+
     #[test]
     fn the_trace_hash_is_pinned_across_processes_and_builds() {
         // The harness's product. Every other assertion about the trace compares
@@ -1832,14 +2172,18 @@ mod tests {
         // `expected_sum` below is what tells them apart: it is a function of
         // the commands alone, so a hash that moved while it held still means
         // the same workload met a different schedule.
-        // Repinned when the workload grew to the rest of the one-key surface:
-        // `MGET`, `PEXPIRE`, `PERSIST`, `TYPE` and `STRLEN` entered the burst
-        // schedule and `DBSIZE` the settle, and the draw that chooses between
-        // the arms was re-sliced to make room for them. The trace folds every
-        // command's kind and every reply, so added commands change it by
-        // construction. A change here with no workload change beside it is a
-        // regression, not a repin.
-        const MINI_1_42: u64 = 0x547b_0be7_5b25_43ee;
+        // Repinned twice in one session, each time beside the workload change
+        // that moved it. First when the workload grew to the rest of the
+        // one-key surface — `MGET`, `PEXPIRE`, `PERSIST`, `TYPE` and `STRLEN`
+        // into the burst schedule, `DBSIZE` into the settle, and the draw
+        // re-sliced to make room for them. Then when it gained the keyspace
+        // walk: every client now writes a walk family and holds `KEYS` to
+        // returning it exactly, the verifier drives a full `SCAN` cycle, and
+        // a step's cursor, count and pattern are folded where previously only
+        // its outcome was. The trace folds every command's kind and every
+        // reply, so an added command changes it by construction. A change here
+        // with no workload change beside it is a regression, not a repin.
+        const MINI_1_42: u64 = 0x9ca7_60da_1e95_7f0b;
 
         let outcome = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(
@@ -1857,9 +2201,10 @@ mod tests {
             (
                 outcome.dead_checks,
                 outcome.alive_checks,
-                outcome.plain_checks
+                outcome.plain_checks,
+                outcome.walk_checks
             ),
-            (54, 25, 147),
+            (54, 25, 147, 16),
             "the recorded workload decides a different number of checks"
         );
     }

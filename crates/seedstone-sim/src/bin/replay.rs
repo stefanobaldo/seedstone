@@ -53,7 +53,7 @@ fn main() -> ExitCode {
     // the invariant held or never ran.
     println!(
         "trace_hash=0x{:016x} expected={} actual={} stale={}/{} spurious={}/{} plain={}/{} \
-         invariant={}",
+         walk={}/{} invariant={}",
         outcome.trace_hash,
         outcome.expected_sum,
         outcome.actual_sum,
@@ -63,6 +63,8 @@ fn main() -> ExitCode {
         outcome.alive_checks,
         outcome.plain_mismatches,
         outcome.plain_checks,
+        outcome.walk_mismatches,
+        outcome.walk_checks,
         if held { "ok" } else { "violated" }
     );
 
