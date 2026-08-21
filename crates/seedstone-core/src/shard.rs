@@ -1697,7 +1697,7 @@ fn scan_step<P: ShardPolicy>(
 /// exactly as an explicit `Del` would.
 ///
 /// An expiration is a change to the keyspace, so it takes a replication
-/// position like every other one: a later phase replaying the log has to see
+/// position like every other one: whatever replays the log later has to see
 /// the key disappear where it disappeared here, and the [`TraceSink`] — which
 /// folds the position each command ran at — sees the position the removal
 /// consumed. Neither has to know what a deadline is.
@@ -2221,7 +2221,7 @@ mod tests {
 
     /// An expiry is a deletion, and a deletion is a logged mutation.
     ///
-    /// The record is what a later phase replays; the replication position it
+    /// The record is what a later replay reads; the replication position it
     /// consumes is what the trace sink folds. So an expiration is visible to
     /// both without either having to know what a deadline is.
     #[tokio::test(start_paused = true)]
@@ -3358,7 +3358,7 @@ mod tests {
         }
     }
 
-    /// The defect O28 exists to be able to plant: the deadline is stored, the
+    /// The defect this seam exists to be able to plant: the deadline is stored, the
     /// clock passes it, and the key is still there — on both paths at once,
     /// which is what makes it a missing expiry rather than a slow one.
     #[tokio::test(start_paused = true)]
