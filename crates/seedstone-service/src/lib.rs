@@ -997,6 +997,11 @@ const UNRENDERABLE_REPLY: &str = "ERR internal reply could not be rendered";
 fn reply_to_frame(reply: Reply) -> Frame {
     match reply {
         Reply::Ok => Frame::Simple("OK".into()),
+        // A simple string, not a bulk. Redis puts `+string` on the wire for
+        // `TYPE`, and a bulk carrying those same six bytes would be a
+        // different frame for the same text — one most clients normalise away
+        // and one a client reading RESP itself would not.
+        Reply::Status(text) => Frame::Simple(text.into()),
         Reply::Bulk(None) => Frame::Null,
         Reply::Bulk(Some(value)) => Frame::Bulk(value),
         Reply::Removed(removed) => Frame::Integer(i64::from(removed)),
@@ -1538,6 +1543,14 @@ const COMMANDS: &[(&[u8], Handler)] = &[
             }))
         }
         _ => Err(wrong_arity("incrby")),
+    }),
+    (b"TYPE", |args, _| match args {
+        [key] => Ok(Action::Dispatch(Command::Type { key: take(key) })),
+        _ => Err(wrong_arity("type")),
+    }),
+    (b"STRLEN", |args, _| match args {
+        [key] => Ok(Action::Dispatch(Command::StrLen { key: take(key) })),
+        _ => Err(wrong_arity("strlen")),
     }),
     // Keyspace-wide: no key to route on, but every shard has to hear it.
     (b"DBSIZE", |args, _| match args {
@@ -2665,6 +2678,53 @@ mod tests {
         assert_eq!(
             frames[18],
             Frame::Error("ERR wrong number of arguments for 'persist' command".into())
+        );
+    }
+
+    /// `TYPE` and `STRLEN` describe an entry without handing back its value.
+    ///
+    /// Both answers `TYPE` can give are here, and the shape of the first is
+    /// half of what is being pinned: Redis puts `+string` on the wire, so a
+    /// bulk reply carrying the same six bytes would be the wrong frame for the
+    /// right text. `STRLEN` answers `0` for a key that is not there, and — as
+    /// measured against Redis 8.10 — the same `0` for a key holding an empty
+    /// value, which is why one is stored here rather than left to a reader's
+    /// assumption.
+    #[tokio::test]
+    async fn type_and_strlen_describe_what_is_stored() {
+        let (mut r, mut w, _pool) = connected(16);
+        let requests: [&[&str]; 9] = [
+            &["SET", "k", "hello"],
+            &["TYPE", "k"],
+            &["TYPE", "missing"],
+            &["STRLEN", "k"],
+            &["STRLEN", "missing"],
+            &["TYPE"],
+            &["SET", "empty", ""],
+            &["STRLEN", "empty"],
+            &["STRLEN", "k", "extra"],
+        ];
+        let mut out = Vec::new();
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        assert_eq!(frames[1], Frame::Simple("string".into()));
+        assert_eq!(frames[2], Frame::Simple("none".into()));
+        assert_eq!(frames[3], Frame::Integer(5));
+        assert_eq!(frames[4], Frame::Integer(0));
+        assert!(matches!(&frames[5], Frame::Error(e) if e.contains("wrong number of arguments")));
+        assert_eq!(
+            frames[7],
+            Frame::Integer(0),
+            "an empty value has a length, and it is zero"
+        );
+        assert_eq!(
+            frames[8],
+            Frame::Error("ERR wrong number of arguments for 'strlen' command".into())
         );
     }
 

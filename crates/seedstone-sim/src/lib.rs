@@ -676,6 +676,9 @@ fn fold_reply(h: u64, reply: &Reply) -> u64 {
         Reply::Bulk(None) => mix(h, 1),
         Reply::Bulk(Some(value)) => fold_bytes(mix(h, 2), value),
         Reply::Ok => mix(h, 3),
+        // Tag 8 because 1 to 7 were already spoken for, and the text after it
+        // because two statuses are two different answers.
+        Reply::Status(text) => fold_bytes(mix(h, 8), text.as_bytes()),
         Reply::Removed(removed) => mix(mix(h, 4), u64::from(*removed)),
         Reply::Integer(n) => mix(mix(h, 5), n.cast_unsigned()),
         // Both fields, not just the cursor: two steps that resumed at the same

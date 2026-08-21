@@ -256,6 +256,25 @@ pub enum Command {
         /// The key to ask about.
         key: Vec<u8>,
     },
+    /// Report what kind of value `key` holds.
+    ///
+    /// The answer is looked up rather than computed: strings are the only
+    /// type this server stores, so `string` for a key that is there and
+    /// `none` for one that is not is the whole of it. A second answer would
+    /// arrive with the command that stores a second type, not before.
+    Type {
+        /// The key to ask about.
+        key: Vec<u8>,
+    },
+    /// Report how many bytes `key`'s value holds.
+    ///
+    /// A key that is not there is `0`, not an error and not a null — Redis's
+    /// answer, and one a key holding an empty value gives too. The two are
+    /// indistinguishable here because they hold the same number of bytes.
+    StrLen {
+        /// The key to measure.
+        key: Vec<u8>,
+    },
     /// Remove every key the shard holds.
     ///
     /// Keyspace-wide: one of these reaches every shard, and each empties its
@@ -342,7 +361,9 @@ impl Command {
             | Self::PExpire { key, .. }
             | Self::Ttl { key }
             | Self::Persist { key }
-            | Self::Exists { key } => Route::Key(key),
+            | Self::Exists { key }
+            | Self::Type { key }
+            | Self::StrLen { key } => Route::Key(key),
             Self::FlushDb | Self::DbSize => Route::Every,
             // The one route that is not self-sufficient. A step knows where it
             // is in *a* shard's table and not which shard's, so it names no
@@ -364,7 +385,8 @@ impl Command {
     ///
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
     /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9, `ScanStep` = 10,
-    /// `PExpire` = 11, `Persist` = 12. These values are folded
+    /// `PExpire` = 11, `Persist` = 12, `Type` = 13, `StrLen` = 14. These
+    /// values are folded
     /// into the simulator's trace hash, so they are part of what a replay
     /// compares: changing one changes every recorded hash. A tag is therefore
     /// never reused and never renumbered.
@@ -383,6 +405,8 @@ impl Command {
             Self::ScanStep { .. } => 10,
             Self::PExpire { .. } => 11,
             Self::Persist { .. } => 12,
+            Self::Type { .. } => 13,
+            Self::StrLen { .. } => 14,
         }
     }
 }
@@ -397,6 +421,18 @@ pub enum Reply {
     Bulk(Option<Vec<u8>>),
     /// The command succeeded and has nothing to return.
     Ok,
+    /// A one-word answer that travels as a simple string rather than a bulk.
+    ///
+    /// `&'static str` for the reason [`ReplyError::wire_text`] gives: the set
+    /// of texts is server-authored and closed, so no peer-supplied byte can
+    /// reach it and split a frame.
+    ///
+    /// [`Ok`](Self::Ok) is not folded into this. It is the answer to a command
+    /// that has nothing to report, which is a different statement from an
+    /// answer whose content happens to be a word — and it is the answer on the
+    /// write path, where a fixed variant beats carrying a string that is
+    /// always the same one.
+    Status(&'static str),
     /// Whether a `Del` removed anything.
     Removed(bool),
     /// An integer result.
@@ -1333,6 +1369,10 @@ fn apply<L: ReplicationLog, P: ExpiryPolicy>(
 
         Command::Exists { key } => Reply::Integer(i64::from(dict.get(key).is_some())),
 
+        Command::Type { key } => Reply::Status(type_name(dict, key)),
+
+        Command::StrLen { key } => Reply::Integer(value_len(dict, key)),
+
         Command::FlushDb => flush_db(dict, log, seq, shard),
 
         // The count includes keys whose deadline has passed but which the
@@ -1369,6 +1409,34 @@ fn flush_db<L: ReplicationLog>(dict: &mut Dict, log: &mut L, seq: &mut u64, shar
     }
     dict.clear();
     Reply::Ok
+}
+
+/// The name of the type `key` holds, or `none` if it holds nothing.
+///
+/// Presence is the whole question. This shard stores strings and nothing
+/// else, so every key that is there holds one and the answer is looked up
+/// rather than derived from the entry. A key whose deadline has passed is
+/// already gone by the time this runs — [`apply`] evicts before it
+/// dispatches — so it reads as absent without this having to ask.
+fn type_name(dict: &Dict, key: &[u8]) -> &'static str {
+    if dict.get(key).is_some() {
+        "string"
+    } else {
+        "none"
+    }
+}
+
+/// How many bytes `key`'s value holds, or `0` if there is no such key.
+///
+/// A missing key and a key holding an empty value both measure `0`, which is
+/// Redis's answer for each. Saturating for the reason [`Command::DbSize`]
+/// saturates: a value longer than `i64::MAX` cannot be held in the first
+/// place, and the ceiling is a better answer than a wrap into a negative
+/// length.
+fn value_len(dict: &Dict, key: &[u8]) -> i64 {
+    dict.get(key).map_or(0, |entry| {
+        i64::try_from(entry.value.len()).unwrap_or(i64::MAX)
+    })
 }
 
 /// A [`Command::Set`]'s pieces, as [`set`] receives them.
@@ -1962,6 +2030,8 @@ mod tests {
             b"pexpire",
             b"del",
             b"incrby",
+            b"type",
+            b"strlen",
         ] {
             assert_eq!(shard.run(set_ex(key, b"1", 10), Instant::now()), Reply::Ok);
         }
@@ -2029,6 +2099,28 @@ mod tests {
             ),
             Reply::Integer(7),
             "an expired counter must start from zero"
+        );
+        // The two that describe an entry rather than read it. Against a key
+        // still in the dict they would report `string` and the length of the
+        // value that outlived its deadline; `none` and `0` are the answers
+        // only an eviction that has already happened can produce.
+        assert_eq!(
+            shard.run(
+                Command::Type {
+                    key: b"type".to_vec()
+                },
+                now
+            ),
+            Reply::Status("none")
+        );
+        assert_eq!(
+            shard.run(
+                Command::StrLen {
+                    key: b"strlen".to_vec()
+                },
+                now
+            ),
+            Reply::Integer(0)
         );
 
         // Each was removed by the command that met it, not merely hidden from
