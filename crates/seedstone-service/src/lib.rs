@@ -48,14 +48,18 @@
 //!   not there in release. This is the enforcement point that is.
 //!
 //!   The frames that skip it are safe by construction, and it is their *type*
-//!   that makes them so: each is either a `&'static str` constant declared in
-//!   this file or a [`ReplyError::wire_text`], and neither can carry a
-//!   terminator a peer chose because neither is built from anything a peer
-//!   sent. Scrubbing a literal would not make it safer, only hide which frames
-//!   the guard is actually for. Two tests hold that claim rather than leaving
-//!   it as an assertion — `every_shard_error_is_frame_safe` for the
-//!   [`ReplyError`] set, and `every_error_constant_is_frame_safe` for the
-//!   constants.
+//!   that makes them so: each is a `&'static str` constant declared in this
+//!   file, a [`ReplyError::wire_text`], or the `&'static str` a
+//!   [`Reply::Status`] carries — and none of the three can carry a terminator
+//!   a peer chose, because none of them is built from anything a peer sent.
+//!   The status texts are in that list rather than outside it because a
+//!   `Frame::Simple` is terminated by the first `\r\n` after its type byte
+//!   exactly as a `Frame::Error` is, so an unscrubbed one splits a response
+//!   just the same. Scrubbing a literal would not make it safer, only hide
+//!   which frames the guard is actually for. Two tests hold that claim rather
+//!   than leaving it as an assertion — `every_shard_error_is_frame_safe` for
+//!   the [`ReplyError`] set, and `every_error_constant_is_frame_safe` for the
+//!   constants and the status texts.
 
 use seedstone_core::shard::{Command, Cond, Expiry, Reply, ReplyError, Router, parse_i64};
 use seedstone_resp::{Decoder, DecoderLimits, Frame, ParseError, encode};
@@ -4655,23 +4659,30 @@ mod tests {
         }
     }
 
-    /// The error texts this module keeps as constants are frame-safe too.
+    /// The texts this module puts on the wire without scrubbing are
+    /// frame-safe: the error constants it declares, and the status texts a
+    /// shard hands it.
     ///
     /// [`every_shard_error_is_frame_safe`] holds the [`ReplyError`] set to the
-    /// property the frame format needs; these four reach the wire the same way
-    /// and by the same argument — a `&'static str` nobody composed from
+    /// property the frame format needs; these reach the wire the same way and
+    /// by the same argument — a `&'static str` nobody composed from
     /// peer-supplied bytes — but nothing held them to it. The module
-    /// documentation now names their type as the reason they may skip
+    /// documentation names their type as the reason they may skip
     /// [`safe_error`], so the type's claim is checked here rather than
     /// asserted there.
     ///
-    /// It bites: a `\r` or `\n` added to any of these four, or a lowercase
-    /// error code, fails this test. It cannot bite for a constant added later
-    /// and not listed — there is no exhaustiveness to lean on for free
-    /// constants, which is exactly why the list is short and lives beside the
+    /// The status texts are read back through a real pool rather than listed,
+    /// because they are the shard's to choose and a list here would be this
+    /// module's guess at them. `TYPE` is what produces one, and its two
+    /// answers are a key that is there and a key that is not.
+    ///
+    /// It bites: a `\r` or `\n` added to any of these, or a lowercase error
+    /// code, fails this test. It cannot bite for a constant added later and
+    /// not listed — there is no exhaustiveness to lean on for free constants,
+    /// which is exactly why the list is short and lives beside the
     /// declarations it names.
-    #[test]
-    fn every_error_constant_is_frame_safe() {
+    #[tokio::test]
+    async fn every_error_constant_is_frame_safe() {
         for (name, text) in [
             ("INVALID_CURSOR", INVALID_CURSOR),
             ("UNRENDERABLE_REPLY", UNRENDERABLE_REPLY),
@@ -4689,6 +4700,34 @@ mod tests {
                 }),
                 "{name} does not open with an error code: {text:?}"
             );
+        }
+
+        let pool = ShardPool::spawn(1, 1, DictSeed { k0: 3, k1: 5 }, NoTrace);
+        pool.dispatch(Command::Set {
+            key: b"present".to_vec(),
+            value: b"v".to_vec(),
+            expiry: None,
+            cond: None,
+            keep_ttl: false,
+            get: false,
+        })
+        .await;
+        for key in [b"present".to_vec(), b"absent".to_vec()] {
+            let named = String::from_utf8_lossy(&key).into_owned();
+            let reply = pool.dispatch(Command::Type { key }).await;
+            assert!(
+                matches!(reply, Reply::Status(_)),
+                "TYPE {named} answered {reply:?} rather than a status"
+            );
+            let frame = reply_to_frame(reply);
+            let Frame::Simple(text) = frame else {
+                panic!("a status reached the wire as {frame:?} rather than a simple string");
+            };
+            assert!(
+                !text.contains(['\r', '\n']),
+                "the status for {named} carries a frame terminator: {text:?}"
+            );
+            assert!(!text.is_empty(), "the status for {named} has no text");
         }
     }
 
