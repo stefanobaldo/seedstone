@@ -395,6 +395,49 @@ impl SimConfig {
         }
     }
 
+    /// A shape narrow enough for a client to walk its cycle to the end.
+    ///
+    /// One shard rather than a thousand, and that is the whole point: a
+    /// complete `SCAN` cycle costs at least one round trip per shard *and*
+    /// each shard after the first meets a table that everything written since
+    /// the walk began has been growing. Widening this to two shards took the
+    /// same walk from ninety steps to seventeen hundred, all of it in the
+    /// second shard, for no property the first one does not already show —
+    /// the cursor under test belongs to one dict.
+    ///
+    /// What a shape this narrow gives up is placement, and it gives it up
+    /// knowingly: nothing here is about which shard a key lands in. What it
+    /// buys is the only condition under which a walk's *liveness* is
+    /// observable at all — a table deep enough that a step is a fraction of
+    /// it, still growing while the cursor is inside it. The swept shape has
+    /// neither: a thousand shards hold about four keys each, and one step
+    /// finishes a table that size before anything can happen underneath it.
+    ///
+    /// Two clients, which is what keeps the walk affordable. The keyspace
+    /// grows while the walk runs, so every extra client churning alongside it
+    /// doubles the table the cursor has left to cross — the cost is
+    /// exponential in how many of them there are, not linear.
+    ///
+    /// A shape for tests that need a finished cycle, not a second sweep.
+    #[must_use]
+    pub const fn narrow(workload_seed: u64, sim_seed: u64) -> Self {
+        Self {
+            shards: 1,
+            executors: 1,
+            clients: 2,
+            plain_keys: 32,
+            volatile_keys: 16,
+            counter_keys: 4,
+            ops_per_client: 16,
+            pipeline_depth: 4,
+            workload_seed,
+            sim_seed,
+            quiescent_walk: false,
+            concurrent_scan_cycle: true,
+            planted: None,
+        }
+    }
+
     /// A smaller shape for tests: few enough client hosts to run in a unit
     /// test, enough operations per client to keep the counters contended.
     #[must_use]
@@ -448,6 +491,24 @@ pub enum Plant {
     /// `expires_at` is. Caught by `spurious_deaths` and by the plain keys'
     /// model.
     SweepEatsAll,
+    /// A scan cursor that counts buckets upwards instead of advancing in
+    /// reverse binary order.
+    ///
+    /// It is right on a table that never changes size, and it is what the
+    /// reverse order exists to avoid on one that does: a step moves the cursor
+    /// one bucket while a doubling moves the finish line by the whole width of
+    /// the table, so a keyspace growing faster than the cursor advances
+    /// outruns it and the cycle never comes back to `0`. Caught by
+    /// `walk_mismatches`, through the step bound — not through a lost key,
+    /// which is worth being exact about: under a table that only ever grows,
+    /// an upward cursor visits every bucket that is still ahead of it, and
+    /// what it fails at is *arriving*, which is what the walk's step bound is
+    /// stated to catch.
+    ///
+    /// Invisible to any walk that is not stepping bucket by bucket while its
+    /// shard's table grows, which is why it has a shape of its own rather than
+    /// a place in the swept one — see `tests/planted_walk.rs`.
+    ScanMissesRehash,
 }
 
 impl Plant {
@@ -459,12 +520,18 @@ impl Plant {
             Self::LostUpdate => "lost-update",
             Self::ServeExpired => "serve-expired",
             Self::SweepEatsAll => "sweep-eats-all",
+            Self::ScanMissesRehash => "scan-misses-rehash",
         }
     }
 
     /// Every plant, so a caller listing or sweeping them cannot miss one
     /// added later.
-    pub const ALL: [Self; 3] = [Self::LostUpdate, Self::ServeExpired, Self::SweepEatsAll];
+    pub const ALL: [Self; 4] = [
+        Self::LostUpdate,
+        Self::ServeExpired,
+        Self::SweepEatsAll,
+        Self::ScanMissesRehash,
+    ];
 
     /// The plant `name` selects, if it names one.
     #[must_use]
@@ -857,6 +924,37 @@ impl ExpiryPolicy for SweepEatsAll {
     }
 }
 
+/// A cursor that counts buckets upwards instead of advancing in reverse
+/// binary order.
+///
+/// Honest about deadlines, and it has to be: what this plant is about is a
+/// walk that cannot finish, and a walk whose keyspace was also disappearing
+/// underneath it would leave the two indistinguishable.
+#[derive(Clone, Copy)]
+struct ScanMissesRehash;
+
+impl WalkOrder for ScanMissesRehash {
+    fn advance(&self, cursor: u64, mask: u64) -> u64 {
+        // Wrapping rather than plain, and it costs nothing: a cursor arrives
+        // from the wire and a client may send any number at all, so the
+        // arithmetic has to be total. The honest order is total for the same
+        // reason.
+        cursor.wrapping_add(1) & mask
+    }
+}
+
+impl ExpiryPolicy for ScanMissesRehash {
+    fn due_on_read(&self, expires_at: Option<Instant>, now: Instant) -> bool {
+        Deadlines.due_on_read(expires_at, now)
+    }
+    fn due_on_sweep(&self, expires_at: Option<Instant>, now: Instant) -> bool {
+        Deadlines.due_on_sweep(expires_at, now)
+    }
+    fn takes_undated(&self) -> bool {
+        false
+    }
+}
+
 /// A router that serves the workload through one deliberate defect.
 ///
 /// This is the harness's self-test: a simulator that never fails proves
@@ -989,6 +1087,9 @@ async fn server(
         }
         Some(Plant::SweepEatsAll) => {
             ShardPool::spawn_with_policy(shards, executors, seed, sink, SweepEatsAll)
+        }
+        Some(Plant::ScanMissesRehash) => {
+            ShardPool::spawn_with_policy(shards, executors, seed, sink, ScanMissesRehash)
         }
         // The honest pool, and the lost-update plant's too: that defect lives
         // above the shard, where a real one would.
@@ -1321,9 +1422,10 @@ const WALK_STEP_COUNT: usize = 1;
 /// could never be exceeded. What the honest cursor promises under growth is
 /// not a step count but *convergence* — a doubling halves the size of every
 /// later step instead of doubling the number of steps left — so the number of
-/// steps it needs is bounded even while the table is not. Measured at well
-/// under a hundred on the shape that drives a cycle; this is that with room
-/// enough that only a cursor which has stopped converging can reach it.
+/// steps it needs is bounded even while the table is not. Measured across six
+/// seeds of the shape that drives a cycle: 151 to 217 steps, a tight enough
+/// cluster that five times the widest of them is room a converging cursor
+/// cannot use and a cursor that has stopped converging reaches on every seed.
 const WALK_CYCLE_STEP_BOUND: u64 = 1024;
 
 /// Where the counter family's share of a hundred rolls ends and the plain
