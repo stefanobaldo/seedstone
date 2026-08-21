@@ -70,11 +70,10 @@ make that reproducibility possible — including a self-test that plants genuine
 defects inside the server itself, a lost-update race, two broken expiry
 decisions and a keyspace walk that outruns its own cursor, and requires each to
 be caught and a second process to replay it byte for byte — then drives the
-release binary with `redis-cli`,
-`redis-benchmark`, redis-py and go-redis, and finishes by pointing a third
-party's cache-backend test suite at it, run against a digest-verified archive in
-a container whose tag fixes the interpreter that client pair needs rather than
-leaving it to the runner.
+release binary with `redis-cli`, `redis-benchmark`, redis-py and go-redis, and
+finishes by pointing a third party's cache-backend test suite at it, run
+against a digest-verified archive in a container whose tag fixes the
+interpreter that client pair needs rather than leaving it to the runner.
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains the decisions and why
 they were made; [docs/coding-guide.md](docs/coding-guide.md) is what a reviewer
