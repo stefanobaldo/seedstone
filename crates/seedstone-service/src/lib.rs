@@ -340,10 +340,11 @@ const MAX_EXPIRE_SECONDS: i64 = i64::MAX / 1000;
 /// **`SET … PX` does not share this ceiling, and Redis is why.** The same
 /// server answers `OK` to `SET k v PX 9223372036854775807` and refuses
 /// `PEXPIRE k 9223372036854775807`: it validates a `PEXPIRE` against the wall
-/// clock and validates a `PX` against nothing. So the two ceilings in this file
-/// disagreeing about the same unit is Redis's own asymmetry rather than an
-/// oversight in either — see [`expiry_unit`] for the `PX` side of it, and for
-/// the divergence it leaves open here.
+/// clock and holds a `PX` to no ceiling at all, refusing only a non-positive
+/// one. So the two ceilings in this file disagreeing about the same unit is
+/// Redis's own asymmetry rather than an oversight in either — see
+/// [`expiry_unit`] for the `PX` side of it, and for the divergence it leaves
+/// open here.
 const MAX_EXPIRE_MILLIS: i64 = MAX_EXPIRE_SECONDS * 1000;
 
 /// What this server answers `HELLO` with, and what it calls itself.
@@ -2620,8 +2621,8 @@ mod tests {
             &["PEXPIRE", "n", "-1"],
             &["EXISTS", "n"],
             // The ceiling, from both sides: the largest span this server
-            // accepts, and the first number past it. A refusal alone would
-            // pin only that the ceiling is somewhere below `i64::MAX`.
+            // accepts, and a number past it. A refusal alone would pin only
+            // that the ceiling is somewhere below `i64::MAX`.
             &["PEXPIRE", "k", "9223372036854775807"],
             &["PEXPIRE", "k", "9223372036854775000"],
             // The arity, for each of the two.
