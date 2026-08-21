@@ -22,9 +22,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 /// everything up to the first unfinished seed.
 ///
 /// Workers are held to a fixed window ahead of that prefix, so one slow seed
-/// costs the sweep throughput rather than memory. It costs nothing at all to
-/// a sweep whose seeds finish in comparable time, which is every sweep of a
-/// single shape.
+/// costs the sweep throughput rather than memory. A sweep whose seeds finish
+/// in comparable time — every sweep of a single shape — never reaches the
+/// window at all, and pays only the one mutex a worker takes before each
+/// seed, which is nothing measurable against the run it precedes.
 ///
 /// Returns what the sweep found: how many seeds violated an invariant, and
 /// the union of every command form its clients emitted.
@@ -72,16 +73,20 @@ where
 /// straight into the pending map, so no producer ever waits — and a collector
 /// that stopped draining to make one wait would stall behind its own head
 /// seed, whose result is in the queue it stopped reading.
+///
+/// Since the window is a ceiling on seeds in flight, a sweep asked for more
+/// workers than this runs at this much concurrency and no more. That is
+/// correct rather than merely tolerable, and no caller comes near it.
 const PENDING_LIMIT: u64 = 4 * 1024;
 
 /// What holds a worker back from beginning a seed too far ahead of the one
 /// the collector is waiting for.
 ///
-/// Seeds are handed out in ascending order, so that seed is always among
-/// those already begun, and its own worker is never one of the waiters —
-/// `seed - head` is zero for it, and the gate lets it through however long
-/// the queue behind it grows. That is what makes the bound deadlock-free
-/// rather than merely small.
+/// Seeds are handed out in ascending order, so whenever a worker is waiting
+/// here, the seed at the head was drawn before that worker's — and the head's
+/// own worker is never one of the waiters: `seed - head` is zero for it, and
+/// the gate lets it through however long the queue behind it grows. That is
+/// what makes the bound deadlock-free rather than merely small.
 struct StartGate {
     state: Mutex<GateState>,
     admitted: Condvar,
@@ -91,7 +96,7 @@ struct StartGate {
 struct GateState {
     /// The lowest seed the collector has not yet reported.
     head: u64,
-    /// Whether any seed will ever be reported again.
+    /// Whether the sweep has given up on the seeds nobody has begun yet.
     ///
     /// A worker that panics owes the collector a seed it will never send. If
     /// that seed is the head, the head never moves, and without this every
@@ -323,10 +328,11 @@ mod tests {
     /// and no longer than [`HOLD_STEPS`] × [`HOLD_STEP`] whatever happens.
     ///
     /// The count is the condition and the stretch is only a ceiling, so a
-    /// sweep that reaches the count is held for microseconds and one that
-    /// never can is held for a fifth of a second rather than forever. Nothing
-    /// here is asserted on wall clock: the stretch decides how long a test
-    /// waits, never whether it passes.
+    /// sweep that reaches the count is held for a step or two — this loop
+    /// cannot notice any sooner than [`HOLD_STEP`] — and one that never can
+    /// is held for a fifth of a second rather than forever. Nothing here is
+    /// asserted on wall clock: the stretch decides how long a test waits,
+    /// never whether it passes.
     fn hold_until(in_flight: &AtomicU64, at_least: u64) {
         for _ in 0..HOLD_STEPS {
             if in_flight.load(Ordering::Acquire) >= at_least {
@@ -387,6 +393,17 @@ mod tests {
                         // Held until the queue behind it passes the bound —
                         // which is the failure, so the unbounded sweep is the
                         // one that finishes fast.
+                        //
+                        // A bounded sweep can never reach a count above the
+                        // bound, which is the point of asking for one: this
+                        // hold runs out its whole ceiling on every green run,
+                        // and that cost is deliberate. Trimming the threshold
+                        // to PENDING_LIMIT to buy the fifth of a second back
+                        // would make the count reachable under the bound, so
+                        // the head would stop holding while the queue behind
+                        // it was still filling — and an unbounded sweep whose
+                        // peak stopped at exactly PENDING_LIMIT would pass an
+                        // assertion it is supposed to fail.
                         hold_until(&in_flight, PENDING_LIMIT + 1);
                     }
                     nothing_observed()
@@ -415,6 +432,16 @@ mod tests {
     /// is only possible if the workers behind it are let go first, and a
     /// version that hung here instead would take a whole gate with it and
     /// report nothing at all.
+    ///
+    /// A regression surfaces here as a hang rather than as a failure: the
+    /// workers stay queued on a head that never moves, and the test never
+    /// returns. A job timing out at this test *is* the report that this
+    /// guard broke. Turning that into a message would take running
+    /// `sweep_with` on a second spawned thread and a `recv_timeout` in the
+    /// body — a second `clippy::disallowed_methods` site in a file whose
+    /// allow census is deliberately one entry and is listed as such in
+    /// `docs/coding-guide.md`. A standing exception in the determinism
+    /// gate's own census is the more expensive half of that trade.
     #[test]
     #[should_panic(expected = "a sweep worker panicked; its seed never reported")]
     fn a_panicking_head_seed_does_not_strand_the_workers_queued_behind_it() {
