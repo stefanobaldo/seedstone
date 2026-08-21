@@ -1538,6 +1538,16 @@ fn frame_to_action(frame: Frame, node: &NodeInfo) -> Action {
 /// what keeps `COMMAND COUNT` from drifting away from it.
 type Handler = fn(&mut [Vec<u8>], &NodeInfo) -> Result<Action, String>;
 
+/// Every command name this server answers.
+///
+/// Exported so the simulator's contract can be confronted with the surface
+/// rather than with a copy of it. A hand-maintained second list is exactly the
+/// thing that goes stale, and going stale here means the sweep's PASS quietly
+/// stops covering something.
+pub fn command_names() -> impl Iterator<Item = &'static [u8]> {
+    COMMANDS.iter().map(|(name, _)| *name)
+}
+
 /// Every command name this server accepts, and what each one does about its
 /// arguments.
 ///
