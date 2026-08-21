@@ -120,6 +120,8 @@ use tokio::time::Instant;
 
 // The one thing here that lives outside a simulation rather than inside one:
 // it starts runs, in parallel, and reaches into none of them.
+pub mod contract;
+
 mod sweep;
 
 pub use sweep::sweep;

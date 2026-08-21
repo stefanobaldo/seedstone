@@ -1,0 +1,298 @@
+//! What the simulated client can and cannot put on the wire.
+//!
+//! The sweep reports PASS over the shapes this client reaches, and for a long
+//! time those shapes were undocumented — so the PASS had no denominator and
+//! nobody could say what it did not cover.
+//!
+//! The contract is in two halves, because a declaration alone is not evidence:
+//!
+//! - **Declared**, below: every command the server answers, classified as
+//!   emitted (with its forms) or not emitted (with a reason). A test confronts
+//!   this with the server's own command table, so a command added to the
+//!   server without a line here fails the build.
+//! - **Observed**, in [`crate::sweep`]: what the client actually emitted over
+//!   a sweep. A form declared as emitted that no seed ever produced is a false
+//!   claim, and the sweep fails on it.
+//!
+//! Neither half is sufficient. Together they mean the coverage claim is both
+//! stated and true.
+//!
+//! # What a reason may say
+//!
+//! A [`Coverage::NotEmitted`] reason states why the workload will *never*
+//! emit the command — a property of the command, not of how far this harness
+//! has got. "Not built yet" is a schedule, and a schedule recorded here reads
+//! as a decision to whoever finds it later; it belongs in the plan's open
+//! items instead. The consequence is deliberate: a command the workload
+//! merely has not reached yet leaves only one honest way to make this table
+//! pass, which is to emit it.
+
+/// Whether the simulated client emits a command, and what that claim rests on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    /// The client emits this command, in these argument forms.
+    ///
+    /// Each form is a label the workload also reports, so the observed half
+    /// can be compared against this list name by name.
+    Emitted { forms: &'static [&'static str] },
+    /// The client does not emit this command, for this reason.
+    ///
+    /// A reason is required: "not covered" with no cause is how a gap becomes
+    /// permanent by nobody noticing it.
+    NotEmitted { reason: &'static str },
+}
+
+/// The contract. One line per command the server answers.
+///
+/// Ordered as the server's own table is, so the two can be read side by side.
+pub const DECLARED: &[(&[u8], Coverage)] = &[
+    (b"GET", Coverage::Emitted { forms: &[FORM_GET] }),
+    (
+        b"SET",
+        Coverage::Emitted {
+            forms: &[FORM_SET, FORM_SET_EX, FORM_SET_PX],
+        },
+    ),
+    (
+        b"MGET",
+        Coverage::Emitted {
+            forms: &[FORM_MGET],
+        },
+    ),
+    (b"DEL", Coverage::Emitted { forms: &[FORM_DEL] }),
+    (
+        b"EXISTS",
+        Coverage::Emitted {
+            forms: &[FORM_EXISTS],
+        },
+    ),
+    (
+        b"EXPIRE",
+        Coverage::Emitted {
+            forms: &[FORM_EXPIRE],
+        },
+    ),
+    (b"TTL", Coverage::Emitted { forms: &[FORM_TTL] }),
+    (
+        b"PEXPIRE",
+        Coverage::Emitted {
+            forms: &[FORM_PEXPIRE],
+        },
+    ),
+    (
+        b"PERSIST",
+        Coverage::Emitted {
+            forms: &[FORM_PERSIST],
+        },
+    ),
+    (
+        b"INCRBY",
+        Coverage::Emitted {
+            forms: &[FORM_INCRBY],
+        },
+    ),
+    (
+        b"TYPE",
+        Coverage::Emitted {
+            forms: &[FORM_TYPE],
+        },
+    ),
+    (
+        b"STRLEN",
+        Coverage::Emitted {
+            forms: &[FORM_STRLEN],
+        },
+    ),
+    (
+        b"DBSIZE",
+        Coverage::Emitted {
+            forms: &[FORM_DBSIZE],
+        },
+    ),
+    (
+        b"KEYS",
+        Coverage::Emitted {
+            forms: &[FORM_KEYS],
+        },
+    ),
+    (
+        b"SCAN",
+        Coverage::Emitted {
+            forms: &[FORM_SCAN_MATCH, FORM_SCAN_MATCH_COUNT],
+        },
+    ),
+    (
+        b"FLUSHDB",
+        Coverage::NotEmitted {
+            reason: "it empties the keyspace every other client in the run is \
+                     asserting over, so a single emission would turn every one \
+                     of their models into a false accusation. Nothing about \
+                     the harness makes this temporary: the invariants are \
+                     stated over keys a client owns, and a command that \
+                     removes keys it does not own cannot coexist with them.",
+        },
+    ),
+    (
+        b"PING",
+        Coverage::NotEmitted {
+            reason: "the reply is a constant and no keyspace state is \
+                     touched, so the only thing a client could fold into the \
+                     trace is that constant.",
+        },
+    ),
+    (
+        b"ECHO",
+        Coverage::NotEmitted {
+            reason: "the reply is the argument the client just sent; there is \
+                     no server state for an invariant to be about.",
+        },
+    ),
+    (
+        b"HELLO",
+        Coverage::NotEmitted {
+            reason: "it negotiates a protocol version and describes the node. \
+                     The harness asserts no invariant over server identity, \
+                     and the one protocol it speaks is the one the codec \
+                     already encodes.",
+        },
+    ),
+    (
+        b"INFO",
+        Coverage::NotEmitted {
+            reason: "its body is node identity and counters, which no client \
+                     model can predict and no invariant here is about.",
+        },
+    ),
+    (
+        b"COMMAND",
+        Coverage::NotEmitted {
+            reason: "it describes the surface rather than acting on the \
+                     keyspace, and the surface is confronted with this table \
+                     by the test below — a stronger check than a client \
+                     asking for it at runtime.",
+        },
+    ),
+    (
+        b"CLIENT",
+        Coverage::NotEmitted {
+            reason: "connection-local naming: nothing in the keyspace moves \
+                     and no reply is predictable from a client's model.",
+        },
+    ),
+    (
+        b"QUIT",
+        Coverage::NotEmitted {
+            reason: "it closes the connection the rest of the burst is being \
+                     read on, so a client that sent one would end its own run \
+                     mid-workload rather than exercise anything.",
+        },
+    ),
+];
+
+// The form labels, named once and shared by the two halves. A literal spelled
+// twice is a literal that can disagree with itself, and the disagreement would
+// surface as the sweep accusing the contract of a claim it does not make.
+pub(crate) const FORM_GET: &str = "GET key";
+pub(crate) const FORM_SET: &str = "SET key value";
+pub(crate) const FORM_SET_EX: &str = "SET key value EX seconds";
+pub(crate) const FORM_SET_PX: &str = "SET key value PX millis";
+pub(crate) const FORM_MGET: &str = "MGET key [key ...]";
+pub(crate) const FORM_DEL: &str = "DEL key [key ...]";
+pub(crate) const FORM_EXISTS: &str = "EXISTS key [key ...]";
+pub(crate) const FORM_EXPIRE: &str = "EXPIRE key seconds";
+pub(crate) const FORM_TTL: &str = "TTL key";
+pub(crate) const FORM_PEXPIRE: &str = "PEXPIRE key millis";
+pub(crate) const FORM_PERSIST: &str = "PERSIST key";
+pub(crate) const FORM_INCRBY: &str = "INCRBY key delta";
+pub(crate) const FORM_TYPE: &str = "TYPE key";
+pub(crate) const FORM_STRLEN: &str = "STRLEN key";
+pub(crate) const FORM_DBSIZE: &str = "DBSIZE";
+pub(crate) const FORM_KEYS: &str = "KEYS pattern";
+pub(crate) const FORM_SCAN_MATCH: &str = "SCAN cursor MATCH pattern";
+pub(crate) const FORM_SCAN_MATCH_COUNT: &str = "SCAN cursor MATCH pattern COUNT count";
+
+/// Every form the contract claims the client emits.
+///
+/// The denominator the observed half is compared against. Built from
+/// [`DECLARED`] rather than listed a second time, for the same reason
+/// [`DECLARED`] is confronted with the server's table rather than copied from
+/// it.
+pub fn declared_forms() -> impl Iterator<Item = &'static str> {
+    DECLARED
+        .iter()
+        .filter_map(|(_, coverage)| match coverage {
+            Coverage::Emitted { forms } => Some(forms.iter().copied()),
+            Coverage::NotEmitted { .. } => None,
+        })
+        .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn every_command_the_server_answers_is_classified() {
+        let declared: BTreeSet<&[u8]> = DECLARED.iter().map(|(name, _)| *name).collect();
+        let served: BTreeSet<&[u8]> = seedstone_service::command_names().collect();
+
+        let unclassified: Vec<_> = served
+            .difference(&declared)
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "the server answers commands the simulated client's contract does not \
+             classify: {unclassified:?}. Add a line to DECLARED saying whether the \
+             client emits it, and if not, why."
+        );
+
+        let phantom: Vec<_> = declared
+            .difference(&served)
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect();
+        assert!(
+            phantom.is_empty(),
+            "the contract classifies commands the server does not answer: {phantom:?}"
+        );
+    }
+
+    /// A name listed twice would let one line's claim hide behind another's,
+    /// and the set difference above cannot see it: two entries collapse into
+    /// one member.
+    #[test]
+    fn no_command_is_classified_twice() {
+        let mut seen = BTreeSet::new();
+        for (name, _) in DECLARED {
+            assert!(
+                seen.insert(*name),
+                "{} is classified twice",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    /// Every reason has to say something. An empty one passes the type and
+    /// fails the purpose.
+    #[test]
+    fn every_reason_and_every_form_says_something() {
+        for (name, coverage) in DECLARED {
+            let name = String::from_utf8_lossy(name);
+            match coverage {
+                Coverage::Emitted { forms } => {
+                    assert!(!forms.is_empty(), "{name} claims coverage with no form");
+                    for form in *forms {
+                        assert!(
+                            form.starts_with(name.as_ref()),
+                            "{name}'s form {form:?} does not name the command it is a form of"
+                        );
+                    }
+                }
+                Coverage::NotEmitted { reason } => {
+                    assert!(!reason.is_empty(), "{name} is excluded with no reason");
+                }
+            }
+        }
+    }
+}
