@@ -423,10 +423,13 @@ enum Action {
 /// what keeps that ordering requirement in one place instead of restated at
 /// each call site, where the next one would be the one that forgot.
 enum Unbatched {
-    /// One request naming several keys, split into the one-key commands the
-    /// shards that own them can run, carrying how their replies become one
-    /// again — see [`fan_out`], which also states what the split costs in
-    /// atomicity.
+    /// One request's keys, split into the one-key commands the shards that
+    /// own them can run, carrying how their replies become one again — see
+    /// [`fan_out`], which also states what the split costs in atomicity.
+    ///
+    /// Usually several keys, but not only: a fold that changes the shape of a
+    /// lone reply sends a one-key request through here too — see
+    /// [`Fold::is_identity_on_one`].
     FanOut {
         /// The commands, in the order the peer named their keys.
         cmds: Vec<Command>,
@@ -466,7 +469,8 @@ enum Unbatched {
 /// elements.
 ///
 /// Both places that read this match the whole enum, so a third fold added
-/// later is a compile error at each of them rather than a silent miscount.
+/// later is a compile error at each of them rather than a reply quietly folded
+/// the wrong way — miscounted on one side, mis-shaped on the other.
 #[derive(Clone, Copy)]
 enum Fold {
     /// One integer: every reply is a count and the answer is their sum —
@@ -932,6 +936,17 @@ where
     delivered
 }
 
+/// The answer to a reply this layer holds but cannot turn into the frame the
+/// request is owed.
+///
+/// Two places can meet one, and neither is reachable from anything a peer can
+/// send: [`reply_to_frame`] handed a scan step, and [`fan_out`]'s array fold
+/// handed something that is not a bulk. Both would be a wiring mistake made
+/// here, and both answer this rather than a frame of the wrong shape — one bad
+/// reply on one connection, instead of a stream the client parses happily and
+/// reads wrong.
+const UNRENDERABLE_REPLY: &str = "ERR internal reply could not be rendered";
+
 /// Translates a shard's [`Reply`] into the frame that carries it.
 fn reply_to_frame(reply: Reply) -> Frame {
     match reply {
@@ -947,7 +962,7 @@ fn reply_to_frame(reply: Reply) -> Frame {
         // driver can build. Nothing routes a step here today; the arm is what
         // keeps a routing mistake made later a bad reply on one connection
         // rather than a panicked connection task.
-        Reply::Scan { .. } => Frame::Error("ERR internal reply could not be rendered".into()),
+        Reply::Scan { .. } => Frame::Error(UNRENDERABLE_REPLY.into()),
         // No `safe_error` here, and that is not an omission. A shard error is
         // a [`ReplyError`] variant, so its text is a literal in `shard.rs`
         // rather than anything a router composed — the type is what rules out
@@ -1230,11 +1245,21 @@ async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
 /// the failure cost, would be worse than a refusal: the peer cannot tell
 /// either of them from the truth.
 ///
-/// **Argument order is the array fold's contract**, and it is the loop that
-/// keeps it: the commands are dispatched one at a time in the order the peer
-/// named their keys, and each reply is appended where it lands. A key named
-/// twice is two commands and therefore two entries — nothing here
-/// deduplicates.
+/// **The two folds do not dispatch alike, and the difference is deliberate.**
+/// [`Fold::Array`] hands the whole set to [`Router::dispatch_many`], which
+/// costs about one envelope per executor however many keys were named; the
+/// sequential loop it replaced cost one cross-task hop per key, and `MGET` is
+/// what a client's multi-key read compiles to. It can afford that because a
+/// `GET` leaves nothing behind: returning early would spare nothing a peer
+/// could observe. [`Fold::Sum`] stays sequential for the opposite reason —
+/// stopping at the first error is what keeps a partial `DEL` from deleting
+/// further, and that is worth the hops.
+///
+/// **Argument order is the array fold's contract**, and neither dispatch
+/// weakens it: `dispatch_many` reassembles its replies by recorded position,
+/// so the entries are in the order the peer named the keys whatever order the
+/// executors answered in. A key named twice is two commands and therefore two
+/// entries — nothing here deduplicates.
 async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>, fold: Fold) -> Frame {
     match fold {
         Fold::Sum => {
@@ -1249,13 +1274,25 @@ async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>, fold: Fold) -> Frame
             Frame::Integer(total)
         }
         Fold::Array => {
-            let mut entries = Vec::with_capacity(cmds.len());
-            for cmd in cmds {
-                match router.dispatch(cmd).await {
+            let replies = router.dispatch_many(cmds).await;
+            let mut entries = Vec::with_capacity(replies.len());
+            for reply in replies {
+                match reply {
                     // A key that is not there is an entry all the same — the
                     // array's null, in its own slot, never a shorter array.
                     reply @ Reply::Bulk(_) => entries.push(reply_to_frame(reply)),
-                    other => return reply_to_frame(other),
+                    // First error in reply order wins, and it wins over
+                    // everything behind it: the whole set was dispatched, so
+                    // this is a choice of which answer to give rather than a
+                    // point the work stopped at.
+                    error @ Reply::Error(_) => return reply_to_frame(error),
+                    // Anything else is a reply of a shape this fold cannot
+                    // put in an array — a command wired to [`Fold::Array`]
+                    // whose shard answers with a count, say. Refused rather
+                    // than rendered: a `:5` where an array of one was due is
+                    // read happily and wrongly, and the peer has no way to
+                    // tell.
+                    _ => return Frame::Error(UNRENDERABLE_REPLY.into()),
                 }
             }
             Frame::Array(entries)
@@ -3457,6 +3494,43 @@ mod tests {
         assert!(
             sizes.contains(&CHUNK_COMMANDS),
             "no chunk ever closed mid-drain, so the bound was never reached"
+        );
+    }
+
+    /// A one-key `DEL` travels in the drain's batch instead of closing the
+    /// chunk in front of it.
+    ///
+    /// This is what [`Fold::is_identity_on_one`] buys, and the replies cannot
+    /// show it: a one-key `DEL` answers `:1` whether it went with the batch or
+    /// fanned out alone. What changes is how many messages the pool is handed
+    /// — one batch of two here, against a batch of one and a separate dispatch
+    /// behind it if the shortcut were dropped. [`BatchSizes`] is where that
+    /// difference is visible, so it is where it is held.
+    #[tokio::test]
+    async fn a_one_key_del_travels_in_the_batch() {
+        let sizes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = BatchSizes {
+            sizes: std::sync::Arc::clone(&sizes),
+            inner: ShardPool::spawn(16, 4, DictSeed { k0: 8, k1: 8 }, NoTrace),
+        };
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(serve_connection(server, router, NodeInfo::for_tests()));
+        let (mut r, mut w) = tokio::io::split(client);
+
+        let mut out = Vec::new();
+        for parts in [&["SET", "a", "1"][..], &["DEL", "a"]] {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 2).await;
+        assert_eq!(frames[0], Frame::Simple("OK".into()));
+        assert_eq!(frames[1], Frame::Integer(1));
+        assert_eq!(
+            *sizes.lock().expect("sizes mutex"),
+            vec![2],
+            "the SET and the DEL must reach the pool as one batch"
         );
     }
 
