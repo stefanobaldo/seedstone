@@ -2962,38 +2962,55 @@ mod tests {
         }
     }
 
-    /// A key that hashes to `shard`, found by search — the seed is fixed, so
-    /// the search is deterministic and the test does not depend on which key
-    /// it finds.
+    /// `count` distinct keys that hash to `shard`, found by search — the seed
+    /// is fixed, so the search is deterministic and the test does not depend
+    /// on which keys it finds.
     ///
     /// The search is bounded rather than open-ended: an unbounded one would
     /// hang forever on the day `shard_of` stopped reaching some shard, which
     /// is precisely the bug a caller is using this to rule out.
-    fn key_landing_on(shard: u16, shards: u16) -> Vec<u8> {
-        (0u32..10_000)
+    fn keys_landing_on(shard: u16, shards: u16, count: usize) -> Vec<Vec<u8>> {
+        let keys: Vec<Vec<u8>> = (0u32..10_000)
             .map(|n| format!("probe-{n}").into_bytes())
-            .find(|k| shard_of(k, shards) == shard)
-            .expect("ten thousand probes reach every shard of a small pool")
+            .filter(|k| shard_of(k, shards) == shard)
+            .take(count)
+            .collect();
+        assert_eq!(
+            keys.len(),
+            count,
+            "ten thousand probes reach every shard of a small pool {count} times"
+        );
+        keys
     }
 
+    /// Shard `i` is given `i + 1` keys, so every shard's `DBSIZE` differs from
+    /// every other's and the replies can only be compared in one order.
+    ///
+    /// A broadcast that answered a key each would pass any permutation: the
+    /// order is claimed by [`Route::Every`] and by
+    /// [`Router::dispatch_every`], and a claim no test can fail is not held.
     #[tokio::test]
     async fn a_broadcast_is_answered_once_per_shard_in_shard_order() {
         let pool = ShardPool::spawn(8, 4, DictSeed { k0: 1, k1: 1 }, NoTrace);
         for i in 0..8u16 {
-            let key = key_landing_on(i, 8);
-            pool.dispatch(Command::Set {
-                key,
-                value: b"v".to_vec(),
-                expiry: None,
-                cond: None,
-                keep_ttl: false,
-                get: false,
-            })
-            .await;
+            for key in keys_landing_on(i, 8, usize::from(i) + 1) {
+                pool.dispatch(Command::Set {
+                    key,
+                    value: b"v".to_vec(),
+                    expiry: None,
+                    cond: None,
+                    keep_ttl: false,
+                    get: false,
+                })
+                .await;
+            }
         }
         let replies = pool.dispatch_every(Command::DbSize).await;
-        assert_eq!(replies.len(), 8);
-        assert!(replies.iter().all(|r| *r == Reply::Integer(1)));
+        let expected: Vec<Reply> = (1..=8).map(Reply::Integer).collect();
+        assert_eq!(
+            replies, expected,
+            "a broadcast answered out of shard order, or not once per shard"
+        );
     }
 
     #[tokio::test]
