@@ -231,6 +231,11 @@ const REPLY_HIGH_WATER: usize = REPLY_SHED;
 /// commands, so the batch's length is the delay it can impose on everything
 /// else queued behind it.
 ///
+/// That third reason is not the drain's alone: a multi-key request answered
+/// with an array slices on this same number before it dispatches, and for
+/// exactly that property — see [`fan_out`]. One constant, because it is one
+/// question: how long a single request may occupy an executor.
+///
 /// The number sits above what a pipelining client sends in one round trip, so
 /// the ordinary burst is still a single batch, while leaving a full
 /// [`READ_CEILING`] of the smallest commands a dozen-odd batches rather than
@@ -1231,14 +1236,21 @@ async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
 /// request are in general owned by different shards, so there is no single
 /// shard the request could be sent to, and it becomes one command per key.
 ///
-/// **The set is not a transaction.** Each key's command is atomic on the shard
-/// that owns it — that is the shard runtime's guarantee and it is unaffected —
-/// but the commands run one after another, and another connection's work can
-/// land between any two of them. A peer that deletes three keys can therefore
-/// be observed halfway through. Redis in cluster mode makes the same trade, and
-/// it is the only one available here: the alternative is a lock spanning
-/// shards, which would put the multi-key path's cost in front of every
-/// single-key one.
+/// **The set is not a transaction, and neither arm makes it one.** Each key's
+/// command is atomic on the shard that owns it — that is the shard runtime's
+/// guarantee and it is unaffected — but nothing spans the set, so a peer that
+/// deletes three keys can be observed halfway through. Redis in cluster mode
+/// makes the same trade, and it is the only one available here: the
+/// alternative is a lock spanning shards, which would put the multi-key path's
+/// cost in front of every single-key one.
+///
+/// What can land in the middle differs by arm, and it is the weaker of the two
+/// that may be relied on. [`Fold::Sum`] dispatches one command at a time, so
+/// another connection's work can land between any two of them. [`Fold::Array`]
+/// hands an executor a whole slice at once and an executor applies an envelope
+/// without yielding, so the keys of one slice that share an executor do in
+/// fact move together — a consequence of how they are dispatched, not a
+/// promise, and one that stops at the slice boundary in any case.
 ///
 /// A shard that answers with an error ends the fan-out and that error is the
 /// reply. A partial count reported as a total, or an array short by whatever
@@ -1246,20 +1258,31 @@ async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
 /// either of them from the truth.
 ///
 /// **The two folds do not dispatch alike, and the difference is deliberate.**
-/// [`Fold::Array`] hands the whole set to [`Router::dispatch_many`], which
-/// costs about one envelope per executor however many keys were named; the
-/// sequential loop it replaced cost one cross-task hop per key, and `MGET` is
-/// what a client's multi-key read compiles to. It can afford that because a
-/// `GET` leaves nothing behind: returning early would spare nothing a peer
-/// could observe. [`Fold::Sum`] stays sequential for the opposite reason —
-/// stopping at the first error is what keeps a partial `DEL` from deleting
-/// further, and that is worth the hops.
+/// [`Fold::Array`] hands its commands to [`Router::dispatch_many`], which costs
+/// about one envelope per executor rather than one cross-task hop per key, and
+/// a multi-key read is what a client's cache layer compiles to. Not stopping
+/// early costs it nothing: what was dispatched has already run by the time the
+/// first reply is read, so an early return would spare no work that was still
+/// avoidable. That, and not harmlessness, is the reason — a `GET` does leave
+/// something behind when it finds a key expired. [`Fold::Sum`] stays
+/// sequential because there an early return is real work not done: stopping at
+/// the first error is what keeps a partial `DEL` from deleting further.
 ///
-/// **Argument order is the array fold's contract**, and neither dispatch
-/// weakens it: `dispatch_many` reassembles its replies by recorded position,
-/// so the entries are in the order the peer named the keys whatever order the
-/// executors answered in. A key named twice is two commands and therefore two
-/// entries — nothing here deduplicates.
+/// **A slice at a time, of [`CHUNK_COMMANDS`].** An executor applies an
+/// envelope without yielding between its commands, so an envelope's length is
+/// the delay one request can impose on every other connection whose keys live
+/// on that executor's shards — the same property that bounds a drain's chunk,
+/// bounded by the same number. It needs its own bound here because a request's
+/// arity is not capped: `MGET` takes as many keys as the protocol's array
+/// limit allows, as it does in Redis, so a pathological one is answered slowly
+/// rather than refused while an ordinary one still travels in a single slice.
+///
+/// **Argument order is the array fold's contract**, and neither the dispatch
+/// nor the slicing weakens it: `dispatch_many` reassembles its replies by
+/// recorded position, so a slice comes back in the order its keys were named
+/// whatever order the executors answered in, and the slices are appended in
+/// the order they were cut. A key named twice is two commands and therefore
+/// two entries — nothing here deduplicates.
 async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>, fold: Fold) -> Frame {
     match fold {
         Fold::Sum => {
@@ -1274,25 +1297,36 @@ async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>, fold: Fold) -> Frame
             Frame::Integer(total)
         }
         Fold::Array => {
-            let replies = router.dispatch_many(cmds).await;
-            let mut entries = Vec::with_capacity(replies.len());
-            for reply in replies {
-                match reply {
-                    // A key that is not there is an entry all the same — the
-                    // array's null, in its own slot, never a shorter array.
-                    reply @ Reply::Bulk(_) => entries.push(reply_to_frame(reply)),
-                    // First error in reply order wins, and it wins over
-                    // everything behind it: the whole set was dispatched, so
-                    // this is a choice of which answer to give rather than a
-                    // point the work stopped at.
-                    error @ Reply::Error(_) => return reply_to_frame(error),
-                    // Anything else is a reply of a shape this fold cannot
-                    // put in an array — a command wired to [`Fold::Array`]
-                    // whose shard answers with a count, say. Refused rather
-                    // than rendered: a `:5` where an array of one was due is
-                    // read happily and wrongly, and the peer has no way to
-                    // tell.
-                    _ => return Frame::Error(UNRENDERABLE_REPLY.into()),
+            let mut entries = Vec::with_capacity(cmds.len());
+            let mut pending = cmds.into_iter();
+            loop {
+                // The slice's length is how long one request may occupy an
+                // executor, which is why it is `CHUNK_COMMANDS` rather than a
+                // number of its own — see this function's doc.
+                let slice: Vec<Command> = pending.by_ref().take(CHUNK_COMMANDS).collect();
+                if slice.is_empty() {
+                    break;
+                }
+                for reply in router.dispatch_many(slice).await {
+                    match reply {
+                        // A key that is not there is an entry all the same — the
+                        // array's null, in its own slot, never a shorter array.
+                        reply @ Reply::Bulk(_) => entries.push(reply_to_frame(reply)),
+                        // First error in reply order wins, and it wins over
+                        // everything behind it in its slice: that slice has
+                        // already run, so this is a choice of which answer to
+                        // give rather than a point the work stopped at. The
+                        // slices behind it are the exception, and they are
+                        // genuinely not dispatched.
+                        error @ Reply::Error(_) => return reply_to_frame(error),
+                        // Anything else is a reply of a shape this fold cannot
+                        // put in an array — a command wired to [`Fold::Array`]
+                        // whose shard answers with a count, say. Refused rather
+                        // than rendered: a `:5` where an array of one was due
+                        // is read happily and wrongly, and the peer has no way
+                        // to tell.
+                        _ => return Frame::Error(UNRENDERABLE_REPLY.into()),
+                    }
                 }
             }
             Frame::Array(entries)
@@ -3494,6 +3528,80 @@ mod tests {
         assert!(
             sizes.contains(&CHUNK_COMMANDS),
             "no chunk ever closed mid-drain, so the bound was never reached"
+        );
+    }
+
+    /// An `MGET` naming more keys than a chunk may hold is dispatched in
+    /// slices, and answers as if it had not been.
+    ///
+    /// Arity here is bounded only by the protocol's array limit, so without
+    /// the slicing one request could hand a single executor a quarter of a
+    /// million commands — and an executor applies an envelope without yielding
+    /// between them, which is the delay [`CHUNK_COMMANDS`] exists to bound. So
+    /// both halves are held: the array is one entry per argument in argument
+    /// order *across the slice boundaries*, including the null of a key that
+    /// was never set, and no batch the router was handed exceeds the mark.
+    ///
+    /// The batch sizes are asserted exactly rather than as a ceiling. A
+    /// ceiling alone would pass if the fold dispatched one command at a time,
+    /// which is the shape this replaced and the one that gave up the pass per
+    /// executor.
+    #[tokio::test]
+    async fn a_long_mget_is_dispatched_in_bounded_slices() {
+        /// Two full slices and a remainder, so the boundary is crossed twice
+        /// and the last slice is short.
+        const KEYS: usize = 2 * CHUNK_COMMANDS + 3;
+        /// A key inside the second slice that is never written, so a null has
+        /// to hold its slot on the far side of a boundary.
+        const MISSING: usize = CHUNK_COMMANDS + 2;
+
+        let sizes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = BatchSizes {
+            sizes: std::sync::Arc::clone(&sizes),
+            inner: ShardPool::spawn(16, 4, DictSeed { k0: 8, k1: 8 }, NoTrace),
+        };
+        let (client, server) = tokio::io::duplex(1 << 20);
+        tokio::spawn(serve_connection(server, router, NodeInfo::for_tests()));
+        let (mut r, mut w) = tokio::io::split(client);
+
+        let mut out = Vec::new();
+        for i in (0..KEYS).filter(|&i| i != MISSING) {
+            encode(
+                &req(&["SET", &format!("key:{i}"), &i.to_string()]),
+                &mut out,
+            );
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let written = read_frames(&mut r, KEYS - 1).await;
+        assert!(written.iter().all(|f| *f == Frame::Simple("OK".into())));
+        // The writes had chunks of their own, and they are not what is under
+        // test here.
+        sizes.lock().expect("sizes mutex").clear();
+
+        let mut parts = vec!["MGET".to_owned()];
+        parts.extend((0..KEYS).map(|i| format!("key:{i}")));
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        out.clear();
+        encode(&req(&parts), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 1).await;
+        let expected: Vec<Frame> = (0..KEYS)
+            .map(|i| {
+                if i == MISSING {
+                    Frame::Null
+                } else {
+                    Frame::Bulk(i.to_string().into_bytes())
+                }
+            })
+            .collect();
+        assert_eq!(frames[0], Frame::Array(expected));
+        assert_eq!(
+            *sizes.lock().expect("sizes mutex"),
+            vec![CHUNK_COMMANDS, CHUNK_COMMANDS, KEYS - 2 * CHUNK_COMMANDS],
+            "the fan-out must reach the router in slices of at most {CHUNK_COMMANDS}"
         );
     }
 
