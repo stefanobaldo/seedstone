@@ -349,6 +349,26 @@ pub struct SimConfig {
     /// half that *is* schedule-sensitive: every client walks its own family
     /// with `KEYS` while the others are still writing.
     pub quiescent_walk: bool,
+    /// Whether a client's own walk drives its `SCAN` cycle to the end, or
+    /// stops after a short prefix.
+    ///
+    /// Off in both shapes below, and for the same arithmetic that keeps
+    /// [`SimConfig::quiescent_walk`] off: a complete cycle costs at least one
+    /// round trip per shard, and a *client's* cycle costs that once per
+    /// client. On the deployed shard count that is six figures of sequential
+    /// round trips for a single seed.
+    ///
+    /// What the prefix gives up is only the completeness half of the
+    /// guarantee — at-least-once, which needs a walk that finished. The
+    /// `KEYS` that closes every walk carries that half instead, complete by
+    /// construction and one round trip wide, so what is lost is the claim
+    /// stated over `SCAN` specifically. Everything else a walk promises is a
+    /// property of each step and is asserted on every one of them.
+    ///
+    /// Turned on by a shape narrow enough to afford it, which is where the
+    /// cursor's own liveness can be put under test: a walk that never
+    /// finishes is only visible to a walk that was trying to.
+    pub concurrent_scan_cycle: bool,
     /// Which deliberate defect, if any, to serve the workload through.
     pub planted: Option<Plant>,
 }
@@ -370,6 +390,7 @@ impl SimConfig {
             workload_seed,
             sim_seed,
             quiescent_walk: false,
+            concurrent_scan_cycle: false,
             planted: None,
         }
     }
@@ -390,6 +411,7 @@ impl SimConfig {
             workload_seed,
             sim_seed,
             quiescent_walk: false,
+            concurrent_scan_cycle: false,
             planted: None,
         }
     }
@@ -1042,7 +1064,7 @@ async fn client(id: u16, cfg: SimConfig, shared: Shared) -> turmoil::Result {
     model.settle(&mut conn, depth as usize).await?;
     // After the settle, so the walk keys are the only thing this client has
     // written that nothing is still deciding the fate of.
-    model.walk(&mut conn, depth as usize).await?;
+    model.walk(&mut conn, &cfg, depth as usize).await?;
     lock(&shared.tally).done += 1;
     Ok(())
 }
@@ -1256,6 +1278,53 @@ const WALK_KEYS: u32 = 8;
 /// number the server uses — a `COUNT` above the clamp would exercise the clamp
 /// instead of the option.
 const WALK_SCAN_COUNT: usize = 32;
+
+/// How many fresh keys a client writes into its own walk family between two
+/// steps of its own walk.
+///
+/// This is the churn the concurrent invariant is stated under, and it is the
+/// client's *own* family rather than a neighbour's on purpose: a key another
+/// client writes cannot appear in this walk's answers at all, so it changes
+/// the table and nothing else. A key of this family can appear, and whether
+/// it does is exactly what the guarantee refuses to promise — a key created
+/// during a walk may be returned or missed. Asserting over a family that
+/// nothing added to would be asserting over the quiescent case again.
+const WALK_CHURN_WRITES: u32 = 3;
+
+/// How many churn keys the same burst removes again, oldest first.
+///
+/// Fewer than it writes, so the family grows: growth is what makes a table
+/// double, and a doubling with a walk in flight is the case the whole cursor
+/// design exists for. Removing the oldest rather than the newest is what puts
+/// the removals behind the cursor, where a walk has already been.
+const WALK_CHURN_DELETES: u32 = 1;
+
+/// How many steps a client's walk takes when it is not driving its cycle to
+/// the end. See [`SimConfig::concurrent_scan_cycle`].
+const WALK_PREFIX_STEPS: u64 = 4;
+
+/// The `COUNT` a client's own walk asks for, on the clients that send one.
+///
+/// One bucket, the smallest a step can be, and that is the point: a step
+/// large enough to finish a shard's table hands back cursor `0` and there is
+/// no walk in flight for anything to happen underneath. Half the clients send
+/// no `COUNT` at all — see [`Model::walk`] — so both parse paths are on the
+/// wire in every run, and the half that names one is the half whose cursor
+/// spends time between shards.
+const WALK_STEP_COUNT: usize = 1;
+
+/// How many steps a cycle-completing walk is allowed before the harness calls
+/// it a walk that is not going to finish.
+///
+/// Not derived from the keyspace, and the churn is why: the walk grows the
+/// family as it goes, so a bound stated in keys would grow with the walk and
+/// could never be exceeded. What the honest cursor promises under growth is
+/// not a step count but *convergence* — a doubling halves the size of every
+/// later step instead of doubling the number of steps left — so the number of
+/// steps it needs is bounded even while the table is not. Measured at well
+/// under a hundred on the shape that drives a cycle; this is that with room
+/// enough that only a cursor which has stopped converging can reach it.
+const WALK_CYCLE_STEP_BOUND: u64 = 1024;
 
 /// Where the counter family's share of a hundred rolls ends and the plain
 /// family's begins.
@@ -1819,26 +1888,66 @@ impl Model {
         Ok(())
     }
 
-    /// Writes this client's walk keys, stops writing them, and holds `KEYS`
-    /// to returning exactly that set.
+    /// Writes a set of keys nothing will touch again, walks its own family
+    /// while churning the rest of it, and holds the walk to its guarantee.
     ///
-    /// The strongest assertion available for a keyspace walk, and the reason
-    /// it is available at all is that the set is quiescent: this client has
-    /// finished writing these keys and no other client can name one. The
-    /// keyspace *around* them is not quiescent — the other fifteen are still
-    /// working — and that is deliberate rather than tolerated. The pattern
-    /// isolates what this client owns, so growth elsewhere can rehash the
-    /// table under the walk without making the answer any less exactly
-    /// predictable, which is the one thing a reverse-increment cursor exists
-    /// to survive.
+    /// The concurrent case, and the one the quiescent oracle cannot reach.
+    /// What is quiescent here is a *set*, not the keyspace and not even this
+    /// client's family: the stable keys are written before the walk starts
+    /// and nothing touches them until it ends, while the same client writes
+    /// and deletes other keys of the same family between the walk's steps and
+    /// the other clients mutate everything else. Growth is what makes a
+    /// shard's table double with the walk in flight, which is the one case a
+    /// reverse-binary cursor exists to survive and the one no quiescent
+    /// assertion can produce.
     ///
-    /// Set equality is what is asserted, not the weaker at-least-once the
-    /// guarantee promises: `KEYS` deduplicates at the edge, so a repeat is a
-    /// finding here rather than an allowance. This is where a wrong matcher, a
-    /// shard missing from the fan-out, an inverted filter, a cursor that
-    /// stopped early or a broken dedup shows up with a legible message
-    /// instead of as an unreadable failing seed.
-    async fn walk(&self, conn: &mut Conn, depth: usize) -> turmoil::Result<()> {
+    /// Four claims, and they are the guarantee split into the parts a
+    /// concurrent walk can still make:
+    ///
+    /// - **No phantom.** Every key any step returns is one this client wrote
+    ///   — a stable key or a churn key. A name nothing here ever sent is a
+    ///   walk answering out of another family, another client's slice, or
+    ///   nowhere at all.
+    /// - **Bounded.** A cycle-completing walk finishes inside
+    ///   [`WALK_CYCLE_STEP_BOUND`] steps. Exceeding it is a cursor that has
+    ///   stopped converging, and it is reported with the step count rather
+    ///   than as a run that hung.
+    /// - **At least once.** A walk that reached the end of its cycle returned
+    ///   every stable key. Only a completed walk can claim this, which is why
+    ///   the prefix shape does not — see
+    ///   [`SimConfig::concurrent_scan_cycle`].
+    /// - **`KEYS` does not repeat, and is exact.** The closing `KEYS` is one
+    ///   round trip and complete by construction, taken once the churn has
+    ///   stopped, so the model knows precisely what the family holds: every
+    ///   stable key, plus every churn key whose write was acknowledged and
+    ///   whose removal was not. `SCAN` may return a key twice and this may
+    ///   not.
+    ///
+    /// **What the prefix shape's steps can and cannot see, measured rather
+    /// than assumed.** Four steps of a cursor cover four of a thousand
+    /// shards, so most of these walks return nothing at all: on the swept
+    /// shape, four clients in a hundred and twenty-eight had a key of their
+    /// own in the stretch they walked. That is thin per seed and not thin
+    /// across a sweep, and it is why the result-level claim every seed rests
+    /// on is the closing `KEYS` rather than the steps. What the steps carry
+    /// every time is the rest of it — a well-formed reply, a cursor that
+    /// moves, and nothing returned that belongs to anyone else — under a
+    /// schedule, which is coverage `SCAN` had nowhere before. Widening it is
+    /// not a matter of taking more steps: a spent shard hands back the next
+    /// one's start rather than continuing into it, so a step is a shard
+    /// whatever its bucket budget, and the fix is to let one call cross that
+    /// boundary.
+    ///
+    /// The two `SCAN` forms are split by client id rather than alternated
+    /// within a walk. A step carrying no `COUNT` takes the server's own
+    /// bucket budget, which is large enough to finish a small shard's table
+    /// in one call; a walk built out of those has no cursor between its steps
+    /// for anything to happen underneath. Alternating would give every walk
+    /// half of that and leave none of them stepping bucket by bucket, so the
+    /// choice is per client: both parse paths are exercised in every run, and
+    /// the odd-numbered clients are the ones whose cursor is genuinely in
+    /// flight.
+    async fn walk(&self, conn: &mut Conn, cfg: &SimConfig, depth: usize) -> turmoil::Result<()> {
         let names: Vec<String> = (0..WALK_KEYS).map(|slot| walk_key(self.id, slot)).collect();
         // The value is the key: nothing reads it back, and a value that names
         // its own key is what makes a mis-shelved one legible if something
@@ -1849,36 +1958,204 @@ impl Model {
             .collect();
 
         self.record_form(contract::FORM_SET);
+        self.record_form(contract::FORM_DEL);
         self.record_form(contract::FORM_KEYS);
+        self.record_form(if self.names_a_count() {
+            contract::FORM_SCAN_MATCH_COUNT
+        } else {
+            contract::FORM_SCAN_MATCH
+        });
 
-        let mut written = BTreeSet::new();
+        let mut stable = BTreeSet::new();
         for (batch, burst) in writes.chunks(depth).enumerate() {
             for (offset, reply) in conn.request_many(burst).await?.into_iter().enumerate() {
                 // Only an acknowledged write is a key we may insist on. A
                 // refusal is a key that is legitimately absent, and demanding
                 // it back would manufacture a violation.
                 if reply == Frame::Simple("OK".into()) {
-                    written.insert(names[batch * depth + offset].clone().into_bytes());
+                    stable.insert(names[batch * depth + offset].clone().into_bytes());
                 }
             }
         }
-        lock(&self.shared.walk).extend(written.iter().cloned());
+
+        let walk = self.walk_the_family(conn, cfg, &stable).await?;
+        let mut present = stable;
+        present.extend(walk.present.iter().cloned());
+        lock(&self.shared.walk).extend(present.iter().cloned());
 
         let reply = conn
             .request_many(&[command(&["KEYS", &walk_pattern(self.id)])])
             .await?;
         {
             let mut tally = lock(&self.shared.tally);
-            tally.walk_checks += 1;
+            tally.walk_checks += 2;
+            if !walk.holds {
+                tally.walk_mismatches += 1;
+            }
             // `Some((set, false))` is the only shape that can agree: anything
             // else is a malformed reply or a key returned twice, and `KEYS`
             // promises neither.
-            if listed_keys(&reply[0]) != Some((written, false)) {
+            if listed_keys(&reply[0]) != Some((present, false)) {
                 tally.walk_mismatches += 1;
             }
         }
         Ok(())
     }
+
+    /// Whether this client's walk names a `COUNT` on the wire.
+    ///
+    /// Split by client id rather than alternated within one walk. See
+    /// [`Model::walk`] for why: a step with no `COUNT` takes the server's own
+    /// bucket budget and can finish a small shard's table in one call, so a
+    /// walk built out of them has no cursor in flight between its steps.
+    const fn names_a_count(&self) -> bool {
+        !self.id.is_multiple_of(2)
+    }
+
+    /// Drives the `SCAN` half of [`Model::walk`] and reports what it found.
+    ///
+    /// Every burst is churn first and the step last, in one write, so the
+    /// step meets a family that has changed since the step before it. Which
+    /// of the two the server reaches first is not this client's to decide and
+    /// is not asserted on — the guarantee is stated over the stable set
+    /// precisely because the rest of the family has no predictable answer.
+    async fn walk_the_family(
+        &self,
+        conn: &mut Conn,
+        cfg: &SimConfig,
+        stable: &BTreeSet<Vec<u8>>,
+    ) -> turmoil::Result<WalkOutcome> {
+        let pattern = walk_pattern(self.id);
+        let count = WALK_STEP_COUNT.to_string();
+
+        // Churn keys whose write was acknowledged, in the order they were
+        // written, and how many of them a removal has been aimed at. The
+        // index is what makes the removals go oldest first and never twice at
+        // the same key; `gone` is what says which of them the server
+        // confirmed, since only a confirmed removal takes a key out of the
+        // family the closing `KEYS` is held to.
+        let mut written: Vec<String> = Vec::new();
+        let mut attempted = 0usize;
+        let mut gone: BTreeSet<Vec<u8>> = BTreeSet::new();
+        // Every churn name this client has *sent*, acknowledged or not. The
+        // no-phantom check is against this rather than against what was
+        // acknowledged: a write whose reply said nothing may still have
+        // landed, and a walk returning it is not the failure being looked for.
+        let mut sent: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut next_slot = WALK_KEYS;
+
+        let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut cursor = 0u64;
+        let mut steps = 0u64;
+        let mut holds = true;
+
+        let completed = loop {
+            let mut burst = Vec::new();
+            let mut fresh = Vec::new();
+            for _ in 0..WALK_CHURN_WRITES {
+                let name = walk_key(self.id, next_slot);
+                next_slot += 1;
+                burst.push(command(&["SET", &name, &name]));
+                fresh.push(name);
+            }
+            let deleting = (written.len() - attempted).min(WALK_CHURN_DELETES as usize);
+            let targets: Vec<String> = written[attempted..attempted + deleting].to_vec();
+            attempted += deleting;
+            for name in &targets {
+                burst.push(command(&["DEL", name]));
+            }
+            let cursor_text = cursor.to_string();
+            burst.push(if self.names_a_count() {
+                command(&["SCAN", &cursor_text, "MATCH", &pattern, "COUNT", &count])
+            } else {
+                command(&["SCAN", &cursor_text, "MATCH", &pattern])
+            });
+
+            let replies = conn.request_many(&burst).await?;
+            steps += 1;
+            for (name, reply) in fresh.iter().zip(&replies) {
+                sent.insert(name.clone().into_bytes());
+                if *reply == Frame::Simple("OK".into()) {
+                    written.push(name.clone());
+                }
+            }
+            for (name, reply) in targets.iter().zip(&replies[fresh.len()..]) {
+                // A refusal removes nothing — the shard declines before it
+                // touches the keyspace — so a removal only counts once the
+                // server has said it happened.
+                if matches!(reply, Frame::Integer(_)) {
+                    gone.insert(name.clone().into_bytes());
+                }
+            }
+
+            let Some((next, keys)) = scan_reply(replies.last().expect("the step is in the burst"))
+            else {
+                holds = false;
+                break false;
+            };
+            // Repeats are `SCAN`'s to make, so the union across steps is what
+            // the guarantee is about and a key returned twice is not a
+            // finding here.
+            if !keys
+                .iter()
+                .all(|key| stable.contains(key) || sent.contains(key))
+            {
+                holds = false;
+            }
+            seen.extend(keys);
+            cursor = next;
+
+            if cursor == 0 {
+                break true;
+            }
+            if cfg.concurrent_scan_cycle {
+                if steps >= WALK_CYCLE_STEP_BOUND {
+                    holds = false;
+                    break false;
+                }
+            } else if steps >= WALK_PREFIX_STEPS {
+                break false;
+            }
+        };
+
+        // Only a walk that reached the end of its cycle saw the whole family,
+        // so only that walk is held to having returned all of it.
+        if completed && !stable.iter().all(|key| seen.contains(key)) {
+            holds = false;
+        }
+
+        Ok(WalkOutcome {
+            holds,
+            present: written
+                .into_iter()
+                .map(String::into_bytes)
+                .filter(|name| !gone.contains(name))
+                .collect(),
+        })
+    }
+}
+
+/// What the `SCAN` half of a client's walk found.
+struct WalkOutcome {
+    /// Whether every claim [`Model::walk`] lists held.
+    holds: bool,
+    /// The churn keys the client believes it left behind: written, and not
+    /// removed since.
+    present: BTreeSet<Vec<u8>>,
+}
+
+/// The cursor and the keys a `SCAN` reply carries, or `None` for a reply that
+/// is not one.
+fn scan_reply(reply: &Frame) -> Option<(u64, BTreeSet<Vec<u8>>)> {
+    let Frame::Array(parts) = reply else {
+        return None;
+    };
+    let [Frame::Bulk(next), keys] = parts.as_slice() else {
+        return None;
+    };
+    let next = parse_u64(next)?;
+    let (keys, _) = listed_keys(keys)?;
+    Some((next, keys))
 }
 
 /// The keys a reply lists, and whether any of them was listed twice.
@@ -1977,11 +2254,19 @@ async fn walk_the_whole_family(
     // bucket budget, which takes more keys than exist. So the shard count plus
     // the keyspace is a bound the walk cannot legitimately reach, and reaching
     // it is a cursor that stopped advancing.
+    //
+    // The walk family is the stable keys plus every churn key a client's own
+    // walk wrote, which is why the churn is counted here: this runs after the
+    // clients have finished, so what it walks is whatever they left behind.
+    // It is stated against the prefix shape's step count on purpose — the
+    // cycle-completing shape churns for as long as its walk runs, and the two
+    // are never asked for together.
+    let walk_family = u64::from(WALK_KEYS) + u64::from(WALK_CHURN_WRITES) * WALK_PREFIX_STEPS;
     let bound = u64::from(cfg.shards)
         + u64::from(cfg.plain_keys)
         + u64::from(cfg.volatile_keys)
         + u64::from(cfg.counter_keys)
-        + u64::from(cfg.clients) * u64::from(WALK_KEYS);
+        + u64::from(cfg.clients) * walk_family;
 
     let mut seen = BTreeSet::new();
     let mut cursor = 0u64;
@@ -2223,8 +2508,40 @@ mod tests {
         // otherwise pass here for the wrong reason.
         assert_eq!(
             outcome.walk_checks,
-            u64::from(cfg.clients) + 2,
-            "one walk per client, plus the quiescent pair: {outcome:?}"
+            2 * u64::from(cfg.clients) + 2,
+            "a walk and a KEYS per client, plus the quiescent pair: {outcome:?}"
+        );
+    }
+
+    /// The walk's guarantee, held under the schedule it is stated over.
+    ///
+    /// The quiescent oracle above knows the whole family because nothing is
+    /// mutating; this is the case it cannot reach. Every client writes a
+    /// stable set, then walks its own family while writing and deleting
+    /// *other* keys of that family between the walk's steps — so the table
+    /// grows and rehashes with the walk in flight, which is the one thing a
+    /// reverse-binary cursor exists to survive, and fifteen other clients are
+    /// mutating the keyspace around it the whole time.
+    ///
+    /// It runs the shape the gate sweeps rather than `mini`: what is being
+    /// asserted is that the invariant holds where it is actually swept, and
+    /// `standard` is the only shape that is.
+    #[test]
+    fn a_walk_under_concurrent_writers_still_returns_what_it_must() {
+        let outcome = run_sim(&SimConfig::standard(7, 11));
+        assert!(outcome.invariant_holds(), "{outcome:?}");
+        assert!(
+            outcome.invariants_were_exercised(),
+            "a run that decided nothing proves nothing: {outcome:?}"
+        );
+        // Two checks per client, named rather than left to the line above:
+        // the walk and the `KEYS` that closes it are separate claims, and a
+        // run that quietly stopped making one of them would still satisfy
+        // `walk_checks > 0`.
+        assert_eq!(
+            outcome.walk_checks,
+            2 * u64::from(SimConfig::standard(7, 11).clients),
+            "one walk and one KEYS per client: {outcome:?}"
         );
     }
 
@@ -2250,7 +2567,7 @@ mod tests {
         // `expected_sum` below is what tells them apart: it is a function of
         // the commands alone, so a hash that moved while it held still means
         // the same workload met a different schedule.
-        // Repinned twice in one session, each time beside the workload change
+        // Repinned three times so far, each time beside the workload change
         // that moved it. First when the workload grew to the rest of the
         // one-key surface — `MGET`, `PEXPIRE`, `PERSIST`, `TYPE` and `STRLEN`
         // into the burst schedule, `DBSIZE` into the settle, and the draw
@@ -2258,10 +2575,14 @@ mod tests {
         // walk: every client now writes a walk family and holds `KEYS` to
         // returning it exactly, the verifier drives a full `SCAN` cycle, and
         // a step's cursor, count and pattern are folded where previously only
-        // its outcome was. The trace folds every command's kind and every
-        // reply, so an added command changes it by construction. A change here
-        // with no workload change beside it is a regression, not a repin.
-        const MINI_1_42: u64 = 0x9ca7_60da_1e95_7f0b;
+        // its outcome was. Then when that walk was put under churn: a client
+        // now steps its own family with `SCAN` while writing and deleting
+        // other keys of it, so `SCAN` is on the wire in every seed rather
+        // than only where a test asked for a full cycle. The trace folds every
+        // command's kind and every reply, so an added command changes it by
+        // construction. A change here with no workload change beside it is a
+        // regression, not a repin.
+        const MINI_1_42: u64 = 0xbe58_473a_df88_f506;
 
         let outcome = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(
@@ -2282,7 +2603,7 @@ mod tests {
                 outcome.plain_checks,
                 outcome.walk_checks
             ),
-            (54, 25, 147, 16),
+            (54, 25, 147, 32),
             "the recorded workload decides a different number of checks"
         );
     }
