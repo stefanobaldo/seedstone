@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Drives seedstone with the django-redis suite inside a pinned container.
+# Drives seedstone with the django-redis suite inside a container, whose tag
+# fixes the interpreter that client pair needs rather than the image's bytes.
 #
 # The suite is not vendored: it is fetched from its published sdist, verified
 # against a pinned digest, and extracted for the run. That keeps a third
