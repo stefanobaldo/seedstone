@@ -84,14 +84,16 @@ fn main() -> ExitCode {
                 // cancelled — by CI, by a person — has still reported what it
                 // found up to that point.
                 println!(
-                    "FAIL seed={} trace=0x{:016x} expected={} actual={} stale={} spurious={} plain={}",
+                    "FAIL seed={} trace=0x{:016x} expected={} actual={} stale={} spurious={} \
+                     plain={} walk={}",
                     sim_seed,
                     outcome.trace_hash,
                     outcome.expected_sum,
                     outcome.actual_sum,
                     outcome.stale_reads,
                     outcome.spurious_deaths,
-                    outcome.plain_mismatches
+                    outcome.plain_mismatches,
+                    outcome.walk_mismatches
                 );
             }
         },
