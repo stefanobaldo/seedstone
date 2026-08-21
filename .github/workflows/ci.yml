@@ -109,8 +109,9 @@ jobs:
         run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 275 --workload-seed 1
 
   # Every gate in the job above is this project judging itself: our tests, our
-  # simulator, our reading of the protocol. This one is three programs nobody
-  # here wrote, connecting the way they connect to Redis and accepting or
+  # simulator, our reading of the protocol. This one is four programs nobody
+  # here wrote — three clients, and behind them a cache backend's own test
+  # suite — connecting the way they connect to Redis and accepting or
   # rejecting the answers on their own terms. It is the only place where being
   # wrong about the protocol shows up as a failure rather than as agreement.
   #

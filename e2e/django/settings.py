@@ -23,6 +23,10 @@ _HOST = os.environ.get("SEEDSTONE_HOST", "127.0.0.1")
 _PORT = os.environ.get("SEEDSTONE_PORT", "6390")
 _SERVER = "redis://%s:%s?db=0" % (_HOST, _PORT)
 
+# Not a secret. Django refuses to configure without one, and this settings
+# module exists only to point a test suite at a server on loopback: nothing
+# here signs a cookie, a session or a token that outlives the container. A
+# secret scanner will flag the line anyway, which is why it says so here.
 SECRET_KEY = "seedstone-compat-lane"
 CACHES = {
     "default": {
