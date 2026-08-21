@@ -424,10 +424,15 @@ enum Action {
 /// each call site, where the next one would be the one that forgot.
 enum Unbatched {
     /// One request naming several keys, split into the one-key commands the
-    /// shards that own them can run. The replies are summed into a single
-    /// integer — see [`fan_out`], which also states what the split costs in
+    /// shards that own them can run, carrying how their replies become one
+    /// again — see [`fan_out`], which also states what the split costs in
     /// atomicity.
-    FanOut(Vec<Command>),
+    FanOut {
+        /// The commands, in the order the peer named their keys.
+        cmds: Vec<Command>,
+        /// What the replies are folded into.
+        fold: Fold,
+    },
     /// A request naming no key at all: it reaches every shard and the answers
     /// are folded into one reply — see [`broadcast`].
     Every(Command),
@@ -451,11 +456,47 @@ enum Unbatched {
     },
 }
 
+/// What a fan-out's replies are folded into.
+///
+/// Carried by the request rather than read off the replies, because the two
+/// folds are not distinguishable from a reply: a one-key `MGET` and a `GET`
+/// both come back `Reply::Bulk`, and only the request knows that one of the
+/// two still owes the peer an array around it. Inferring it here would answer
+/// that `MGET` with a bare bulk and desynchronise every client that counts
+/// elements.
+///
+/// Both places that read this match the whole enum, so a third fold added
+/// later is a compile error at each of them rather than a silent miscount.
+#[derive(Clone, Copy)]
+enum Fold {
+    /// One integer: every reply is a count and the answer is their sum —
+    /// `DEL`, `EXISTS`.
+    Sum,
+    /// One array: every reply is an entry, one per command — `MGET`.
+    Array,
+}
+
+impl Fold {
+    /// Whether folding a lone reply gives back exactly that reply's frame.
+    ///
+    /// [`Sum`](Fold::Sum) over one count is that count, so a one-key `DEL`
+    /// needs no fan-out at all and can travel in the drain's batch like any
+    /// other keyed command. [`Array`](Fold::Array) cannot: an array of one is
+    /// a different frame from the bulk inside it, and the difference is the
+    /// whole reply as far as a client parsing it is concerned.
+    const fn is_identity_on_one(self) -> bool {
+        match self {
+            Self::Sum => true,
+            Self::Array => false,
+        }
+    }
+}
+
 impl Unbatched {
     /// Runs the request and answers with the single frame it earns.
     async fn answer<R: Router>(self, router: &R) -> Frame {
         match self {
-            Self::FanOut(cmds) => fan_out(router, cmds).await,
+            Self::FanOut { cmds, fold } => fan_out(router, cmds, fold).await,
             Self::Every(cmd) => broadcast(router, cmd).await,
             Self::Keys(pattern) => keys(router, pattern).await,
             Self::Scan {
@@ -1167,11 +1208,13 @@ async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
     .await
 }
 
-/// Runs one command per key and answers the request with their sum.
+/// Runs one command per key and folds the replies into the one frame the
+/// request is owed — see [`Fold`] for which fold, and why the request has to
+/// say rather than the replies.
 ///
-/// This is how a variadic `DEL` or `EXISTS` is served: the keys of one request
-/// are in general owned by different shards, so there is no single shard the
-/// request could be sent to, and it becomes one command per key.
+/// This is how a variadic `DEL`, `EXISTS` or `MGET` is served: the keys of one
+/// request are in general owned by different shards, so there is no single
+/// shard the request could be sent to, and it becomes one command per key.
 ///
 /// **The set is not a transaction.** Each key's command is atomic on the shard
 /// that owns it — that is the shard runtime's guarantee and it is unaffected —
@@ -1183,18 +1226,41 @@ async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
 /// single-key one.
 ///
 /// A shard that answers with an error ends the fan-out and that error is the
-/// reply. A partial count reported as a total would be worse than a refusal:
-/// the peer cannot tell the two apart.
-async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>) -> Frame {
-    let mut total: i64 = 0;
-    for cmd in cmds {
-        total = match router.dispatch(cmd).await {
-            Reply::Removed(removed) => total.saturating_add(i64::from(removed)),
-            Reply::Integer(n) => total.saturating_add(n),
-            other => return reply_to_frame(other),
-        };
+/// reply. A partial count reported as a total, or an array short by whatever
+/// the failure cost, would be worse than a refusal: the peer cannot tell
+/// either of them from the truth.
+///
+/// **Argument order is the array fold's contract**, and it is the loop that
+/// keeps it: the commands are dispatched one at a time in the order the peer
+/// named their keys, and each reply is appended where it lands. A key named
+/// twice is two commands and therefore two entries — nothing here
+/// deduplicates.
+async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>, fold: Fold) -> Frame {
+    match fold {
+        Fold::Sum => {
+            let mut total: i64 = 0;
+            for cmd in cmds {
+                total = match router.dispatch(cmd).await {
+                    Reply::Removed(removed) => total.saturating_add(i64::from(removed)),
+                    Reply::Integer(n) => total.saturating_add(n),
+                    other => return reply_to_frame(other),
+                };
+            }
+            Frame::Integer(total)
+        }
+        Fold::Array => {
+            let mut entries = Vec::with_capacity(cmds.len());
+            for cmd in cmds {
+                match router.dispatch(cmd).await {
+                    // A key that is not there is an entry all the same — the
+                    // array's null, in its own slot, never a shorter array.
+                    reply @ Reply::Bulk(_) => entries.push(reply_to_frame(reply)),
+                    other => return reply_to_frame(other),
+                }
+            }
+            Frame::Array(entries)
+        }
     }
-    Frame::Integer(total)
 }
 
 /// Builds an error frame whose text cannot split the response.
@@ -1310,11 +1376,17 @@ const COMMANDS: &[(&[u8], Handler)] = &[
         }
         _ => Err(wrong_arity("set")),
     }),
+    (b"MGET", |args, _| {
+        // One `Get` per argument, and no new command: what `MGET` adds to a
+        // pile of `GET`s is the array around them, which is the fold's job
+        // rather than a shard's.
+        per_key(args, "mget", Fold::Array, |key| Command::Get { key })
+    }),
     (b"DEL", |args, _| {
-        per_key(args, "del", |key| Command::Del { key })
+        per_key(args, "del", Fold::Sum, |key| Command::Del { key })
     }),
     (b"EXISTS", |args, _| {
-        per_key(args, "exists", |key| Command::Exists { key })
+        per_key(args, "exists", Fold::Sum, |key| Command::Exists { key })
     }),
     (b"EXPIRE", |args, _| match args {
         [key, seconds] => {
@@ -1636,20 +1708,25 @@ fn hello_frame(node: &NodeInfo) -> Frame {
 
 /// Builds the action for a command that names one key or many.
 ///
-/// One key stays a single dispatch — the common case, and the one that travels
-/// in the drain's batch with everything else. Several become a [`fan_out`],
-/// with the atomicity that costs stated there.
+/// Several keys become a [`fan_out`], with the atomicity that costs stated
+/// there. One key stays a single dispatch — the common case, and the one that
+/// travels in the drain's batch with everything else — but only where the fold
+/// leaves a lone reply as it is: see [`Fold::is_identity_on_one`], which is
+/// what sends a one-key `MGET` through the fan-out to be wrapped in the array
+/// of one it is owed.
 fn per_key(
     args: &mut [Vec<u8>],
     name: &str,
+    fold: Fold,
     command: fn(Vec<u8>) -> Command,
 ) -> Result<Action, String> {
     match args {
         [] => Err(wrong_arity(name)),
-        [key] => Ok(Action::Dispatch(command(take(key)))),
-        keys => Ok(Action::Unbatched(Unbatched::FanOut(
-            keys.iter_mut().map(|key| command(take(key))).collect(),
-        ))),
+        [key] if fold.is_identity_on_one() => Ok(Action::Dispatch(command(take(key)))),
+        keys => Ok(Action::Unbatched(Unbatched::FanOut {
+            cmds: keys.iter_mut().map(|key| command(take(key))).collect(),
+            fold,
+        })),
     }
 }
 
@@ -2980,6 +3057,51 @@ mod tests {
             frames[11],
             Frame::Error("ERR wrong number of arguments for 'exists' command".into())
         );
+    }
+
+    /// `MGET` answers one entry per argument, in the order the peer wrote
+    /// them, whatever shard each key lives on.
+    ///
+    /// The one-key request is in here deliberately: its answer is a
+    /// one-element array, not the bare bulk a plain `GET` would give. A client
+    /// that counts array elements — django-redis's `get_many` sends a one-key
+    /// `MGET` whenever its caller passes one key — reads a bare bulk as the
+    /// first frame of something longer and loses the stream from there.
+    #[tokio::test]
+    async fn mget_answers_one_entry_per_argument_in_order() {
+        let (mut r, mut w, _pool) = connected(16);
+        let requests: [&[&str]; 5] = [
+            &["SET", "a", "1"],
+            &["SET", "c", "3"],
+            // A key named twice is answered twice: each name is its own
+            // command, so nothing here deduplicates.
+            &["MGET", "a", "missing", "c", "a"],
+            &["MGET", "a"],
+            &["MGET"],
+        ];
+        let mut out = Vec::new();
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        assert_eq!(
+            frames[2],
+            Frame::Array(vec![
+                Frame::Bulk(b"1".to_vec()),
+                Frame::Null,
+                Frame::Bulk(b"3".to_vec()),
+                Frame::Bulk(b"1".to_vec()),
+            ])
+        );
+        assert_eq!(
+            frames[3],
+            Frame::Array(vec![Frame::Bulk(b"1".to_vec())]),
+            "one key is still an array"
+        );
+        assert!(matches!(&frames[4], Frame::Error(e) if e.contains("wrong number of arguments")));
     }
 
     /// A fan-out runs behind whatever the peer pipelined in front of it.
