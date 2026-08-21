@@ -306,6 +306,26 @@ pub const INVALID_CURSOR: &str = "ERR invalid cursor";
 /// number is refused here, where it is still a number.
 const MAX_EXPIRE_SECONDS: i64 = i64::MAX / 1000;
 
+/// The largest span, in milliseconds, `PEXPIRE` may name.
+///
+/// Not [`MAX_EXPIRE_SECONDS`] restated: the reason `EXPIRE` has a ceiling at
+/// all is the multiplication by a thousand its unit forces, and a span that
+/// arrives already in milliseconds is multiplied by nothing. What is left is
+/// the ceiling the two share by being one command in two units — the longest
+/// deadline `EXPIRE` can name, written out in milliseconds. A span `EXPIRE`
+/// refuses is not one `PEXPIRE` should accept because it was spelled in a
+/// smaller unit.
+///
+/// Redis's ceiling here is `i64::MAX` minus its own wall-clock reading in
+/// milliseconds, so it moves as the clock does: measured on 8.10, a span of
+/// `9223370249000000000` was accepted and `9223370249544775806` was refused.
+/// This server keeps deadlines as monotonic instants and has no wall clock to
+/// subtract, so it cannot reproduce a moving boundary. The two therefore
+/// disagree over a band at the very top of the `i64` range — spans from
+/// `i64::MAX` minus the current Unix time in milliseconds up to this ceiling,
+/// every one of them some 290 million years out.
+const MAX_EXPIRE_MILLIS: i64 = MAX_EXPIRE_SECONDS * 1000;
+
 /// What this server answers `HELLO` with, and what it calls itself.
 const SERVER_NAME: &str = "seedstone";
 
@@ -1473,6 +1493,20 @@ const COMMANDS: &[(&[u8], Handler)] = &[
         [key] => Ok(Action::Dispatch(Command::Ttl { key: take(key) })),
         _ => Err(wrong_arity("ttl")),
     }),
+    (b"PEXPIRE", |args, _| match args {
+        [key, millis] => {
+            let millis = expire_millis(millis)?;
+            Ok(Action::Dispatch(Command::PExpire {
+                key: take(key),
+                millis,
+            }))
+        }
+        _ => Err(wrong_arity("pexpire")),
+    }),
+    (b"PERSIST", |args, _| match args {
+        [key] => Ok(Action::Dispatch(Command::Persist { key: take(key) })),
+        _ => Err(wrong_arity("persist")),
+    }),
     (b"INCRBY", |args, _| match args {
         [key, delta] => {
             let delta =
@@ -2143,6 +2177,23 @@ fn expire_seconds(seconds: &[u8]) -> Result<i64, String> {
     Ok(seconds)
 }
 
+/// Parses `PEXPIRE`'s span, which like `EXPIRE`'s may be zero or negative.
+///
+/// Checked in one direction only, where `EXPIRE`'s span is checked in both.
+/// Redis bounds a span in seconds at each end because each end is multiplied,
+/// and bounds a span in milliseconds only from above — measured on 8.10, where
+/// `PEXPIRE k -9223372036854775808` deletes the key and answers `1`. Every
+/// non-positive span means the same thing whatever its size, so a floor here
+/// would refuse a number the command already knows what to do with.
+fn expire_millis(millis: &[u8]) -> Result<i64, String> {
+    let millis =
+        parse_i64(millis).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
+    if millis > MAX_EXPIRE_MILLIS {
+        return Err(invalid_expire("pexpire"));
+    }
+    Ok(millis)
+}
+
 /// The invalid-expiry message, with the command's own lowercase name — a
 /// literal from the table above, never peer-supplied text.
 fn invalid_expire(name: &str) -> String {
@@ -2501,6 +2552,72 @@ mod tests {
         for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
             assert_eq!(got, want, "request {i}: {:?}", requests[i]);
         }
+    }
+
+    /// `PEXPIRE` and `PERSIST`: a deadline named in milliseconds, and one
+    /// taken away.
+    ///
+    /// Every row is measured against a live `redis-server v=8.10.0`, including
+    /// the three that are not obvious. A `PERSIST` over a key that is there but
+    /// carries no deadline answers `0`, not `1` — the answer is whether a
+    /// deadline was removed, not whether the key is now without one. A
+    /// `PEXPIRE` whose span is not in the future answers `1` and deletes the
+    /// key, which is `EXPIRE`'s applied-expiry answer in the smaller unit. And
+    /// a span of `i64::MAX` is refused as an invalid expire time rather than
+    /// accepted as a key that outlives the universe.
+    #[tokio::test]
+    async fn pexpire_and_persist_move_a_deadline_and_take_it_away() {
+        let (mut r, mut w, _pool) = connected(16);
+        let requests: [&[&str]; 17] = [
+            &["SET", "k", "v"],
+            &["PERSIST", "k"], // nothing to remove
+            &["PEXPIRE", "k", "100000"],
+            &["TTL", "k"],
+            &["PERSIST", "k"], // removes it
+            &["TTL", "k"],
+            &["PEXPIRE", "missing", "1000"],
+            &["PERSIST", "missing"],
+            &["PEXPIRE", "k", "notanumber"],
+            // A deadline in the past is a deletion, reported as an expiry that
+            // was applied. Zero and a negative say the same thing.
+            &["SET", "z", "v"],
+            &["PEXPIRE", "z", "0"],
+            &["EXISTS", "z"],
+            &["SET", "n", "v"],
+            &["PEXPIRE", "n", "-1"],
+            &["EXISTS", "n"],
+            // The ceiling, and the arity.
+            &["PEXPIRE", "k", "9223372036854775807"],
+            &["PERSIST", "k", "extra"],
+        ];
+        let mut out = Vec::new();
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        assert_eq!(frames[1], Frame::Integer(0));
+        assert_eq!(frames[2], Frame::Integer(1));
+        assert!(matches!(frames[3], Frame::Integer(n) if (90..=100).contains(&n)));
+        assert_eq!(frames[4], Frame::Integer(1));
+        assert_eq!(frames[5], Frame::Integer(-1));
+        assert_eq!(frames[6], Frame::Integer(0));
+        assert_eq!(frames[7], Frame::Integer(0));
+        assert!(matches!(&frames[8], Frame::Error(e) if e.contains("not an integer")));
+        assert_eq!(frames[10], Frame::Integer(1), "a deadline already past");
+        assert_eq!(frames[11], Frame::Integer(0), "and the key it deleted");
+        assert_eq!(frames[13], Frame::Integer(1), "a negative span, the same");
+        assert_eq!(frames[14], Frame::Integer(0));
+        assert_eq!(
+            frames[15],
+            Frame::Error("ERR invalid expire time in 'pexpire' command".into())
+        );
+        assert_eq!(
+            frames[16],
+            Frame::Error("ERR wrong number of arguments for 'persist' command".into())
+        );
     }
 
     /// `FLUSHDB` reaches every shard, and the keyspace is empty afterwards.
