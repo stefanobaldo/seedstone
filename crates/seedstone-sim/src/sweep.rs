@@ -9,9 +9,9 @@
 
 use crate::{SimConfig, SimOutcome, run_sim};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 /// Runs `seeds` simulations starting at `first_seed` on `workers` OS
 /// threads, delivering every outcome to `on_result` in ascending seed order.
@@ -20,6 +20,11 @@ use std::sync::mpsc;
 /// at any worker count. Flushing the contiguous prefix as it completes keeps
 /// the property the serial sweep had — a cancelled sweep has still reported
 /// everything up to the first unfinished seed.
+///
+/// Workers are held to a fixed window ahead of that prefix, so one slow seed
+/// costs the sweep throughput rather than memory. It costs nothing at all to
+/// a sweep whose seeds finish in comparable time, which is every sweep of a
+/// single shape.
 ///
 /// Returns what the sweep found: how many seeds violated an invariant, and
 /// the union of every command form its clients emitted.
@@ -41,10 +46,164 @@ pub fn sweep<C, F>(
     seeds: u64,
     workers: usize,
     config_for: C,
+    on_result: F,
+) -> SweepReport
+where
+    C: Fn(u64) -> SimConfig + Send + Sync + 'static,
+    F: FnMut(u64, &SimOutcome),
+{
+    sweep_with(first_seed, seeds, workers, config_for, run_sim, on_result)
+}
+
+/// How many seeds a sweep may have begun and not yet reported — and so, since
+/// a result reaches the collector only after its run began, how many
+/// finished-but-unreported seeds the collector holds.
+///
+/// In-order reporting means a finished seed waits for every earlier seed, so
+/// the pending set tracks the spread between the slowest seed and the rest.
+/// Unbounded, that is fine at today's shard width and stops being fine the
+/// moment someone widens the window — which is exactly the assumption nobody
+/// re-checks. A bound makes a slow head seed apply backpressure to the
+/// producers instead of to memory.
+///
+/// Which is why the bound is applied where runs *begin* rather than where
+/// results queue. A bounded results channel would bound the channel and
+/// nothing else: the collector drains it as fast as the workers fill it,
+/// straight into the pending map, so no producer ever waits — and a collector
+/// that stopped draining to make one wait would stall behind its own head
+/// seed, whose result is in the queue it stopped reading.
+const PENDING_LIMIT: u64 = 4 * 1024;
+
+/// What holds a worker back from beginning a seed too far ahead of the one
+/// the collector is waiting for.
+///
+/// Seeds are handed out in ascending order, so that seed is always among
+/// those already begun, and its own worker is never one of the waiters —
+/// `seed - head` is zero for it, and the gate lets it through however long
+/// the queue behind it grows. That is what makes the bound deadlock-free
+/// rather than merely small.
+struct StartGate {
+    state: Mutex<GateState>,
+    admitted: Condvar,
+}
+
+/// What the workers wait on.
+struct GateState {
+    /// The lowest seed the collector has not yet reported.
+    head: u64,
+    /// Whether any seed will ever be reported again.
+    ///
+    /// A worker that panics owes the collector a seed it will never send. If
+    /// that seed is the head, the head never moves, and without this every
+    /// other worker would wait on it forever: the panic `sweep` documents and
+    /// re-raises would surface as a hang instead.
+    abandoned: bool,
+}
+
+impl StartGate {
+    const fn new(first_seed: u64) -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                head: first_seed,
+                abandoned: false,
+            }),
+            admitted: Condvar::new(),
+        }
+    }
+
+    /// The gate's state, poisoned or not.
+    ///
+    /// It is two plain values that no unwind can leave half-written, and the
+    /// one thread that would find the lock poisoned is a worker releasing the
+    /// waiters from inside a drop guard — where refusing to read them would
+    /// turn the panic this sweep reports into an abort.
+    fn locked(&self) -> MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Blocks until `seed` is within [`PENDING_LIMIT`] of the collector's
+    /// head, and reports whether the sweep still wants it run.
+    fn admit(&self, seed: u64) -> bool {
+        let mut state = self.locked();
+        // The head never passes a seed nobody has reported, and `seed` is one
+        // nobody has even begun, so `head <= seed` and the difference is what
+        // to take. Comparing against `head + PENDING_LIMIT` would instead
+        // saturate a sweep of the last seed in the space out of its own first
+        // run.
+        while !state.abandoned && seed - state.head >= PENDING_LIMIT {
+            state = self
+                .admitted
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        !state.abandoned
+    }
+
+    /// Records that every seed below `head` has been reported.
+    fn head_reached(&self, head: u64) {
+        self.locked().head = head;
+        self.admitted.notify_all();
+    }
+
+    /// Releases every waiter, for good.
+    fn abandon(&self) {
+        self.locked().abandoned = true;
+        self.admitted.notify_all();
+    }
+}
+
+/// A worker's side of the gate, which releases the others if it unwinds.
+struct WorkerGate(Arc<StartGate>);
+
+impl WorkerGate {
+    fn admit(&self, seed: u64) -> bool {
+        self.0.admit(seed)
+    }
+}
+
+impl Drop for WorkerGate {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.abandon();
+        }
+    }
+}
+
+/// The collector's side of the gate.
+///
+/// Dropping it — whether the sweep returns or unwinds through a caller's
+/// `on_result` — is what keeps a worker from waiting on a head that nobody
+/// is left to move.
+struct CollectorGate(Arc<StartGate>);
+
+impl CollectorGate {
+    fn head_reached(&self, head: u64) {
+        self.0.head_reached(head);
+    }
+}
+
+impl Drop for CollectorGate {
+    fn drop(&mut self) {
+        self.0.abandon();
+    }
+}
+
+/// [`sweep`], with the per-seed run supplied rather than fixed.
+///
+/// The seam exists for one thing the public entry point cannot offer: a test
+/// of how far the sweep lets its workers run ahead needs thousands of seeds
+/// in flight, and thousands of real simulations is not a test anyone runs.
+fn sweep_with<C, R, F>(
+    first_seed: u64,
+    seeds: u64,
+    workers: usize,
+    config_for: C,
+    run: R,
     mut on_result: F,
 ) -> SweepReport
 where
     C: Fn(u64) -> SimConfig + Send + Sync + 'static,
+    R: Fn(&SimConfig) -> SimOutcome + Send + Sync + 'static,
     F: FnMut(u64, &SimOutcome),
 {
     assert!(
@@ -64,12 +223,16 @@ where
 
     let next = Arc::new(AtomicU64::new(first_seed));
     let config_for = Arc::new(config_for);
+    let run = Arc::new(run);
+    let gate = Arc::new(StartGate::new(first_seed));
     let (tx, rx) = mpsc::channel();
 
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
         let next = Arc::clone(&next);
         let config_for = Arc::clone(&config_for);
+        let run = Arc::clone(&run);
+        let gate = WorkerGate(Arc::clone(&gate));
         let tx = tx.clone();
         // Outside every simulation: starts runs, never reaches inside one.
         #[allow(
@@ -88,7 +251,13 @@ where
                 if seed < first_seed || seed > last_seed {
                     break;
                 }
-                let outcome = run_sim(&config_for(seed));
+                // An abandoned gate means nobody is left to report this seed:
+                // a worker panicked, or the collector went away. Either way
+                // the sweep is already unwinding towards what it reports.
+                if !gate.admit(seed) {
+                    break;
+                }
+                let outcome = run(&config_for(seed));
                 if tx.send((seed, outcome)).is_err() {
                     break;
                 }
@@ -97,11 +266,13 @@ where
     }
     drop(tx);
 
+    let gate = CollectorGate(gate);
     let mut report = SweepReport::default();
     let mut pending = BTreeMap::new();
     let mut expected = first_seed;
     for (seed, outcome) in rx {
         pending.insert(seed, outcome);
+        let head_before = expected;
         while let Some(outcome) = pending.remove(&expected) {
             if !outcome.invariant_holds() {
                 report.violations += 1;
@@ -109,6 +280,9 @@ where
             report.forms.extend(outcome.forms_emitted.iter().copied());
             on_result(expected, &outcome);
             expected = expected.saturating_add(1);
+        }
+        if expected != head_before {
+            gate.head_reached(expected);
         }
     }
     for handle in handles {
@@ -131,4 +305,142 @@ pub struct SweepReport {
     /// Every command form any of the sweep's clients emitted, named as
     /// [`crate::contract`] names it.
     pub forms: BTreeSet<&'static str>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PENDING_LIMIT, sweep_with};
+    use crate::{SimConfig, SimOutcome};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    const HOLD_STEPS: u32 = 200;
+    const HOLD_STEP: Duration = Duration::from_millis(1);
+
+    /// Holds the calling seed until `at_least` seeds are in flight behind it,
+    /// and no longer than [`HOLD_STEPS`] × [`HOLD_STEP`] whatever happens.
+    ///
+    /// The count is the condition and the stretch is only a ceiling, so a
+    /// sweep that reaches the count is held for microseconds and one that
+    /// never can is held for a fifth of a second rather than forever. Nothing
+    /// here is asserted on wall clock: the stretch decides how long a test
+    /// waits, never whether it passes.
+    fn hold_until(in_flight: &AtomicU64, at_least: u64) {
+        for _ in 0..HOLD_STEPS {
+            if in_flight.load(Ordering::Acquire) >= at_least {
+                break;
+            }
+            std::thread::sleep(HOLD_STEP);
+        }
+    }
+
+    /// A run that observed nothing.
+    ///
+    /// The question here is how many runs the sweep keeps in flight, not what
+    /// any of them found, and answering it takes several thousand seeds. That
+    /// many real simulations would answer it no better and never be run.
+    fn nothing_observed() -> SimOutcome {
+        SimOutcome {
+            trace_hash: 0,
+            expected_sum: 0,
+            actual_sum: 0,
+            stale_reads: 0,
+            spurious_deaths: 0,
+            plain_mismatches: 0,
+            dead_checks: 0,
+            alive_checks: 0,
+            plain_checks: 0,
+            walk_mismatches: 0,
+            walk_checks: 0,
+            forms_emitted: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn a_slow_head_seed_does_not_let_the_pending_map_grow_without_bound() {
+        // One seed deliberately slow, many fast ones behind it. In-order
+        // reporting holds the fast results until the head finishes; what must
+        // be bounded is how many it holds.
+        //
+        // Measured as seeds begun but not yet reported, which is the set the
+        // pending map is a subset of — a result reaches the map only after
+        // its run began — so a bound on the wider set is a bound on the map.
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let peak = Arc::new(AtomicU64::new(0));
+        let seeds = PENDING_LIMIT + 512;
+        let mut reported = 0_u64;
+
+        sweep_with(
+            1,
+            seeds,
+            8,
+            |sim_seed| SimConfig::mini(1, sim_seed),
+            {
+                let in_flight = Arc::clone(&in_flight);
+                let peak = Arc::clone(&peak);
+                move |cfg: &SimConfig| {
+                    let begun = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(begun, Ordering::AcqRel);
+                    if cfg.sim_seed == 1 {
+                        // Held until the queue behind it passes the bound —
+                        // which is the failure, so the unbounded sweep is the
+                        // one that finishes fast.
+                        hold_until(&in_flight, PENDING_LIMIT + 1);
+                    }
+                    nothing_observed()
+                }
+            },
+            |_, _| {
+                in_flight.fetch_sub(1, Ordering::AcqRel);
+                reported += 1;
+            },
+        );
+
+        let observed_peak = peak.load(Ordering::Acquire);
+        assert!(
+            observed_peak <= PENDING_LIMIT,
+            "the collector held {observed_peak} results, above the \
+             {PENDING_LIMIT} it bounds itself to"
+        );
+        // A sweep that bounded itself by dropping seeds would satisfy the
+        // assertion above and sweep nothing.
+        assert_eq!(reported, seeds, "every seed in the range is reported");
+    }
+
+    /// Holding a worker back turns a panic into a queue of workers waiting on
+    /// the seed that panicked, and if that seed is the head the queue is
+    /// everyone. `sweep` documents the panic and re-raises it; re-raising it
+    /// is only possible if the workers behind it are let go first, and a
+    /// version that hung here instead would take a whole gate with it and
+    /// report nothing at all.
+    #[test]
+    #[should_panic(expected = "a sweep worker panicked; its seed never reported")]
+    fn a_panicking_head_seed_does_not_strand_the_workers_queued_behind_it() {
+        let in_flight = Arc::new(AtomicU64::new(0));
+
+        sweep_with(
+            1,
+            PENDING_LIMIT + 512,
+            8,
+            |sim_seed| SimConfig::mini(1, sim_seed),
+            {
+                let in_flight = Arc::clone(&in_flight);
+                move |cfg: &SimConfig| {
+                    in_flight.fetch_add(1, Ordering::AcqRel);
+                    if cfg.sim_seed == 1 {
+                        // Not before the workers behind it are queued at the
+                        // gate: that queue is the arrangement that hangs.
+                        hold_until(&in_flight, PENDING_LIMIT);
+                        panic!("the head seed's worker fails");
+                    }
+                    nothing_observed()
+                }
+            },
+            |_, _| {
+                in_flight.fetch_sub(1, Ordering::AcqRel);
+            },
+        );
+    }
 }
