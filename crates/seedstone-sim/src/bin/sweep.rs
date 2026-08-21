@@ -123,6 +123,18 @@ fn main() -> ExitCode {
         unreached
     );
 
+    // Stderr, beside the binary's other diagnostics: stdout here is a parsed
+    // artifact — `--hashes` lines are fed back into `replay` by a script, and
+    // the two lines above have a fixed shape — so a warning that is not a
+    // result of the sweep does not belong in it. Printed after them, because
+    // what a number does not cover is only useful next to the number.
+    if let Some(warning) = args
+        .plant
+        .and_then(|plant| unobservable_warning(plant, shape(&args)))
+    {
+        eprintln!("{warning}");
+    }
+
     if report.violations == 0 {
         ExitCode::SUCCESS
     } else {
@@ -158,6 +170,24 @@ const fn shape(args: &args::Args) -> &'static str {
     if args.mini { "mini" } else { "standard" }
 }
 
+/// The warning a sweep owes its reader when the plant it was serving is one
+/// the shape it swept cannot catch, and `None` when the shape can catch it —
+/// the case that needs no words, because there the violation count *is* a
+/// statement about the plant.
+///
+/// A function rather than a `format!` inside `main` so the three things the
+/// line has to carry — the plant, the shape, the place the defect does show —
+/// can be held to by a test.
+fn unobservable_warning(plant: Plant, shape: &str) -> Option<String> {
+    let place = plant.unobservable_on_swept_shapes()?;
+    Some(format!(
+        "sweep: WARNING --plant {} was served, but the {shape} shape cannot catch it: \
+         the violation count above is not evidence about that defect. \
+         It is observable on {place}",
+        plant.name()
+    ))
+}
+
 /// Reports a usage problem on stderr, leaving stdout for the sweep's own
 /// output.
 fn fail(message: &str) -> ExitCode {
@@ -168,7 +198,8 @@ fn fail(message: &str) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::range;
+    use super::{range, unobservable_warning};
+    use seedstone_sim::Plant;
 
     /// Every way a caller can ask for a range that cannot be walked, and the
     /// two edges that look like one but are legal.
@@ -204,5 +235,24 @@ mod tests {
         ] {
             assert!(super::USAGE.contains(flag), "usage does not name {flag}");
         }
+    }
+
+    /// What the warning has to carry to be worth printing: which plant is
+    /// being served, that this shape cannot catch it, and where it is caught
+    /// instead. A reader who gets less than all three is left with a clean
+    /// bill and no way to tell it is not one.
+    #[test]
+    fn the_warning_names_the_plant_the_shape_and_where_the_defect_shows() {
+        let warning = unobservable_warning(Plant::ScanMissesRehash, "mini")
+            .expect("a plant the swept shapes cannot catch is warned about");
+        assert!(warning.contains("scan-misses-rehash"), "{warning}");
+        assert!(warning.contains("mini"), "{warning}");
+        assert!(warning.contains("planted_walk.rs"), "{warning}");
+
+        assert_eq!(
+            unobservable_warning(Plant::LostUpdate, "standard"),
+            None,
+            "a plant this shape does catch must not be warned about: its zero is evidence"
+        );
     }
 }
