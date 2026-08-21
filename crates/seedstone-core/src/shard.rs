@@ -231,8 +231,10 @@ pub enum Command {
     /// is not in the future.
     ///
     /// [`Expire`](Self::Expire) in a smaller unit, and nothing else: the span
-    /// is not multiplied on its way to a deadline, which is the whole of the
-    /// difference between the two.
+    /// is wrapped in [`Expiry::Px`] where the other wraps it in
+    /// [`Expiry::Ex`], and from there the two are one handler. Where the unit
+    /// does make a difference is the ceiling the service layer holds each
+    /// command to, which is the one place that argument belongs.
     PExpire {
         /// The key to put a deadline on.
         key: Vec<u8>,
@@ -1572,8 +1574,8 @@ fn span_deadline(now: Instant, span: i64, unit: fn(u64) -> Expiry) -> Deadline {
     Deadline::At(deadline(now, Some(unit(span))))
 }
 
-/// Puts the deadline a command named on its key, answering whether there was a
-/// key to receive one.
+/// Applies what a span turned out to mean — a deadline, or a removal —
+/// answering whether there was a key to apply it to.
 fn set_expiry<L: ReplicationLog>(
     dict: &mut Dict,
     log: &mut L,
@@ -1952,7 +1954,15 @@ mod tests {
         // One key per command, all past the same deadline: every arm meets an
         // entry that is still in the dict and already gone, which is the state
         // a handler that skipped the liveness check would answer from.
-        for key in [&b"get"[..], b"exists", b"ttl", b"del", b"incrby"] {
+        for key in [
+            &b"get"[..],
+            b"exists",
+            b"ttl",
+            b"persist",
+            b"pexpire",
+            b"del",
+            b"incrby",
+        ] {
             assert_eq!(shard.run(set_ex(key, b"1", 10), Instant::now()), Reply::Ok);
         }
         tokio::time::advance(Duration::from_secs(11)).await;
@@ -1976,6 +1986,29 @@ mod tests {
                 now
             ),
             Reply::Integer(-2)
+        );
+        // Both would answer `1` against an entry that was still there: a
+        // `PERSIST` would find the stale deadline to clear, and a `PEXPIRE` a
+        // key to put a new one on. `0` is the answer only an eviction that has
+        // already happened can produce.
+        assert_eq!(
+            shard.run(
+                Command::Persist {
+                    key: b"persist".to_vec()
+                },
+                now
+            ),
+            Reply::Integer(0)
+        );
+        assert_eq!(
+            shard.run(
+                Command::PExpire {
+                    key: b"pexpire".to_vec(),
+                    millis: 10_000
+                },
+                now
+            ),
+            Reply::Integer(0)
         );
         assert_eq!(
             shard.run(

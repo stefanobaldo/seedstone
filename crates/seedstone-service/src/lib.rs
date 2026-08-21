@@ -308,22 +308,42 @@ const MAX_EXPIRE_SECONDS: i64 = i64::MAX / 1000;
 
 /// The largest span, in milliseconds, `PEXPIRE` may name.
 ///
-/// Not [`MAX_EXPIRE_SECONDS`] restated: the reason `EXPIRE` has a ceiling at
-/// all is the multiplication by a thousand its unit forces, and a span that
-/// arrives already in milliseconds is multiplied by nothing. What is left is
-/// the ceiling the two share by being one command in two units — the longest
-/// deadline `EXPIRE` can name, written out in milliseconds. A span `EXPIRE`
-/// refuses is not one `PEXPIRE` should accept because it was spelled in a
-/// smaller unit.
+/// Not [`MAX_EXPIRE_SECONDS`] restated. That ceiling stands on the two reasons
+/// its own documentation gives, and neither of them reaches a span already
+/// written in milliseconds:
+///
+/// - The multiplication by a thousand the unit forces does not happen here.
+/// - The immortality hole cannot be reached here either. A span so long that
+///   `now` plus it leaves the clock's range is stored as *no deadline* — which
+///   on the `EXPIRE` path would clear a deadline and report success — but an
+///   `i64` of milliseconds is some three orders of magnitude below what
+///   [`Instant`](std::time::Instant)'s seconds field holds, so every one of
+///   them is a deadline the clock can still represent. Measured on this
+///   platform rather than reasoned about: `Instant::checked_add` answers
+///   `Some` for `Duration::from_millis(i64::MAX as u64)`.
+///
+/// What is left is the ceiling the two share by being one command in two units
+/// — the longest deadline `EXPIRE` can name, written out in milliseconds. A
+/// span `EXPIRE` refuses is not one `PEXPIRE` should accept because it was
+/// spelled in a smaller unit.
 ///
 /// Redis's ceiling here is `i64::MAX` minus its own wall-clock reading in
 /// milliseconds, so it moves as the clock does: measured on 8.10, a span of
-/// `9223370249000000000` was accepted and `9223370249544775806` was refused.
-/// This server keeps deadlines as monotonic instants and has no wall clock to
-/// subtract, so it cannot reproduce a moving boundary. The two therefore
-/// disagree over a band at the very top of the `i64` range — spans from
-/// `i64::MAX` minus the current Unix time in milliseconds up to this ceiling,
-/// every one of them some 290 million years out.
+/// `9223370000000000000` was accepted and `i64::MAX` was refused, with the
+/// boundary between them different every day. This server keeps deadlines as
+/// monotonic instants and has no wall clock to subtract, so it cannot
+/// reproduce a moving boundary. The two therefore disagree over a band at the
+/// very top of the `i64` range — spans from `i64::MAX` minus the current Unix
+/// time in milliseconds up to this ceiling, every one of them some 290 million
+/// years out.
+///
+/// **`SET … PX` does not share this ceiling, and Redis is why.** The same
+/// server answers `OK` to `SET k v PX 9223372036854775807` and refuses
+/// `PEXPIRE k 9223372036854775807`: it validates a `PEXPIRE` against the wall
+/// clock and validates a `PX` against nothing. So the two ceilings in this file
+/// disagreeing about the same unit is Redis's own asymmetry rather than an
+/// oversight in either — see [`expiry_unit`] for the `PX` side of it, and for
+/// the divergence it leaves open here.
 const MAX_EXPIRE_MILLIS: i64 = MAX_EXPIRE_SECONDS * 1000;
 
 /// What this server answers `HELLO` with, and what it calls itself.
@@ -2069,7 +2089,20 @@ fn expiry_unit(option: &[u8]) -> Option<ExpiryUnit> {
         })
     } else if option.eq_ignore_ascii_case(b"PX") {
         // Already in the unit that ceiling exists to protect, so anything
-        // positive an `i64` can hold is a span Redis accepts.
+        // positive an `i64` can hold is a span Redis accepts — measured on
+        // 8.10, where `SET k v PX 9223372036854775807` answers `OK` while
+        // `PEXPIRE k 9223372036854775807` is refused. Redis really does take
+        // through this door what it turns away at the other, which is why this
+        // ceiling and [`MAX_EXPIRE_MILLIS`] disagree about the same unit.
+        //
+        // **A known divergence, recorded rather than closed.** Redis lets the
+        // addition overflow and stores the key already expired, so its `TTL`
+        // answers `-2` for a `SET` it just accepted. Here the span fits a
+        // monotonic instant, so the key keeps a deadline some 290 million
+        // years out and stays alive — measured through this server, where the
+        // same `SET` is followed by `TTL k` answering `9223372036854776`.
+        // Narrowing the accepted range to match would refuse a `SET` Redis
+        // performs, which is the larger incompatibility of the two.
         Some(ExpiryUnit {
             option: ExpiryOption::Px,
             ceiling: i64::MAX,
@@ -2568,7 +2601,7 @@ mod tests {
     #[tokio::test]
     async fn pexpire_and_persist_move_a_deadline_and_take_it_away() {
         let (mut r, mut w, _pool) = connected(16);
-        let requests: [&[&str]; 17] = [
+        let requests: [&[&str]; 19] = [
             &["SET", "k", "v"],
             &["PERSIST", "k"], // nothing to remove
             &["PEXPIRE", "k", "100000"],
@@ -2586,8 +2619,13 @@ mod tests {
             &["SET", "n", "v"],
             &["PEXPIRE", "n", "-1"],
             &["EXISTS", "n"],
-            // The ceiling, and the arity.
+            // The ceiling, from both sides: the largest span this server
+            // accepts, and the first number past it. A refusal alone would
+            // pin only that the ceiling is somewhere below `i64::MAX`.
             &["PEXPIRE", "k", "9223372036854775807"],
+            &["PEXPIRE", "k", "9223372036854775000"],
+            // The arity, for each of the two.
+            &["PEXPIRE", "k"],
             &["PERSIST", "k", "extra"],
         ];
         let mut out = Vec::new();
@@ -2616,6 +2654,15 @@ mod tests {
         );
         assert_eq!(
             frames[16],
+            Frame::Integer(1),
+            "the ceiling itself is a span that is accepted"
+        );
+        assert_eq!(
+            frames[17],
+            Frame::Error("ERR wrong number of arguments for 'pexpire' command".into())
+        );
+        assert_eq!(
+            frames[18],
             Frame::Error("ERR wrong number of arguments for 'persist' command".into())
         );
     }
