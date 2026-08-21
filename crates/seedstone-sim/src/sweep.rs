@@ -332,9 +332,8 @@ mod tests {
     /// is read before the first sleep, so a count already reached costs
     /// nothing and one reached later is noticed within a [`HOLD_STEP`] — and
     /// one that never can is held for a fifth of a second rather than
-    /// forever. Nothing here is
-    /// asserted on wall clock: the stretch decides how long a test waits,
-    /// never whether it passes.
+    /// forever. Nothing here is asserted on wall clock: the stretch decides
+    /// how long a test waits, never whether it passes.
     fn hold_until(in_flight: &AtomicU64, at_least: u64) {
         for _ in 0..HOLD_STEPS {
             if in_flight.load(Ordering::Acquire) >= at_least {
