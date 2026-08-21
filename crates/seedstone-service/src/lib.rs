@@ -335,17 +335,29 @@ const MAX_EXPIRE_SECONDS: i64 = i64::MAX / 1000;
 /// Read beside [`MAX_EXPIRE_SECONDS`] those two paragraphs look like they
 /// disagree, because the spans they talk about are the same magnitude:
 /// `i64::MAX` milliseconds *is* `MAX_EXPIRE_SECONDS` seconds, to the second.
-/// They are about different bands. The immortality hole is not at that
-/// magnitude — it is strictly above it, on the seconds in
-/// `(MAX_EXPIRE_SECONDS, i64::MAX]`, where `Duration::from_secs` of the span
-/// makes `Instant::checked_add` answer `None` for any non-zero uptime: no
-/// deadline stored, the one the key already had cleared, and `1` reported as
-/// though the expiry had been set. `MAX_EXPIRE_SECONDS` is the ceiling that
-/// excludes exactly that band, which is what closes the hole. The largest
-/// millisecond span there is lands *on* the band's floor rather than inside
-/// it, three orders of magnitude short of its top, so no `PEXPIRE` argument
-/// reaches the hole at all. One paragraph is about the last span the clock can
-/// represent; the other is about the first it cannot.
+/// They do not disagree, and the reason is that neither of those spans is
+/// where the immortality hole is. An [`Instant`](std::time::Instant) holds its
+/// seconds in an `i64` of its own, so `checked_add` fails only where the
+/// process's uptime in seconds plus the span overflows that — a sliver at the
+/// very top of the range, `[i64::MAX - uptime, i64::MAX]` seconds, whose floor
+/// drops by a second for every second the node has been up. Measured on this
+/// platform rather than reasoned about: at an uptime of 26,674 seconds the
+/// largest span `checked_add` accepted was `9_223_372_036_854_749_133`, which
+/// is `i64::MAX` minus that uptime, and `EXPIRE k 9223372036854775807` is the
+/// argument that lands in the sliver — no deadline stored, the one the key
+/// already had cleared, `1` reported as though the expiry had been set.
+///
+/// `MAX_EXPIRE_SECONDS` sits some three orders of magnitude *below* that
+/// sliver's floor, so it excludes the hole with room to spare rather than
+/// being fitted to it: `Duration::from_secs(MAX_EXPIRE_SECONDS + 1)` is still
+/// a deadline this clock represents, and so is `i64::MAX / 2`. The ceiling is
+/// where it is for the reasons its own documentation gives — Redis's number,
+/// and the multiplication by a thousand — and closing the hole is something it
+/// does comfortably on the way past. A millisecond span is three orders below
+/// the sliver for the same reason the bullet above gives, the largest one
+/// there is coming to `MAX_EXPIRE_SECONDS` seconds, so no `PEXPIRE` argument
+/// reaches the hole either. Both ceilings are far from it, in the same
+/// direction, and neither is the edge of it.
 ///
 /// What is left is the ceiling the two share by being one command in two units
 /// — the longest deadline `EXPIRE` can name, written out in milliseconds. A
