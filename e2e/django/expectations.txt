@@ -36,18 +36,8 @@ test_backend.py::DjangoRedisCacheTests::test_lock_released_by_thread | out-of-ru
 test_backend.py::DjangoRedisCacheTests::test_incr_ignore_check | out-of-rule | EVAL: the client increments through a script, and its recovery path cannot create a key that is missing
 
 # --- not-yet -------------------------------------------------------------
-# MGET.
-test_backend.py::DjangoRedisCacheTests::test_get_many | not-yet | MGET
-test_backend.py::DjangoRedisCacheTests::test_get_many_unicode | not-yet | MGET
-
-# PERSIST.
-test_backend.py::DjangoRedisCacheTests::test_persist | not-yet | PERSIST
-test_backend.py::DjangoRedisCacheTests::test_touch_forever | not-yet | PERSIST
-test_backend.py::DjangoRedisCacheTests::test_touch_forever_nonexistent | not-yet | PERSIST
-
-# PEXPIRE.
-test_backend.py::DjangoRedisCacheTests::test_touch_default_timeout | not-yet | PEXPIRE
-test_backend.py::DjangoRedisCacheTests::test_touch_missed_key | not-yet | PEXPIRE
-test_backend.py::DjangoRedisCacheTests::test_touch_negative_timeout | not-yet | PEXPIRE
-test_backend.py::DjangoRedisCacheTests::test_touch_positive_timeout | not-yet | PEXPIRE
-test_backend.py::DjangoRedisCacheTests::test_touch_zero_timeout | not-yet | PEXPIRE
+# Empty. Every test this suite runs that does not end at a command named
+# above now passes: the rows that stood here named MGET, PERSIST and PEXPIRE,
+# and each came out the moment the command it waited for landed. A row
+# belongs here only while a planned command is unbuilt, and what is left in
+# this file is the permanent half.
