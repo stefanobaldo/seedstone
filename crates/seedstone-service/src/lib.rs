@@ -1701,7 +1701,7 @@ struct SetOptions {
 /// behaviour a server grows by accident and clients then depend on.
 fn set_options(mut rest: &[Vec<u8>], node: &NodeInfo) -> Result<SetOptions, String> {
     // The surviving expiry option and the bytes that followed it, unread.
-    let mut deadline: Option<(ExpiryUnit, &[u8])> = None;
+    let mut expiry_arg: Option<(ExpiryUnit, &[u8])> = None;
     let mut named: Option<ExpiryOption> = None;
     let mut cond: Option<Cond> = None;
     let mut keep_ttl = false;
@@ -1712,7 +1712,7 @@ fn set_options(mut rest: &[Vec<u8>], node: &NodeInfo) -> Result<SetOptions, Stri
             let Some((value, after)) = tail.split_first() else {
                 return Err(SYNTAX_ERROR.to_owned());
             };
-            deadline = Some((unit, value));
+            expiry_arg = Some((unit, value));
             rest = after;
         } else if option.eq_ignore_ascii_case(b"KEEPTTL") {
             // In the expiry family, so it conflicts with all of it: a peer
@@ -1737,7 +1737,7 @@ fn set_options(mut rest: &[Vec<u8>], node: &NodeInfo) -> Result<SetOptions, Stri
         }
     }
     // The one surviving argument, validated now that nothing can discard it.
-    let expiry = match deadline {
+    let expiry = match expiry_arg {
         None => None,
         Some((unit, value)) => {
             let value = set_expire_value(value, unit.ceiling)?;
@@ -1776,11 +1776,20 @@ fn claim(held: &mut Option<ExpiryOption>, option: ExpiryOption) -> Result<(), St
 
 /// `SCAN`'s options: `MATCH <glob>` and `COUNT <n>`, in either order.
 ///
-/// A repeated option takes the last occurrence, as Redis does — the same rule
-/// `SET` follows. `COUNT` must be positive: Redis answers a syntax error for
-/// zero and for a negative, which is a different failure from a `COUNT` that
-/// is not a number at all, and clients distinguish them. What it asks for is
-/// then bounded by [`WALK_STEP_BUCKETS`], which states why.
+/// A repeated option takes the last occurrence, as Redis does — and there the
+/// resemblance to [`set_options`] stops. `SCAN` validates every occurrence as
+/// it reads it, so an earlier one keeps a veto: `COUNT 0 COUNT 10` is a syntax
+/// error here where `EX 0 EX 10` is a 10-second deadline, and
+/// `COUNT notanum COUNT 10` is refused where `EX notanum EX 10` is run. The
+/// asymmetry is Redis's own, measured on a live `redis-server v=8.10.0`
+/// against both commands rather than inferred from either; this server copies
+/// it because a client that learned one command's behaviour learned it from
+/// the server it is replacing.
+///
+/// `COUNT` must be positive: Redis answers a syntax error for zero and for a
+/// negative, which is a different failure from a `COUNT` that is not a number
+/// at all, and clients distinguish them. What it asks for is then bounded by
+/// [`WALK_STEP_BUCKETS`], which states why.
 fn scan_options(mut rest: &[Vec<u8>]) -> Result<(Option<Vec<u8>>, usize), String> {
     let mut pattern = None;
     let mut count = SCAN_DEFAULT_COUNT;
@@ -2174,12 +2183,14 @@ mod tests {
         // milliseconds — and [`NodeInfo::for_tests`] freezes the wall clock at
         // `FIXED_UNIX_MILLIS`, so the remaining span is exactly
         // 99_999_999_999_000 − 1_700_000_000_000 milliseconds and the seconds
-        // `TTL` reports are arithmetic, not a measurement. Only the monotonic
-        // gap between a row and its `TTL` — a fraction of a millisecond on a
-        // loopback pipeline — can cost the last second, which is the whole
-        // width of the range below. A `> 0` assertion would pass just as well
-        // if the deadline had been read as a *relative* span, which is the
-        // defect these rows exist to catch.
+        // `TTL` reports are arithmetic, not a measurement: the answer is the
+        // upper end of the range below. The range admits the second under it
+        // only because `remaining_seconds` rounds to nearest, which puts the
+        // boundary a full 500 milliseconds away — the gap between a row and
+        // its `TTL` on a loopback pipeline cannot reach it, and a machine
+        // stalled that long is the one case worth not flaking on. A `> 0`
+        // assertion would pass just as well if the deadline had been read as a
+        // *relative* span, which is the defect these rows exist to catch.
         const CLOCK_ROWS: [usize; 2] = [12, 16];
         const FAR_TTL_SECONDS: std::ops::RangeInclusive<i64> = 98_299_999_998..=98_299_999_999;
 
