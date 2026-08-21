@@ -1070,15 +1070,15 @@ impl Router for ShardPool {
             // Executors own contiguous ascending shard ranges, so concatenating
             // their answers in executor order is shard order — while every
             // executor answers. An executor whose channel errored contributes
-            // one `ShardUnavailable` instead of one per shard it owned, and
-            // one whose send failed is not in `pending` at all and contributes
-            // nothing; either way the `resize` below pads at the tail, so a
-            // death mid-flight shortens one run and shifts every reply behind
-            // it: the vector is still the right length and every entry is
-            // still a reply this pool produced, but index `i` is no longer
-            // shard `i`. Nothing relies on the correspondence today —
-            // `broadcast` sums or folds and no caller indexes by shard — and
-            // a live pool cannot get there, so this is stated rather than
+            // one `ShardUnavailable` instead of one per shard it owned, and one
+            // whose send failed leaves its slot `None` for `.flatten()` to drop
+            // and contributes nothing; either way the `resize` below pads at
+            // the tail, so a death mid-flight shortens one run and shifts every
+            // reply behind it: the vector is still the right length and every
+            // entry is still a reply this pool produced, but index `i` is no
+            // longer shard `i`. Nothing relies on the correspondence today —
+            // `broadcast` sums or folds and no caller indexes by shard — and a
+            // live pool cannot get there, so this is stated rather than
             // defended against. A caller that does want to read replies
             // positionally has to make the padding per-executor first.
             //
