@@ -328,6 +328,11 @@ const FIXED_UNIX_MILLIS: u64 = 1_700_000_000_000;
 /// chose, the start is a reading of a clock, and the peer count is maintained
 /// by the accept loop. Passing them in is what keeps the connection layer a
 /// pure function of its inputs, and therefore replayable.
+///
+/// [`now_unix_millis`](Self::now_unix_millis) is the exception that proves the
+/// rule: it is not a fact but the dependency that supplies one, because the
+/// fact it supplies changes while a connection is being served. Everything
+/// said above about why the others are passed in applies to it doubly.
 #[derive(Clone, Debug)]
 pub struct NodeInfo {
     /// The version this node reports.
@@ -1680,8 +1685,23 @@ struct SetOptions {
 /// deadline. What it refuses is a *different* option from the same family:
 /// `EX 10 PX 5` and `NX XX` are syntax errors, in either order, because there
 /// is no answer to give a peer that asked for both. See [`ExpiryOption`].
+///
+/// That rule reaches further than which occurrence wins, and the difference is
+/// visible from the wire. **A discarded occurrence is discarded whole, its
+/// argument included, and that argument is never looked at** — so
+/// `EX notanum EX 10` is a command Redis runs, while `EX 10 EX notanum` is the
+/// one it refuses. This walk therefore performs syntax and family checks only,
+/// carrying the surviving option and its *raw* argument, and the one argument
+/// that survived is validated afterwards, once. A syntax error anywhere
+/// consequently beats an invalid expire time anywhere, in either order:
+/// `EX 0 BOGUS` is `ERR syntax error`, not an invalid expire time.
+///
+/// Both paragraphs are measurements of a live `redis-server v=8.10.0` rather
+/// than reasoning about what a parser ought to do — they are the kind of
+/// behaviour a server grows by accident and clients then depend on.
 fn set_options(mut rest: &[Vec<u8>], node: &NodeInfo) -> Result<SetOptions, String> {
-    let mut expiry: Option<Expiry> = None;
+    // The surviving expiry option and the bytes that followed it, unread.
+    let mut deadline: Option<(ExpiryUnit, &[u8])> = None;
     let mut named: Option<ExpiryOption> = None;
     let mut cond: Option<Cond> = None;
     let mut keep_ttl = false;
@@ -1689,22 +1709,10 @@ fn set_options(mut rest: &[Vec<u8>], node: &NodeInfo) -> Result<SetOptions, Stri
     while let Some((option, tail)) = rest.split_first() {
         if let Some(unit) = expiry_unit(option) {
             claim(&mut named, unit.option)?;
-            let Some((span, after)) = tail.split_first() else {
+            let Some((value, after)) = tail.split_first() else {
                 return Err(SYNTAX_ERROR.to_owned());
             };
-            // The value is validated before it is turned into an `Expiry`,
-            // so `EX 10 EX 0` is an invalid expire time and not the last-wins
-            // assignment succeeding on a zero. `EXAT`/`PXAT` are held to the
-            // same rule against the same ceilings, which is what Redis does:
-            // `EXAT 0` is an invalid expire time there too, however the
-            // deadline it names compares to the clock.
-            let value = set_expire_span(span, unit.ceiling)?;
-            expiry = Some(match unit.form {
-                ExpiryForm::Span(build) => build(value),
-                ExpiryForm::Deadline(unit_millis) => {
-                    remaining_from(value.saturating_mul(unit_millis), node)
-                }
-            });
+            deadline = Some((unit, value));
             rest = after;
         } else if option.eq_ignore_ascii_case(b"KEEPTTL") {
             // In the expiry family, so it conflicts with all of it: a peer
@@ -1728,6 +1736,24 @@ fn set_options(mut rest: &[Vec<u8>], node: &NodeInfo) -> Result<SetOptions, Stri
             return Err(SYNTAX_ERROR.to_owned());
         }
     }
+    // The one surviving argument, validated now that nothing can discard it.
+    let expiry = match deadline {
+        None => None,
+        Some((unit, value)) => {
+            let value = set_expire_value(value, unit.ceiling)?;
+            Some(match unit.form {
+                ExpiryForm::Span(build) => build(value),
+                // The multiplication cannot overflow: `set_expire_value` has
+                // just held the value to a ceiling of `i64::MAX` milliseconds
+                // expressed in this unit. Saturating anyway, so that a ceiling
+                // relaxed later is a deadline further off than anyone waits
+                // rather than a wrapped one.
+                ExpiryForm::Deadline(unit_millis) => {
+                    remaining_from(value.saturating_mul(unit_millis), node)
+                }
+            })
+        }
+    };
     Ok(SetOptions {
         expiry,
         cond,
@@ -1894,14 +1920,22 @@ fn expiry_unit(option: &[u8]) -> Option<ExpiryUnit> {
 /// very next command that looks at it finds it gone. That is Redis's own
 /// answer to `SET k v EXAT 1` — `+OK`, and no key — and it is a shape no other
 /// path produces, since a span of zero on the wire is refused before it gets
-/// this far; see [`set_expire_span`].
+/// this far; see [`set_expire_value`].
+///
+/// The span is measured here, at parse time, and added to the shard's `now`
+/// when the command reaches it, so the deadline lands later than the client
+/// named it by however long the dispatch took. `EX` and `PX` already behave
+/// exactly this way — every span this server takes is measured against the
+/// clock of the layer that reads it — so an absolute deadline is no less
+/// faithful than a relative one; it is the same microseconds of drift, on a
+/// command that happens to say when rather than how long.
 fn remaining_from(deadline_millis: u64, node: &NodeInfo) -> Expiry {
     let now = (node.now_unix_millis)();
-    // Saturating on both steps, and neither is a formality: the subtraction
-    // saturates for every deadline in the past, and a `u128` of milliseconds
-    // that a `u64` cannot hold is a deadline further off than this process
-    // will live, which the largest span there is says better than a wrapped
-    // one would.
+    // The subtraction is the live one: it saturates for every deadline already
+    // past, which is the case this function exists to answer. The conversion
+    // below cannot narrow — a value that got here was held to a ceiling of
+    // `i64::MAX` milliseconds — and is written defensively rather than as
+    // `as`, so that a ceiling relaxed later saturates instead of wrapping.
     let remaining = u128::from(deadline_millis).saturating_sub(u128::from(now));
     Expiry::Px(u64::try_from(remaining).unwrap_or(u64::MAX))
 }
@@ -1917,19 +1951,25 @@ const fn condition(option: &[u8]) -> Option<Cond> {
     }
 }
 
-/// Parses the span an `EX`/`PX` names: strictly positive, and within what the
-/// unit can carry.
+/// Validates the value an expiry option names: strictly positive, and within
+/// what the unit can carry.
 ///
-/// A `SET` whose deadline has already passed is not a write Redis performs and
-/// then undoes — it is refused outright, so zero and negative spans are errors
-/// rather than deletions. `ceiling` is what the option's unit may carry; see
+/// Called once per `SET`, on the occurrence that survived the walk rather than
+/// on each one — [`set_options`] says why that is observable.
+///
+/// Positive is a rule about the value, not about the deadline it resolves to,
+/// and the two come apart for the absolute options: `EXAT 1` names a moment
+/// decades gone and is a write Redis performs, while `EX 0` and `EXAT 0` are
+/// both `ERR invalid expire time in 'set' command`. So a `SET` whose deadline
+/// has already passed is not a write refused, but a `SET` whose *number* is
+/// zero or negative is. `ceiling` is what the option's unit may carry; see
 /// [`expiry_unit`].
-fn set_expire_span(span: &[u8], ceiling: i64) -> Result<u64, String> {
-    let span = parse_i64(span).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
-    if span <= 0 || span > ceiling {
+fn set_expire_value(value: &[u8], ceiling: i64) -> Result<u64, String> {
+    let value = parse_i64(value).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
+    if value <= 0 || value > ceiling {
         return Err(invalid_expire("set"));
     }
-    u64::try_from(span).map_err(|_| invalid_expire("set"))
+    u64::try_from(value).map_err(|_| invalid_expire("set"))
 }
 
 /// Parses `EXPIRE`'s span, which unlike `SET`'s may be zero or negative.
@@ -2043,7 +2083,7 @@ mod tests {
     async fn set_options_parse_as_redis_does() {
         let (mut r, mut w, _pool) = connected(16);
         let mut out = Vec::new();
-        let requests: [&[&str]; 19] = [
+        let requests: [&[&str]; 20] = [
             &["SET", "k", "v", "EX", "10"],
             &["TTL", "k"],
             &["SET", "k", "other", "PX", "500", "NX"],
@@ -2064,6 +2104,12 @@ mod tests {
             &["SET", "k", "v", "EX", "9223372036854775807"],
             &["SET", "k", "v", "PX", "0"],
             &["SET", "k", "v", "EX", "notanum"],
+            // An option outside this server's surface, which is what the
+            // paragraph above is about. Redis takes `PERSIST` on `GETEX` and
+            // not on `SET`, so this row is one both servers refuse — and it is
+            // the row that keeps the refusal itself tested now that the
+            // options this server used to refuse are options it takes.
+            &["SET", "k", "v", "PERSIST"],
             &["GET", "k"],
         ];
         for parts in requests {
@@ -2077,7 +2123,7 @@ mod tests {
         let expire = Frame::Error("ERR invalid expire time in 'set' command".into());
         // Sized to the requests above, so one added without its answer is a
         // compile error rather than a `zip` that quietly stops early.
-        let expected: [Frame; 19] = [
+        let expected: [Frame; 20] = [
             Frame::Simple("OK".into()),
             Frame::Integer(10),
             Frame::Null,
@@ -2097,6 +2143,7 @@ mod tests {
             expire.clone(),
             expire,
             Frame::Error("ERR value is not an integer or out of range".into()),
+            Frame::Error("ERR syntax error".into()),
             // Every refusal above left the connection usable.
             Frame::Bulk(b"v".to_vec()),
         ];
@@ -2108,27 +2155,37 @@ mod tests {
     /// The rest of the algebra: a repeated option, `KEEPTTL`, `GET`, and the
     /// deadlines `EXAT`/`PXAT` name.
     ///
-    /// Every row is a command this server used to answer `ERR syntax error`,
-    /// and every one of them is something a real client sends: `KEEPTTL` and
-    /// `GET` because they are how a client updates a value without losing what
-    /// it knows about the key, the absolute forms because a scheduler that
-    /// computed a deadline once should not have to re-derive a span per
-    /// retry, and the repeat because a client that builds a command by
-    /// appending options emits one without meaning to.
+    /// Where the test above is mostly refusals, this one is mostly commands
+    /// that work — every option here is one this server answered `ERR syntax
+    /// error` until it implemented them, and each is something a real client
+    /// sends: `KEEPTTL` and `GET` because they are how a client updates a value
+    /// without losing what it knows about the key, the absolute forms because a
+    /// scheduler that computed a deadline once should not have to re-derive a
+    /// span per retry, and the repeat because a client that builds a command by
+    /// appending options emits one without meaning to. The three rows that are
+    /// still refusals are here because they are what those options conflict
+    /// with.
     ///
     /// Reads the same as the test above: literal answers, and Redis's own.
     #[tokio::test]
     async fn set_keeps_a_ttl_answers_the_old_value_and_takes_a_deadline() {
-        // The one answer below that no literal can state: `EXAT` names a
-        // deadline decades out, so what `TTL` reports is whatever the clock
-        // makes of it. The claim worth asserting is the one that row was
-        // written for — the key got a deadline in the future rather than none
-        // at all, which is what a `TTL` of `-1` or `-2` would have said.
-        const CLOCK_ROW: usize = 10;
+        // The two rows no literal can answer for, and what they are worth
+        // asserting: both name the same instant — one in seconds, one in
+        // milliseconds — and [`NodeInfo::for_tests`] freezes the wall clock at
+        // `FIXED_UNIX_MILLIS`, so the remaining span is exactly
+        // 99_999_999_999_000 − 1_700_000_000_000 milliseconds and the seconds
+        // `TTL` reports are arithmetic, not a measurement. Only the monotonic
+        // gap between a row and its `TTL` — a fraction of a millisecond on a
+        // loopback pipeline — can cost the last second, which is the whole
+        // width of the range below. A `> 0` assertion would pass just as well
+        // if the deadline had been read as a *relative* span, which is the
+        // defect these rows exist to catch.
+        const CLOCK_ROWS: [usize; 2] = [12, 16];
+        const FAR_TTL_SECONDS: std::ops::RangeInclusive<i64> = 98_299_999_998..=98_299_999_999;
 
         let (mut r, mut w, _pool) = connected(16);
         let mut out = Vec::new();
-        let requests: [&[&str]; 20] = [
+        let requests: [&[&str]; 26] = [
             // Last occurrence wins, where this server used to answer a syntax error.
             &["SET", "k", "v", "EX", "100", "EX", "50"],
             &["TTL", "k"],
@@ -2139,14 +2196,24 @@ mod tests {
             // KEEPTTL and an expiry option together are a syntax error.
             &["SET", "k", "v", "KEEPTTL", "EX", "10"],
             &["SET", "k", "v", "EX", "10", "KEEPTTL"],
+            // KEEPTTL under a condition that refuses the write is not: the
+            // command is well formed, it simply does not happen, and the
+            // deadline it would have kept is still there afterwards.
+            &["SET", "k", "other", "NX", "KEEPTTL"],
+            &["TTL", "k"],
             // GET answers the previous value, and the absent case is null.
             &["SET", "k", "new", "GET"],
             &["SET", "brandnew", "first", "GET"],
-            // Absolute deadlines.
+            // Absolute deadlines, in both units. The two `SET`s below name the
+            // same instant, so their two `TTL`s answer the same number.
             &["SET", "at", "v", "EXAT", "99999999999"],
             &["TTL", "at"],
             &["SET", "past", "v", "EXAT", "1"],
             &["EXISTS", "past"],
+            &["SET", "atms", "v", "PXAT", "99999999999000"],
+            &["TTL", "atms"],
+            &["SET", "pastms", "v", "PXAT", "1"],
+            &["EXISTS", "pastms"],
             // NX and XX still conflict, and are still last-wins-free.
             &["SET", "k", "v", "NX", "XX"],
             &["SET", "k", "v", "XX", "XX"],
@@ -2168,7 +2235,7 @@ mod tests {
 
         let frames = read_frames(&mut r, requests.len()).await;
         let syntax = Frame::Error("ERR syntax error".into());
-        let expected: [Frame; 20] = [
+        let expected: [Frame; 26] = [
             Frame::Simple("OK".into()),
             Frame::Integer(50),
             Frame::Simple("OK".into()),
@@ -2176,14 +2243,20 @@ mod tests {
             Frame::Bulk(b"kept".to_vec()),
             syntax.clone(),
             syntax.clone(),
+            Frame::Null,
+            Frame::Integer(50),
             Frame::Bulk(b"kept".to_vec()),
             Frame::Null,
             Frame::Simple("OK".into()),
-            // Asserted below rather than here; see CLOCK_ROW.
+            // Asserted below rather than here; see CLOCK_ROWS.
             Frame::Integer(0),
             Frame::Simple("OK".into()),
             // A deadline in the past stores the key and leaves it already due,
             // so the next command to look for it does not find it.
+            Frame::Integer(0),
+            Frame::Simple("OK".into()),
+            Frame::Integer(0),
+            Frame::Simple("OK".into()),
             Frame::Integer(0),
             syntax,
             Frame::Simple("OK".into()),
@@ -2194,16 +2267,81 @@ mod tests {
             Frame::Integer(0),
         ];
         for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
-            if i == CLOCK_ROW {
+            if CLOCK_ROWS.contains(&i) {
                 continue;
             }
             assert_eq!(got, want, "request {i}: {:?}", requests[i]);
         }
-        assert!(
-            matches!(frames[CLOCK_ROW], Frame::Integer(n) if n > 0),
-            "{:?}",
-            frames[CLOCK_ROW]
-        );
+        for row in CLOCK_ROWS {
+            assert!(
+                matches!(frames[row], Frame::Integer(n) if FAR_TTL_SECONDS.contains(&n)),
+                "request {row}: {:?} answered {:?}",
+                requests[row],
+                frames[row]
+            );
+        }
+    }
+
+    /// A repeated option discards the earlier occurrence whole — its argument
+    /// with it, unread.
+    ///
+    /// The rule is not "the last value wins" but "the earlier occurrence never
+    /// happened", and the two differ on exactly the rows below: an argument
+    /// that would have been refused is not refused if a later occurrence
+    /// replaces it, because nothing ever looks at it. `EX notanum EX 10` is
+    /// therefore a command that works and `EX 10 EX notanum` is not, and the
+    /// order of the two words is the entire difference.
+    ///
+    /// It follows that a syntax error anywhere beats an invalid expire time
+    /// anywhere: the walk refuses an unknown word while reading it, and the one
+    /// surviving argument is validated only once the walk has finished. The
+    /// last row is that consequence.
+    ///
+    /// Measured against a live `redis-server v=8.10.0` rather than reasoned
+    /// about — a parser written from the outside in would have validated
+    /// eagerly, and every row here would have been wrong in a way no client
+    /// could work around.
+    #[tokio::test]
+    async fn a_repeated_set_option_discards_the_earlier_one_argument_and_all() {
+        let (mut r, mut w, _pool) = connected(16);
+        let mut out = Vec::new();
+        let requests: [&[&str]; 7] = [
+            // A zero the later occurrence discards, where `EX 0` alone is an
+            // invalid expire time.
+            &["SET", "k", "v", "EX", "0", "EX", "10"],
+            &["TTL", "k"],
+            // The same for an argument that is not a number at all. The `TTL`
+            // proves the surviving occurrence took effect rather than the
+            // command quietly losing its deadline.
+            &["SET", "k", "v", "EX", "notanum", "EX", "10"],
+            &["TTL", "k"],
+            // Reversed, both are refused — and refused differently, which is
+            // what says the *surviving* argument is the one being validated.
+            &["SET", "k", "v", "EX", "10", "EX", "notanum"],
+            &["SET", "k", "v", "EX", "10", "EX", "0"],
+            // An unknown word after an argument that would have been refused:
+            // the syntax error is the answer, because it happens first.
+            &["SET", "k", "v", "EX", "0", "BOGUS"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        let expected: [Frame; 7] = [
+            Frame::Simple("OK".into()),
+            Frame::Integer(10),
+            Frame::Simple("OK".into()),
+            Frame::Integer(10),
+            Frame::Error("ERR value is not an integer or out of range".into()),
+            Frame::Error("ERR invalid expire time in 'set' command".into()),
+            Frame::Error("ERR syntax error".into()),
+        ];
+        for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
+            assert_eq!(got, want, "request {i}: {:?}", requests[i]);
+        }
     }
 
     /// `FLUSHDB` reaches every shard, and the keyspace is empty afterwards.
