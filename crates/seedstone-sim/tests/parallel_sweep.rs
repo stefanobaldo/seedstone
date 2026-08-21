@@ -8,7 +8,7 @@ use seedstone_sim::{Plant, SimConfig, sweep};
 
 fn collect(workers: usize) -> (u64, Vec<(u64, u64, bool)>) {
     let mut rows = Vec::new();
-    let violations = sweep(
+    let report = sweep(
         1,
         8,
         workers,
@@ -19,7 +19,7 @@ fn collect(workers: usize) -> (u64, Vec<(u64, u64, bool)>) {
         },
         |seed, outcome| rows.push((seed, outcome.trace_hash, outcome.invariant_holds())),
     );
-    (violations, rows)
+    (report.violations, rows)
 }
 
 #[test]
@@ -50,14 +50,14 @@ fn worker_count_changes_nothing_but_wall_clock() {
 #[test]
 fn the_last_seed_in_the_space_terminates() {
     let mut rows = Vec::new();
-    let violations = sweep(
+    let report = sweep(
         u64::MAX,
         1,
         4,
         |sim_seed| SimConfig::mini(1, sim_seed),
         |seed, outcome| rows.push((seed, outcome.trace_hash)),
     );
-    assert_eq!(violations, 0, "the mini shape holds unplanted");
+    assert_eq!(report.violations, 0, "the mini shape holds unplanted");
     assert_eq!(rows.len(), 1, "one seed asked for, one seed reported");
     assert_eq!(rows[0].0, u64::MAX);
 }
