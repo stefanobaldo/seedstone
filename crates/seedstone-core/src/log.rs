@@ -381,9 +381,9 @@ pub trait ReplicationLog: Send + 'static {
 
 /// A [`ReplicationLog`] that keeps nothing.
 ///
-/// The one implementation this server ships today. Every method succeeds without
-/// doing anything: there are no bytes to write, so there is nothing for
-/// [`sync`](ReplicationLog::sync) to make durable and it is trivially
+/// The one implementation this server ships today. Every method succeeds
+/// without doing anything: there are no bytes to write, so there is nothing
+/// for [`sync`](ReplicationLog::sync) to make durable and it is trivially
 /// satisfied.
 #[derive(Debug)]
 pub struct NoopLog;

@@ -6,13 +6,14 @@
 //! and a key are both sequences of bytes and a class member is a byte.
 //!
 //! The reference is `stringmatchlen` in Redis's `util.c`, followed byte for
-//! byte with one deliberate departure: a run of two or more stars against an
-//! empty subject matches here and does not there. Redis can afford to answer
-//! no because `KEYS` short-circuits the one-byte `*` pattern through its
-//! all-keys path without ever calling the matcher — so a key named `""` is
-//! still returned by `KEYS *`. Having no such short-circuit, this matcher has
-//! to answer yes to a star against an empty subject for `KEYS *` to behave as
-//! Redis's does, and the residue of that is the multi-star case.
+//! byte with one deliberate departure: a single `*` against an empty subject
+//! matches here and does not there. Redis can afford to answer no because
+//! `KEYS` short-circuits the one-byte `*` pattern through its all-keys path
+//! without ever calling the matcher — so a key named `""` is still returned
+//! by `KEYS *`. Having no such short-circuit, this matcher has to answer yes
+//! to a star against an empty subject for `KEYS *` to behave as Redis's does,
+//! and the residue of that is the multi-star case: a run of two or more stars
+//! matches an empty subject here too.
 //!
 //! The implementation is iterative with one remembered star, not recursive.
 //! A recursive matcher on a pattern of many stars retries exponentially, and

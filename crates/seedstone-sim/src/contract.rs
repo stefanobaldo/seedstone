@@ -22,8 +22,8 @@
 //! A [`Coverage::NotEmitted`] reason states why the workload will *never*
 //! emit the command — a property of the command, not of how far this harness
 //! has got. "Not built yet" is a schedule, and a schedule recorded here reads
-//! as a decision to whoever finds it later; it belongs in the plan's open
-//! items instead. The consequence is deliberate: a command the workload
+//! as a decision to whoever finds it later; it belongs in this project's own
+//! planning, not here. The consequence is deliberate: a command the workload
 //! merely has not reached yet leaves only one honest way to make this table
 //! pass, which is to emit it.
 
