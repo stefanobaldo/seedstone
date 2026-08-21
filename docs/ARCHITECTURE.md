@@ -213,8 +213,9 @@ true.
   unify into them.
 - **Real clients are the last gate.** `redis-cli`, `redis-benchmark`, redis-py
   and go-redis drive the release binary on every code change, and behind them a
-  third party's cache-backend test suite runs against it in a pinned container,
-  from an archive checked against a pinned digest. That suite is what finishes
-  the pipeline. They are the only judges in it that this project did not write,
-  and the last of them judges the client pair that lane exercises rather than
-  the protocol in the abstract.
+  third party's cache-backend test suite runs against it from an archive
+  checked against a pinned digest, in a container whose tag fixes the
+  interpreter that client pair needs rather than leaving it to whatever the
+  runner offers. That suite is what finishes the pipeline. They are the only
+  judges in it that this project did not write, and the last of them judges the
+  client pair that lane exercises rather than the protocol in the abstract.
