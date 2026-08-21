@@ -27,6 +27,7 @@
 //! Exits 1 if any seed violated any invariant.
 
 use seedstone_sim::Plant;
+use std::ops::RangeInclusive;
 use std::process::ExitCode;
 
 #[path = "shared/args.rs"]
@@ -46,19 +47,15 @@ fn main() -> ExitCode {
     if args.sim_seed.is_some() {
         return fail("--sim-seed runs one seed; sweep runs a range — see replay");
     }
-    let Some(seeds) = args.seeds else {
+    let Some(requested) = args.seeds else {
         return fail("--seeds is required");
     };
-    if seeds == 0 {
-        return fail("--seeds must be at least 1");
-    }
-    let first_seed = args.seed_start.unwrap_or(1);
-    if first_seed == 0 {
-        return fail("--seed-start must be at least 1");
-    }
-    if first_seed.checked_add(seeds - 1).is_none() {
-        return fail("--seed-start plus --seeds overflows the seed space");
-    }
+    let seed_range = match range(args.seed_start.unwrap_or(1), requested) {
+        Ok(seed_range) => seed_range,
+        Err(message) => return fail(&message),
+    };
+    let first_seed = *seed_range.start();
+    let seeds = seed_range.end() - seed_range.start() + 1;
     let workers = match args.workers {
         Some(0) => return fail("--workers must be at least 1"),
         Some(k) => k,
@@ -133,6 +130,28 @@ fn main() -> ExitCode {
     }
 }
 
+/// The seeds a sweep will walk, or the reason it cannot walk them.
+///
+/// A function rather than a run of `if`s in `main` because these three
+/// refusals are the only thing standing between a mistyped window and a sweep
+/// that quietly runs seeds nobody asked for — and a guard that can only be
+/// exercised by launching the binary is a guard nothing notices the loss of.
+fn range(seed_start: u64, seeds: u64) -> Result<RangeInclusive<u64>, String> {
+    if seeds == 0 {
+        return Err("--seeds must be at least 1".to_owned());
+    }
+    if seed_start == 0 {
+        return Err("--seed-start must be at least 1".to_owned());
+    }
+    // `seeds - 1` cannot underflow: the zero case was refused above. The last
+    // seed of the space is a legal range of one, so the sum that must fit is
+    // the last seed, not the one past it.
+    let Some(last_seed) = seed_start.checked_add(seeds - 1) else {
+        return Err("--seed-start plus --seeds overflows the seed space".to_owned());
+    };
+    Ok(seed_start..=last_seed)
+}
+
 /// How the swept configuration is named in the summary, so a pasted line says
 /// which shape produced it.
 const fn shape(args: &args::Args) -> &'static str {
@@ -149,6 +168,26 @@ fn fail(message: &str) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use super::range;
+
+    /// Every way a caller can ask for a range that cannot be walked, and the
+    /// two edges that look like one but are legal.
+    #[test]
+    fn a_seed_range_is_refused_when_it_cannot_be_walked() {
+        assert!(range(0, 10).is_err(), "seed 0 is not a seed");
+        assert!(
+            range(u64::MAX, 2).is_err(),
+            "a range that runs off the end of the seed space is not a range"
+        );
+        assert_eq!(range(1, 3).unwrap(), 1..=3);
+        assert_eq!(
+            range(u64::MAX, 1).unwrap(),
+            u64::MAX..=u64::MAX,
+            "the last seed in the space is a legal one-seed range"
+        );
+        assert!(range(1, 0).is_err(), "a zero-length range runs nothing");
+    }
+
     /// The usage line is the only documentation a caller gets at the moment
     /// they need it, and a flag that exists but is not named there is a flag
     /// nobody finds.
