@@ -80,16 +80,19 @@ with no benefit.
   over the log's own operations is enough.
 - **The trace is ours by definition.** A production server compares its
   execution against nothing; the trace exists so a simulated one can.
-- **The expiry decision is ours, and it is the one seam built to be broken.**
-  Both halves of expiration — the check in front of every command and the
-  housekeeping sweep — ask a policy chosen when the shard pool is spawned.
-  Production links exactly one, an honest zero-sized implementation; the harness
-  supplies defective ones, so what an expiration invariant catches is the defect
-  itself rather than an imitation of what it would look like from outside. A
-  cargo feature could not do this job: a workspace-wide build unifies features,
-  so the harness's would be compiled into the shipped binary. A type parameter
-  puts the broken implementations in a crate the binary does not depend on,
-  where they are unlinkable rather than merely unused.
+- **The shard policy is ours, and it is the one seam built to be broken.** It
+  carries every decision a shard executor consults that production has exactly
+  one answer for: today, when a deadline comes due — asked by both halves of
+  expiration, the check in front of every command and the housekeeping sweep —
+  and how a keyspace walk's cursor advances. They travel as one value because
+  the same executor holds both for the same span. Production links exactly one
+  policy, an honest zero-sized implementation; the harness supplies defective
+  ones, so what an invariant catches is the defect itself rather than an
+  imitation of what it would look like from outside. A cargo feature could not
+  do this job: a workspace-wide build unifies features, so the harness's would
+  be compiled into the shipped binary. A type parameter puts the broken
+  implementations in a crate the binary does not depend on, where they are
+  unlinkable rather than merely unused.
 
 **Entropy enters in exactly one place.** The hash seed is drawn in `main`, the
 composition root, and injected downward; nothing below it reads randomness or
@@ -111,8 +114,12 @@ modification, and it is deliberately the thinnest part of the system.
 The binary is the only place a socket is opened, a signal is handled, or
 entropy is drawn. Below it, the connection loop is generic over its transport;
 commands that concern the connection rather than the keyspace are answered
-there, and keyed commands are routed to the executor that owns their shard.
-Multi-key commands fan out from the same layer.
+there, and a command that names a key is routed to the executor that owns its
+shard. Two other routing shapes share that path: a command that names a *shard*
+instead of a key, which is how one step of a keyspace walk reaches the shard
+whose cursor it carries, and a command every shard must see, such as emptying
+the keyspace or counting it. Multi-key commands fan out from this layer, and so
+does the whole-keyspace walk — one cursor loop per shard, run concurrently.
 
 That layer is its own crate, and the dependency arrow is the reason. It depends
 on the core and on the codec; the core depends on neither. An adapter the core
@@ -137,6 +144,49 @@ touched and actively by a budgeted, cursor-ordered sweep on a housekeeping
 tick — deterministic in both halves, because the cursor order is fixed and the
 clock belongs to the runtime.
 
+## Where we differ from Redis, and why
+
+The differences below are behavioural and observable from a client, so they are
+stated here rather than left to be discovered.
+
+**A keyspace walk is at-least-once, not a snapshot.** `KEYS` and `SCAN` answer
+with a set that was the keyspace at no single instant: a key created while a
+walk is in flight may be missed, and a key deleted while it is in flight may
+still appear. Redis's `KEYS` is atomic because Redis is single-threaded, not
+because the guarantee was designed; here the keyspace is spread across shards
+that no lock spans, and a global instant would cost a barrier every single-key
+command would pay for. What a walk does guarantee is that it terminates, and
+that a cursor carried across a table resize can only re-visit buckets, never
+skip them. `KEYS` removes the duplicates that follow from that, so it does not
+report a key twice; `SCAN` may, exactly as in Redis.
+
+**`KEYS` does not stop the server, and is still `O(keyspace)`.** It walks in
+bounded steps that yield between them, and every shard walks at once, so
+nothing queues behind it — but it competes for CPU with traffic for as long as
+it runs, and it accumulates the whole answer at the edge before any of it
+reaches the wire. Not blocking is the difference worth having; it is not the
+same thing as being cheap. Use `SCAN`.
+
+**A `SCAN` cursor names the shard it is walking, and belongs to one process.**
+The cursor packs a shard number and that shard's own cursor into the single
+integer the command exchanges, which is how a client that knows nothing about
+shards ends up walking all of them. Three consequences follow. The shard count
+is fixed for the life of the process, so a cursor does not survive a restart. A
+cursor is accepted only in the canonical decimal it was issued in, so `SCAN
+007` is an error here where Redis reads cursor `7` — a cursor is not a number a
+person types, but one this server issued and the client hands straight back.
+And a full cycle costs at least one round trip per shard whatever the keyspace
+holds, because a spent shard hands back the next shard's start rather than
+continuing into it: walking a thousand keys costs about a thousand calls, where
+Redis answers the same walk in about a hundred at its default `COUNT`. That is
+a floor on round trips, not on work — each call still costs what a `GET` costs.
+
+**The surface is a named list, and anything outside it is refused.** A command
+this server does not implement is answered with an error naming it, rather than
+with an approximation of what it might have meant. The list is chosen for the
+workloads this project targets; it grows by being extended, and a client that
+needs more than it holds finds out at once rather than through a wrong answer.
+
 ## What CI enforces
 
 The properties above are only worth as much as the machinery that keeps them
@@ -152,7 +202,10 @@ true.
   range of seeds. A companion self-test plants a genuine lost-update race and
   requires the sweep to find it and a second process to replay it byte for
   byte; the expiration invariants are held to the same standard, each watched
-  failing against a deliberately broken server before being trusted.
+  failing against a deliberately broken server before being trusted. So is the
+  walk's cursor — against a keyspace narrow and deep enough for a cursor to be
+  caught between steps, which the swept shape deliberately is not, and the
+  test that plants it says so where it lives.
 - **The simulator may not reach production.** One gate proves the simulation
   crate is absent from the production dependency graph — with a positive
   control, so it cannot pass by searching an empty graph — and another compiles
