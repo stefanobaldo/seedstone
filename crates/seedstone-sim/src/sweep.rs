@@ -8,7 +8,7 @@
 //! `docs/coding-guide.md` lists this site in the allow census.
 
 use crate::{SimConfig, SimOutcome, run_sim};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -21,7 +21,14 @@ use std::sync::mpsc;
 /// the property the serial sweep had — a cancelled sweep has still reported
 /// everything up to the first unfinished seed.
 ///
-/// Returns the number of seeds whose invariants did not hold.
+/// Returns what the sweep found: how many seeds violated an invariant, and
+/// the union of every command form its clients emitted.
+///
+/// The union is a sweep-level number by construction, which is the only level
+/// it means anything at. A form the workload reaches on one roll in fifty is
+/// absent from most seeds and present in any sweep worth the name, so a
+/// per-seed comparison against the contract would fail on luck rather than on
+/// coverage.
 ///
 /// # Panics
 ///
@@ -35,7 +42,7 @@ pub fn sweep<C, F>(
     workers: usize,
     config_for: C,
     mut on_result: F,
-) -> u64
+) -> SweepReport
 where
     C: Fn(u64) -> SimConfig + Send + Sync + 'static,
     F: FnMut(u64, &SimOutcome),
@@ -90,15 +97,16 @@ where
     }
     drop(tx);
 
-    let mut violations = 0u64;
+    let mut report = SweepReport::default();
     let mut pending = BTreeMap::new();
     let mut expected = first_seed;
     for (seed, outcome) in rx {
         pending.insert(seed, outcome);
         while let Some(outcome) = pending.remove(&expected) {
             if !outcome.invariant_holds() {
-                violations += 1;
+                report.violations += 1;
             }
+            report.forms.extend(outcome.forms_emitted.iter().copied());
             on_result(expected, &outcome);
             expected = expected.saturating_add(1);
         }
@@ -112,5 +120,15 @@ where
         pending.is_empty(),
         "a seed was skipped without a worker panic"
     );
-    violations
+    report
+}
+
+/// What a whole sweep found, as against what one seed found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// How many seeds violated an invariant.
+    pub violations: u64,
+    /// Every command form any of the sweep's clients emitted, named as
+    /// [`crate::contract`] names it.
+    pub forms: BTreeSet<&'static str>,
 }

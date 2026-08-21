@@ -66,7 +66,7 @@ fn main() -> ExitCode {
     };
     let config_args = args.clone();
     let hashes = args.hashes;
-    let violations = seedstone_sim::sweep(
+    let report = seedstone_sim::sweep(
         first_seed,
         seeds,
         workers,
@@ -106,10 +106,27 @@ fn main() -> ExitCode {
         shape(&args),
         args.workload_seed,
         args.plant.map_or("none", Plant::name),
-        violations
+        report.violations
     );
 
-    if violations == 0 {
+    // What this sweep did *not* reach, named. The simulated client's contract
+    // declares every form it can emit, and a shape decides which of them a
+    // given sweep gets to: the quiescent walk is a test's to ask for, so a
+    // gate sweeping without it does not reach the forms only that walk sends.
+    // Printed rather than asserted, because the gap is a property of the
+    // shape and not a defect — but printed every time, because a coverage
+    // claim nobody states is the thing this contract exists to end.
+    let unreached: Vec<&str> = seedstone_sim::contract::declared_forms()
+        .filter(|form| !report.forms.contains(form))
+        .collect();
+    println!(
+        "coverage {}/{} declared forms; not reached by this shape: {:?}",
+        report.forms.len(),
+        seedstone_sim::contract::declared_forms().count(),
+        unreached
+    );
+
+    if report.violations == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

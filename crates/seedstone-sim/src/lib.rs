@@ -125,7 +125,7 @@ pub mod contract;
 
 mod sweep;
 
-pub use sweep::sweep;
+pub use sweep::{SweepReport, sweep};
 
 /// The port the simulated server listens on. Redis's, for familiarity; in a
 /// simulation nothing else is competing for it.
@@ -458,7 +458,7 @@ impl Plant {
 /// beside a non-zero check count — this is the same discipline the counter
 /// sum is held to, where a workload that acknowledged no `INCRBY` satisfies
 /// `0 == 0` while proving nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimOutcome {
     /// The fold of every command the server completed, in the order it
     /// completed them. A function of the two seeds and the configuration
@@ -489,6 +489,16 @@ pub struct SimOutcome {
     /// Keyspace walks decided against an exactly known set — the denominator
     /// of [`SimOutcome::walk_mismatches`].
     pub walk_checks: u64,
+    /// Every form of every command this run's clients actually emitted, named
+    /// as [`crate::contract`] names it.
+    ///
+    /// The numerator to the contract's denominator, and it is a *set* rather
+    /// than a count on purpose: which forms were reached is the question, and
+    /// how many times each was reached says nothing about coverage. Compared
+    /// against the declaration at sweep level and never per seed — a rare form
+    /// missing from one seed is expected; missing from a whole sweep is a
+    /// claim that was never true.
+    pub forms_emitted: BTreeSet<&'static str>,
 }
 
 impl SimOutcome {
@@ -600,6 +610,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         plain_checks: tally.plain_checks,
         walk_mismatches: tally.walk_mismatches,
         walk_checks: tally.walk_checks,
+        forms_emitted: lock(&shared.forms).clone(),
     }
 }
 
@@ -621,6 +632,13 @@ struct Shared {
     /// clients publish what they were told took, and the verifier holds the
     /// server to exactly that.
     walk: Arc<Mutex<BTreeSet<Vec<u8>>>>,
+    /// Every form label the run's clients actually put on the wire.
+    ///
+    /// The observed half of the contract. A declaration alone can claim a
+    /// form the generator never reaches — a branch with probability zero, or
+    /// one a bug made unreachable — and the only thing that can tell the two
+    /// apart is a record of what was really sent.
+    forms: Arc<Mutex<BTreeSet<&'static str>>>,
 }
 
 /// Everything the hosts count between them.
@@ -1004,9 +1022,10 @@ async fn client(id: u16, cfg: SimConfig, shared: Shared) -> turmoil::Result {
         // The rolls are drawn in the same order at any depth, so the workload
         // a seed describes is the same workload however it is pipelined.
         for op in 0..this_burst {
-            let (frame, check) = model.compose(&mut rng, sent, issued + op);
-            burst.push(frame);
-            checks.push(check);
+            let op = model.compose(&mut rng, sent, issued + op);
+            model.record_form(op.form);
+            burst.push(op.frame);
+            checks.push(op.check);
         }
         let replies = conn.request_many(&burst).await?;
         model.observe(&replies, &checks, sent, Instant::now());
@@ -1068,6 +1087,20 @@ enum Known {
     /// Written by its owner with these bytes, and nothing has written it
     /// since.
     Value(Vec<u8>),
+}
+
+/// One operation a client is about to issue.
+///
+/// The form travels with the frame rather than being derived from it later:
+/// the arm that composed the command is the one place that knows without
+/// question which of the contract's forms it is, and a reader that had to
+/// recover it from the bytes would be a second implementation of the
+/// contract's spelling.
+struct Op {
+    frame: Frame,
+    check: Check,
+    /// The contract's name for what this is. See [`crate::contract`].
+    form: &'static str,
 }
 
 /// What one reply is worth to the client that asked for it.
@@ -1135,6 +1168,9 @@ struct Deadline {
     option: &'static str,
     argument: u64,
     millis: u64,
+    /// Which of the contract's `SET` forms this deadline makes the command.
+    /// The two options are two forms, and this is where they are told apart.
+    form: &'static str,
 }
 
 /// The deadlines the workload hands out.
@@ -1152,26 +1188,31 @@ const DEADLINES: [Deadline; 6] = [
         option: "PX",
         argument: 1,
         millis: 1,
+        form: contract::FORM_SET_PX,
     },
     Deadline {
         option: "PX",
         argument: 20,
         millis: 20,
+        form: contract::FORM_SET_PX,
     },
     Deadline {
         option: "PX",
         argument: 60,
         millis: 60,
+        form: contract::FORM_SET_PX,
     },
     Deadline {
         option: "PX",
         argument: 150,
         millis: 150,
+        form: contract::FORM_SET_PX,
     },
     Deadline {
         option: "PX",
         argument: 300,
         millis: 300,
+        form: contract::FORM_SET_PX,
     },
     // The one that outlives the settle, and the only way to reach the `EX`
     // arm of the option parser: keys given this are never decided dead, only
@@ -1180,6 +1221,7 @@ const DEADLINES: [Deadline; 6] = [
         option: "EX",
         argument: 1,
         millis: 1000,
+        form: contract::FORM_SET_EX,
     },
 ];
 
@@ -1275,6 +1317,15 @@ impl Model {
         }
     }
 
+    /// Notes that this client put `form` on the wire.
+    ///
+    /// Called at the point a command is composed rather than counted from the
+    /// bytes afterwards, so the label the contract is checked against is the
+    /// one the generator chose and not a second reading of it.
+    fn record_form(&self, form: &'static str) {
+        lock(&self.shared.forms).insert(form);
+    }
+
     /// One to three plain slots, for the commands that take several keys.
     ///
     /// Repeats are not prevented: `DEL k k` and `EXISTS k k` mean different
@@ -1300,7 +1351,7 @@ impl Model {
     /// is what every deadline here is measured from; `seq` is the client's
     /// own operation counter, which goes into written values so a value that
     /// turns up under the wrong key is visible as such.
-    fn compose(&self, rng: &mut ChaCha8Rng, sent: Instant, seq: u32) -> (Frame, Check) {
+    fn compose(&self, rng: &mut ChaCha8Rng, sent: Instant, seq: u32) -> Op {
         // Drawn here rather than inside each family so the roll is one draw
         // whichever family it lands in: a helper that rolled again would make
         // the stream a function of how the arms happen to be grouped.
@@ -1309,10 +1360,11 @@ impl Model {
             0..COUNTER_OPS => {
                 let key = rng.random_range(0..self.counter_keys);
                 let delta = rng.random_range(-10..=10i64);
-                (
-                    command(&["INCRBY", &counter_key(key), &delta.to_string()]),
-                    Check::Counter(delta),
-                )
+                Op {
+                    frame: command(&["INCRBY", &counter_key(key), &delta.to_string()]),
+                    check: Check::Counter(delta),
+                    form: contract::FORM_INCRBY,
+                }
             }
             COUNTER_OPS..PLAIN_END => self.compose_plain(roll, rng, seq),
             _ => self.compose_volatile(roll, rng, sent, seq),
@@ -1321,140 +1373,150 @@ impl Model {
 
     /// An operation on a plain key: no deadline ever, and a model that knows
     /// the exact bytes.
-    fn compose_plain(&self, roll: u32, rng: &mut ChaCha8Rng, seq: u32) -> (Frame, Check) {
+    fn compose_plain(&self, roll: u32, rng: &mut ChaCha8Rng, seq: u32) -> Op {
         match roll {
             COUNTER_OPS..29 => {
                 let slot = self.plain.pick(rng);
                 let value = format!("{seq}@{}", self.plain.key(slot));
-                let frame = command(&["SET", &plain_key(self.plain.key(slot)), &value]);
-                (
-                    frame,
-                    Check::PlainSet {
+                Op {
+                    frame: command(&["SET", &plain_key(self.plain.key(slot)), &value]),
+                    check: Check::PlainSet {
                         slot,
                         value: value.into_bytes(),
                     },
-                )
+                    form: contract::FORM_SET,
+                }
             }
             29..38 => {
                 let slot = self.plain.pick(rng);
-                (
-                    command(&["GET", &plain_key(self.plain.key(slot))]),
-                    Check::PlainGet { slot },
-                )
+                Op {
+                    frame: command(&["GET", &plain_key(self.plain.key(slot))]),
+                    check: Check::PlainGet { slot },
+                    form: contract::FORM_GET,
+                }
             }
             38..42 => {
                 let slots = self.several(rng);
-                (self.plain_command("DEL", &slots), Check::PlainDel { slots })
+                Op {
+                    frame: self.plain_command("DEL", &slots),
+                    check: Check::PlainDel { slots },
+                    form: contract::FORM_DEL,
+                }
             }
             42..46 => {
                 let slots = self.several(rng);
-                (
-                    self.plain_command("EXISTS", &slots),
-                    Check::PlainExists { slots },
-                )
+                Op {
+                    frame: self.plain_command("EXISTS", &slots),
+                    check: Check::PlainExists { slots },
+                    form: contract::FORM_EXISTS,
+                }
             }
             46..50 => {
                 let slots = self.several(rng);
-                (
-                    self.plain_command("MGET", &slots),
-                    Check::PlainMGet { slots },
-                )
+                Op {
+                    frame: self.plain_command("MGET", &slots),
+                    check: Check::PlainMGet { slots },
+                    form: contract::FORM_MGET,
+                }
             }
             50..52 => {
                 let slot = self.plain.pick(rng);
-                (
-                    command(&["TYPE", &plain_key(self.plain.key(slot))]),
-                    Check::PlainType { slot },
-                )
+                Op {
+                    frame: command(&["TYPE", &plain_key(self.plain.key(slot))]),
+                    check: Check::PlainType { slot },
+                    form: contract::FORM_TYPE,
+                }
             }
             _ => {
                 let slot = self.plain.pick(rng);
-                (
-                    command(&["STRLEN", &plain_key(self.plain.key(slot))]),
-                    Check::PlainStrLen { slot },
-                )
+                Op {
+                    frame: command(&["STRLEN", &plain_key(self.plain.key(slot))]),
+                    check: Check::PlainStrLen { slot },
+                    form: contract::FORM_STRLEN,
+                }
             }
         }
     }
 
     /// An operation on a volatile key: always a deadline, and a model that
     /// knows when — not what.
-    fn compose_volatile(
-        &self,
-        roll: u32,
-        rng: &mut ChaCha8Rng,
-        sent: Instant,
-        seq: u32,
-    ) -> (Frame, Check) {
+    fn compose_volatile(&self, roll: u32, rng: &mut ChaCha8Rng, sent: Instant, seq: u32) -> Op {
         match roll {
             PLAIN_END..70 => {
                 let slot = self.volatile.pick(rng);
                 let deadline = &DEADLINES[rng.random_range(0..DEADLINES.len())];
-                let frame = command(&[
-                    "SET",
-                    &volatile_key(self.volatile.key(slot)),
-                    &format!("{seq}@{}", self.volatile.key(slot)),
-                    deadline.option,
-                    &deadline.argument.to_string(),
-                ]);
-                (
-                    frame,
-                    Check::VolatileSet {
+                Op {
+                    frame: command(&[
+                        "SET",
+                        &volatile_key(self.volatile.key(slot)),
+                        &format!("{seq}@{}", self.volatile.key(slot)),
+                        deadline.option,
+                        &deadline.argument.to_string(),
+                    ]),
+                    check: Check::VolatileSet {
                         slot,
                         deadline: sent + Duration::from_millis(deadline.millis),
                     },
-                )
+                    // Carried by the deadline rather than derived from its
+                    // option here: the two spellings would then be two places
+                    // to keep in step, and the one that drifted would be the
+                    // one nothing reads.
+                    form: deadline.form,
+                }
             }
             70..82 => {
                 let slot = self.volatile.pick(rng);
-                (
-                    command(&["GET", &volatile_key(self.volatile.key(slot))]),
-                    Check::VolatileGet { slot },
-                )
+                Op {
+                    frame: command(&["GET", &volatile_key(self.volatile.key(slot))]),
+                    check: Check::VolatileGet { slot },
+                    form: contract::FORM_GET,
+                }
             }
             82..90 => {
                 let slot = self.volatile.pick(rng);
-                let frame = command(&[
-                    "EXPIRE",
-                    &volatile_key(self.volatile.key(slot)),
-                    &EXPIRE_SECONDS.to_string(),
-                ]);
-                (
-                    frame,
-                    Check::VolatileExpire {
+                Op {
+                    frame: command(&[
+                        "EXPIRE",
+                        &volatile_key(self.volatile.key(slot)),
+                        &EXPIRE_SECONDS.to_string(),
+                    ]),
+                    check: Check::VolatileExpire {
                         slot,
                         deadline: sent + Duration::from_secs(EXPIRE_SECONDS),
                     },
-                )
+                    form: contract::FORM_EXPIRE,
+                }
             }
             90..94 => {
                 let slot = self.volatile.pick(rng);
-                let frame = command(&[
-                    "PEXPIRE",
-                    &volatile_key(self.volatile.key(slot)),
-                    &PEXPIRE_MILLIS.to_string(),
-                ]);
-                (
-                    frame,
-                    Check::VolatileExpire {
+                Op {
+                    frame: command(&[
+                        "PEXPIRE",
+                        &volatile_key(self.volatile.key(slot)),
+                        &PEXPIRE_MILLIS.to_string(),
+                    ]),
+                    check: Check::VolatileExpire {
                         slot,
                         deadline: sent + Duration::from_millis(PEXPIRE_MILLIS),
                     },
-                )
+                    form: contract::FORM_PEXPIRE,
+                }
             }
             94..97 => {
                 let slot = self.volatile.pick(rng);
-                (
-                    command(&["PERSIST", &volatile_key(self.volatile.key(slot))]),
-                    Check::VolatilePersist { slot },
-                )
+                Op {
+                    frame: command(&["PERSIST", &volatile_key(self.volatile.key(slot))]),
+                    check: Check::VolatilePersist { slot },
+                    form: contract::FORM_PERSIST,
+                }
             }
             _ => {
                 let slot = self.volatile.pick(rng);
-                (
-                    command(&["TTL", &volatile_key(self.volatile.key(slot))]),
-                    Check::Ignored,
-                )
+                Op {
+                    frame: command(&["TTL", &volatile_key(self.volatile.key(slot))]),
+                    check: Check::Ignored,
+                    form: contract::FORM_TTL,
+                }
             }
         }
     }
@@ -1742,6 +1804,8 @@ impl Model {
         // decide a run's cost by itself.
         frames.push(command(&["DBSIZE"]));
         checks.push(Check::Ignored);
+        self.record_form(contract::FORM_GET);
+        self.record_form(contract::FORM_DBSIZE);
 
         for (burst, checks) in frames.chunks(depth).zip(checks.chunks(depth)) {
             let sent = Instant::now();
@@ -1779,6 +1843,9 @@ impl Model {
             .iter()
             .map(|name| command(&["SET", name, name]))
             .collect();
+
+        self.record_form(contract::FORM_SET);
+        self.record_form(contract::FORM_KEYS);
 
         let mut written = BTreeSet::new();
         for (batch, burst) in writes.chunks(depth).enumerate() {
@@ -1848,6 +1915,7 @@ async fn verifier(cfg: SimConfig, shared: Shared) -> turmoil::Result {
     // would buy is only simulated seconds, and those are paid for in ticks
     // the whole simulation walks through.
     let depth = cfg.pipeline_depth.max(1) as usize;
+    lock(&shared.forms).insert(contract::FORM_GET);
     let keys: Vec<Frame> = (0..cfg.counter_keys)
         .map(|key| command(&["GET", &counter_key(key)]))
         .collect();
@@ -1889,6 +1957,12 @@ async fn walk_the_whole_family(
     shared: &Shared,
 ) -> turmoil::Result<()> {
     let expected = lock(&shared.walk).clone();
+    {
+        let mut forms = lock(&shared.forms);
+        forms.insert(contract::FORM_KEYS);
+        forms.insert(contract::FORM_SCAN_MATCH);
+        forms.insert(contract::FORM_SCAN_MATCH_COUNT);
+    }
 
     let reply = conn.request_many(&[command(&["KEYS", WALK_ALL])]).await?;
     let keys_agrees = listed_keys(&reply[0]) == Some((expected.clone(), false));
