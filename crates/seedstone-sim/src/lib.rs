@@ -1432,7 +1432,17 @@ const WALK_CHURN_DELETES: u32 = 1;
 
 /// How many steps a client's walk takes when it is not driving its cycle to
 /// the end. See [`SimConfig::concurrent_scan_cycle`].
-const WALK_PREFIX_STEPS: u64 = 4;
+///
+/// Two, and it is a price rather than a property: every step is a round trip
+/// for every client, and the walk is already the most expensive thing at the
+/// tail of a run. Measured against the sweep this gate runs — 275 seeds of the
+/// swept shape — two steps cost 8 % of the whole sweep's CPU and four cost
+/// 20 %, against a budget with about a fifth of itself spare. What the extra
+/// two steps would have bought is more of the *per-step* checks; what carries
+/// the walk's result every seed is the `KEYS` that closes it, which is one
+/// round trip and complete by construction, and both `SCAN` forms are on the
+/// wire either way because the form is chosen per client rather than per step.
+const WALK_PREFIX_STEPS: u64 = 2;
 
 /// The `COUNT` a client's own walk asks for, on the clients that send one.
 ///
@@ -2173,12 +2183,12 @@ impl Model {
     ///   not.
     ///
     /// **What the prefix shape's steps can and cannot see, measured rather
-    /// than assumed.** Four steps of a cursor cover four of a thousand
-    /// shards, so most of these walks return nothing at all: on the swept
-    /// shape, four clients in a hundred and twenty-eight had a key of their
-    /// own in the stretch they walked. That is thin per seed and not thin
-    /// across a sweep, and it is why the result-level claim every seed rests
-    /// on is the closing `KEYS` rather than the steps. What the steps carry
+    /// than assumed.** A step is a shard at most, so two steps cover two of a
+    /// thousand and most of these walks return nothing at all: on the swept
+    /// shape, two clients in a hundred and twenty-eight had a key of their own
+    /// in the stretch they walked. That is thin per seed and not thin across a
+    /// sweep, and it is why the result-level claim every seed rests on is the
+    /// closing `KEYS` rather than the steps. What the steps carry
     /// every time is the rest of it — a well-formed reply, a cursor that
     /// moves, and nothing returned that belongs to anyone else — under a
     /// schedule, which is coverage `SCAN` had nowhere before. Widening it is
@@ -2827,7 +2837,10 @@ mod tests {
         // its outcome was. Then when that walk was put under churn: a client
         // now steps its own family with `SCAN` while writing and deleting
         // other keys of it, so `SCAN` is on the wire in every seed rather
-        // than only where a test asked for a full cycle. And then when the
+        // than only where a test asked for a full cycle — repinned once more
+        // when that prefix was cut from four steps to two, which is a change
+        // to *when* the workload issues what it already issued and moves this
+        // without moving `expected_sum`. And then when the
         // `SET` algebra the client could reach went in: `NX`, `XX`, `GET` and
         // `KEEPTTL` took four rolls in a hundred off the bare `SET` and the
         // plain `GET`, so this moved and `plain_checks` rose by two — the
@@ -2836,7 +2849,7 @@ mod tests {
         // kind and every reply, so an added command changes it by
         // construction. A change here with no workload change beside it is a
         // regression, not a repin.
-        const MINI_1_42: u64 = 0x0400_9ca6_cd09_e14b;
+        const MINI_1_42: u64 = 0xa308_5f64_4e73_d96a;
 
         let outcome = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(
