@@ -98,3 +98,77 @@ impl MemoryLimit {
         self.ceiling.is_some_and(|ceiling| used > ceiling)
     }
 }
+
+/// Reads a byte size the way `redis.conf` documents one.
+///
+/// A bare integer is bytes. A suffix scales it, and the distinction Redis
+/// draws is honoured exactly: `k` is 1000 and `kb` is 1024, `m` is a million
+/// and `mb` is a mebibyte, `g` a billion and `gb` a gibibyte. The suffix is
+/// case-insensitive. Anything else — a sign, a fraction, a space before the
+/// suffix, a figure that overflows — is no size at all.
+///
+/// The two-letter suffixes are tried first, so `kb` is never read as `k`
+/// followed by a stray `b`.
+#[must_use]
+pub fn parse_bytes(text: &str) -> Option<u64> {
+    /// Longest suffix first, so `kb` wins over `k`.
+    const SUFFIXES: [(&str, u64); 7] = [
+        ("gb", 1 << 30),
+        ("mb", 1 << 20),
+        ("kb", 1 << 10),
+        ("g", 1_000_000_000),
+        ("m", 1_000_000),
+        ("k", 1000),
+        ("b", 1),
+    ];
+    let lowered = text.to_ascii_lowercase();
+    let (digits, scale) = SUFFIXES
+        .into_iter()
+        .find_map(|(suffix, scale)| Some((lowered.strip_suffix(suffix)?, scale)))
+        .unwrap_or((lowered.as_str(), 1));
+    digits.parse::<u64>().ok()?.checked_mul(scale)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EvictionMode, MemoryLimit, parse_bytes};
+
+    #[test]
+    fn byte_sizes_parse_as_redis_conf_documents_them() {
+        assert_eq!(parse_bytes("1024"), Some(1024));
+        assert_eq!(parse_bytes("1k"), Some(1000));
+        assert_eq!(parse_bytes("1kb"), Some(1024));
+        assert_eq!(parse_bytes("64MB"), Some(64 * 1024 * 1024));
+        assert_eq!(parse_bytes("1gb"), Some(1 << 30));
+        assert_eq!(parse_bytes("2g"), Some(2_000_000_000));
+        assert_eq!(parse_bytes("0"), Some(0));
+        for bad in ["", "-1", "1.5gb", "1 gb", "gb", "99999999999999999999gb"] {
+            assert_eq!(parse_bytes(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The two directions of a mode's name agree, over the whole set rather
+    /// than over the one that happens to be convenient.
+    #[test]
+    fn every_mode_parses_back_from_the_name_it_prints() {
+        for mode in [EvictionMode::AllKeysLru, EvictionMode::NoEviction] {
+            assert_eq!(EvictionMode::from_name(mode.name()), Some(mode));
+        }
+        assert_eq!(EvictionMode::from_name("volatile-lru"), None);
+        assert_eq!(EvictionMode::from_name(""), None);
+    }
+
+    /// The ceiling is a ceiling, not a threshold: a node holding exactly
+    /// `maxmemory` is at it and not over it.
+    #[test]
+    fn a_limit_is_exceeded_only_strictly_past_its_ceiling() {
+        let limit = MemoryLimit {
+            ceiling: Some(100),
+            mode: EvictionMode::AllKeysLru,
+        };
+        assert!(!limit.exceeded(99));
+        assert!(!limit.exceeded(100));
+        assert!(limit.exceeded(101));
+        assert!(!MemoryLimit::default().exceeded(u64::MAX));
+    }
+}
