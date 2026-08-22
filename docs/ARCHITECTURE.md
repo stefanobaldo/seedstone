@@ -194,7 +194,34 @@ exactness: it counts the bytes a value has, not the bytes the allocator
 rounded them up to, and it does not count what the process spends outside the
 keyspace. `mem_fragmentation_ratio` is therefore always `1.00` — the honest
 answer for a figure that is not measured against an allocator at all, rather
-than a ratio invented to fill the field.
+than a ratio invented to fill the field. It also means the process's resident
+size is larger than `used_memory` — by the allocator's rounding and by
+everything the process holds outside the keyspace — so an operator sizing a
+ceiling against the machine should leave room for the difference.
+
+**Eviction samples from the shard that is writing, against a ceiling the whole
+node shares.** `maxmemory` is compared with one figure — the sum of what every
+shard holds — so the node evicts when *it* is full, as an operator reads it in
+`INFO`. The victim, though, is chosen by the shard that just wrote, from a
+sample of its own keys, because no shard reaches into another's table: with
+many shards and a seeded hash, a sample of one shard is a fair sample of the
+keyspace. The stamp the sample compares is a per-shard command counter, not a
+clock, so which key is oldest replays exactly. A write that has to make room
+does so before it is answered, which is latency on that write and on nothing
+else — and it never frees room by undoing itself, so a value larger than the
+whole ceiling is stored and leaves the node over it rather than being written
+and immediately taken back. Only `allkeys-lru` and `noeviction` exist: the
+`volatile-*` family reclaims nothing from a keyspace that carries no
+deadlines, and offering a policy that evicts nothing would be offering a
+ceiling that holds nothing.
+
+**The ceiling is compared against what the node already holds, so one write
+crosses it.** A command is refused or made room for on the figure as it stood
+*before* it ran, which is how Redis compares it too: a write that arrives with
+the node exactly at its ceiling lands, and it is the write after it that meets
+the refusal. Under `allkeys-lru` the crossing is reclaimed immediately and the
+figure is back under before the reply goes out; under `noeviction` the node
+sits marginally over its ceiling until something is deleted or expires.
 
 **The surface is a named list, and anything outside it is refused.** A command
 this server does not implement is answered with an error naming it, rather than

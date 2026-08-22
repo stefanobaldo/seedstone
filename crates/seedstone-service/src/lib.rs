@@ -61,7 +61,7 @@
 //!   the [`ReplyError`] set, and `every_error_constant_is_frame_safe` for the
 //!   constants and the status texts.
 
-use seedstone_core::memory::MemoryGauge;
+use seedstone_core::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use seedstone_core::shard::{
     Command, Cond, Expiry, Reply, ReplyError, Router, ShardStats, parse_i64,
 };
@@ -464,6 +464,13 @@ pub struct NodeInfo {
     /// and in the simulator from its pool — so the number a scrape reads is
     /// the number the eviction decision is taken against.
     pub memory: MemoryGauge,
+    /// The ceiling that figure is held under, and what happens at it.
+    ///
+    /// Read from the pool at the composition root, for the reason
+    /// [`memory`](Self::memory) is: what `INFO` reports and what the
+    /// executors evict by must be the same value, not two configurations that
+    /// happen to agree.
+    pub limit: MemoryLimit,
 }
 
 impl NodeInfo {
@@ -490,6 +497,7 @@ impl NodeInfo {
             connected: Arc::new(AtomicU64::new(0)),
             now_unix_millis: || FIXED_UNIX_MILLIS,
             memory: MemoryGauge::default(),
+            limit: MemoryLimit::default(),
         }
     }
 }
@@ -1932,13 +1940,29 @@ async fn info<R: Router>(router: &R, node: &NodeInfo, wanted: &[Vec<u8>]) -> Str
     }
     if asked_for(b"memory") {
         let used = node.memory.used();
+        // Redis reports an absent ceiling as `0`, and reports `noeviction`
+        // as the policy whenever there is no ceiling to reach — whatever the
+        // configuration nominally holds. Both are matched here rather than
+        // improved on: an operator's tooling reads these two fields together
+        // and already knows what that pair means.
+        let ceiling = node.limit.ceiling.unwrap_or(0);
+        let policy = if node.limit.ceiling.is_some() {
+            node.limit.mode
+        } else {
+            EvictionMode::NoEviction
+        };
         let _ = write!(
             text,
             "# Memory\r\n\
              used_memory:{used}\r\n\
              used_memory_human:{}\r\n\
+             maxmemory:{ceiling}\r\n\
+             maxmemory_human:{}\r\n\
+             maxmemory_policy:{}\r\n\
              mem_fragmentation_ratio:1.00\r\n\r\n",
             human_bytes(used),
+            human_bytes(ceiling),
+            policy.name(),
         );
     }
     if asked_for(b"stats") {
@@ -2520,6 +2544,36 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("used_memory_human:"), "{text}");
+    }
+
+    /// The ceiling and its policy are reported as Redis reports them: `0` for
+    /// no ceiling, and `noeviction` beside it whatever the mode nominally
+    /// holds — a policy with no ceiling to reach evicts nothing, so saying so
+    /// is the honest field.
+    #[tokio::test]
+    async fn info_memory_reports_the_ceiling_and_its_policy() {
+        // The memory section reaches no shard, so any router serves; this
+        // one is the smallest a pool can be.
+        let router = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let mut node = NodeInfo::for_tests();
+        node.limit = MemoryLimit {
+            ceiling: Some(1 << 20),
+            mode: EvictionMode::AllKeysLru,
+        };
+        let text = info(&router, &node, &[b"memory".to_vec()]).await;
+        assert!(text.contains("\r\nmaxmemory:1048576\r\n"), "{text}");
+        assert!(text.contains("\r\nmaxmemory_human:1.00M\r\n"), "{text}");
+        assert!(
+            text.contains("\r\nmaxmemory_policy:allkeys-lru\r\n"),
+            "{text}"
+        );
+
+        let text = info(&router, &NodeInfo::for_tests(), &[b"memory".to_vec()]).await;
+        assert!(text.contains("\r\nmaxmemory:0\r\n"), "{text}");
+        assert!(
+            text.contains("\r\nmaxmemory_policy:noeviction\r\n"),
+            "{text}"
+        );
     }
 
     /// `evicted_keys` is the sum of what the shards report, and it is a

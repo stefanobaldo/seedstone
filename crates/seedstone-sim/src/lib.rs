@@ -1140,6 +1140,10 @@ async fn server(
     // the reason the field states: a scrape and an eviction decision must not
     // be able to disagree.
     node.memory = pool.memory();
+    // And the ceiling beside it, for the same reason: a run whose `INFO`
+    // reported a different `maxmemory` from the one its executors evicted by
+    // would be a run whose invariants are checked against the wrong number.
+    node.limit = pool.limit();
     loop {
         let (stream, _peer) = listener.accept().await?;
         // Only one plant is a router now. The other two are inside the server,

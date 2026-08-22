@@ -168,6 +168,7 @@ async fn started(max_clients: usize) -> std::net::SocketAddr {
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         max_clients,
+        ..Config::default()
     };
     let server = Server::bind(cfg, DictSeed { k0: 1, k1: 2 }).await.unwrap();
     let addr = server.local_addr();

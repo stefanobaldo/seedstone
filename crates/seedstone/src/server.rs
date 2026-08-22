@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use seedstone_core::dict::DictSeed;
+use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{NoTrace, ShardPool};
 use seedstone_resp::{Frame, encode};
 use seedstone_service::{NodeInfo, serve_connection};
@@ -61,7 +62,8 @@ fn executors() -> u16 {
 pub const MAX_CLIENTS_REACHED: &str = "ERR max number of clients reached";
 
 /// The usage text, printed on any argument this binary does not understand.
-const USAGE: &str = "usage: seedstone [--bind ADDR:PORT] [--max-clients N]";
+const USAGE: &str = "usage: seedstone [--bind ADDR:PORT] [--max-clients N] [--maxmemory SIZE] \
+                     [--maxmemory-policy allkeys-lru|noeviction]";
 
 /// What the binary was asked to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +72,8 @@ pub struct Config {
     pub bind: SocketAddr,
     /// How many connections may be served at once.
     pub max_clients: usize,
+    /// The ceiling the keyspace is held under, and what happens at it.
+    pub limit: MemoryLimit,
 }
 
 impl Default for Config {
@@ -77,6 +81,7 @@ impl Default for Config {
         Self {
             bind: DEFAULT_BIND,
             max_clients: DEFAULT_MAX_CLIENTS,
+            limit: MemoryLimit::default(),
         }
     }
 }
@@ -94,10 +99,21 @@ impl Config {
     /// The usage text, prefixed by what was wrong, when an argument is
     /// unknown, is missing its value, or does not parse. `--max-clients 0` is
     /// rejected too: a server that can serve nobody is a configuration
-    /// mistake, not a configuration.
+    /// mistake, not a configuration, and `--maxmemory 0` for the same reason
+    /// in the other direction — Redis spells "no ceiling" as the flag's
+    /// absence, so a zero here is a server that may store nothing rather than
+    /// a server with no limit.
+    ///
+    /// `--maxmemory-policy` without `--maxmemory` is refused as well. A
+    /// policy names what to do at a ceiling, and accepting one with no
+    /// ceiling to reach would be accepting a flag that does nothing while
+    /// reading as though it does.
     pub fn from_args(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut cfg = Self::default();
         let mut args = args;
+        // Held aside rather than written straight into `cfg`, because whether
+        // a policy is acceptable depends on a flag that may come after it.
+        let mut policy = None;
         while let Some(flag) = args.next() {
             match flag.as_str() {
                 "--bind" => {
@@ -117,8 +133,35 @@ impl Config {
                         }
                     };
                 }
+                "--maxmemory" => {
+                    let value = value_for(&flag, &mut args)?;
+                    cfg.limit.ceiling = match parse_bytes(&value) {
+                        Some(bytes) if bytes > 0 => Some(bytes),
+                        _ => {
+                            return Err(refused(&format!(
+                                "--maxmemory: not a positive byte size: {value}"
+                            )));
+                        }
+                    };
+                }
+                "--maxmemory-policy" => {
+                    let value = value_for(&flag, &mut args)?;
+                    policy = Some(EvictionMode::from_name(&value).ok_or_else(|| {
+                        refused(&format!("--maxmemory-policy: not a policy: {value}"))
+                    })?);
+                }
                 other => return Err(refused(&format!("unknown argument: {other}"))),
             }
+        }
+        // After the loop, because the two flags may arrive in either order.
+        match (policy, cfg.limit.ceiling) {
+            (Some(_), None) => {
+                return Err(refused(
+                    "--maxmemory-policy: names what to do at a ceiling, but no --maxmemory was given",
+                ));
+            }
+            (Some(mode), Some(_)) => cfg.limit.mode = mode,
+            (None, _) => {}
         }
         Ok(cfg)
     }
@@ -164,7 +207,7 @@ impl Server {
             listener,
             local_addr,
             max_clients: cfg.max_clients,
-            pool: ShardPool::spawn(SHARDS, executors(), seed, NoTrace),
+            pool: ShardPool::spawn_limited(SHARDS, executors(), seed, NoTrace, cfg.limit),
         })
     }
 
@@ -198,6 +241,7 @@ impl Server {
             connected: Arc::new(AtomicU64::new(0)),
             now_unix_millis: wall_clock,
             memory: self.pool.memory(),
+            limit: self.pool.limit(),
         };
         loop {
             tokio::select! {
@@ -300,7 +344,10 @@ fn wall_clock() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, DEFAULT_BIND, MAX_CLIENTS_REACHED, SHARDS, USAGE, executors};
+    use super::{
+        Config, DEFAULT_BIND, EvictionMode, MAX_CLIENTS_REACHED, MemoryLimit, SHARDS, USAGE,
+        executors,
+    };
 
     /// Whatever this host answers, the count has to be one the pool accepts:
     /// at least one executor, never more than there are shards to host.
@@ -325,6 +372,37 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.bind.to_string(), "0.0.0.0:7000");
         assert_eq!(cfg.max_clients, 64);
+        assert_eq!(cfg.limit, MemoryLimit::default());
+
+        let cfg = Config::from_args(
+            ["--maxmemory", "64mb", "--maxmemory-policy", "noeviction"]
+                .iter()
+                .map(ToString::to_string),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.limit,
+            MemoryLimit {
+                ceiling: Some(64 << 20),
+                mode: EvictionMode::NoEviction,
+            }
+        );
+
+        // The policy may be named before the ceiling it applies to: the rule
+        // is checked after the whole line has been read, not as it is read.
+        let cfg = Config::from_args(
+            ["--maxmemory-policy", "allkeys-lru", "--maxmemory", "1k"]
+                .iter()
+                .map(ToString::to_string),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.limit,
+            MemoryLimit {
+                ceiling: Some(1000),
+                mode: EvictionMode::AllKeysLru,
+            }
+        );
     }
 
     #[test]
@@ -335,6 +413,13 @@ mod tests {
             &["--max-clients", "-1"],
             &["--max-clients"],
             &["--max-clients", "0"],
+            &["--maxmemory", "lots"],
+            &["--maxmemory"],
+            // A zero ceiling is a server that may store nothing.
+            &["--maxmemory", "0"],
+            &["--maxmemory-policy", "volatile-lru"],
+            // A policy this server does have, but with no ceiling to reach.
+            &["--maxmemory-policy", "allkeys-lru"],
             &["--wat"],
             // A value with no flag in front of it: silently ignoring it would
             // mean a mistyped `--bind` starts a server on the default port.
