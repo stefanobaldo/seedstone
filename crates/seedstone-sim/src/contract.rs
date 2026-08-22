@@ -166,9 +166,8 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
     ),
     (
         b"INFO",
-        Coverage::NotEmitted {
-            reason: "its body is node identity and counters, which no client \
-                     model can predict and no invariant here is about.",
+        Coverage::Emitted {
+            forms: &[FORM_INFO_MEMORY, FORM_INFO_STATS],
         },
     ),
     (
@@ -243,6 +242,14 @@ pub(crate) const FORM_DBSIZE: &str = "DBSIZE";
 pub(crate) const FORM_KEYS: &str = "KEYS pattern";
 pub(crate) const FORM_SCAN_MATCH: &str = "SCAN cursor MATCH pattern";
 pub(crate) const FORM_SCAN_MATCH_COUNT: &str = "SCAN cursor MATCH pattern COUNT count";
+// Emitted only by the eviction shape, which is the one that has an invariant
+// over this document's body. Everywhere else `INFO` is what it always was —
+// node identity and counters no client model can predict — and the shape that
+// reads it reads exactly the two numbers it can hold the server to:
+// `used_memory` against the ceiling, and `evicted_keys` against what the
+// clients saw go missing.
+pub(crate) const FORM_INFO_MEMORY: &str = "INFO memory";
+pub(crate) const FORM_INFO_STATS: &str = "INFO stats";
 
 /// Every form the contract claims the client emits.
 ///

@@ -115,6 +115,16 @@ jobs:
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 275 --workload-seed 1
 
+      # The shape that decides the memory invariants, and the only one that
+      # does: it is the shape with a ceiling, so it is the only place a node
+      # over its limit or reclaiming under it is visible at all. A second step
+      # rather than the gate's own shape, because the gate's shape is the one
+      # measured to be schedule-sensitive and this one is sixteen shards wide.
+      # Seconds, not minutes — twenty-four seeds of a narrow shape.
+      - name: DST sweep, bounded memory
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 24 --eviction --workload-seed 1
+
   # Every gate in the job above is this project judging itself: our tests, our
   # simulator, our reading of the protocol. This one is four programs nobody
   # here wrote — `redis-cli`, `redis-benchmark`, a Python client and a Go

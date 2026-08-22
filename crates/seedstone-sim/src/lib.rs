@@ -681,6 +681,32 @@ pub struct SimOutcome {
     /// Keyspace walks decided against an exactly known set — the denominator
     /// of [`SimOutcome::walk_mismatches`].
     pub walk_checks: u64,
+    /// Reads of a plain key that answered `nil` where this client's model
+    /// held a value, on a shape with a ceiling.
+    ///
+    /// The model side of eviction: what a client can see of it without being
+    /// told. Excused rather than counted as a mismatch — but counted, because
+    /// a tolerance nobody measures is a tolerance that could be swallowing
+    /// the invariant whole.
+    pub evictions_observed: u64,
+    /// The node's own `evicted_keys`, read from the verifier's final `INFO
+    /// stats`.
+    ///
+    /// The server side of the same story, and the two are compared rather
+    /// than each trusted alone: a node that reclaimed nothing cannot have
+    /// been the reason a key went missing.
+    pub evicted_keys: u64,
+    /// Readings of `used_memory` that were past `maxmemory`.
+    pub ceiling_breaches: u64,
+    /// Readings of `used_memory` taken at all — the denominator of
+    /// [`SimOutcome::ceiling_breaches`].
+    pub ceiling_checks: u64,
+    /// Whether this run's node had a ceiling at all.
+    ///
+    /// What lets [`SimOutcome::invariants_were_exercised`] ask for a ceiling
+    /// check on the shape that has one and not on the shapes that do not: a
+    /// zero means two different things either side of this flag.
+    pub evictable: bool,
     /// Every form of every command this run's clients actually emitted, named
     /// as [`crate::contract`] names it.
     ///
@@ -704,11 +730,30 @@ impl SimOutcome {
     /// and a walk over a set nobody is touching returns that set.
     #[must_use]
     pub const fn invariant_holds(&self) -> bool {
-        self.expected_sum == self.actual_sum
+        // The counter sum is claimed only where nothing can reclaim a
+        // counter. Under a ceiling it is not merely weaker, it is
+        // unstateable: a counter key can be evicted, its accumulated value
+        // goes with it, and the deltas are of either sign — so no inequality
+        // survives either. Nor can a client repair the model as the plain
+        // family's does: the sum is shared, no client knows when a key
+        // vanished, and an increment landing on the key afterwards recreates
+        // it holding a value that is right for nobody's arithmetic. The
+        // shapes that sweep for lost updates are the ones with no ceiling,
+        // which is where that invariant is measured — see
+        // `tests/planted_race.rs`.
+        (self.evictable || self.expected_sum == self.actual_sum)
             && self.stale_reads == 0
             && self.spurious_deaths == 0
             && self.plain_mismatches == 0
             && self.walk_mismatches == 0
+            && self.ceiling_breaches == 0
+            // A key the model saw vanish that the node never reclaimed is a
+            // key that vanished for some other reason, and the tolerance
+            // above was wrong to excuse it. Stated as an inequality rather
+            // than an equality because the two count different things: the
+            // node evicts keys nobody reads back, and one client's reads are
+            // a sample of what it took.
+            && self.evicted_keys >= self.evictions_observed
     }
 
     /// Whether the run's invariants decided anything at all.
@@ -725,6 +770,10 @@ impl SimOutcome {
             && self.alive_checks > 0
             && self.plain_checks > 0
             && self.walk_checks > 0
+            // Only where there is a ceiling to check against. On a shape with
+            // none, a zero here is the honest answer and not a harness that
+            // measured nothing.
+            && (!self.evictable || self.ceiling_checks > 0)
     }
 }
 
@@ -806,6 +855,11 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         plain_checks: tally.plain_checks,
         walk_mismatches: tally.walk_mismatches,
         walk_checks: tally.walk_checks,
+        evictions_observed: tally.evictions_observed,
+        evicted_keys: tally.evicted_keys,
+        ceiling_breaches: tally.ceiling_breaches,
+        ceiling_checks: tally.ceiling_checks,
+        evictable: cfg.maxmemory.is_some(),
         forms_emitted: lock(&shared.forms).clone(),
     }
 }
@@ -856,6 +910,10 @@ struct Tally {
     plain_checks: u64,
     walk_mismatches: u64,
     walk_checks: u64,
+    evictions_observed: u64,
+    evicted_keys: u64,
+    ceiling_breaches: u64,
+    ceiling_checks: u64,
 }
 
 /// Takes a lock that cannot be contended, and says so if it was poisoned.
@@ -1381,6 +1439,11 @@ async fn client(id: u16, cfg: SimConfig, shared: Shared) -> turmoil::Result {
         }
         let replies = conn.request_many(&burst).await?;
         model.observe(&replies, &checks, sent, Instant::now());
+        // After the burst rather than inside it: the reading has to describe
+        // a node with every one of those writes applied, and an `INFO`
+        // pipelined among them describes whatever had run by the time it was
+        // reached.
+        model.probe_ceiling(&mut conn).await?;
 
         issued += this_burst;
         let nap = rng.random_range(0..=BURST_NAP_MAX_MS);
@@ -1743,6 +1806,16 @@ struct Model {
     /// from its own clock *before* the request left — so the deadline the
     /// server computed is this instant or later, never earlier.
     deadlines: Vec<Option<Instant>>,
+    /// Whether the node this client is talking to has a ceiling.
+    ///
+    /// The one thing that weakens the plain family's model, and it is
+    /// deliberately the whole of what it weakens: a key may be *gone* when a
+    /// ceiling exists, and it may never hold a value its owner did not write.
+    /// Every relaxation below is that one sentence in a different
+    /// vocabulary.
+    evictable: bool,
+    /// The ceiling itself, for the readings taken against it.
+    ceiling: Option<u64>,
     shared: Shared,
 }
 
@@ -1757,6 +1830,8 @@ impl Model {
             counter_keys: cfg.counter_keys,
             plain_state: vec![Known::Nothing; plain.len as usize],
             deadlines: vec![None; volatile.len as usize],
+            evictable: cfg.maxmemory.is_some(),
+            ceiling: cfg.maxmemory,
             plain,
             volatile,
             shared,
@@ -2164,6 +2239,15 @@ impl Model {
     /// commands count differently on a repeated key, which is the point of
     /// letting the draw repeat one: `DEL k k` removes it once, `EXISTS k k`
     /// finds it twice.
+    ///
+    /// **Weakened under a ceiling**, and this is the one check where the
+    /// weakening is not merely an excused `nil`: any of the keys named may
+    /// have been reclaimed, so the model's count becomes an upper bound and
+    /// anything from zero up to it agrees. A count *above* it is still a
+    /// mismatch — eviction can only ever remove keys, so a fan-out finding
+    /// more than this client wrote is finding something nobody wrote. What is
+    /// given up is the exactness, and it is given up only on the shape that
+    /// has a ceiling; every other shape decides this as strictly as before.
     fn check_plain_fan_out(&mut self, slots: &[u32], reply: &Frame, removing: bool) {
         let mut counted = 0i64;
         let mut predictable = true;
@@ -2181,9 +2265,14 @@ impl Model {
         }
 
         if predictable {
+            let agrees = if self.evictable {
+                matches!(reply, Frame::Integer(n) if (0..=counted).contains(n))
+            } else {
+                *reply == Frame::Integer(counted)
+            };
             let mut tally = lock(&self.shared.tally);
             tally.plain_checks += 1;
-            if *reply != Frame::Integer(counted) {
+            if !agrees {
                 tally.plain_mismatches += 1;
             }
         }
@@ -2214,11 +2303,27 @@ impl Model {
     ///
     /// A repeated key is not special here as it is for `DEL` and `EXISTS`:
     /// each name is its own read, and reads do not consume anything.
-    fn check_plain_mget(&self, slots: &[u32], reply: &Frame) {
+    fn check_plain_mget(&mut self, slots: &[u32], reply: &Frame) {
+        let mut evicted = 0;
         let agrees = match reply {
             Frame::Array(values) if values.len() == slots.len() => {
-                slots.iter().zip(values).all(|(slot, value)| {
-                    match (&self.plain_state[*slot as usize], value) {
+                let evictable = self.evictable;
+                let mut agrees = true;
+                for (slot, value) in slots.iter().zip(values) {
+                    let slot = *slot as usize;
+                    // Element by element, exactly as [`Model::check_plain`]
+                    // does it for a single `GET`: an evictable model excuses
+                    // a written key that is gone and follows the server, and
+                    // a wrong *value* is never excused.
+                    if evictable
+                        && matches!(self.plain_state[slot], Known::Value(_))
+                        && matches!(value, Frame::Null)
+                    {
+                        self.plain_state[slot] = Known::Absent;
+                        evicted += 1;
+                        continue;
+                    }
+                    agrees &= match (&self.plain_state[slot], value) {
                         // Unpredictable on its own, and the element beside it
                         // still is: one unknown key does not excuse the rest
                         // of the array.
@@ -2226,13 +2331,15 @@ impl Model {
                         (Known::Absent, value) => matches!(value, Frame::Null),
                         (Known::Value(expected), Frame::Bulk(got)) => got == expected,
                         (Known::Value(_), _) => false,
-                    }
-                })
+                    };
+                }
+                agrees
             }
             _ => false,
         };
         let mut tally = lock(&self.shared.tally);
         tally.plain_checks += 1;
+        tally.evictions_observed += evicted;
         if !agrees {
             tally.plain_mismatches += 1;
         }
@@ -2250,6 +2357,12 @@ impl Model {
         let agrees = match &self.plain_state[slot as usize] {
             Known::Nothing => return,
             Known::Absent => reply == absent,
+            // Under a ceiling the key may have been reclaimed between the
+            // write and this question, so both answers are legitimate. The
+            // model is not updated from it: `TYPE` and `STRLEN` do not
+            // distinguish a reclaimed key from one that was never there, and
+            // a `GET` will say which soon enough.
+            Known::Value(_) if self.evictable => reply == present || reply == absent,
             Known::Value(_) => reply == present,
         };
         let mut tally = lock(&self.shared.tally);
@@ -2257,6 +2370,21 @@ impl Model {
         if !agrees {
             tally.plain_mismatches += 1;
         }
+    }
+
+    /// Asks the node what it is holding, and holds it to its ceiling.
+    ///
+    /// A no-op with no ceiling, so a client on any other shape sends nothing:
+    /// this is the eviction shape's frame and it does not belong in the
+    /// traces every other shape produces.
+    async fn probe_ceiling(&self, conn: &mut Conn) -> turmoil::Result<()> {
+        let Some(ceiling) = self.ceiling else {
+            return Ok(());
+        };
+        self.record_form(contract::FORM_INFO_MEMORY);
+        let replies = conn.request_many(&[command(&["INFO", "memory"])]).await?;
+        check_ceiling(&replies[0], ceiling, &self.shared);
+        Ok(())
     }
 
     /// Holds a `GET` of a plain key against what this client last wrote.
@@ -2267,7 +2395,24 @@ impl Model {
     /// shape for the same reason the volatile check is lenient about it —
     /// there, an error frame is a question left unanswered; here, a `GET` of
     /// a key this client owns has no legitimate way to fail.
-    fn check_plain(&self, slot: u32, reply: &Frame) {
+    fn check_plain(&mut self, slot: u32, reply: &Frame) {
+        // The one thing a ceiling excuses, and it is excused before anything
+        // else is judged: a key this client wrote is simply gone. The model
+        // follows the server rather than keeping a value it now knows is not
+        // there, so the next read of the same slot is decided against
+        // `Absent` and is exact again.
+        if self.evictable
+            && matches!(self.plain_state[slot as usize], Known::Value(_))
+            && matches!(reply, Frame::Null)
+        {
+            self.plain_state[slot as usize] = Known::Absent;
+            {
+                let mut tally = lock(&self.shared.tally);
+                tally.plain_checks += 1;
+                tally.evictions_observed += 1;
+            }
+            return;
+        }
         let agrees = match (&self.plain_state[slot as usize], reply) {
             (Known::Nothing, _) => return,
             (Known::Absent, reply) => matches!(reply, Frame::Null),
@@ -2295,7 +2440,19 @@ impl Model {
     /// The two ends take different bands, [`STALE_SLACK`] and [`LIVE_SLACK`],
     /// because they are not owed the same thing; each constant carries its own
     /// derivation.
-    fn check_volatile(&self, slot: u32, reply: &Frame, sent: Instant, received: Instant) {
+    ///
+    /// **Under a ceiling only the *stale* end still decides.** Eviction
+    /// removes keys and never resurrects one, so a value served past its
+    /// deadline is a missed expiry whatever the node's memory is doing — that
+    /// half is untouched. An *absence* inside the live band, though, is now
+    /// explicable: the node may have reclaimed the key. So it is diverted to
+    /// [`SimOutcome::evictions_observed`] rather than counted as a decided
+    /// check the invariant happened to pass, and the model forgets the
+    /// deadline so one reclaimed key is observed once and not on every read
+    /// that follows. A *present* key inside the band is still a decided
+    /// check, which is what keeps `alive_checks` a count of what the
+    /// invariant actually settled.
+    fn check_volatile(&mut self, slot: u32, reply: &Frame, sent: Instant, received: Instant) {
         let Some(deadline) = self.deadlines[slot as usize] else {
             return;
         };
@@ -2307,6 +2464,11 @@ impl Model {
             Frame::Null => false,
             _ => return,
         };
+        if self.evictable && !present && received + LIVE_SLACK < deadline {
+            self.deadlines[slot as usize] = None;
+            lock(&self.shared.tally).evictions_observed += 1;
+            return;
+        }
         let mut tally = lock(&self.shared.tally);
         if sent > deadline + STALE_SLACK {
             tally.dead_checks += 1;
@@ -2375,6 +2537,7 @@ impl Model {
             let replies = conn.request_many(burst).await?;
             self.observe(&replies, checks, sent, Instant::now());
         }
+        self.probe_ceiling(conn).await?;
         Ok(())
     }
 
@@ -2485,7 +2648,17 @@ impl Model {
             // `Some((set, false))` is the only shape that can agree: anything
             // else is a malformed reply or a key returned twice, and `KEYS`
             // promises neither.
-            if listed_keys(&reply[0]) != Some((present, false)) {
+            //
+            // Under a ceiling the set becomes an upper bound and the equality
+            // a subset: a key this client wrote may have been reclaimed since,
+            // and nothing about the walk can tell that from a key the server
+            // lost. What the check keeps is the half eviction cannot excuse —
+            // no name that was never written, and no name returned twice.
+            let agrees = match listed_keys(&reply[0]) {
+                Some((keys, false)) if self.evictable => keys.is_subset(&present),
+                listed => listed == Some((present, false)),
+            };
+            if !agrees {
                 tally.walk_mismatches += 1;
             }
         }
@@ -2609,8 +2782,12 @@ impl Model {
         };
 
         // Only a walk that reached the end of its cycle saw the whole family,
-        // so only that walk is held to having returned all of it.
-        if completed && !stable.iter().all(|key| seen.contains(key)) {
+        // so only that walk is held to having returned all of it — and only
+        // on a node that cannot have reclaimed a stable key underneath it.
+        // Under a ceiling, at-least-once is exactly the claim eviction is
+        // allowed to break; what survives is the rest, and every one of those
+        // claims is asserted above whatever the shape.
+        if completed && !self.evictable && !stable.iter().all(|key| seen.contains(key)) {
             holds = false;
         }
 
@@ -2705,10 +2882,77 @@ async fn verifier(cfg: SimConfig, shared: Shared) -> turmoil::Result {
     }
     lock(&shared.tally).actual = total;
 
+    // The node's own account of the run, taken once and last: every client
+    // has finished, so `evicted_keys` is final and `used_memory` describes a
+    // node nothing is still writing to. The clients' own readings are the
+    // ones taken under load; this is the one taken at rest, and the two
+    // together are what `ceiling_breaches` is a count over.
+    if let Some(ceiling) = cfg.maxmemory {
+        {
+            let mut forms = lock(&shared.forms);
+            forms.insert(contract::FORM_INFO_STATS);
+            forms.insert(contract::FORM_INFO_MEMORY);
+        }
+        let replies = conn
+            .request_many(&[command(&["INFO", "stats"]), command(&["INFO", "memory"])])
+            .await?;
+        lock(&shared.tally).evicted_keys = evicted_keys(&replies[0]).unwrap_or(0);
+        check_ceiling(&replies[1], ceiling, &shared);
+    }
+
     if cfg.quiescent_walk {
         walk_the_whole_family(&mut conn, &cfg, &shared).await?;
     }
     Ok(())
+}
+
+/// The `evicted_keys:` figure of an `INFO stats` document, if it holds one.
+fn evicted_keys(info: &Frame) -> Option<u64> {
+    let Frame::Bulk(body) = info else {
+        return None;
+    };
+    String::from_utf8_lossy(body).lines().find_map(|line| {
+        line.strip_prefix("evicted_keys:")?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    })
+}
+
+/// Holds an `INFO memory` document to the ceiling the shape configured.
+///
+/// The one invariant here that is about the *node* rather than about a key:
+/// whatever the schedule, whatever was written, a node told to hold its
+/// keyspace under `maxmemory` is under it whenever anyone looks. A document
+/// with no `used_memory:` line at all decides nothing — that is a reply the
+/// caller could not read, not a node over its ceiling.
+///
+/// Taken after every burst as well as at each client's settle and once at
+/// rest by the verifier, because a breach is transient: the node reclaims
+/// inside the command that crossed the line, so a reading taken only at the
+/// end of a run would meet a node that had been over its ceiling all the way
+/// through and was under it by then.
+///
+/// A free function rather than a method because both callers need it and only
+/// one of them owns a [`Model`]: the check is about the node, not about a
+/// client's keys.
+fn check_ceiling(info: &Frame, ceiling: u64, shared: &Shared) {
+    let Frame::Bulk(body) = info else {
+        return;
+    };
+    let Some(used) = String::from_utf8_lossy(body).lines().find_map(|line| {
+        line.strip_prefix("used_memory:")?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    }) else {
+        return;
+    };
+    let mut tally = lock(&shared.tally);
+    tally.ceiling_checks += 1;
+    if used > ceiling {
+        tally.ceiling_breaches += 1;
+    }
 }
 
 /// The quiescent walk over every walk key in the run, by both commands.
@@ -2722,6 +2966,12 @@ async fn verifier(cfg: SimConfig, shared: Shared) -> turmoil::Result {
 /// once for the run rather than once per client. N of them would buy nothing
 /// the one does not: the walk is over a set nobody is touching, so a second
 /// walker sees exactly what the first did.
+///
+/// **Under a ceiling the equality becomes containment**, in both halves and
+/// for the reason [`Model::walk`] states over its own slice: a key nobody is
+/// touching can still be reclaimed, so what nothing may return is a name that
+/// was never written, and what `KEYS` may still not do is return one twice.
+/// Completeness is exactly the claim eviction is allowed to break.
 async fn walk_the_whole_family(
     conn: &mut Conn,
     cfg: &SimConfig,
@@ -2735,8 +2985,12 @@ async fn walk_the_whole_family(
         forms.insert(contract::FORM_SCAN_MATCH_COUNT);
     }
 
+    let evictable = cfg.maxmemory.is_some();
     let reply = conn.request_many(&[command(&["KEYS", WALK_ALL])]).await?;
-    let keys_agrees = listed_keys(&reply[0]) == Some((expected.clone(), false));
+    let keys_agrees = match listed_keys(&reply[0]) {
+        Some((keys, false)) if evictable => keys.is_subset(&expected),
+        listed => listed == Some((expected.clone(), false)),
+    };
 
     // Every shard costs a step even when it holds nothing, because a spent
     // shard hands back the next one's start rather than continuing into it;
@@ -2816,7 +3070,12 @@ async fn walk_the_whole_family(
         if !keys_agrees {
             tally.walk_mismatches += 1;
         }
-        if !scan_agrees || seen != expected {
+        let scan_set_agrees = if evictable {
+            seen.is_subset(&expected)
+        } else {
+            seen == expected
+        };
+        if !scan_agrees || !scan_set_agrees {
             tally.walk_mismatches += 1;
         }
     }
