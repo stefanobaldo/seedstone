@@ -24,11 +24,13 @@ The pin extends to the interpreter, which is why the lane runs in a container
 rather than on whatever Python the CI runner offers. The pair wants an
 interpreter older than the runner images will keep providing, and an
 interpreter chosen by the runner is a variable this gate did not intend to
-have. What the container fixes is that choice and only that: the image is
-named by a tag carrying the interpreter version the pair needs, so the
-interpreter is this lane's to decide, while the bytes behind that tag are the
-registry's to rebuild. The suite is the half held to its bytes — the archive
-either matches the digest `run.sh` names or the lane stops.
+have. The image is selected by the **manifest-list digest** recorded in
+`run.sh` — the digest of the multi-architecture index, not of one platform's
+image, so that a machine developing on one architecture and a runner gating on
+another resolve the same release rather than the same name. The tag is kept
+beside it in a comment, for a human reader; the digest is what runs. Archive
+and image are therefore both held to their bytes: each either matches the
+digest `run.sh` names or the lane stops.
 
 **The pin is lifted once this milestone's work is complete.** At that point the
 frozen pair is replaced by current releases — still pinned, never floating —
