@@ -33,6 +33,7 @@
 use crate::dict::{Dict, DictSeed, Entry, WalkOrder};
 use crate::glob;
 use crate::log::{NoopLog, Record, ReplicationLog};
+use crate::memory::MemoryGauge;
 use crate::slot::{executor_of, shard_of};
 use std::future::Future;
 use std::sync::Arc;
@@ -699,6 +700,13 @@ pub struct ShardPool {
     /// How many executor tasks host those shards. Redundant with
     /// `inboxes.len()`, for the reason `shards` states.
     executors: u16,
+    /// The node-wide memory figure every executor of this pool keeps current.
+    ///
+    /// Owned here rather than by a caller because it has to be handed to the
+    /// executors as they are spawned, and this is the only place that spawns
+    /// them; [`memory`](ShardPool::memory) is how everything else gets a
+    /// handle to the same word.
+    memory: MemoryGauge,
 }
 
 impl ShardPool {
@@ -813,6 +821,7 @@ impl ShardPool {
         // so each executor's states arrive contiguously and in ascending shard
         // order, which is what makes `first_shard` plus an offset enough to
         // address them.
+        let memory = MemoryGauge::default();
         let mut inboxes = Vec::with_capacity(usize::from(executors));
         let mut pending: Option<(u16, Vec<ShardState<L>>)> = None;
         for shard in 0..shards {
@@ -825,6 +834,10 @@ impl ShardPool {
                 log: make_log(shard),
                 expire_cursor: 0,
             };
+            // A fresh dict already costs its table, and the gauge is the sum
+            // of what the dicts account — so it starts at the sum of the
+            // empty ones rather than at zero.
+            memory.apply(0, state.dict.used_bytes());
             match &mut pending {
                 Some((first_shard, states))
                     if executor_of(shard, shards, executors)
@@ -839,6 +852,7 @@ impl ShardPool {
                             states,
                             trace.clone(),
                             policy.clone(),
+                            memory.clone(),
                         ));
                     }
                     pending = Some((shard, vec![state]));
@@ -846,13 +860,20 @@ impl ShardPool {
             }
         }
         if let Some((first_shard, states)) = pending {
-            inboxes.push(spawn_executor(first_shard, states, trace, policy));
+            inboxes.push(spawn_executor(
+                first_shard,
+                states,
+                trace,
+                policy,
+                memory.clone(),
+            ));
         }
 
         Self {
             inboxes: Arc::new(inboxes),
             shards,
             executors,
+            memory,
         }
     }
 
@@ -866,6 +887,12 @@ impl ShardPool {
     #[must_use]
     pub const fn executors(&self) -> u16 {
         self.executors
+    }
+
+    /// The node-wide memory figure the executors keep current.
+    #[must_use]
+    pub fn memory(&self) -> MemoryGauge {
+        self.memory.clone()
     }
 
     /// The shard a keyed or shard-addressed command belongs to, or `None`
@@ -935,9 +962,10 @@ fn spawn_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
     states: Vec<ShardState<L>>,
     trace: T,
     policy: P,
+    memory: MemoryGauge,
 ) -> mpsc::UnboundedSender<Envelope> {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_executor(first_shard, states, trace, policy, rx));
+    tokio::spawn(run_executor(first_shard, states, trace, policy, memory, rx));
     tx
 }
 
@@ -1119,6 +1147,7 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
     mut states: Vec<ShardState<L>>,
     trace: T,
     policy: P,
+    memory: MemoryGauge,
     mut inbox: mpsc::UnboundedReceiver<Envelope>,
 ) {
     let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
@@ -1180,6 +1209,11 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                 for (shard, cmd) in &mut cmds {
                     let state = &mut states[usize::from(*shard - first_shard)];
                     let at = state.seq;
+                    // The gauge is the sum of what the dicts account, so it is
+                    // moved by the difference this command made to one of
+                    // them. Read either side of `apply` rather than inside it:
+                    // the handlers stay unaware there is a gauge at all.
+                    let before = state.dict.used_bytes();
                     let answer = apply(
                         &mut state.dict,
                         &mut state.log,
@@ -1189,6 +1223,7 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                         now,
                         &policy,
                     );
+                    memory.apply(before, state.dict.used_bytes());
                     trace.record(*shard, at, cmd, &answer);
                     replies.push(answer);
                 }
@@ -1205,6 +1240,11 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                 // expired.
                 let now = Instant::now();
                 for (offset, state) in states.iter_mut().enumerate() {
+                    // One reading either side of the whole tick's work: the
+                    // rehash step changes what the tables cost and the sweep
+                    // changes what the entries do, and the gauge only cares
+                    // about the sum.
+                    let before = state.dict.used_bytes();
                     state.dict.rehash_step(REHASH_BUCKETS_PER_TICK);
                     // The inverse of the envelope arm's `shard - first_shard`:
                     // these states were built from a `0..shards` walk in
@@ -1213,6 +1253,7 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                     let shard = first_shard
                         + u16::try_from(offset).expect("a shard range is shorter than u16::MAX");
                     sweep_expired(state, shard, &trace, now, &policy);
+                    memory.apply(before, state.dict.used_bytes());
                     // The durability point, and the only place in a shard that
                     // can afford to be one: `append` runs inside a handler that
                     // cannot `await`, so it must stay cheap, while this arm is
@@ -2610,6 +2651,31 @@ mod tests {
             Some((0, 1, 3, Reply::Removed(true))),
             "the expiry did not take the position after the write"
         );
+    }
+
+    /// The gauge is the sum of every dict's figure, kept current by the
+    /// executors: a write moves it up by what the dict says the write cost,
+    /// and a delete moves it back down by the same amount.
+    #[tokio::test]
+    async fn the_pool_gauge_follows_what_its_dicts_account() {
+        let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let gauge = pool.memory();
+        let empty = gauge.used();
+        assert_eq!(
+            empty,
+            4 * 8 * crate::dict::BUCKET_OVERHEAD,
+            "four empty tables"
+        );
+        assert_eq!(pool.dispatch(set(b"k", &[0u8; 100])).await, Reply::Ok);
+        assert_eq!(
+            gauge.used(),
+            empty + crate::dict::entry_bytes(b"k", &[0u8; 100])
+        );
+        assert_eq!(
+            pool.dispatch(Command::Del { key: b"k".to_vec() }).await,
+            Reply::Removed(true)
+        );
+        assert_eq!(gauge.used(), empty);
     }
 
     #[tokio::test]

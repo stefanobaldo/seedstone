@@ -9,5 +9,6 @@
 pub mod dict;
 pub mod glob;
 pub mod log;
+pub mod memory;
 pub mod shard;
 pub mod slot;
