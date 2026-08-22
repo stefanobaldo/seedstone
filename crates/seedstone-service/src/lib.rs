@@ -61,6 +61,10 @@
 //!   the [`ReplyError`] set, and `every_error_constant_is_frame_safe` for the
 //!   constants and the status texts.
 
+mod auth;
+
+pub use auth::{AUTH_NOT_CONFIGURED, NOAUTH, Secret, WRONGPASS};
+
 use seedstone_core::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use seedstone_core::shard::{
     Command, Cond, Expiry, Reply, ReplyError, Router, ShardStats, parse_i64,
@@ -471,6 +475,15 @@ pub struct NodeInfo {
     /// executors evict by must be the same value, not two configurations that
     /// happen to agree.
     pub limit: MemoryLimit,
+    /// The password every connection must present, or `None` on a node that
+    /// asks for none.
+    ///
+    /// A fact about the process like everything else here, and read from the
+    /// composition root for the reason the others are — but with one more
+    /// consequence: this is the only field whose *absence* changes what the
+    /// connection loop will run. `None` is an open node, which is why the
+    /// edge refuses to configure one on an address a network can reach.
+    pub password: Option<Secret>,
 }
 
 impl NodeInfo {
@@ -498,7 +511,15 @@ impl NodeInfo {
             now_unix_millis: || FIXED_UNIX_MILLIS,
             memory: MemoryGauge::default(),
             limit: MemoryLimit::default(),
+            password: None,
         }
+    }
+
+    /// Whether a connection to this node must authenticate before it can run
+    /// anything.
+    #[must_use]
+    pub const fn requires_auth(&self) -> bool {
+        self.password.is_some()
     }
 }
 
@@ -515,8 +536,51 @@ enum Action {
     Unbatched(Unbatched),
     /// Answer with this frame; the connection continues.
     Reply(Frame),
+    /// The outcome of an authentication attempt: `Ok` marks the connection
+    /// authenticated and replies with the frame, `Err` replies and leaves it
+    /// as it was.
+    ///
+    /// A variant of its own rather than a `Reply` plus a flag, because it is
+    /// the one action whose effect is on the connection rather than on the
+    /// keyspace — and because [`gated`] must let it through, which it can only
+    /// do by name.
+    Authenticate(Result<Frame, Frame>),
+    /// A `HELLO` that carried no `AUTH`: answered exactly as [`Reply`] is, and
+    /// let through unauthenticated.
+    ///
+    /// Redis answers `HELLO` to a connection that has not authenticated — it
+    /// is how a client learns which protocol to speak before it can say
+    /// anything else — and the variant exists so [`gated`] can say that
+    /// without a wildcard arm that would silently adopt the next action added
+    /// beside it.
+    ///
+    /// [`Reply`]: Action::Reply
+    Hello(Frame),
     /// Answer with this frame, then hang up.
     ReplyThenClose(Frame),
+}
+
+/// What an action becomes on a connection that has not authenticated yet.
+///
+/// Three pass: the attempt itself, the handshake that carries it, and the
+/// goodbye. Everything else is refused *here* — before the router is touched,
+/// so an unauthenticated peer moves no key and learns nothing about the
+/// keyspace, not even from how long a refusal took.
+///
+/// Exhaustive by construction: a new [`Action`] does not compile until this
+/// function says which side of the gate it is on.
+fn gated(action: Action, authenticated: bool) -> Action {
+    if authenticated {
+        return action;
+    }
+    match action {
+        Action::Authenticate(outcome) => Action::Authenticate(outcome),
+        Action::Hello(frame) => Action::Hello(frame),
+        Action::ReplyThenClose(frame) => Action::ReplyThenClose(frame),
+        Action::Dispatch(_) | Action::Unbatched(_) | Action::Reply(_) => {
+            Action::Reply(safe_error(NOAUTH))
+        }
+    }
 }
 
 /// A request that is answered on its own, after the chunk in front of it has
@@ -741,6 +805,9 @@ async fn serve_connection_limited<S, R>(
     let mut armed = false;
     let mut reads: u64 = 0;
     let mut reads_when_armed: u64 = 0;
+    // A node with no password starts every connection authenticated, so the
+    // gate below is inert where there is nothing to gate.
+    let mut authenticated = !node.requires_auth();
 
     loop {
         // Drain every complete frame the decoder already holds before asking
@@ -750,7 +817,7 @@ async fn serve_connection_limited<S, R>(
         let mut drained = false;
         while !drained && !hang_up {
             match decoder.try_next() {
-                Ok(Some(frame)) => match frame_to_action(frame, &node) {
+                Ok(Some(frame)) => match gated(frame_to_action(frame, &node), authenticated) {
                     Action::Dispatch(cmd) => {
                         slots.push(Slot::Pending(batch.len()));
                         batch.push(cmd);
@@ -781,7 +848,10 @@ async fn serve_connection_limited<S, R>(
                         }
                         slots.push(Slot::Ready(request.answer(&router, &node).await));
                     }
-                    Action::Reply(frame) => slots.push(Slot::Ready(frame)),
+                    Action::Reply(frame) | Action::Hello(frame) => slots.push(Slot::Ready(frame)),
+                    Action::Authenticate(outcome) => {
+                        slots.push(Slot::Ready(settle_auth(outcome, &mut authenticated)));
+                    }
                     Action::ReplyThenClose(frame) => {
                         slots.push(Slot::Ready(frame));
                         hang_up = true;
@@ -1569,6 +1639,22 @@ fn quote(bytes: &[u8]) -> String {
     rendered
 }
 
+/// Applies an authentication outcome to the connection and returns the frame
+/// it is answered with.
+///
+/// The only place `authenticated` is ever set, and the reason the flag is not
+/// touched anywhere else in the drain: a success is the frame *and* the state
+/// change, and separating them is how one of the two gets forgotten.
+fn settle_auth(outcome: Result<Frame, Frame>, authenticated: &mut bool) -> Frame {
+    match outcome {
+        Ok(frame) => {
+            *authenticated = true;
+            frame
+        }
+        Err(frame) => frame,
+    }
+}
+
 /// Maps a request frame to what should happen because of it.
 ///
 /// Every failure below is answered and survived: a frame that is well-formed
@@ -1731,6 +1817,27 @@ const COMMANDS: &[(&[u8], Handler)] = &[
     (b"ECHO", |args, _| match args {
         [message] => Ok(Action::Reply(Frame::Bulk(take(message)))),
         _ => Err(wrong_arity("echo")),
+    }),
+    (b"AUTH", |args, node| {
+        let (user, pass) = match &*args {
+            [pass] => (None, pass),
+            [user, pass] => (Some(user), pass),
+            _ => return Err(wrong_arity("auth")),
+        };
+        let Some(secret) = &node.password else {
+            return Err(AUTH_NOT_CONFIGURED.to_owned());
+        };
+        let user_ok = user.is_none_or(|u| u.eq_ignore_ascii_case(b"default"));
+        // Both checked whatever the username said, so a wrong user and a
+        // wrong password cost the same time.
+        let pass_ok = secret.matches(pass);
+        if user_ok && pass_ok {
+            Ok(Action::Authenticate(Ok(Frame::Simple("OK".into()))))
+        } else {
+            Ok(Action::Authenticate(Err(Frame::Error(
+                WRONGPASS.to_owned(),
+            ))))
+        }
     }),
     (b"HELLO", |args, node| hello(args, node)),
     (b"INFO", |args, _| {
@@ -2027,28 +2134,67 @@ fn human_bytes(bytes: u64) -> String {
 /// exactly one accepted value. The refusal for every other one is
 /// [`NOPROTO`] — see that constant for why the exact text is a contract.
 fn hello(args: &[Vec<u8>], node: &NodeInfo) -> Result<Action, String> {
-    let version = match args {
-        [] => 2,
+    let (version, credentials) = match args {
+        [] => (2, None),
         [version, rest @ ..] => {
-            if let Some(option) = rest.first() {
-                // Redis takes AUTH and SETNAME here. This server has neither
-                // to offer, and saying so is better than ignoring the option
-                // and letting a client believe it authenticated.
-                return Err(format!(
-                    "ERR Syntax error in HELLO option '{}'",
-                    quote(option)
-                ));
-            }
-            parse_i64(version).ok_or_else(|| {
+            let credentials = hello_auth(rest)?;
+            let version = parse_i64(version).ok_or_else(|| {
                 "ERR Protocol version is not an integer or out of range".to_owned()
-            })?
+            })?;
+            (version, credentials)
         }
     };
-    if version == 2 {
-        Ok(Action::Reply(hello_frame(node)))
-    } else {
-        Err(NOPROTO.to_owned())
+    if version != 2 {
+        return Err(NOPROTO.to_owned());
     }
+    let Some(Credentials { user, pass }) = credentials else {
+        return Ok(Action::Hello(hello_frame(node)));
+    };
+    // A handshake that names a password against a node that has none is the
+    // same configuration mistake as an `AUTH` against one, and is told so in
+    // the same words.
+    let Some(secret) = &node.password else {
+        return Err(AUTH_NOT_CONFIGURED.to_owned());
+    };
+    let user_ok = user.eq_ignore_ascii_case(b"default");
+    let pass_ok = secret.matches(pass);
+    if user_ok && pass_ok {
+        Ok(Action::Authenticate(Ok(hello_frame(node))))
+    } else {
+        Ok(Action::Authenticate(Err(Frame::Error(
+            WRONGPASS.to_owned(),
+        ))))
+    }
+}
+
+/// The options after `HELLO`'s protocol version.
+///
+/// Redis's grammar is `HELLO [protover [AUTH username password] [SETNAME
+/// clientname]]`. `AUTH` is answered; `SETNAME` is refused as it has been,
+/// because this server has no client name to set and ignoring the option
+/// would let a client believe it took effect — the same reason the refusal
+/// was there before `AUTH` was accepted beside it.
+fn hello_auth(options: &[Vec<u8>]) -> Result<Option<Credentials<'_>>, String> {
+    match options {
+        [] => Ok(None),
+        [keyword, user, pass] if keyword.eq_ignore_ascii_case(b"auth") => {
+            Ok(Some(Credentials { user, pass }))
+        }
+        [option, ..] => Err(format!(
+            "ERR Syntax error in HELLO option '{}'",
+            quote(option)
+        )),
+    }
+}
+
+/// The pair `AUTH` names, wherever it is spelled — as a command of its own or
+/// as an option of `HELLO`.
+struct Credentials<'a> {
+    /// The username. Only `default` exists on this server, and a name that is
+    /// not it is refused with the same text a wrong password is.
+    user: &'a [u8],
+    /// The candidate password.
+    pass: &'a [u8],
 }
 
 /// The `HELLO` reply: a flat array of key-value pairs, which is how RESP2
@@ -3922,6 +4068,7 @@ mod tests {
             &["HELLO", "3"],
             &["HELLO", "notanumber"],
             &["HELLO", "2", "AUTH", "user", "pass"],
+            &["HELLO", "2", "SETNAME", "client"],
             // Last: it closes the connection.
             &["QUIT"],
         ] {
@@ -3930,7 +4077,7 @@ mod tests {
         w.write_all(&out).await.unwrap();
         w.flush().await.unwrap();
 
-        let frames = read_frames(&mut r, 12).await;
+        let frames = read_frames(&mut r, 13).await;
         assert_eq!(frames[0], Frame::Simple("PONG".into()));
         assert_eq!(frames[1], Frame::Simple("PONG".into()), "case-insensitive");
         assert_eq!(frames[2], Frame::Bulk(b"hi".to_vec()));
@@ -3946,12 +4093,18 @@ mod tests {
             frames[9],
             Frame::Error("ERR Protocol version is not an integer or out of range".into())
         );
-        assert_eq!(
-            frames[10],
-            Frame::Error("ERR Syntax error in HELLO option 'AUTH'".into())
-        );
+        // `AUTH` is an option this handshake now takes, so what refuses it
+        // here is the node having no password to check it against — not the
+        // grammar. `SETNAME` is the option that is still not offered, and it
+        // is refused rather than ignored for the reason it always was: a
+        // client must not be able to believe it took effect.
+        assert_eq!(frames[10], Frame::Error(AUTH_NOT_CONFIGURED.into()));
         assert_eq!(
             frames[11],
+            Frame::Error("ERR Syntax error in HELLO option 'SETNAME'".into())
+        );
+        assert_eq!(
+            frames[12],
             Frame::Simple("OK".into()),
             "QUIT is acknowledged"
         );
@@ -4931,6 +5084,9 @@ mod tests {
             ("UNRENDERABLE_REPLY", UNRENDERABLE_REPLY),
             ("SYNTAX_ERROR", SYNTAX_ERROR),
             ("NOPROTO", NOPROTO),
+            ("NOAUTH", NOAUTH),
+            ("WRONGPASS", WRONGPASS),
+            ("AUTH_NOT_CONFIGURED", AUTH_NOT_CONFIGURED),
         ] {
             assert!(
                 !text.contains(['\r', '\n']),
@@ -5826,6 +5982,149 @@ mod tests {
             READ_CEILING,
             "the buffer fell back instead of settling at the ceiling"
         );
+    }
+
+    // --- authentication ---
+
+    fn node_with_password(pw: &[u8]) -> NodeInfo {
+        let mut node = NodeInfo::for_tests();
+        node.password = Some(Secret::new(pw.to_vec()));
+        node
+    }
+
+    /// Before `AUTH`, everything but `AUTH`, `HELLO` and `QUIT` is refused and
+    /// the stream stays in sync; after it, the same commands answer.
+    #[tokio::test]
+    async fn a_password_gates_every_command_until_auth() {
+        let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(
+            server,
+            pool,
+            node_with_password(b"s3cret"),
+        ));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        for parts in [
+            &["PING"][..],
+            &["SET", "k", "v"],
+            &["INFO"],
+            &["AUTH", "wrong"],
+            &["AUTH", "admin", "s3cret"],
+            &["AUTH", "s3cret"],
+            &["SET", "k", "v"],
+            &["GET", "k"],
+            &["AUTH", "default", "s3cret"],
+        ] {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 9).await;
+        assert_eq!(frames[0], Frame::Error(NOAUTH.to_owned()));
+        assert_eq!(frames[1], Frame::Error(NOAUTH.to_owned()));
+        assert_eq!(frames[2], Frame::Error(NOAUTH.to_owned()));
+        assert_eq!(frames[3], Frame::Error(WRONGPASS.to_owned()));
+        assert_eq!(
+            frames[4],
+            Frame::Error(WRONGPASS.to_owned()),
+            "a username other than default is refused with the same text as a wrong password"
+        );
+        assert_eq!(frames[5], Frame::Simple("OK".into()));
+        assert_eq!(frames[6], Frame::Simple("OK".into()));
+        assert_eq!(frames[7], Frame::Bulk(b"v".to_vec()));
+        assert_eq!(
+            frames[8],
+            Frame::Simple("OK".into()),
+            "AUTH again, authenticated, is fine"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_without_a_configured_password_is_the_redis_error() {
+        let (mut r, mut w, _pool) = connected(4);
+        let mut out = Vec::new();
+        encode(&req(&["AUTH", "anything"]), &mut out);
+        encode(&req(&["PING"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 2).await;
+        assert_eq!(frames[0], Frame::Error(AUTH_NOT_CONFIGURED.to_owned()));
+        assert_eq!(frames[1], Frame::Simple("PONG".into()));
+    }
+
+    /// `HELLO 2 AUTH default <pw>` authenticates in the handshake, and
+    /// `HELLO 2 AUTH` with a wrong password answers WRONGPASS and leaves the
+    /// connection unauthenticated.
+    #[tokio::test]
+    async fn hello_carries_auth() {
+        let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server, pool, node_with_password(b"pw")));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        encode(&req(&["HELLO", "2", "AUTH", "default", "nope"]), &mut out);
+        encode(&req(&["PING"]), &mut out);
+        encode(&req(&["HELLO", "2", "AUTH", "default", "pw"]), &mut out);
+        encode(&req(&["PING"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 4).await;
+        assert_eq!(frames[0], Frame::Error(WRONGPASS.to_owned()));
+        assert_eq!(frames[1], Frame::Error(NOAUTH.to_owned()));
+        assert!(
+            matches!(frames[2], Frame::Array(_)),
+            "HELLO with the right password answers the map"
+        );
+        assert_eq!(frames[3], Frame::Simple("PONG".into()));
+    }
+
+    /// `HELLO` with no `AUTH` is let through unauthenticated, as Redis does:
+    /// it is how a client learns what it is talking to before it can say
+    /// anything else, and it authenticates nothing by itself.
+    #[tokio::test]
+    async fn hello_without_auth_answers_but_does_not_authenticate() {
+        let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server, pool, node_with_password(b"pw")));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        encode(&req(&["HELLO", "2"]), &mut out);
+        encode(&req(&["PING"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 2).await;
+        assert!(matches!(frames[0], Frame::Array(_)), "{:?}", frames[0]);
+        assert_eq!(frames[1], Frame::Error(NOAUTH.to_owned()));
+    }
+
+    /// `QUIT` is answered before authentication: a client that decides to go
+    /// away is not asked for a password first.
+    #[tokio::test]
+    async fn quit_is_answered_unauthenticated() {
+        let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server, pool, node_with_password(b"pw")));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        encode(&req(&["QUIT"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 1).await;
+        assert_eq!(frames[0], Frame::Simple("OK".into()));
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "the server kept talking after QUIT");
+    }
+
+    #[test]
+    fn the_secret_does_not_print_itself() {
+        let secret = Secret::new(b"hunter2".to_vec());
+        assert!(!format!("{secret:?}").contains("hunter2"));
+        assert!(secret.matches(b"hunter2"));
+        assert!(!secret.matches(b"hunter"));
+        assert!(!secret.matches(b"hunter22"));
+        assert!(!secret.matches(b""));
     }
 
     // --- helpers ---

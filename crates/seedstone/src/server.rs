@@ -242,6 +242,7 @@ impl Server {
             now_unix_millis: wall_clock,
             memory: self.pool.memory(),
             limit: self.pool.limit(),
+            password: None,
         };
         loop {
             tokio::select! {
