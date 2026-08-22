@@ -95,6 +95,20 @@ const REHASH_BUCKETS_PER_TICK: usize = 1024;
 /// due rather than with the budget.
 const EXPIRE_BUCKETS_PER_TICK: usize = 256;
 
+/// How many entries one eviction looks at before choosing the one it removes.
+///
+/// Redis's `maxmemory-samples` default, and the same trade: five is enough
+/// that the key removed is nearly always among the older ones, and few enough
+/// that making room costs a handful of comparisons rather than a walk of the
+/// keyspace. Approximate LRU is the deliberate part — an exact one wants a
+/// list threaded through every entry, which is per-key memory spent to
+/// improve a hit rate that sampling already gets most of.
+///
+/// What five buys is measured rather than asserted:
+/// `sampled_eviction_rarely_takes_a_recently_touched_key` in `dict.rs` holds
+/// the sample to a bound on how often it takes a recently used key.
+pub const EVICTION_SAMPLES: usize = 5;
+
 /// Every way a shard can refuse a command.
 ///
 /// A closed set, and that is the point. The wire text used to be a `String`
@@ -1341,15 +1355,17 @@ fn sweep_expired<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
 ///
 /// **An arm whose logic is extracted gets a named free function directly
 /// below, in match order.** Plenty of arms are not extracted and carry real
-/// decisions anyway — `Del`, `IncrBy`, `Ttl` and `Persist` all do, `IncrBy`
-/// over some twenty lines — because a handler that says no more than the arm
-/// already says buys a name and a signature for nothing. What earns an
-/// extraction is one of three things: logic two arms share, as `Expire` and
-/// `PExpire` share [`set_expiry`]; an argument list the dispatcher would
-/// otherwise have to assemble inline, as `Set` does through [`SetArgs`]; or an
-/// arm long enough that leaving it here costs the reader the dispatcher, which
-/// is the judgement `clippy::too_many_lines` eventually makes on our behalf
-/// and which `IncrBy` is the nearest to.
+/// decisions anyway — `Del`, `Ttl` and `Persist` all do — because a handler
+/// that says no more than the arm already says buys a name and a signature
+/// for nothing. What earns an extraction is one of three things: logic two
+/// arms share, as `Expire` and `PExpire` share [`set_expiry`]; an argument
+/// list the dispatcher would otherwise have to assemble inline, as `Set` does
+/// through [`SetArgs`]; or an arm long enough that leaving it here costs the
+/// reader the dispatcher, which is the judgement `clippy::too_many_lines`
+/// makes on our behalf. `IncrBy` was the nearest to that third case and is
+/// now [`incr_by`], extracted on the commit that gave the write paths their
+/// LRU stamp and took the dispatcher one line over the limit. `Del` is now
+/// the nearest.
 ///
 /// The ordering is the half with no judgement in it, and it is what the next
 /// extraction has to respect: every extracted handler sits below in the order
@@ -1383,7 +1399,14 @@ fn apply<L: ReplicationLog, P: ShardPolicy>(
     }
 
     match cmd {
-        Command::Get { key } => Reply::Bulk(dict.get(key).map(|entry| entry.value.clone())),
+        // A read is a use, so it stamps the key exactly as a write does:
+        // `allkeys-lru` is about what the keyspace is *using*, and a cache
+        // whose hot keys are read and never written would otherwise offer its
+        // whole working set up for eviction.
+        Command::Get { key } => {
+            dict.touch(key);
+            Reply::Bulk(dict.get(key).map(|entry| entry.value.clone()))
+        }
 
         Command::Set {
             key,
@@ -1419,31 +1442,7 @@ fn apply<L: ReplicationLog, P: ShardPolicy>(
             Reply::Removed(true)
         }
 
-        Command::IncrBy { key, delta } => {
-            let (current, expires_at) = match dict.get(key) {
-                None => (0, None),
-                Some(entry) => match parse_i64(&entry.value) {
-                    Some(n) => (n, entry.expires_at),
-                    None => return Reply::Error(ReplyError::NotAnInteger),
-                },
-            };
-            let Some(next) = current.checked_add(*delta) else {
-                return Reply::Error(ReplyError::WouldOverflow);
-            };
-            if let Err(failed) = append(log, seq, shard) {
-                return failed;
-            }
-            // The deadline rides along, as it does in Redis: an increment
-            // changes what a counter holds, not how long it lives.
-            dict.insert(
-                key.clone(),
-                Entry {
-                    value: next.to_string().into_bytes(),
-                    expires_at,
-                },
-            );
-            Reply::Integer(next)
-        }
+        Command::IncrBy { key, delta } => incr_by(dict, log, seq, shard, key, *delta),
 
         Command::Expire { key, seconds } => {
             let at = span_deadline(now, *seconds, Expiry::Ex);
@@ -1582,9 +1581,61 @@ fn set<L: ReplicationLog>(
         Entry {
             value: std::mem::take(value),
             expires_at,
+            touched: 0,
         },
     );
+    // As in `IncrBy`: the entry goes in unstamped and is stamped here, so a
+    // key that was just written is the last one an eviction sample would take.
+    dict.touch(key);
     if get { Reply::Bulk(old) } else { Reply::Ok }
+}
+
+/// Adds `delta` to the integer under `key`, treating a missing key as zero.
+///
+/// Extracted for the reason [`apply`] names as the third one: the arm had
+/// grown long enough that leaving it inline cost the reader the dispatcher,
+/// and `clippy::too_many_lines` said so on the commit that added the touch.
+///
+/// Three answers and only one of them is a write: a value that is not an
+/// integer and a result that would leave `i64` both refuse before anything
+/// reaches the log, which is what keeps the log free of records that replay
+/// to a no-op.
+fn incr_by<L: ReplicationLog>(
+    dict: &mut Dict,
+    log: &mut L,
+    seq: &mut u64,
+    shard: u16,
+    key: &[u8],
+    delta: i64,
+) -> Reply {
+    let (current, expires_at) = match dict.get(key) {
+        None => (0, None),
+        Some(entry) => match parse_i64(&entry.value) {
+            Some(n) => (n, entry.expires_at),
+            None => return Reply::Error(ReplyError::NotAnInteger),
+        },
+    };
+    let Some(next) = current.checked_add(delta) else {
+        return Reply::Error(ReplyError::WouldOverflow);
+    };
+    if let Err(failed) = append(log, seq, shard) {
+        return failed;
+    }
+    // The deadline rides along, as it does in Redis: an increment changes what
+    // a counter holds, not how long it lives.
+    dict.insert(
+        key.to_vec(),
+        Entry {
+            value: next.to_string().into_bytes(),
+            expires_at,
+            touched: 0,
+        },
+    );
+    // The stamp the insert left is the placeholder [`Entry`] documents, never
+    // what a write leaves behind: the touch right after it is what makes this
+    // key the newest one an eviction sample can meet.
+    dict.touch(key);
+    Reply::Integer(next)
 }
 
 /// What `EXPIRE`'s or `PEXPIRE`'s span turned out to mean, once its unit is
