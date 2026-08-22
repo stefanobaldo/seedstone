@@ -101,6 +101,40 @@ type Table = Vec<Bucket>;
 /// grows on demand.
 const INITIAL_BUCKETS: usize = 8;
 
+/// What one entry costs beyond its key and value bytes.
+///
+/// A bucket slot is `(u64, Vec<u8>, Entry)` — 8 for the stored hash, 24 for
+/// the key's `Vec` header, and `Entry` at 40 (a 24-byte `Vec` header for the
+/// value and a 16-byte `Option<Instant>`) — 72 bytes, as the [`Entry`] doc
+/// derives. The LRU stamp added later widens `Entry` by 8 through padding.
+/// The two heap allocations the headers point at are counted through their
+/// lengths by [`entry_bytes`]; their allocator rounding is not, and that is
+/// deliberate: this is a formula the simulator can replay, not a reading.
+pub const ENTRY_OVERHEAD: u64 = 80;
+
+/// What one bucket costs when empty: its `Vec` header. A chain's slots are
+/// counted per entry above.
+pub const BUCKET_OVERHEAD: u64 = 24;
+
+/// The bytes one entry is accounted at.
+///
+/// # Panics
+///
+/// If a `usize` does not fit a `u64`, which no target this builds for has.
+/// The conversion is spelled fallibly rather than with a cast because the
+/// coding guide admits no bare `as` between integer widths.
+#[must_use]
+pub fn entry_bytes(key: &[u8], value: &[u8]) -> u64 {
+    ENTRY_OVERHEAD
+        + u64::try_from(key.len()).expect("a key length is a usize")
+        + u64::try_from(value.len()).expect("a value length is a usize")
+}
+
+/// What a table of `buckets` buckets is accounted at, empty.
+fn table_bytes(buckets: usize) -> u64 {
+    u64::try_from(buckets).expect("a bucket count is a usize") * BUCKET_OVERHEAD
+}
+
 /// A keyspace: byte-string keys mapped to byte-string values.
 ///
 /// One shard task owns one `Dict` and is the only thing that touches it, so
@@ -129,6 +163,14 @@ pub struct Dict {
     /// deadlines anywhere — which is nearly every keyspace — must not pay a
     /// hash per command for the expiries it does not have.
     may_hold_deadlines: bool,
+    /// What this dict is accounted at, maintained by every operation that can
+    /// move it rather than derived on demand.
+    ///
+    /// A running figure because the alternative is a walk of the keyspace per
+    /// read, and the reader is the memory gauge every write consults. The
+    /// tests hold it to a full recount after every mutation, which is what
+    /// makes maintaining it in five places defensible.
+    used_bytes: u64,
 }
 
 impl Dict {
@@ -142,6 +184,7 @@ impl Dict {
             rehash_index: 0,
             len: 0,
             may_hold_deadlines: false,
+            used_bytes: table_bytes(INITIAL_BUCKETS),
         }
     }
 
@@ -234,19 +277,25 @@ impl Dict {
         self.may_hold_deadlines |= entry.expires_at.is_some();
 
         let hash = hash_key(self.seed, &key);
+        // The new size is computed before the move, since `entry` goes into
+        // the table and the old entry's is read off what is still there.
+        let after = entry_bytes(&key, &entry.value);
         if let Some(existing) = find_mut(&mut self.old, hash, &key) {
+            self.used_bytes = self.used_bytes - entry_bytes(&key, &existing.value) + after;
             *existing = entry;
             return;
         }
         if let Some(new) = self.new.as_mut()
             && let Some(existing) = find_mut(new, hash, &key)
         {
+            self.used_bytes = self.used_bytes - entry_bytes(&key, &existing.value) + after;
             *existing = entry;
             return;
         }
 
         // A key that is not present yet goes straight into the table that will
         // survive the rehash, so it never has to be migrated.
+        self.used_bytes += after;
         let table = self.new.as_mut().unwrap_or(&mut self.old);
         let index = bucket_index(hash, table.len());
         table[index].push((hash, key, entry));
@@ -264,7 +313,8 @@ impl Dict {
             let new = self.new.as_mut()?;
             remove_from(new, hash, key)
         });
-        if removed.is_some() {
+        if let Some(removed) = &removed {
+            self.used_bytes -= entry_bytes(key, &removed.value);
             self.len -= 1;
             // The one place the flag can honestly go back down: a dict holding
             // nothing holds no deadlines. Everything short of empty stays
@@ -301,6 +351,14 @@ impl Dict {
     #[must_use]
     pub const fn len(&self) -> usize {
         self.len
+    }
+
+    /// The bytes this dict is accounted at: every entry through
+    /// [`entry_bytes`], plus [`BUCKET_OVERHEAD`] per bucket of every table it
+    /// currently holds — two while a rehash is in flight.
+    #[must_use]
+    pub const fn used_bytes(&self) -> u64 {
+        self.used_bytes
     }
 
     /// Whether the dict holds no entries.
@@ -352,6 +410,8 @@ impl Dict {
         if self.rehash_index == self.old.len()
             && let Some(migrated) = self.new.take()
         {
+            // The drained table is dropped here, and stops being accounted.
+            self.used_bytes -= table_bytes(self.old.len());
             self.old = migrated;
             self.rehash_index = 0;
         }
@@ -558,6 +618,9 @@ impl Dict {
         // invariant and is what a cursor-based scan across the two tables
         // relies on.
         self.new = Some(empty_table(self.old.len() * 2));
+        // The second table's buckets are held alongside the first's until the
+        // migration ends, and are accounted for the whole time they exist.
+        self.used_bytes += table_bytes(self.old.len() * 2);
         self.rehash_index = 0;
     }
 }
@@ -1661,6 +1724,117 @@ mod tests {
                 Some(format!("v{i}").as_bytes()),
                 "key {i} came back with the wrong value"
             );
+        }
+    }
+
+    /// Recomputes what `used_bytes` claims, from nothing but the entries and
+    /// the tables, so the running figure is held to a second derivation.
+    fn recount(dict: &Dict) -> u64 {
+        let mut total = 0u64;
+        for table in std::iter::once(&dict.old).chain(dict.new.iter()) {
+            total += u64::try_from(table.len()).expect("bucket count fits") * BUCKET_OVERHEAD;
+            for bucket in table {
+                for (_, key, entry) in bucket {
+                    total += entry_bytes(key, &entry.value);
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn used_bytes_tracks_every_mutation_including_growth_and_clear() {
+        let mut dict = Dict::with_seed(DictSeed { k0: 1, k1: 2 });
+        assert_eq!(
+            dict.used_bytes(),
+            recount(&dict),
+            "an empty dict is only its table"
+        );
+        for i in 0..200u32 {
+            dict.insert(
+                format!("k{i}").into_bytes(),
+                Entry {
+                    value: vec![b'v'; (i % 17) as usize],
+                    expires_at: None,
+                },
+            );
+            assert_eq!(dict.used_bytes(), recount(&dict), "after insert {i}");
+        }
+        // Overwrite with a longer and then a shorter value.
+        dict.insert(
+            b"k3".to_vec(),
+            Entry {
+                value: vec![0; 1000],
+                expires_at: None,
+            },
+        );
+        assert_eq!(dict.used_bytes(), recount(&dict));
+        dict.insert(
+            b"k3".to_vec(),
+            Entry {
+                value: vec![0; 1],
+                expires_at: None,
+            },
+        );
+        assert_eq!(dict.used_bytes(), recount(&dict));
+        for i in (0..200u32).step_by(3) {
+            dict.remove(format!("k{i}").as_bytes());
+            assert_eq!(dict.used_bytes(), recount(&dict), "after remove {i}");
+        }
+        while dict.is_rehashing() {
+            dict.rehash_step(7);
+            assert_eq!(dict.used_bytes(), recount(&dict), "mid-rehash");
+        }
+        dict.clear();
+        assert_eq!(dict.used_bytes(), recount(&dict));
+        assert_eq!(
+            dict.used_bytes(),
+            u64::try_from(INITIAL_BUCKETS).expect("a small constant") * BUCKET_OVERHEAD
+        );
+    }
+
+    /// Every interleaving of four operations over two keys, so a pair that
+    /// only disagrees under one order is not left to a longer run to find.
+    #[test]
+    fn used_bytes_agrees_with_a_recount_over_every_short_sequence() {
+        #[derive(Clone, Copy)]
+        enum Op {
+            Put(u8, usize),
+            Del(u8),
+            Clear,
+        }
+        let ops = [
+            Op::Put(0, 3),
+            Op::Put(1, 40),
+            Op::Put(0, 0),
+            Op::Del(0),
+            Op::Del(1),
+            Op::Clear,
+        ];
+        for a in ops {
+            for b in ops {
+                for c in ops {
+                    for d in ops {
+                        let mut dict = Dict::with_seed(DictSeed { k0: 9, k1: 9 });
+                        for op in [a, b, c, d] {
+                            match op {
+                                Op::Put(k, len) => dict.insert(
+                                    vec![k],
+                                    Entry {
+                                        value: vec![1; len],
+                                        expires_at: None,
+                                    },
+                                ),
+                                Op::Del(k) => {
+                                    dict.remove(&[k]);
+                                }
+                                Op::Clear => dict.clear(),
+                            }
+                            assert_eq!(dict.used_bytes(), recount(&dict));
+                        }
+                    }
+                }
+            }
         }
     }
 }
