@@ -48,6 +48,11 @@ side scripting, and transactions. The surface is a named list chosen for the
 workloads this project targets; anything outside it is refused with an error
 naming the command, rather than answered approximately.
 
+**Releases:** a tag publishes a GitHub Release carrying an x86_64 Linux binary
+and its `sha256`. [CHANGELOG.md](CHANGELOG.md) is what changed;
+[docs/RELEASING.md](docs/RELEASING.md) is how a version is cut. There is no tag
+yet — for now the server is built from source, as above.
+
 ## How it is built
 
 - `seedstone` — the edge: the process, its configuration, and the only socket,

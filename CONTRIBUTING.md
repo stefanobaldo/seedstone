@@ -14,7 +14,8 @@ declined for now — open an issue first so we can talk before you write code.
 - Branches mirror the same vocabulary: `feat/<slug>`, `fix/<slug>`,
   `docs/<slug>`, `chore/<slug>`, kebab-case.
 - `main` is protected. Changes land by pull request with a linear history
-  (rebase merge). Versions are annotated tags on `main`, SemVer `0.x`.
+  (rebase merge). Versions are annotated tags on `main`, SemVer `0.x` —
+  [docs/RELEASING.md](docs/RELEASING.md) is how one is cut.
 
 ## Developer Certificate of Origin
 
