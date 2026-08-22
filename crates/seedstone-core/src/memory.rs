@@ -35,3 +35,66 @@ impl MemoryGauge {
         }
     }
 }
+
+/// What a node does when the gauge passes the ceiling.
+///
+/// Two modes and not Redis's eight. The `volatile-*` family reclaims only
+/// from keys that carry a deadline, and a keyspace that carries none — which
+/// is the shape this server is built for — would answer every write over the
+/// ceiling with a refusal while holding a keyspace it was told it could
+/// evict. Offering a policy that evicts nothing would be offering a ceiling
+/// that holds nothing. `allkeys-random` is the one that could exist and does
+/// not: it is strictly worse than sampled LRU at the same cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EvictionMode {
+    /// Remove the least recently touched of a sample from the shard that is
+    /// writing, until the write fits. Redis's `allkeys-lru`.
+    #[default]
+    AllKeysLru,
+    /// Refuse the write. Redis's `noeviction`.
+    NoEviction,
+}
+
+impl EvictionMode {
+    /// The name Redis uses, which `CONFIG GET maxmemory-policy` reports and
+    /// the command line accepts.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::AllKeysLru => "allkeys-lru",
+            Self::NoEviction => "noeviction",
+        }
+    }
+
+    /// The mode `name` selects, if it names one.
+    ///
+    /// Written over the list rather than as a `match` on strings so that the
+    /// two directions cannot drift: a mode added later is spelled once, in
+    /// [`name`](Self::name), and parsing follows.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::AllKeysLru, Self::NoEviction]
+            .into_iter()
+            .find(|mode| mode.name() == name)
+    }
+}
+
+/// The ceiling and what to do at it. `None` is no ceiling, Redis's default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MemoryLimit {
+    /// `maxmemory`, or `None` for unbounded.
+    pub ceiling: Option<u64>,
+    /// `maxmemory-policy`.
+    pub mode: EvictionMode,
+}
+
+impl MemoryLimit {
+    /// Whether `used` is past the ceiling. `false` with no ceiling.
+    ///
+    /// Strictly past, as Redis compares it: a node holding exactly
+    /// `maxmemory` bytes is at its ceiling and not over it.
+    #[must_use]
+    pub fn exceeded(self, used: u64) -> bool {
+        self.ceiling.is_some_and(|ceiling| used > ceiling)
+    }
+}

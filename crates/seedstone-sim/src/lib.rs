@@ -905,6 +905,11 @@ fn fold_reply(h: u64, reply: &Reply) -> u64 {
             }
             acc
         }
+        // Both fields the eviction shape asserts over, and only those: the
+        // counters the operational surface adds later join this fold on the
+        // commit that starts maintaining them, since a field folded while it
+        // is always zero is a field whose first real value moves every hash.
+        Reply::Stats(stats) => mix(mix(mix(h, 9), stats.keys), stats.evicted),
         // Folds the wire text, not the variant tag: the recorded hashes
         // predate the enum and must not move for a change that renamed
         // nothing a client can see.

@@ -33,7 +33,7 @@
 use crate::dict::{Dict, DictSeed, Entry, WalkOrder};
 use crate::glob;
 use crate::log::{NoopLog, Record, ReplicationLog};
-use crate::memory::MemoryGauge;
+use crate::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use crate::slot::{executor_of, shard_of};
 use std::future::Future;
 use std::sync::Arc;
@@ -144,6 +144,14 @@ pub enum ReplyError {
     /// reading it too narrowly: it means the shard could not record a change
     /// it was about to make, and so did not make it.
     LogWriteFailed,
+    /// A write that would add bytes, refused because the node is over its
+    /// ceiling and its policy is `noeviction`.
+    ///
+    /// The commands it can answer are exactly the ones
+    /// [`Command::denied_when_full`] names. A read, a delete and an expiry
+    /// are never refused this way: refusing the operations that *reclaim* is
+    /// how a full node stays full.
+    OutOfMemory,
 }
 
 impl ReplyError {
@@ -158,6 +166,8 @@ impl ReplyError {
             Self::WouldOverflow => "ERR increment or decrement would overflow",
             Self::ShardUnavailable => "ERR shard is unavailable",
             Self::LogWriteFailed => "ERR replication log write failed",
+            // Redis's text, trailing full stop and all: clients match on it.
+            Self::OutOfMemory => "OOM command not allowed when used memory > 'maxmemory'.",
         }
     }
 }
@@ -327,6 +337,17 @@ pub enum Command {
         /// the edge so the channel does not carry a keyspace to discard it.
         pattern: Option<Vec<u8>>,
     },
+    /// Report what this shard has counted since it started.
+    ///
+    /// Keyspace-wide, and never sent by a peer: `INFO` broadcasts one of
+    /// these and sums the answers, which is the only way a per-shard counter
+    /// becomes a node-wide figure. The alternative — one shared atomic per
+    /// counter, incremented by every executor — is a contended word on the
+    /// hot path to save a broadcast on a command nothing hot issues.
+    ///
+    /// It is answered by the executor rather than by [`apply`], because what
+    /// it reports lives beside the dict rather than in it.
+    Stats,
 }
 
 /// How a command reaches the shards that must run it.
@@ -394,7 +415,7 @@ impl Command {
             | Self::Exists { key }
             | Self::Type { key }
             | Self::StrLen { key } => Route::Key(key),
-            Self::FlushDb | Self::DbSize => Route::Every,
+            Self::FlushDb | Self::DbSize | Self::Stats => Route::Every,
             // The one route that is not self-sufficient. A step knows where it
             // is in *a* shard's table and not which shard's, so it names no
             // shard and the caller supplies the real one through
@@ -415,7 +436,8 @@ impl Command {
     ///
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
     /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9, `ScanStep` = 10,
-    /// `PExpire` = 11, `Persist` = 12, `Type` = 13, `StrLen` = 14. These
+    /// `PExpire` = 11, `Persist` = 12, `Type` = 13, `StrLen` = 14,
+    /// `Stats` = 15. These
     /// values are folded into the simulator's trace hash, so they are part of
     /// what a replay compares: changing one changes every recorded hash. A tag
     /// is therefore never reused and never renumbered.
@@ -436,7 +458,20 @@ impl Command {
             Self::Persist { .. } => 12,
             Self::Type { .. } => 13,
             Self::StrLen { .. } => 14,
+            Self::Stats => 15,
         }
+    }
+
+    /// Whether this command is refused under `noeviction` once the gauge is
+    /// past the ceiling: the ones that add bytes. Redis's `denyoom` flag.
+    ///
+    /// `Set` and `IncrBy` and nothing else. `Expire` and `Persist` rewrite a
+    /// field on an entry already there, and every other command either reads
+    /// or reclaims — refusing those would leave a full node with no way back
+    /// under its ceiling.
+    #[must_use]
+    pub const fn denied_when_full(&self) -> bool {
+        matches!(self, Self::Set { .. } | Self::IncrBy { .. })
     }
 }
 
@@ -479,9 +514,54 @@ pub enum Reply {
         /// step's budget is buckets, and buckets can be empty.
         keys: Vec<Vec<u8>>,
     },
+    /// What one shard has counted. Never a wire answer — see [`ShardStats`].
+    ///
+    /// **Boxed, and that is not incidental.** [`ShardStats`] is 176 bytes,
+    /// almost all of it the per-command call counts, and every other variant
+    /// of this enum fits in forty. Stored inline it would be the size of a
+    /// `Reply`, which is the type every command answers with and which an
+    /// envelope holds one of per command — so a figure a scrape asks for once
+    /// a minute would be paid for by every `GET` on the machine. One
+    /// allocation on the one command nothing on the hot path issues is the
+    /// cheaper side of that trade by a wide margin.
+    Stats(Box<ShardStats>),
     /// The command failed. See [`ReplyError`] — a closed set of
     /// server-authored failures, none of whose texts can split a frame.
     Error(ReplyError),
+}
+
+/// One shard's counters, as [`Command::Stats`] reports them.
+///
+/// Every field is a running total from the moment the shard started, except
+/// [`keys`](Self::keys) and [`expires`](Self::expires), which are the
+/// keyspace as it stands. `INFO` sums them field by field across the shards
+/// and prints the sum; nothing here is ever divided or averaged, so the sum
+/// is the whole of the arithmetic.
+///
+/// It reaches no client under this name: the reply carrying it is refused by
+/// the service layer's renderer, because a peer that could dispatch one would
+/// be reading one shard's counters as if they were the node's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShardStats {
+    /// Entries the dict holds, including any whose deadline has passed and
+    /// which the sweep has not yet reached — the figure `DBSIZE` reports, for
+    /// the reason its arm states.
+    pub keys: u64,
+    /// How many of those entries carry a deadline.
+    pub expires: u64,
+    /// Entries this shard has evicted to stay under the node's ceiling.
+    /// Expiries are not evictions and are not counted here.
+    pub evicted: u64,
+    /// Keyed lookups that found a live entry.
+    pub hits: u64,
+    /// Keyed lookups that found nothing.
+    pub misses: u64,
+    /// Entries removed because their deadline had passed, by either half of
+    /// expiration.
+    pub expired: u64,
+    /// How many commands of each [`Command::kind`] this shard has run,
+    /// indexed by the tag minus one.
+    pub calls: [u64; 16],
 }
 
 /// One unit of work for an executor: a batch of commands and where its
@@ -721,6 +801,10 @@ pub struct ShardPool {
     /// them; [`memory`](ShardPool::memory) is how everything else gets a
     /// handle to the same word.
     memory: MemoryGauge,
+    /// The ceiling this node's keyspace is held under, and what happens at
+    /// it. Stored so that the edge can report it — `INFO` prints `maxmemory`
+    /// and `maxmemory_policy` — from the same value the executors evict by.
+    limit: MemoryLimit,
 }
 
 impl ShardPool {
@@ -740,7 +824,46 @@ impl ShardPool {
     /// If `shards` is zero — there would be nowhere to route a key — or if
     /// `executors` is not in `1..=shards`.
     pub fn spawn<T: TraceSink>(shards: u16, executors: u16, seed: DictSeed, trace: T) -> Self {
-        Self::spawn_full(shards, executors, seed, trace, |_shard| NoopLog, Deadlines)
+        Self::spawn_full(
+            shards,
+            executors,
+            seed,
+            trace,
+            |_shard| NoopLog,
+            Deadlines,
+            MemoryLimit::default(),
+        )
+    }
+
+    /// [`spawn`](ShardPool::spawn) with a ceiling on what the node's keyspace
+    /// may be accounted at.
+    ///
+    /// The one constructor a production node uses when `--maxmemory` is
+    /// given; without it the default is Redis's, which is no ceiling at all.
+    /// The limit is a property of the pool rather than of each executor
+    /// because the figure it bounds is the node's: a shard evicts when the
+    /// *node* is full, not when its own dict is.
+    ///
+    /// # Panics
+    ///
+    /// If `shards` is zero — there would be nowhere to route a key — or if
+    /// `executors` is not in `1..=shards`.
+    pub fn spawn_limited<T: TraceSink>(
+        shards: u16,
+        executors: u16,
+        seed: DictSeed,
+        trace: T,
+        limit: MemoryLimit,
+    ) -> Self {
+        Self::spawn_full(
+            shards,
+            executors,
+            seed,
+            trace,
+            |_shard| NoopLog,
+            Deadlines,
+            limit,
+        )
     }
 
     /// [`spawn`](ShardPool::spawn) with the replication log supplied per shard.
@@ -773,7 +896,15 @@ impl ShardPool {
         L: ReplicationLog,
         F: Fn(u16) -> L,
     {
-        Self::spawn_full(shards, executors, seed, trace, make_log, Deadlines)
+        Self::spawn_full(
+            shards,
+            executors,
+            seed,
+            trace,
+            make_log,
+            Deadlines,
+            MemoryLimit::default(),
+        )
     }
 
     /// [`spawn`](ShardPool::spawn) with the executor's own decisions supplied.
@@ -796,7 +927,15 @@ impl ShardPool {
         T: TraceSink,
         P: ShardPolicy,
     {
-        Self::spawn_full(shards, executors, seed, trace, |_shard| NoopLog, policy)
+        Self::spawn_full(
+            shards,
+            executors,
+            seed,
+            trace,
+            |_shard| NoopLog,
+            policy,
+            MemoryLimit::default(),
+        )
     }
 
     /// The one constructor with every seam exposed; the three public ones are
@@ -815,6 +954,7 @@ impl ShardPool {
         trace: T,
         make_log: F,
         policy: P,
+        limit: MemoryLimit,
     ) -> Self
     where
         T: TraceSink,
@@ -835,7 +975,10 @@ impl ShardPool {
         // so each executor's states arrive contiguously and in ascending shard
         // order, which is what makes `first_shard` plus an offset enough to
         // address them.
-        let memory = MemoryGauge::default();
+        let memory = Memory {
+            gauge: MemoryGauge::default(),
+            limit,
+        };
         let mut inboxes = Vec::with_capacity(usize::from(executors));
         let mut pending: Option<(u16, Vec<ShardState<L>>)> = None;
         for shard in 0..shards {
@@ -847,11 +990,13 @@ impl ShardPool {
                 seq: 0,
                 log: make_log(shard),
                 expire_cursor: 0,
+                evict_cursor: 0,
+                evicted: 0,
             };
             // A fresh dict already costs its table, and the gauge is the sum
             // of what the dicts account — so it starts at the sum of the
             // empty ones rather than at zero.
-            memory.apply(0, state.dict.used_bytes());
+            memory.gauge.apply(0, state.dict.used_bytes());
             match &mut pending {
                 Some((first_shard, states))
                     if executor_of(shard, shards, executors)
@@ -887,7 +1032,8 @@ impl ShardPool {
             inboxes: Arc::new(inboxes),
             shards,
             executors,
-            memory,
+            memory: memory.gauge,
+            limit,
         }
     }
 
@@ -907,6 +1053,12 @@ impl ShardPool {
     #[must_use]
     pub fn memory(&self) -> MemoryGauge {
         self.memory.clone()
+    }
+
+    /// The ceiling this pool holds its keyspace under, and what it does at it.
+    #[must_use]
+    pub const fn limit(&self) -> MemoryLimit {
+        self.limit
     }
 
     /// The shard a keyed or shard-addressed command belongs to, or `None`
@@ -976,7 +1128,7 @@ fn spawn_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
     states: Vec<ShardState<L>>,
     trace: T,
     policy: P,
-    memory: MemoryGauge,
+    memory: Memory,
 ) -> mpsc::UnboundedSender<Envelope> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(run_executor(first_shard, states, trace, policy, memory, rx));
@@ -1135,6 +1287,22 @@ impl Router for ShardPool {
     }
 }
 
+/// What an executor needs to know about the node's memory: the figure, and
+/// what to do when it is too large.
+///
+/// One argument rather than two because [`run_executor`] and
+/// [`spawn_executor`] were already at the parameter count where the next one
+/// is a list nobody reads. They also always travel together: a gauge with no
+/// ceiling to compare against decides nothing, and a ceiling with no gauge
+/// has nothing to compare.
+#[derive(Clone, Debug, Default)]
+struct Memory {
+    /// The node-wide figure every executor keeps current.
+    gauge: MemoryGauge,
+    /// The ceiling that figure is held under, and how.
+    limit: MemoryLimit,
+}
+
 /// One virtual shard's state: what used to be one task's locals.
 struct ShardState<L> {
     dict: Dict,
@@ -1146,6 +1314,17 @@ struct ShardState<L> {
     /// dict for the same reason a `SCAN` command's does: the dict offers a
     /// position, and what keeps a position between calls is whoever is walking.
     expire_cursor: u64,
+    /// Where the eviction sample resumes, kept for the reason the sweep keeps
+    /// its own: successive samples that all started at `0` would re-read one
+    /// corner of the table and offer the same few keys up every time.
+    ///
+    /// Separate from [`expire_cursor`](Self::expire_cursor) on purpose. The
+    /// two walks have nothing to do with each other, and sharing one position
+    /// would make how often a key is offered for eviction depend on how many
+    /// deadlines the keyspace happens to carry.
+    evict_cursor: u64,
+    /// How many entries this shard has evicted, for `INFO`'s `evicted_keys`.
+    evicted: u64,
 }
 
 /// One executor task: own a contiguous range of shards, answer the inbox,
@@ -1161,7 +1340,7 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
     mut states: Vec<ShardState<L>>,
     trace: T,
     policy: P,
-    memory: MemoryGauge,
+    memory: Memory,
     mut inbox: mpsc::UnboundedReceiver<Envelope>,
 ) {
     let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
@@ -1223,21 +1402,55 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                 for (shard, cmd) in &mut cmds {
                     let state = &mut states[usize::from(*shard - first_shard)];
                     let at = state.seq;
-                    // The gauge is the sum of what the dicts account, so it is
-                    // moved by the difference this command made to one of
-                    // them. Read either side of `apply` rather than inside it:
-                    // the handlers stay unaware there is a gauge at all.
-                    let before = state.dict.used_bytes();
-                    let answer = apply(
-                        &mut state.dict,
-                        &mut state.log,
-                        &mut state.seq,
-                        *shard,
-                        cmd,
-                        now,
-                        &policy,
-                    );
-                    memory.apply(before, state.dict.used_bytes());
+                    // Three ways a command is answered, and only the last one
+                    // reaches a handler.
+                    //
+                    // `Stats` is answered here rather than in `apply` because
+                    // what it reports — the eviction count — lives beside the
+                    // dict and not in it, and giving `apply` an arm that
+                    // could only ever answer half the fields would be an arm
+                    // whose answer is wrong.
+                    //
+                    // The refusal is here for the same reason in the other
+                    // direction: whether a write is over the ceiling is a
+                    // question about the node, and `apply` is deliberately a
+                    // function of one shard's own state.
+                    let answer = if matches!(cmd, Command::Stats) {
+                        Reply::Stats(Box::new(stats_of(state)))
+                    } else if memory.limit.mode == EvictionMode::NoEviction
+                        && cmd.denied_when_full()
+                        && memory.limit.exceeded(memory.gauge.used())
+                    {
+                        Reply::Error(ReplyError::OutOfMemory)
+                    } else {
+                        // The gauge is the sum of what the dicts account, so
+                        // it is moved by the difference this command made to
+                        // one of them. Read either side of `apply` rather
+                        // than inside it: the handlers stay unaware there is
+                        // a gauge at all.
+                        let before = state.dict.used_bytes();
+                        let answer = apply(
+                            &mut state.dict,
+                            &mut state.log,
+                            &mut state.seq,
+                            *shard,
+                            cmd,
+                            now,
+                            &policy,
+                        );
+                        memory.gauge.apply(before, state.dict.used_bytes());
+                        if memory.limit.mode == EvictionMode::AllKeysLru {
+                            // The command's key survives this. `apply` takes
+                            // a command's value but never its key — the trace
+                            // reads it after — so the route still names it.
+                            let spared = match cmd.route() {
+                                Route::Key(key) => Some(key),
+                                Route::Shard(_) | Route::Every | Route::Unaddressed => None,
+                            };
+                            evict_until_fits(state, *shard, &memory, &trace, spared);
+                        }
+                        answer
+                    };
                     trace.record(*shard, at, cmd, &answer);
                     replies.push(answer);
                 }
@@ -1267,7 +1480,7 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                     let shard = first_shard
                         + u16::try_from(offset).expect("a shard range is shorter than u16::MAX");
                     sweep_expired(state, shard, &trace, now, &policy);
-                    memory.apply(before, state.dict.used_bytes());
+                    memory.gauge.apply(before, state.dict.used_bytes());
                     // The durability point, and the only place in a shard that
                     // can afford to be one: `append` runs inside a handler that
                     // cannot `await`, so it must stay cheap, while this arm is
@@ -1327,6 +1540,104 @@ fn sweep_expired<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
         trace.record(shard, at, &Command::Del { key }, &Reply::Removed(true));
     }
     state.expire_cursor = next;
+}
+
+/// Reclaims from this shard while the node is over its ceiling, one sampled
+/// victim at a time, stopping when the figure fits or the shard is empty.
+///
+/// Synchronous, inside the executor loop, for the reason every handler is: a
+/// write that has to make room does so before its reply is sent, and nothing
+/// on this executor interleaves with it. What it costs is latency on the
+/// write that crossed the line, bounded by how many samples it takes to get
+/// back under — the shape an operator reads in `ARCHITECTURE.md`.
+///
+/// Each removal is a keyspace mutation: it takes a replication position,
+/// appends first, and reaches the trace as the `Del` it amounts to — the
+/// discipline [`sweep_expired`] set.
+///
+/// **The ceiling is the node's and the victims are this shard's**, so this
+/// terminates on this shard running out of keys to give rather than on the
+/// figure: a value larger than the whole ceiling leaves the node over it
+/// until something reclaims elsewhere. Looping instead would be a shard
+/// spinning against bytes it does not own.
+///
+/// `spared` is the key the command that triggered this addressed, and it is
+/// never the victim. Redis reaches the same place from the other side: it
+/// evicts *before* running the command, so the key being written does not yet
+/// exist to be chosen. Evicting here is what lets the decision be taken
+/// against the figure the write actually produced, and sparing the key is
+/// what keeps that from meaning a write can free room by undoing itself —
+/// which on a value larger than the ceiling is the difference between storing
+/// it and storing nothing.
+fn evict_until_fits<T: TraceSink, L: ReplicationLog>(
+    state: &mut ShardState<L>,
+    shard: u16,
+    memory: &Memory,
+    trace: &T,
+    spared: Option<&[u8]>,
+) {
+    while memory.limit.exceeded(memory.gauge.used()) {
+        let Some(victim) = state
+            .dict
+            .sample_oldest(&mut state.evict_cursor, EVICTION_SAMPLES)
+        else {
+            return;
+        };
+        // The sample offers the key just written only when it is the only
+        // one it met, since the write stamped it as the newest there is. So
+        // this is the shard saying it has nothing else to give, and stopping
+        // is the same answer the empty case above gives.
+        if spared == Some(victim.as_slice()) {
+            return;
+        }
+        let at = state.seq;
+        if append(&mut state.log, &mut state.seq, shard).is_err() {
+            return;
+        }
+        let before = state.dict.used_bytes();
+        state.dict.remove(&victim);
+        memory.gauge.apply(before, state.dict.used_bytes());
+        state.evicted += 1;
+        // The command an eviction is indistinguishable from, built after the
+        // removal for the reason the sweep builds its own there: it takes the
+        // key rather than cloning it to say the same thing twice.
+        trace.record(
+            shard,
+            at,
+            &Command::Del { key: victim },
+            &Reply::Removed(true),
+        );
+    }
+}
+
+/// The half of [`ShardStats`] the dict alone can state: a reading of the
+/// keyspace as it stands, rather than a total the shard has been running.
+///
+/// Above [`apply`] with the executor's helpers rather than below it with the
+/// dispatcher's, because it has two callers and the executor is the one that
+/// matters: [`stats_of`] fills in the counters this cannot see, and `apply`'s
+/// own `Stats` arm — which nothing routes to — answers with this alone.
+///
+/// # Panics
+///
+/// If a `usize` does not fit a `u64`, which no target this builds for has.
+fn keyspace_stats(dict: &Dict) -> ShardStats {
+    ShardStats {
+        keys: u64::try_from(dict.len()).expect("a length is a usize"),
+        ..ShardStats::default()
+    }
+}
+
+/// What this shard has counted, as [`Command::Stats`] reports it.
+///
+/// The keyspace figures are read from the dict here and now; the rest are
+/// running totals the shard has been maintaining. Nothing is computed across
+/// shards — summing is the edge's, because only the edge has every answer.
+fn stats_of<L>(state: &ShardState<L>) -> ShardStats {
+    ShardStats {
+        evicted: state.evicted,
+        ..keyspace_stats(&state.dict)
+    }
 }
 
 /// Runs one command against a shard's own state.
@@ -1494,6 +1805,15 @@ fn apply<L: ReplicationLog, P: ShardPolicy>(
             count,
             pattern,
         } => scan_step(dict, *cursor, *count, pattern.as_deref(), now, policy),
+
+        // Answered by the executor, which owns the counters this reports —
+        // see `run_executor`, which matches it before this is reached. The
+        // arm exists because the match has no wildcard, and it answers the
+        // half the dict can state and zero for the half it cannot. Routing
+        // one here would be a wiring mistake, and this is what it would cost:
+        // an `INFO` that reads low, never a panicked executor and never a
+        // figure nothing produced.
+        Command::Stats => Reply::Stats(Box::new(keyspace_stats(dict))),
     }
 }
 
@@ -2032,9 +2352,10 @@ mod tests {
             );
         }
 
-        let keyless: [(Command, Route<'_>); 3] = [
+        let keyless: [(Command, Route<'_>); 4] = [
             (Command::FlushDb, Route::Every),
             (Command::DbSize, Route::Every),
+            (Command::Stats, Route::Every),
             (
                 Command::ScanStep {
                     cursor: 0,
@@ -2727,6 +3048,105 @@ mod tests {
             Reply::Removed(true)
         );
         assert_eq!(gauge.used(), empty);
+    }
+
+    fn limited(ceiling: u64, mode: EvictionMode) -> ShardPool {
+        ShardPool::spawn_limited(
+            2,
+            1,
+            DictSeed { k0: 1, k1: 2 },
+            NoTrace,
+            MemoryLimit {
+                ceiling: Some(ceiling),
+                mode,
+            },
+        )
+    }
+
+    async fn evicted(pool: &ShardPool) -> u64 {
+        pool.dispatch_every(Command::Stats)
+            .await
+            .into_iter()
+            .map(|r| match r {
+                Reply::Stats(s) => s.evicted,
+                other => panic!("{other:?}"),
+            })
+            .sum()
+    }
+
+    /// Writes past the ceiling evict until the figure is under it again, and
+    /// each eviction is counted.
+    #[tokio::test]
+    async fn allkeys_lru_evicts_until_the_write_fits() {
+        let pool = limited(
+            2 * 8 * crate::dict::BUCKET_OVERHEAD + 3 * crate::dict::entry_bytes(b"k0", &[0; 64]),
+            EvictionMode::AllKeysLru,
+        );
+        for i in 0..3u8 {
+            assert_eq!(
+                pool.dispatch(set(&[b'k', b'0' + i], &[0u8; 64])).await,
+                Reply::Ok
+            );
+        }
+        assert_eq!(evicted(&pool).await, 0, "three entries fit exactly");
+        assert_eq!(pool.dispatch(set(b"k9", &[0u8; 64])).await, Reply::Ok);
+        assert!(pool.memory().used() <= pool.limit().ceiling.unwrap());
+        assert_eq!(evicted(&pool).await, 1);
+        assert_eq!(
+            pool.dispatch(get(b"k9")).await,
+            Reply::Bulk(Some(vec![0u8; 64])),
+            "the write that evicted is itself kept"
+        );
+    }
+
+    /// Under `noeviction` the write is refused, byte-exact, and nothing moves.
+    #[tokio::test]
+    async fn noeviction_refuses_a_write_over_the_ceiling_and_keeps_reads() {
+        // The ceiling is what two empty tables already cost, so the first
+        // write is the one that crosses it. The comparison is against what
+        // the node held *before* the command, as Redis's is: a write is never
+        // refused for the bytes it is about to add, only for the ones already
+        // there, so the write that crosses the line lands and the next one is
+        // refused.
+        let pool = limited(
+            2 * 8 * crate::dict::BUCKET_OVERHEAD,
+            EvictionMode::NoEviction,
+        );
+        assert_eq!(pool.dispatch(set(b"k0", &[0u8; 64])).await, Reply::Ok);
+        assert_eq!(
+            pool.dispatch(set(b"k1", &[0u8; 64])).await,
+            Reply::Error(ReplyError::OutOfMemory)
+        );
+        assert_eq!(
+            pool.dispatch(get(b"k0")).await,
+            Reply::Bulk(Some(vec![0u8; 64]))
+        );
+        assert_eq!(
+            pool.dispatch(Command::Del {
+                key: b"k0".to_vec()
+            })
+            .await,
+            Reply::Removed(true),
+            "a delete is never refused"
+        );
+        assert_eq!(
+            ReplyError::OutOfMemory.wire_text(),
+            "OOM command not allowed when used memory > 'maxmemory'."
+        );
+        assert_eq!(evicted(&pool).await, 0);
+    }
+
+    /// A write that cannot fit even on an empty shard stops at empty rather
+    /// than looping: the write lands, the figure is over, and the next write
+    /// starts evicting again.
+    #[tokio::test]
+    async fn a_value_larger_than_the_ceiling_empties_the_shard_and_stops() {
+        let pool = limited(1, EvictionMode::AllKeysLru);
+        assert_eq!(pool.dispatch(set(b"big", &[0u8; 1024])).await, Reply::Ok);
+        assert_eq!(
+            pool.dispatch(get(b"big")).await,
+            Reply::Bulk(Some(vec![0u8; 1024]))
+        );
     }
 
     #[tokio::test]
