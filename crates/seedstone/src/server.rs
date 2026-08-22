@@ -61,8 +61,13 @@ fn executors() -> u16 {
 /// Byte-exact to Redis: clients match on this text.
 pub const MAX_CLIENTS_REACHED: &str = "ERR max number of clients reached";
 
-/// The usage text, printed on any argument this binary does not understand.
-const USAGE: &str = "usage: seedstone [--bind ADDR:PORT] [--max-clients N] [--maxmemory SIZE] \
+/// The usage text, printed on any argument this binary does not understand,
+/// and by `--help`.
+///
+/// Public because the composition root answers `--help` with it before this
+/// module ever sees the arguments: a binary that cannot be asked what it
+/// takes is a binary someone has to read the source of.
+pub const USAGE: &str = "usage: seedstone [--bind ADDR:PORT] [--max-clients N] [--maxmemory SIZE] \
                      [--maxmemory-policy allkeys-lru|noeviction] [--requirepass-file PATH] \
                      [--no-auth]\nenv: SEEDSTONE_REQUIREPASS";
 

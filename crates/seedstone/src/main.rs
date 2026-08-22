@@ -7,16 +7,33 @@
 //! like logic belongs in [`seedstone::server`], where it can be tested without
 //! a process.
 
-use seedstone::server::{Config, Server};
+use seedstone::server::{Config, Server, USAGE};
 use seedstone_core::dict::DictSeed;
 use seedstone_service::RUN_ID_HEX;
 
 fn main() {
+    let mut args = std::env::args().skip(1).peekable();
+    // Answered before anything is parsed, bound, or drawn from the operating
+    // system, because both questions are about the file on disk rather than
+    // about a server: whoever asks is holding an unpacked archive and wants
+    // to know what it is. Only in first position — anywhere else they are
+    // arguments this binary does not understand, and are refused with the
+    // usage text like any other, which is the honest answer to
+    // `--bind :6379 --help`.
+    match args.peek().map(String::as_str) {
+        Some("--version") => {
+            println!("seedstone {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Some("--help") => {
+            println!("{USAGE}");
+            return;
+        }
+        _ => {}
+    }
     // The one place the process environment is read. Every layer below takes
     // it as a parameter, for the reason `from_args_and_env` states.
-    let cfg = match Config::from_args_and_env(std::env::args().skip(1), |name| {
-        std::env::var(name).ok()
-    }) {
+    let cfg = match Config::from_args_and_env(args, |name| std::env::var(name).ok()) {
         Ok(cfg) => cfg,
         Err(usage) => {
             eprintln!("{usage}");

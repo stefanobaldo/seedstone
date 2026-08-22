@@ -177,6 +177,13 @@ jobs:
       - name: build the server
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: cargo build --release -p seedstone --locked
+      # Here rather than in `release.yml` alone, so that the day a tag is
+      # pushed is not the first day this script runs. It packages the binary
+      # this job already built, unpacks it again and makes the result answer
+      # `--help` and `--version`; nothing is published.
+      - name: the release packaging runs
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: bash scripts/package-release.sh target/release/seedstone ci x86_64-unknown-linux-gnu "$RUNNER_TEMP/dist"
       # Every client lane but redis-cli authenticates. The password is a
       # literal: it protects nothing and exists so the authenticated path is
       # the one these lanes exercise. The redis-cli lane runs open on purpose,

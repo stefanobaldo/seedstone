@@ -1,0 +1,59 @@
+name: Release
+
+# A tag is what publishes; the manual trigger exists so the build and the
+# packaging can be proved on a runner without publishing anything.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# Only `gh release create` needs this. `ci.yml` stays read-only.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Pinned by SHA for the reason `ci.yml` states: a tag is a name its
+      # owner may move, and a release is the last place to accept that.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # `--locked` so what is published is built from the lockfile that was
+      # tested, not from whatever resolved on the day.
+      - run: cargo build --release -p seedstone --locked
+      # The binary reports its version in `INFO` and `HELLO`, so a tag that
+      # disagrees with `Cargo.toml` would publish an archive that lies about
+      # itself. Only a tag can disagree; a dispatch names no version.
+      - name: the tag and the crate agree
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(cargo pkgid -p seedstone | sed 's/.*#//')"
+          [ "$tag" = "$crate" ] || { echo "tag v$tag but Cargo.toml says $crate" >&2; exit 1; }
+      - name: package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && version="dispatch-${GITHUB_SHA::8}"
+          bash scripts/package-release.sh target/release/seedstone "$version" x86_64-unknown-linux-gnu dist
+      # The notes are the changelog's section for this version, and a
+      # candidate has none of its own: `docs/RELEASING.md` keeps a
+      # candidate's entries under `[Unreleased]` until the final is cut, so
+      # that is what a missing section falls back to.
+      - name: publish
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          section() {
+            awk -v want="## [$1]" 'index($0, want) == 1 { inside = 1; next }
+                                   inside && /^## \[/ { exit }
+                                   inside { print }' CHANGELOG.md
+          }
+          section "${GITHUB_REF_NAME#v}" > notes.md
+          [ -s notes.md ] || section Unreleased > notes.md
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease";; esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md $prerelease
