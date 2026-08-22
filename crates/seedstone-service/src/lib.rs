@@ -75,7 +75,7 @@ use std::future::{Future, poll_fn};
 use std::mem::take;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -136,6 +136,35 @@ use tokio::time::Instant;
 ///   for the room it grew to hold them, so a `Vec` that doubled past its
 ///   element count is undercounted by up to a further 2×.
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+
+/// How many bytes of key names one `KEYS` reply may accumulate at the edge.
+///
+/// [`keys`] gathers the whole answer here before any of it reaches the wire —
+/// documented as the cost of the shape and the reason `SCAN` exists — and this
+/// is the bound on it. A walk whose gathered key bytes pass this is abandoned
+/// and answered with [`KEYS_TOO_LARGE`].
+///
+/// It is [`MAX_REQUEST_BYTES`] again, for the reason stated there: one request
+/// may make one connection hold this much, on the request side or on the reply
+/// side, and the two halves are held to the same figure so the pair is one
+/// number rather than two to keep in step.
+///
+/// **It prices the key bytes and nothing else.** Not the `Vec` per key, not the
+/// `$<len>\r\n` each one costs on the wire, not the capacity the gathering
+/// vectors grew to hold them. The encoded reply is therefore larger than this
+/// by a per-key constant, and this is a bound on accumulation rather than a
+/// measurement of the frame — the same undercounting [`MAX_REQUEST_BYTES`]
+/// admits to on the parsed side, and acceptable for the same reason: the
+/// figure is a ceiling on the worst case one peer can impose, not a memory
+/// budget.
+pub const KEYS_REPLY_BYTES: usize = 64 * 1024 * 1024;
+
+/// What a peer whose `KEYS` reply outgrew [`KEYS_REPLY_BYTES`] is told.
+///
+/// Redis has no such refusal — it answers every `KEYS`, however large, and
+/// blocks for as long as that takes — so there is no byte-exact text to match
+/// and this one says what the client can do instead.
+pub const KEYS_TOO_LARGE: &str = "ERR KEYS reply exceeds the per-request limit; use SCAN";
 
 /// Bytes a connection's read buffer starts at, and sheds back to.
 ///
@@ -777,7 +806,7 @@ impl Unbatched {
         match self {
             Self::FanOut { cmds, fold } => fan_out(router, cmds, fold).await,
             Self::Every(cmd) => broadcast(router, cmd).await,
-            Self::Keys(pattern) => keys(router, pattern).await,
+            Self::Keys(pattern) => keys(router, pattern, KEYS_REPLY_BYTES).await,
             Self::Scan {
                 cursor,
                 pattern,
@@ -1379,6 +1408,18 @@ async fn broadcast<R: Router>(router: &R, cmd: Command) -> Frame {
     }
 }
 
+/// Why one shard's walk in [`keys`] stopped before it had finished.
+enum WalkStop {
+    /// The shard did not run a step; the peer hears this error's own text.
+    Shard(ReplyError),
+    /// The gathered key bytes passed the ceiling — see [`KEYS_REPLY_BYTES`].
+    ///
+    /// Distinct from [`Shard`](WalkStop::Shard) because the two are different
+    /// answers to different faults: one is the request asking for more than a
+    /// reply may hold, the other is the node failing to serve it.
+    TooLarge,
+}
+
 /// Every key matching `pattern`, gathered from every shard.
 ///
 /// One cursor loop per shard, run concurrently and joined. Each step is an
@@ -1414,10 +1455,27 @@ async fn broadcast<R: Router>(router: &R, cmd: Command) -> Frame {
 /// The walk is `O(keyspace)` and competes for CPU with traffic while it runs.
 /// What it no longer does is stop the server for its duration, which is the
 /// difference worth having and not the same thing as being cheap.
-async fn keys<R: Router>(router: &R, pattern: Vec<u8>) -> Frame {
+///
+/// **What is accumulated is bounded.** The key bytes every walk gathers are
+/// counted into one shared total as they arrive, and the first walk to see
+/// that total past `ceiling` — [`KEYS_REPLY_BYTES`] on the server's own path —
+/// abandons, which makes the whole reply [`KEYS_TOO_LARGE`] rather than a
+/// short array nobody could tell from a small keyspace. The total is shared
+/// because the ceiling is on the answer, not on any one shard's share of it.
+/// It is checked once per step rather than once per key, so what is held can
+/// exceed the ceiling by up to one step's keys per shard — a bound with a
+/// known slack, which is what a ceiling on accumulation needs to be.
+async fn keys<R: Router>(router: &R, pattern: Vec<u8>, ceiling: usize) -> Frame {
+    // Shared by every walk, and a plain `&` reaches all of them: these are
+    // futures joined inside one task, not tasks of their own. `Relaxed` is the
+    // whole ordering requirement — nothing is published alongside the count,
+    // and the only question asked of it is whether the total has passed the
+    // ceiling, which a walk that misses by one step asks again a step later.
+    let gathered = AtomicUsize::new(0);
     let walks: Vec<_> = (0..router.shards())
         .map(|shard| {
             let pattern = pattern.clone();
+            let gathered = &gathered;
             async move {
                 let mut found: Vec<Vec<u8>> = Vec::new();
                 let mut cursor = 0u64;
@@ -1443,18 +1501,29 @@ async fn keys<R: Router>(router: &R, pattern: Vec<u8>) -> Frame {
                         .await;
                     match reply {
                         Reply::Scan { cursor: next, keys } => {
+                            // One add per step, not per key: the ceiling
+                            // bounds an accumulation, and paying an atomic
+                            // per key would price the bound at more than the
+                            // gathering it guards.
+                            let step_bytes: usize = keys.iter().map(Vec::len).sum();
                             found.extend(keys);
+                            let total = gathered
+                                .fetch_add(step_bytes, Ordering::Relaxed)
+                                .saturating_add(step_bytes);
+                            if total > ceiling {
+                                return Err(WalkStop::TooLarge);
+                            }
                             cursor = next;
                             if cursor == 0 {
                                 return Ok(found);
                             }
                         }
-                        Reply::Error(error) => return Err(error),
+                        Reply::Error(error) => return Err(WalkStop::Shard(error)),
                         // A router that answered something else did not run
                         // the step, and there is no partial walk to report:
                         // this is the shard failing to answer, spelled the way
                         // the dispatch path already spells that.
-                        _ => return Err(ReplyError::ShardUnavailable),
+                        _ => return Err(WalkStop::Shard(ReplyError::ShardUnavailable)),
                     }
                 }
             }
@@ -1467,8 +1536,11 @@ async fn keys<R: Router>(router: &R, pattern: Vec<u8>) -> Frame {
             Ok(found) => all.extend(found),
             // One shard that could not answer makes the whole reply wrong, and
             // a short array is a wrong answer a client cannot detect. Say so
-            // instead.
-            Err(error) => return Frame::Error(error.wire_text().to_owned()),
+            // instead — and the same holds for a walk that abandoned on the
+            // ceiling, which is why that is an error too rather than the
+            // partial answer the other walks did gather.
+            Err(WalkStop::Shard(error)) => return Frame::Error(error.wire_text().to_owned()),
+            Err(WalkStop::TooLarge) => return Frame::Error(KEYS_TOO_LARGE.to_owned()),
         }
     }
     all.sort_unstable();
@@ -4070,6 +4142,54 @@ mod tests {
         );
     }
 
+    /// The ceiling on a `KEYS` reply, from both sides.
+    ///
+    /// Both halves are the test. A walk that abandoned unconditionally would
+    /// pass the first assertion on its own, and one that counted nothing
+    /// would pass the second; only a walk that counts what it gathers and
+    /// stops on the ceiling passes both. The keyspace is the same for both,
+    /// because a walk gathers rather than writes.
+    #[tokio::test]
+    async fn a_keys_reply_past_the_ceiling_is_refused_rather_than_gathered() {
+        let pool = ShardPool::spawn(4, 2, DictSeed { k0: 9, k1: 4 }, NoTrace);
+        // 64 names of 2 KiB each: 128 KiB of key bytes, far past the 4 KiB
+        // ceiling below and nowhere near the unbounded one.
+        for i in 0..64u32 {
+            let mut key = format!("{i:02}-").into_bytes();
+            key.resize(2 * 1024, b'k');
+            pool.dispatch(Command::Set {
+                key,
+                value: b"v".to_vec(),
+                expiry: None,
+                cond: None,
+                keep_ttl: false,
+                get: false,
+            })
+            .await;
+        }
+
+        // Matched rather than compared, here and below, so a failure reports
+        // the shape it got instead of printing 128 KiB of key names.
+        match keys(&pool, b"*".to_vec(), 4096).await {
+            Frame::Error(text) => assert_eq!(text, KEYS_TOO_LARGE),
+            Frame::Array(gathered) => panic!(
+                "128 KiB of key names under a 4 KiB ceiling gathered {} keys instead of refusing",
+                gathered.len()
+            ),
+            other => panic!("KEYS answered {other:?} rather than refusing"),
+        }
+
+        let answer = keys(&pool, b"*".to_vec(), usize::MAX).await;
+        let Frame::Array(found) = answer else {
+            panic!("an unbounded KEYS must answer an array, got {answer:?}");
+        };
+        assert_eq!(
+            found.len(),
+            64,
+            "every key must survive a ceiling nothing can reach"
+        );
+    }
+
     /// The cursor packing's three claims, at the edges where a bit-shift is
     /// wrong if it is wrong anywhere.
     #[test]
@@ -5970,6 +6090,7 @@ mod tests {
     async fn every_error_constant_is_frame_safe() {
         for (name, text) in [
             ("INVALID_CURSOR", INVALID_CURSOR),
+            ("KEYS_TOO_LARGE", KEYS_TOO_LARGE),
             ("UNRENDERABLE_REPLY", UNRENDERABLE_REPLY),
             ("SYNTAX_ERROR", SYNTAX_ERROR),
             ("NOPROTO", NOPROTO),

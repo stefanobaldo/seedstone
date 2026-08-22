@@ -165,8 +165,10 @@ report a key twice; `SCAN` may, exactly as in Redis.
 bounded steps that yield between them, and every shard walks at once, so
 nothing queues behind it — but it competes for CPU with traffic for as long as
 it runs, and it accumulates the whole answer at the edge before any of it
-reaches the wire. Not blocking is the difference worth having; it is not the
-same thing as being cheap. Use `SCAN`.
+reaches the wire. Above a per-request ceiling on the reply's size the walk is
+abandoned and answered with an error that says to use `SCAN`; the ceiling is
+the same per-connection figure the request side is held to. Not blocking is the
+difference worth having; it is not the same thing as being cheap. Use `SCAN`.
 
 **A `SCAN` cursor names the shard it is walking, and belongs to one process.**
 The cursor packs a shard number and that shard's own cursor into the single
