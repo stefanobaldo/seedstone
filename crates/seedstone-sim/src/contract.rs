@@ -196,6 +196,15 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
         },
     ),
     (
+        b"CONFIG",
+        Coverage::NotEmitted {
+            reason: "it reports the node's configuration, which no client \
+                     model is about: the values are fixed for the run, so a \
+                     client that read one would be asserting a constant it \
+                     was handed at startup.",
+        },
+    ),
+    (
         b"QUIT",
         Coverage::NotEmitted {
             reason: "it closes the connection the rest of the burst is being \

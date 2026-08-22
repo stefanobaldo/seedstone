@@ -369,6 +369,11 @@ impl Server {
         let node = NodeInfo {
             version: env!("CARGO_PKG_VERSION"),
             tcp_port: self.local_addr.port(),
+            // The address the kernel gave out, not the one that was asked
+            // for: with an unspecified address the two differ, and `CONFIG
+            // GET bind` is read by an operator checking what is reachable.
+            bind: self.local_addr.ip().to_string(),
+            max_clients: self.max_clients,
             started: tokio::time::Instant::now(),
             connected: Arc::new(AtomicU64::new(0)),
             now_unix_millis: wall_clock,
