@@ -62,7 +62,9 @@
 //!   constants and the status texts.
 
 use seedstone_core::memory::MemoryGauge;
-use seedstone_core::shard::{Command, Cond, Expiry, Reply, ReplyError, Router, parse_i64};
+use seedstone_core::shard::{
+    Command, Cond, Expiry, Reply, ReplyError, Router, ShardStats, parse_i64,
+};
 use seedstone_resp::{Decoder, DecoderLimits, Frame, ParseError, encode};
 use std::future::{Future, poll_fn};
 use std::mem::take;
@@ -612,7 +614,7 @@ impl Unbatched {
                 pattern,
                 count,
             } => scan(router, cursor, pattern, count).await,
-            Self::Info(wanted) => Frame::Bulk(info(node, &wanted).into_bytes()),
+            Self::Info(wanted) => Frame::Bulk(info(router, node, &wanted).await.into_bytes()),
         }
     }
 }
@@ -1044,12 +1046,12 @@ where
 /// The answer to a reply this layer holds but cannot turn into the frame the
 /// request is owed.
 ///
-/// Two places can meet one, and neither is reachable from anything a peer can
-/// send: [`reply_to_frame`] handed a scan step, and [`fan_out`]'s array fold
-/// handed something that is not a bulk. Both would be a wiring mistake made
-/// here, and both answer this rather than a frame of the wrong shape — one bad
-/// reply on one connection, instead of a stream the client parses happily and
-/// reads wrong.
+/// Three places can meet one, and none is reachable from anything a peer can
+/// send: [`reply_to_frame`] handed a scan step or a shard's counters, and
+/// [`fan_out`]'s array fold handed something that is not a bulk. All would be
+/// a wiring mistake made here, and all answer this rather than a frame of the
+/// wrong shape — one bad reply on one connection, instead of a stream the
+/// client parses happily and reads wrong.
 const UNRENDERABLE_REPLY: &str = "ERR internal reply could not be rendered";
 
 /// Translates a shard's [`Reply`] into the frame that carries it.
@@ -1065,14 +1067,22 @@ fn reply_to_frame(reply: Reply) -> Frame {
         Reply::Bulk(Some(value)) => Frame::Bulk(value),
         Reply::Removed(removed) => Frame::Integer(i64::from(removed)),
         Reply::Integer(n) => Frame::Integer(n),
-        // A scan step's reply never reaches a client under this name. It is
-        // the shard-side half of a walk the edge drives itself, and whoever
-        // drives one reads the cursor and the keys directly — a client that
-        // is handed a cursor has to be handed the packed one, which only the
-        // driver can build. Nothing routes a step here today; the arm is what
-        // keeps a routing mistake made later a bad reply on one connection
-        // rather than a panicked connection task.
-        Reply::Scan { .. } => Frame::Error(UNRENDERABLE_REPLY.into()),
+        // Neither of these reaches a client under its own name, and both are
+        // refused rather than rendered for the same reason: each is one
+        // shard's half of something the edge assembles, and a peer handed the
+        // half would have nothing on the wire to tell it so.
+        //
+        // A scan step is the shard-side half of a walk the edge drives
+        // itself; whoever drives one reads the cursor and the keys directly,
+        // and a client that is handed a cursor has to be handed the packed
+        // one, which only the driver can build. A shard's counters are the
+        // per-shard half of what `INFO` sums; rendered as the node's they
+        // would report a keyspace a fraction of its real size.
+        //
+        // Nothing routes either here today. The arm is what keeps a routing
+        // mistake made later a bad reply on one connection rather than a
+        // plausible answer over a fraction of the truth.
+        Reply::Scan { .. } | Reply::Stats(_) => Frame::Error(UNRENDERABLE_REPLY.into()),
         // No `safe_error` here, and that is not an omission. A shard error is
         // a [`ReplyError`] variant, so its text is a literal in `shard.rs`
         // rather than anything a router composed — the type is what rules out
@@ -1880,7 +1890,7 @@ const INFO_WHOLE_DOCUMENT: [&[u8]; 3] = [b"all", b"default", b"everything"];
 ///
 /// Only what this node can state truthfully is printed. A field invented to
 /// fill out the section is a number some dashboard will plot.
-fn info(node: &NodeInfo, wanted: &[Vec<u8>]) -> String {
+async fn info<R: Router>(router: &R, node: &NodeInfo, wanted: &[Vec<u8>]) -> String {
     use std::fmt::Write as _;
 
     // One of the whole-document names anywhere in the list drops the filter
@@ -1931,7 +1941,41 @@ fn info(node: &NodeInfo, wanted: &[Vec<u8>]) -> String {
             human_bytes(used),
         );
     }
+    if asked_for(b"stats") {
+        // The broadcast is paid for only by a request that asks for this
+        // section: `INFO memory` reaches no shard at all, and a scrape that
+        // wants everything pays it once.
+        let stats = gather_stats(router).await;
+        let _ = write!(text, "# Stats\r\nevicted_keys:{}\r\n\r\n", stats.evicted);
+    }
     text
+}
+
+/// Sums every shard's counters into the node's.
+///
+/// Field by field, because that is the whole of the arithmetic: each figure
+/// is a count of things that happened on one shard, and what an operator asks
+/// about is how many happened on the node. A shard that answers anything but
+/// [`Reply::Stats`] contributes nothing rather than failing the document —
+/// `INFO` is what an operator reads when something is already wrong, and a
+/// scrape that fails entirely because one shard is unreachable is a scrape
+/// that goes blind exactly when it is needed.
+async fn gather_stats<R: Router>(router: &R) -> ShardStats {
+    let mut total = ShardStats::default();
+    for reply in router.dispatch_every(Command::Stats).await {
+        if let Reply::Stats(stats) = reply {
+            total.keys += stats.keys;
+            total.expires += stats.expires;
+            total.evicted += stats.evicted;
+            total.hits += stats.hits;
+            total.misses += stats.misses;
+            total.expired += stats.expired;
+            for (sum, count) in total.calls.iter_mut().zip(stats.calls) {
+                *sum += count;
+            }
+        }
+    }
+    total
 }
 
 /// Redis's `_human` spelling: two decimals and a binary unit, `1.23K`,
@@ -2421,6 +2465,7 @@ fn wrong_arity(name: &str) -> String {
 mod tests {
     use super::*;
     use seedstone_core::dict::DictSeed;
+    use seedstone_core::memory::{EvictionMode, MemoryLimit};
     use seedstone_core::shard::{NoTrace, ShardPool};
     use seedstone_resp::{MAX_ARRAY_LEN, MAX_BULK_LEN, parse};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2475,6 +2520,61 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("used_memory_human:"), "{text}");
+    }
+
+    /// `evicted_keys` is the sum of what the shards report, and it is a
+    /// figure this layer cannot hold itself: the count lives beside each
+    /// shard's dict, so the section is a broadcast rather than a field.
+    #[tokio::test]
+    async fn info_stats_reports_the_evictions_the_shards_counted() {
+        // A ceiling of what the empty tables already cost, so the first write
+        // crosses it and every write after that evicts.
+        let pool = ShardPool::spawn_limited(
+            4,
+            2,
+            DictSeed { k0: 1, k1: 2 },
+            NoTrace,
+            MemoryLimit {
+                ceiling: Some(4 * 8 * 24),
+                mode: EvictionMode::AllKeysLru,
+            },
+        );
+        let mut node = NodeInfo::for_tests();
+        node.memory = pool.memory();
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server, pool, node));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        for i in 0..8u8 {
+            encode(&req(&["SET", &format!("k{i}"), "0123456789"]), &mut out);
+        }
+        encode(&req(&["INFO", "stats"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 9).await;
+        let Frame::Bulk(text) = &frames[8] else {
+            panic!("INFO answered {:?}", frames[8])
+        };
+        let text = String::from_utf8(text.clone()).unwrap();
+        assert!(text.starts_with("# Stats\r\n"), "{text}");
+        let evicted: u64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("evicted_keys:"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(evicted > 0, "nothing was evicted under a ceiling: {text}");
+    }
+
+    /// A shard's counters are not a wire answer: an operator asks about the
+    /// node, and one shard's figures rendered as the node's would be a
+    /// keyspace a fraction of its real size with nothing to say so.
+    #[test]
+    fn one_shards_counters_are_refused_rather_than_rendered() {
+        assert_eq!(
+            reply_to_frame(Reply::Stats(Box::default())),
+            Frame::Error(UNRENDERABLE_REPLY.to_owned())
+        );
     }
 
     #[tokio::test]
@@ -4717,6 +4817,7 @@ mod tests {
             ReplyError::WouldOverflow,
             ReplyError::ShardUnavailable,
             ReplyError::LogWriteFailed,
+            ReplyError::OutOfMemory,
         ];
         for error in every {
             // Exhaustiveness: adding a variant makes this match non-exhaustive
@@ -4726,7 +4827,8 @@ mod tests {
                 ReplyError::NotAnInteger
                 | ReplyError::WouldOverflow
                 | ReplyError::ShardUnavailable
-                | ReplyError::LogWriteFailed => {}
+                | ReplyError::LogWriteFailed
+                | ReplyError::OutOfMemory => {}
             }
 
             let text = error.wire_text();
