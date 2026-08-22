@@ -122,6 +122,17 @@ whose cursor it carries, and a command every shard must see, such as emptying
 the keyspace or counting it. Multi-key commands fan out from this layer, and so
 does the whole-keyspace walk — one cursor loop per shard, run concurrently.
 
+Authentication is per-connection state in that same layer: one flag, and a gate
+a decoded command passes before the router ever sees it — so a peer that has
+not authenticated moves no key and learns nothing about the keyspace, not even
+from how long a refusal took. Only the attempt itself, the handshake that can
+carry it, and the goodbye are let through, and which side of the gate a command
+falls on is decided exhaustively, so one added later does not compile until
+somebody has said which. The secret is not that layer's to find: it is a
+dependency the composition root reads from a file or the environment and hands
+down, which is why a node configured without one starts every connection
+already through the gate, and why the simulated node is handed none at all.
+
 That layer is its own crate, and the dependency arrow is the reason. It depends
 on the core and on the codec; the core depends on neither. An adapter the core
 depends on is not at the edge — and with the arrow pointing this way, a second
@@ -226,17 +237,22 @@ the refusal. Under `allkeys-lru` the crossing is reclaimed immediately and the
 figure is back under before the reply goes out; under `noeviction` the node
 sits marginally over its ceiling until something is deleted or expires.
 
-**The slow log and the latency monitor are disabled, by construction.**
-`SLOWLOG GET` is empty, `LATENCY LATEST` is empty, and `CONFIG GET` reports
+**The slow log and the latency monitor are disabled, by construction.** Nothing
+here times a handler, so there is no threshold at which a command would be
+recorded and no sample a reading could be drawn from. `SLOWLOG GET` is empty,
+`LATENCY LATEST` is empty, and `CONFIG GET` reports
 `slowlog-log-slower-than -1` and `latency-monitor-threshold 0` — which is what
 Redis itself reports with both monitors off, so the readings and the
-configuration agree. Only the subcommands named here are answered: the ones
-Redis serves *from* a disabled monitor but this server has no reading for —
-`LATENCY DOCTOR`, `LATENCY GRAPH`, `SLOWLOG HELP` — are refused as unknown
-subcommands rather than given a sentence nobody measured.
+configuration agree. Answering rather than refusing is the deliberate half: a
+refusal carries a different fact — that the command does not exist — and an
+exporter reads the first as the node's answer and the second as a failed
+scrape. The exceptions are the subcommands Redis serves *from* a monitor this
+server has no reading for — `LATENCY DOCTOR`, `LATENCY GRAPH`, `SLOWLOG HELP`
+— which are refused as unknown subcommands rather than given a sentence nobody
+measured.
 
-Nothing here times a handler, so `commandstats` carries call counts and no
-`usec` fields; a zero there would be a measurement this server does not take,
+The same absence of timing shapes `commandstats`, which carries call counts and
+no `usec` fields; a zero there would be a measurement this server does not take,
 printed as if it did. Per-command timing is a measurement campaign's to add,
 with a cost stated, not a field to fill in. **That omission costs a metric, and
 the cost is taken deliberately.** The exporter this project is gated on parses
@@ -279,7 +295,16 @@ true.
   ceiling to be under, and that shape trades exactness for truth — where keys
   may be reclaimed at any moment, a client's model of them becomes an upper
   bound rather than an equality, and the shapes with no ceiling keep the
-  exact one.
+  exact one. That shape is swept as a step of its own rather than by widening
+  the first: the first is the shape whose cost was measured, and every second
+  added to it is paid for in seeds, which are detection power. Every sweep ends
+  by printing how many of the simulated client's declared command forms it
+  reached and naming the ones it did not. A shape with no ceiling never asks
+  the node about one, so the sweep of the standard shape names `INFO memory`
+  and `INFO stats` as unreached while the bounded one reaches every form. That
+  line is printed rather than asserted, because what a shape does not reach is
+  a property of the shape and not a defect — and printed every time, because a
+  coverage claim nobody states is what it exists to end.
 - **The simulator may not reach production.** One gate proves the simulation
   crate is absent from the production dependency graph — with a positive
   control, so it cannot pass by searching an empty graph — and another compiles
@@ -290,6 +315,11 @@ true.
   third party's cache-backend test suite runs against it from an archive
   checked against a pinned digest, in a container pinned by the digest of its
   multi-architecture image, so the interpreter that client pair needs is the
-  same bytes on every machine. That suite is what finishes the pipeline. They are the only
-  judges in it that this project did not write, and the last of them judges the
-  client pair that lane exercises rather than the protocol in the abstract.
+  same bytes on every machine. A stock Prometheus exporter finishes the
+  pipeline, pinned the same way, given no flag it would not be given for
+  Redis and held to one standard: it must log no refused command. An exporter
+  logs every command a server refuses, so an empty error log is what scraping
+  this node without adjustment means mechanically. They are the only judges in
+  the pipeline that this project did not write, and the last two judge what
+  they are — one pinned client pair, one pinned exporter — rather than the
+  protocol in the abstract.
