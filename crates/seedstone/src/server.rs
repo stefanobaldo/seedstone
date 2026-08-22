@@ -15,7 +15,7 @@ use seedstone_core::dict::DictSeed;
 use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{NoTrace, ShardPool};
 use seedstone_resp::{Frame, encode};
-use seedstone_service::{NodeInfo, serve_connection};
+use seedstone_service::{NodeInfo, Secret, serve_connection};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -63,10 +63,26 @@ pub const MAX_CLIENTS_REACHED: &str = "ERR max number of clients reached";
 
 /// The usage text, printed on any argument this binary does not understand.
 const USAGE: &str = "usage: seedstone [--bind ADDR:PORT] [--max-clients N] [--maxmemory SIZE] \
-                     [--maxmemory-policy allkeys-lru|noeviction]";
+                     [--maxmemory-policy allkeys-lru|noeviction] [--requirepass-file PATH] \
+                     [--no-auth]\nenv: SEEDSTONE_REQUIREPASS";
+
+/// The environment variable the password may arrive in instead of a file.
+///
+/// A path and a variable, and never an argument: a command line is readable by
+/// every other process on the host, and a password that has to be typed there
+/// is a password that ends up in a shell history and a process listing. The
+/// file is the form an orchestrator mounts a secret as; the variable is the
+/// form it injects one as.
+pub const PASSWORD_ENV: &str = "SEEDSTONE_REQUIREPASS";
 
 /// What the binary was asked to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy` and not comparable, because [`password`](Self::password) is
+/// neither: a secret that can be copied implicitly is a secret with more
+/// copies than anyone counted, and one with an `==` is one that can be
+/// compared in variable time by any caller. `Debug` is safe — the secret
+/// redacts itself.
+#[derive(Debug, Clone)]
 pub struct Config {
     /// The address to listen on.
     pub bind: SocketAddr,
@@ -74,6 +90,16 @@ pub struct Config {
     pub max_clients: usize,
     /// The ceiling the keyspace is held under, and what happens at it.
     pub limit: MemoryLimit,
+    /// The password every connection must present, or `None` on a node that
+    /// asks for none.
+    pub password: Option<Secret>,
+    /// Whether running with no password was asked for in so many words.
+    ///
+    /// Kept beside the absent password rather than folded into it, because
+    /// the two are different configurations: `None` with this unset is a
+    /// default that only loopback tolerates, and `None` with it set is a
+    /// decision an operator wrote down.
+    pub no_auth: bool,
 }
 
 impl Default for Config {
@@ -82,6 +108,8 @@ impl Default for Config {
             bind: DEFAULT_BIND,
             max_clients: DEFAULT_MAX_CLIENTS,
             limit: MemoryLimit::default(),
+            password: None,
+            no_auth: false,
         }
     }
 }
@@ -109,8 +137,47 @@ impl Config {
     /// ceiling to reach would be accepting a flag that does nothing while
     /// reading as though it does.
     pub fn from_args(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        Self::from_args_and_env(args, |_| None)
+    }
+
+    /// Parses the command line against an environment.
+    ///
+    /// The environment arrives as a function rather than being read here for
+    /// the reason every other input to this workspace does: a process-global
+    /// read is not a parameter, and a rule about where a password may come
+    /// from is exactly the rule that has to be testable without one.
+    ///
+    /// # The password, and the three ways of getting it wrong
+    ///
+    /// It comes from a file or from [`PASSWORD_ENV`], never from an argument
+    /// — see that constant. Both at once is refused rather than resolved by
+    /// precedence: an operator who set two has one in mind, and picking for
+    /// them is picking wrong half the time. `--no-auth` beside either is
+    /// refused for the same reason, being the flat contradiction of it. An
+    /// empty password is refused wherever it comes from, because a file that
+    /// failed to be written and a variable that expanded to nothing both look
+    /// exactly like this, and neither should start a server that answers
+    /// `AUTH ""`.
+    ///
+    /// # The bind that must be defended
+    ///
+    /// A bind outside loopback with no password is refused unless `--no-auth`
+    /// says so deliberately. [`DEFAULT_BIND`] has always kept an unconfigured
+    /// node off the network; this is the other half of the same property, for
+    /// the node whose operator did configure an address.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_args`](Self::from_args), plus the four refusals above.
+    pub fn from_args_and_env(
+        args: impl Iterator<Item = String>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, String> {
         let mut cfg = Self::default();
         let mut args = args;
+        // Held aside like `policy` below, and for the same reason: whether a
+        // password is acceptable depends on flags that may come after it.
+        let mut password_file: Option<String> = None;
         // Held aside rather than written straight into `cfg`, because whether
         // a policy is acceptable depends on a flag that may come after it.
         let mut policy = None;
@@ -150,8 +217,22 @@ impl Config {
                         refused(&format!("--maxmemory-policy: not a policy: {value}"))
                     })?);
                 }
+                "--requirepass-file" => password_file = Some(value_for(&flag, &mut args)?),
+                "--no-auth" => cfg.no_auth = true,
                 other => return Err(refused(&format!("unknown argument: {other}"))),
             }
+        }
+        cfg.password = password_from(password_file.as_deref(), &env)?;
+        if cfg.no_auth && cfg.password.is_some() {
+            return Err(refused(
+                "--no-auth: a password was configured as well; choose one",
+            ));
+        }
+        if !cfg.bind.ip().is_loopback() && cfg.password.is_none() && !cfg.no_auth {
+            return Err(refused(
+                "a bind outside loopback needs a password: give --requirepass-file PATH or set \
+                 SEEDSTONE_REQUIREPASS, or pass --no-auth to run open on purpose",
+            ));
         }
         // After the loop, because the two flags may arrive in either order.
         match (policy, cfg.limit.ceiling) {
@@ -165,6 +246,51 @@ impl Config {
         }
         Ok(cfg)
     }
+}
+
+/// The configured password, from the file or the environment.
+///
+/// Reading the file here rather than in the flag loop is what lets "both at
+/// once" be one refusal instead of two half-rules: the loop records what was
+/// asked for, and this decides whether the answer is a configuration.
+fn password_from(
+    file: Option<&str>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<Secret>, String> {
+    let from_env = env(PASSWORD_ENV);
+    let Some(path) = file else {
+        return match from_env {
+            Some(value) => Ok(Some(non_empty(value.into_bytes(), PASSWORD_ENV)?)),
+            None => Ok(None),
+        };
+    };
+    if from_env.is_some() {
+        return Err(refused(
+            "--requirepass-file and SEEDSTONE_REQUIREPASS are both set: choose one",
+        ));
+    }
+    let mut bytes = std::fs::read(path)
+        .map_err(|error| refused(&format!("--requirepass-file: {path}: {error}")))?;
+    // One trailing newline, in either spelling: every editor and every
+    // `printf` that writes a secret to a file leaves one, and a password with
+    // an invisible byte on the end is a support ticket nobody solves. More
+    // than one is left alone — that is a file whose content was meant.
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    Ok(Some(non_empty(bytes, "--requirepass-file")?))
+}
+
+/// A password with bytes in it, or the refusal that says where the empty one
+/// came from.
+fn non_empty(bytes: Vec<u8>, source: &str) -> Result<Secret, String> {
+    if bytes.is_empty() {
+        return Err(refused(&format!("{source}: the password is empty")));
+    }
+    Ok(Secret::new(bytes))
 }
 
 /// The value that must follow `flag`.
@@ -184,6 +310,7 @@ pub struct Server {
     local_addr: SocketAddr,
     max_clients: usize,
     pool: ShardPool,
+    password: Option<Secret>,
 }
 
 impl Server {
@@ -208,6 +335,7 @@ impl Server {
             local_addr,
             max_clients: cfg.max_clients,
             pool: ShardPool::spawn_limited(SHARDS, executors(), seed, NoTrace, cfg.limit),
+            password: cfg.password,
         })
     }
 
@@ -242,7 +370,7 @@ impl Server {
             now_unix_millis: wall_clock,
             memory: self.pool.memory(),
             limit: self.pool.limit(),
-            password: None,
+            password: self.password.clone(),
         };
         loop {
             tokio::select! {
@@ -346,8 +474,8 @@ fn wall_clock() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_BIND, EvictionMode, MAX_CLIENTS_REACHED, MemoryLimit, SHARDS, USAGE,
-        executors,
+        Config, DEFAULT_BIND, EvictionMode, MAX_CLIENTS_REACHED, MemoryLimit, PASSWORD_ENV, SHARDS,
+        USAGE, executors,
     };
 
     /// Whatever this host answers, the count has to be one the pool accepts:
@@ -365,8 +493,10 @@ mod tests {
         assert_eq!(cfg.bind.to_string(), "127.0.0.1:6379");
         assert_eq!(cfg.max_clients, 10_000);
 
+        // `--no-auth`, because an open bind with no password no longer
+        // parses: see `an_open_bind_needs_a_password_or_an_explicit_no_auth`.
         let cfg = Config::from_args(
-            ["--bind", "0.0.0.0:7000", "--max-clients", "64"]
+            ["--bind", "0.0.0.0:7000", "--max-clients", "64", "--no-auth"]
                 .iter()
                 .map(ToString::to_string),
         )
@@ -433,10 +563,105 @@ mod tests {
     }
 
     /// The default is loopback, and that is a security property rather than a
-    /// preference: this server has no authentication of any kind.
+    /// preference — now with two halves. An unconfigured node stays off the
+    /// network; a node whose operator configured an address off it must say
+    /// what defends it, which is the refusal below.
     #[test]
     fn the_default_bind_is_not_reachable_from_a_network() {
         assert!(DEFAULT_BIND.ip().is_loopback());
+    }
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    /// A directory of this test's own, named after the test and the process,
+    /// so that a suite running in parallel does not share a password file.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("seedstone-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_open_bind_needs_a_password_or_an_explicit_no_auth() {
+        let open = ["--bind", "0.0.0.0:7000"].iter().map(ToString::to_string);
+        let refusal = Config::from_args_and_env(open.clone(), env(&[]))
+            .expect_err("open bind, no password, accepted");
+        assert!(
+            refusal.contains("--requirepass-file") && refusal.contains("--no-auth"),
+            "{refusal}"
+        );
+
+        let cfg = Config::from_args_and_env(open.clone().chain(["--no-auth".to_owned()]), env(&[]))
+            .unwrap();
+        assert!(cfg.password.is_none() && cfg.no_auth);
+
+        let cfg = Config::from_args_and_env(open, env(&[(PASSWORD_ENV, "pw")])).unwrap();
+        assert!(cfg.password.as_ref().is_some_and(|s| s.matches(b"pw")));
+    }
+
+    #[test]
+    fn the_password_comes_from_a_file_with_one_trailing_newline_stripped() {
+        let dir = scratch("pw");
+        let path = dir.join("password");
+        std::fs::write(&path, "pw\n").unwrap();
+        let args = ["--requirepass-file", path.to_str().unwrap()]
+            .into_iter()
+            .map(ToString::to_string);
+        let cfg = Config::from_args_and_env(args, env(&[])).unwrap();
+        assert!(cfg.password.unwrap().matches(b"pw"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn contradictory_secrets_are_refused() {
+        let dir = scratch("pw2");
+        let path = dir.join("password");
+        std::fs::write(&path, "pw").unwrap();
+        // Collected rather than borrowed: an iterator over an array built
+        // inside the closure would outlive the array.
+        let file_args = || {
+            vec![
+                "--requirepass-file".to_owned(),
+                path.to_str().unwrap().to_owned(),
+            ]
+            .into_iter()
+        };
+        assert!(
+            Config::from_args_and_env(file_args(), env(&[(PASSWORD_ENV, "other")])).is_err(),
+            "file and env together"
+        );
+        assert!(
+            Config::from_args_and_env(file_args().chain(["--no-auth".to_owned()]), env(&[]))
+                .is_err(),
+            "--no-auth with a password"
+        );
+        assert!(
+            Config::from_args_and_env(
+                ["--requirepass-file", "/nonexistent/p"]
+                    .iter()
+                    .map(ToString::to_string),
+                env(&[])
+            )
+            .is_err(),
+            "unreadable file"
+        );
+        std::fs::write(&path, "").unwrap();
+        assert!(
+            Config::from_args_and_env(file_args(), env(&[])).is_err(),
+            "an empty password is no password"
+        );
+        assert!(
+            Config::from_args_and_env(std::iter::empty(), env(&[(PASSWORD_ENV, "")])).is_err(),
+            "an empty password is no password, from the environment either"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The refusal text is what a client matches on, so it is pinned here
