@@ -661,23 +661,51 @@ impl ExpiryPolicy for Deadlines {
 
 impl WalkOrder for Deadlines {}
 
+impl EvictionPolicy for Deadlines {
+    fn must_evict(&self, used: u64, ceiling: Option<u64>) -> bool {
+        ceiling.is_some_and(|ceiling| used > ceiling)
+    }
+}
+
+/// Whether the node must reclaim now.
+///
+/// The other half of the [`ExpiryPolicy`] seam, and it exists for the same
+/// reason: a ceiling nobody has watched fail is a ceiling nobody has
+/// measured. The two defects worth planting are on either side of the
+/// comparison — a node that reads its ceiling and never acts on it, and one
+/// that reclaims whatever it is holding — and neither is expressible by
+/// rewriting a request from outside, because the decision is taken inside the
+/// executor loop against a figure no client can see.
+///
+/// Asked *instead of* the comparison rather than beside it: the honest
+/// implementation is that comparison, so a policy that answers differently is
+/// the whole defect and not an imitation of one.
+pub trait EvictionPolicy: Clone + Send + 'static {
+    /// Whether the node must reclaim now, given the gauge and the ceiling.
+    ///
+    /// `ceiling` is `None` when the node is unbounded, and the honest answer
+    /// is then `false` — a node with no ceiling has nothing to be over.
+    fn must_evict(&self, used: u64, ceiling: Option<u64>) -> bool;
+}
+
 /// Every decision a shard executor consults that production has exactly one
 /// answer for.
 ///
-/// Two so far — when a deadline comes due, and how a walk's cursor advances —
-/// and they travel together because they are held by the same thing for the
-/// same span: one value, handed to [`ShardPool::spawn_with_policy`] and kept
-/// for the life of the executor. Splitting them into two parameters would
-/// double a generic that already reaches from the pool's constructor to the
-/// dict, and buy nothing: a caller supplying one always has an answer for the
-/// other, and the honest answer is a unit struct.
+/// Three so far — when a deadline comes due, how a walk's cursor advances,
+/// and whether the node must reclaim — and they travel together because they
+/// are held by the same thing for the same span: one value, handed to
+/// [`ShardPool::spawn_with_policy`] and kept for the life of the executor.
+/// Splitting them into separate parameters would multiply a generic that
+/// already reaches from the pool's constructor to the dict, and buy nothing:
+/// a caller supplying one always has an answer for the others, and the honest
+/// answer is a unit struct.
 ///
 /// Blanket-implemented, so nothing implements this directly: a type that
 /// answers both questions is a shard policy, and there is no second thing to
 /// remember to do.
-pub trait ShardPolicy: ExpiryPolicy + WalkOrder {}
+pub trait ShardPolicy: ExpiryPolicy + WalkOrder + EvictionPolicy {}
 
-impl<T: ExpiryPolicy + WalkOrder> ShardPolicy for T {}
+impl<T: ExpiryPolicy + WalkOrder + EvictionPolicy> ShardPolicy for T {}
 
 /// Anything that can answer a [`Command`].
 ///
@@ -938,7 +966,42 @@ impl ShardPool {
         )
     }
 
-    /// The one constructor with every seam exposed; the three public ones are
+    /// [`spawn_with_policy`](ShardPool::spawn_with_policy) with a ceiling as
+    /// well.
+    ///
+    /// The one shape the other constructors cannot express, and the one the
+    /// simulator's eviction runs need: a ceiling to be held under *and* the
+    /// decision about reaching it supplied. Either alone leaves the eviction
+    /// path either unreachable or honest, and a planted defect that never
+    /// runs is a defect nothing measures.
+    ///
+    /// # Panics
+    ///
+    /// If `shards` is zero, or if `executors` is not in `1..=shards`.
+    pub fn spawn_with_policy_limited<T, P>(
+        shards: u16,
+        executors: u16,
+        seed: DictSeed,
+        trace: T,
+        policy: P,
+        limit: MemoryLimit,
+    ) -> Self
+    where
+        T: TraceSink,
+        P: ShardPolicy,
+    {
+        Self::spawn_full(
+            shards,
+            executors,
+            seed,
+            trace,
+            |_shard| NoopLog,
+            policy,
+            limit,
+        )
+    }
+
+    /// The one constructor with every seam exposed; the public ones above are
     /// its defaults.
     #[allow(
         clippy::needless_pass_by_value,
@@ -1447,7 +1510,7 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                                 Route::Key(key) => Some(key),
                                 Route::Shard(_) | Route::Every | Route::Unaddressed => None,
                             };
-                            evict_until_fits(state, *shard, &memory, &trace, spared);
+                            evict_until_fits(state, *shard, &memory, &trace, &policy, spared);
                         }
                         answer
                     };
@@ -1542,8 +1605,12 @@ fn sweep_expired<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
     state.expire_cursor = next;
 }
 
-/// Reclaims from this shard while the node is over its ceiling, one sampled
-/// victim at a time, stopping when the figure fits or the shard is empty.
+/// Reclaims from this shard while the policy says the node must, one sampled
+/// victim at a time, stopping when it says otherwise or the shard is empty.
+///
+/// The condition is [`EvictionPolicy::must_evict`] rather than the comparison
+/// it stands for, so that the decision itself is the thing a plant replaces —
+/// see the trait for why that is worth a seam.
 ///
 /// Synchronous, inside the executor loop, for the reason every handler is: a
 /// write that has to make room does so before its reply is sent, and nothing
@@ -1569,14 +1636,15 @@ fn sweep_expired<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
 /// what keeps that from meaning a write can free room by undoing itself —
 /// which on a value larger than the ceiling is the difference between storing
 /// it and storing nothing.
-fn evict_until_fits<T: TraceSink, L: ReplicationLog>(
+fn evict_until_fits<T: TraceSink, L: ReplicationLog, P: EvictionPolicy>(
     state: &mut ShardState<L>,
     shard: u16,
     memory: &Memory,
     trace: &T,
+    policy: &P,
     spared: Option<&[u8]>,
 ) {
-    while memory.limit.exceeded(memory.gauge.used()) {
+    while policy.must_evict(memory.gauge.used(), memory.limit.ceiling) {
         let Some(victim) = state
             .dict
             .sample_oldest(&mut state.evict_cursor, EVICTION_SAMPLES)
@@ -3891,6 +3959,12 @@ mod tests {
         }
     }
 
+    impl EvictionPolicy for NeverDue {
+        fn must_evict(&self, used: u64, ceiling: Option<u64>) -> bool {
+            Deadlines.must_evict(used, ceiling)
+        }
+    }
+
     /// Honest in front of a command, inert on the housekeeping tick.
     ///
     /// What the two trace tests below need is a keyspace where only the lazy
@@ -3910,6 +3984,12 @@ mod tests {
         }
         fn takes_undated(&self) -> bool {
             false
+        }
+    }
+
+    impl EvictionPolicy for NoSweep {
+        fn must_evict(&self, used: u64, ceiling: Option<u64>) -> bool {
+            Deadlines.must_evict(used, ceiling)
         }
     }
 
@@ -3934,6 +4014,71 @@ mod tests {
             pool.dispatch(get(b"k")).await,
             Reply::Bulk(Some(b"v".to_vec())),
             "the policy said nothing was due, so the key must still answer"
+        );
+    }
+
+    /// A policy that reclaims whenever it is asked, whatever the gauge says
+    /// and whether or not there is a ceiling at all.
+    ///
+    /// The eviction counterpart of [`NeverDue`], and it lives here for the
+    /// same reason: the defective answers belong in a crate the binary does
+    /// not depend on.
+    #[derive(Clone, Copy)]
+    struct AlwaysEvicts;
+
+    impl WalkOrder for AlwaysEvicts {}
+
+    impl ExpiryPolicy for AlwaysEvicts {
+        fn due_on_read(&self, expires_at: Option<Instant>, now: Instant) -> bool {
+            Deadlines.due_on_read(expires_at, now)
+        }
+        fn due_on_sweep(&self, expires_at: Option<Instant>, now: Instant) -> bool {
+            Deadlines.due_on_sweep(expires_at, now)
+        }
+        fn takes_undated(&self) -> bool {
+            Deadlines.takes_undated()
+        }
+    }
+
+    impl EvictionPolicy for AlwaysEvicts {
+        fn must_evict(&self, _used: u64, _ceiling: Option<u64>) -> bool {
+            true
+        }
+    }
+
+    /// Whether to reclaim is the policy's answer and not a comparison the
+    /// executor makes for itself.
+    ///
+    /// Two keys, and the *older* one is the one read back: `evict_until_fits`
+    /// never takes the key the triggering command addressed, so a one-key
+    /// shard under this policy keeps its one key. With two, the second write
+    /// reclaims the first and the shard drains to exactly what was written
+    /// last — which is the property, stated exactly.
+    ///
+    /// Spawned with no ceiling on purpose. The limit's mode decides *refuse
+    /// or reclaim* and [`MemoryLimit::default`]'s is `AllKeysLru`, so the
+    /// loop runs and asks the policy; the policy decides *whether now*. The
+    /// honest half below is what makes that a claim rather than a
+    /// coincidence: [`Deadlines`] under no ceiling never evicts anything.
+    #[tokio::test]
+    async fn the_eviction_decision_is_the_policys() {
+        let pool =
+            ShardPool::spawn_with_policy(1, 1, DictSeed { k0: 2, k1: 3 }, NoTrace, AlwaysEvicts);
+        assert_eq!(pool.dispatch(set(b"a", b"v")).await, Reply::Ok);
+        assert_eq!(pool.dispatch(set(b"b", b"v")).await, Reply::Ok);
+        assert_eq!(
+            pool.dispatch(get(b"a")).await,
+            Reply::Bulk(None),
+            "a policy that always evicts keeps only what was written last"
+        );
+
+        let honest = ShardPool::spawn(1, 1, DictSeed { k0: 2, k1: 3 }, NoTrace);
+        assert_eq!(honest.dispatch(set(b"a", b"v")).await, Reply::Ok);
+        assert_eq!(honest.dispatch(set(b"b", b"v")).await, Reply::Ok);
+        assert_eq!(
+            honest.dispatch(get(b"a")).await,
+            Reply::Bulk(Some(b"v".to_vec())),
+            "the honest policy under no ceiling reclaims nothing"
         );
     }
 

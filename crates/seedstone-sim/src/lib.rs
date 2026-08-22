@@ -106,9 +106,10 @@ use seedstone_core::dict::{DictSeed, WalkOrder};
 // indistinguishable from the honest one except in its atomicity, and these
 // strings enter the trace hash — a private copy that drifted would make a
 // planted trace differ for a reason unrelated to the race.
+use seedstone_core::memory::MemoryLimit;
 use seedstone_core::shard::{
-    Command, Deadlines, ExpiryPolicy, Reply, ReplyError, Route, Router, ShardPool, TraceSink,
-    parse_i64,
+    Command, Deadlines, EvictionPolicy, ExpiryPolicy, Reply, ReplyError, Route, Router, ShardPool,
+    TraceSink, parse_i64,
 };
 use seedstone_resp::{Decoder, DecoderLimits, Frame, encode};
 use seedstone_service::{NodeInfo, serve_connection};
@@ -510,6 +511,18 @@ pub enum Plant {
     /// shard's table grows, which is why it has a shape of its own rather than
     /// a place in the swept one — see `tests/planted_walk.rs`.
     ScanMissesRehash,
+    /// A node that reads its ceiling and never acts on it: the gauge climbs
+    /// past `maxmemory` and nothing is ever reclaimed. Caught by
+    /// `ceiling_breaches`, and only on a shape that has a ceiling — see
+    /// `tests/planted_eviction.rs`.
+    IgnoresCeiling,
+    /// A node that reclaims whatever it is holding, ceiling or no ceiling.
+    ///
+    /// Caught by the plain model wherever it runs, which is what makes it the
+    /// counterpart of the one above: the honest policy never evicts without a
+    /// ceiling, so on a shape with none this defect is a written key that
+    /// answers `nil`, and nothing excuses that.
+    EvictsBelowCeiling,
 }
 
 impl Plant {
@@ -522,16 +535,20 @@ impl Plant {
             Self::ServeExpired => "serve-expired",
             Self::SweepEatsAll => "sweep-eats-all",
             Self::ScanMissesRehash => "scan-misses-rehash",
+            Self::IgnoresCeiling => "ignores-ceiling",
+            Self::EvictsBelowCeiling => "evicts-below-ceiling",
         }
     }
 
     /// Every plant, so a caller listing or sweeping them cannot miss one
     /// added later.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::LostUpdate,
         Self::ServeExpired,
         Self::SweepEatsAll,
         Self::ScanMissesRehash,
+        Self::IgnoresCeiling,
+        Self::EvictsBelowCeiling,
     ];
 
     /// The plant `name` selects, if it names one.
@@ -560,12 +577,25 @@ impl Plant {
             // expiration invariants decide on every shape this repository
             // sweeps, and `tests/standard_catches.rs` pins that for the one
             // the gate runs.
-            Self::LostUpdate | Self::ServeExpired | Self::SweepEatsAll => None,
+            // `EvictsBelowCeiling` joins them: it evicts on every shape,
+            // including the ones with no ceiling, where the plain model is
+            // exact and a vanished key is a mismatch with nothing to excuse
+            // it.
+            Self::LostUpdate
+            | Self::ServeExpired
+            | Self::SweepEatsAll
+            | Self::EvictsBelowCeiling => None,
             // Needs a cursor observed *between* steps of a table that is
             // growing under it, and a swept shard holds about four keys, where
             // one step covers the whole table — see this plant's own note.
             Self::ScanMissesRehash => {
                 Some("SimConfig::narrow, walked by crates/seedstone-sim/tests/planted_walk.rs")
+            }
+            // A node that ignores a ceiling it does not have is a node
+            // behaving honestly. The swept shapes set no `maxmemory`, so
+            // nothing they do can tell this defect from the real thing.
+            Self::IgnoresCeiling => {
+                Some("SimConfig::eviction, swept by crates/seedstone-sim/tests/planted_eviction.rs")
             }
         }
     }
@@ -698,13 +728,14 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
     let shards = cfg.shards;
     let executors = cfg.executors;
     let planted = cfg.planted;
+    let limit = MemoryLimit::default();
 
     sim.host(SERVER, move || {
         // Cloned per invocation: turmoil may restart a host, and each start
         // needs its own future. The sink is shared on purpose — a restart
         // continues the same trace.
         let sink = sink.clone();
-        server(shards, executors, dict_seed, sink, planted)
+        server(shards, executors, dict_seed, sink, planted, limit)
     });
 
     for id in 0..cfg.clients {
@@ -937,6 +968,12 @@ impl ExpiryPolicy for ServeExpired {
     }
 }
 
+impl EvictionPolicy for ServeExpired {
+    fn must_evict(&self, used: u64, ceiling: Option<u64>) -> bool {
+        Deadlines.must_evict(used, ceiling)
+    }
+}
+
 /// A sweep that stopped asking whether an entry had a deadline at all.
 ///
 /// Everything it reaches is due, undated keys included — which is why it must
@@ -957,6 +994,12 @@ impl ExpiryPolicy for SweepEatsAll {
     }
     fn takes_undated(&self) -> bool {
         true
+    }
+}
+
+impl EvictionPolicy for SweepEatsAll {
+    fn must_evict(&self, used: u64, ceiling: Option<u64>) -> bool {
+        Deadlines.must_evict(used, ceiling)
     }
 }
 
@@ -988,6 +1031,71 @@ impl ExpiryPolicy for ScanMissesRehash {
     }
     fn takes_undated(&self) -> bool {
         false
+    }
+}
+
+impl EvictionPolicy for ScanMissesRehash {
+    fn must_evict(&self, used: u64, ceiling: Option<u64>) -> bool {
+        Deadlines.must_evict(used, ceiling)
+    }
+}
+
+/// A node that never reclaims: the ceiling is configured, read and ignored.
+///
+/// The cache that takes the host down. Everything else about it is honest —
+/// deadlines fire, the sweep walks — so the only thing a run can be
+/// disagreeing about is the ceiling, and the only counter that can move is
+/// the one that watches it.
+#[derive(Clone, Copy)]
+struct IgnoresCeiling;
+
+impl WalkOrder for IgnoresCeiling {}
+
+impl ExpiryPolicy for IgnoresCeiling {
+    fn due_on_read(&self, expires_at: Option<Instant>, now: Instant) -> bool {
+        Deadlines.due_on_read(expires_at, now)
+    }
+    fn due_on_sweep(&self, expires_at: Option<Instant>, now: Instant) -> bool {
+        Deadlines.due_on_sweep(expires_at, now)
+    }
+    fn takes_undated(&self) -> bool {
+        Deadlines.takes_undated()
+    }
+}
+
+impl EvictionPolicy for IgnoresCeiling {
+    fn must_evict(&self, _used: u64, _ceiling: Option<u64>) -> bool {
+        false
+    }
+}
+
+/// A node that reclaims whenever it holds anything: the ceiling is
+/// irrelevant.
+///
+/// The cache whose hit ratio is inexplicably bad. It fires with `ceiling:
+/// None` too, which is the point — the honest policy never evicts without a
+/// ceiling, so this defect is visible on every shape and not only on the one
+/// that has a ceiling to be under.
+#[derive(Clone, Copy)]
+struct EvictsBelowCeiling;
+
+impl WalkOrder for EvictsBelowCeiling {}
+
+impl ExpiryPolicy for EvictsBelowCeiling {
+    fn due_on_read(&self, expires_at: Option<Instant>, now: Instant) -> bool {
+        Deadlines.due_on_read(expires_at, now)
+    }
+    fn due_on_sweep(&self, expires_at: Option<Instant>, now: Instant) -> bool {
+        Deadlines.due_on_sweep(expires_at, now)
+    }
+    fn takes_undated(&self) -> bool {
+        Deadlines.takes_undated()
+    }
+}
+
+impl EvictionPolicy for EvictsBelowCeiling {
+    fn must_evict(&self, _used: u64, _ceiling: Option<u64>) -> bool {
+        true
     }
 }
 
@@ -1116,20 +1224,48 @@ async fn server(
     seed: DictSeed,
     sink: HashSink,
     planted: Option<Plant>,
+    limit: MemoryLimit,
 ) -> turmoil::Result {
+    // Every arm is spawned with the limit, the honest one included: the
+    // ceiling is the shape's, not the plant's, and a run whose honest node
+    // had no ceiling would be measuring a different server from the one its
+    // planted twin runs.
     let pool = match planted {
         Some(Plant::ServeExpired) => {
-            ShardPool::spawn_with_policy(shards, executors, seed, sink, ServeExpired)
+            ShardPool::spawn_with_policy_limited(shards, executors, seed, sink, ServeExpired, limit)
         }
         Some(Plant::SweepEatsAll) => {
-            ShardPool::spawn_with_policy(shards, executors, seed, sink, SweepEatsAll)
+            ShardPool::spawn_with_policy_limited(shards, executors, seed, sink, SweepEatsAll, limit)
         }
-        Some(Plant::ScanMissesRehash) => {
-            ShardPool::spawn_with_policy(shards, executors, seed, sink, ScanMissesRehash)
-        }
+        Some(Plant::ScanMissesRehash) => ShardPool::spawn_with_policy_limited(
+            shards,
+            executors,
+            seed,
+            sink,
+            ScanMissesRehash,
+            limit,
+        ),
+        Some(Plant::IgnoresCeiling) => ShardPool::spawn_with_policy_limited(
+            shards,
+            executors,
+            seed,
+            sink,
+            IgnoresCeiling,
+            limit,
+        ),
+        Some(Plant::EvictsBelowCeiling) => ShardPool::spawn_with_policy_limited(
+            shards,
+            executors,
+            seed,
+            sink,
+            EvictsBelowCeiling,
+            limit,
+        ),
         // The honest pool, and the lost-update plant's too: that defect lives
         // above the shard, where a real one would.
-        None | Some(Plant::LostUpdate) => ShardPool::spawn(shards, executors, seed, sink),
+        None | Some(Plant::LostUpdate) => {
+            ShardPool::spawn_limited(shards, executors, seed, sink, limit)
+        }
     };
     let listener = turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await?;
     // One per host, as it is in production: it describes the node, not the
@@ -2935,7 +3071,10 @@ mod tests {
         for plant in Plant::ALL {
             let place = plant.unobservable_on_swept_shapes();
             match plant {
-                Plant::LostUpdate | Plant::ServeExpired | Plant::SweepEatsAll => assert_eq!(
+                Plant::LostUpdate
+                | Plant::ServeExpired
+                | Plant::SweepEatsAll
+                | Plant::EvictsBelowCeiling => assert_eq!(
                     place,
                     None,
                     "{} is caught where it is swept, so it has no elsewhere to name",
@@ -2946,6 +3085,14 @@ mod tests {
                         place.expect("the swept shapes cannot observe an upward scan cursor");
                     assert!(
                         place.contains("planted_walk.rs"),
+                        "a reader sent somewhere must be sent to a file: {place}"
+                    );
+                }
+                Plant::IgnoresCeiling => {
+                    let place =
+                        place.expect("a shape with no ceiling cannot observe one being ignored");
+                    assert!(
+                        place.contains("planted_eviction.rs"),
                         "a reader sent somewhere must be sent to a file: {place}"
                     );
                 }
@@ -2965,11 +3112,11 @@ mod tests {
     }
 
     /// Which plants a sweep's violation count is evidence about, pinned as a
-    /// set rather than one by one: the interesting claim is that exactly one
-    /// plant is outside what the swept shapes reach, and a second one
-    /// appearing is a change in what those shapes measure.
+    /// set rather than one by one: the interesting claim is *which* defects
+    /// are outside what the swept shapes reach, and one appearing or leaving
+    /// that set is a change in what those shapes measure.
     #[test]
-    fn the_scan_cursor_is_the_only_plant_the_swept_shapes_cannot_catch() {
+    fn the_plants_the_swept_shapes_cannot_catch_are_the_two_that_need_a_shape() {
         let unobservable: Vec<&str> = Plant::ALL
             .into_iter()
             .filter(|plant| plant.unobservable_on_swept_shapes().is_some())
@@ -2977,7 +3124,7 @@ mod tests {
             .collect();
         assert_eq!(
             unobservable,
-            ["scan-misses-rehash"],
+            ["scan-misses-rehash", "ignores-ceiling"],
             "the plants a swept violation count says nothing about have changed"
         );
     }

@@ -249,10 +249,22 @@ mod tests {
         assert!(warning.contains("mini"), "{warning}");
         assert!(warning.contains("planted_walk.rs"), "{warning}");
 
+        let warning = unobservable_warning(Plant::IgnoresCeiling, "standard")
+            .expect("a node that ignores a ceiling no swept shape sets is warned about");
+        assert!(warning.contains("ignores-ceiling"), "{warning}");
+        assert!(warning.contains("standard"), "{warning}");
+        assert!(warning.contains("planted_eviction.rs"), "{warning}");
+
         assert_eq!(
             unobservable_warning(Plant::LostUpdate, "standard"),
             None,
             "a plant this shape does catch must not be warned about: its zero is evidence"
+        );
+        assert_eq!(
+            unobservable_warning(Plant::EvictsBelowCeiling, "standard"),
+            None,
+            "a node that evicts under no ceiling is caught by the exact plain model, \
+             so its zero is evidence too"
         );
     }
 }
