@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Drives seedstone with the django-redis suite inside a container, whose tag
-# fixes the interpreter that client pair needs rather than the image's bytes.
+# Drives seedstone with the django-redis suite inside a container pinned by
+# digest to the interpreter that client pair needs.
 #
 # The suite is not vendored: it is fetched from its published sdist, verified
 # against a pinned digest, and extracted for the run. That keeps a third
@@ -11,7 +11,10 @@ set -euo pipefail
 server_binary="${1:?usage: run.sh <path-to-seedstone-binary>}"
 port="${SEEDSTONE_PORT:-6390}"
 here="$(cd "$(dirname "$0")" && pwd)"
-image="python:3.7-slim"
+# python:3.7-slim, by the digest of its multi-architecture manifest list: the
+# same selection on arm64 and amd64. The tag is kept in this comment for a
+# human reader; the digest is what runs.
+image="python@sha256:b53f496ca43e5af6994f8e316cf03af31050bf7944e0e4a308ad86c001cf028b"
 
 # The digest the release publishes, not the digest some download happened to
 # produce. It is checked inside the container: an archive that does not match
