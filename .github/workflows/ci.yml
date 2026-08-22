@@ -218,6 +218,13 @@ jobs:
       - name: django-redis
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: bash e2e/django/run.sh target/release/seedstone
+      # The exporter lane: a stock Prometheus exporter, pinned by manifest-list
+      # digest, scrapes the server and must log no refused command. Its
+      # expectations file plays the role the django lane's does — tolerated
+      # today, red the day it goes stale.
+      - name: redis_exporter
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: bash e2e/exporter/run.sh target/release/seedstone
 
   # A performance gate that cannot say what "fast" is, and does not need to.
   # It builds this pull request and the commit it forks from, runs both on the
