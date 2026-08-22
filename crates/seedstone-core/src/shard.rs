@@ -559,8 +559,12 @@ pub struct ShardStats {
     /// Entries removed because their deadline had passed, by either half of
     /// expiration.
     pub expired: u64,
-    /// How many commands of each [`Command::kind`] this shard has run,
-    /// indexed by the tag minus one.
+    /// How many commands of each [`Command::kind`] this shard has run, indexed
+    /// by the tag itself — slot `0` is no command and stays zero.
+    ///
+    /// The three commands a single request sends to *every* shard are absent
+    /// from this: see [`count_call`], which says why counting them here would
+    /// report one request as sixteen.
     pub calls: [u64; 16],
 }
 
@@ -1045,17 +1049,13 @@ impl ShardPool {
         let mut inboxes = Vec::with_capacity(usize::from(executors));
         let mut pending: Option<(u16, Vec<ShardState<L>>)> = None;
         for shard in 0..shards {
-            let state = ShardState {
-                dict: Dict::with_seed(DictSeed {
+            let state = ShardState::new(
+                Dict::with_seed(DictSeed {
                     k0: seed.k0 ^ u64::from(shard),
                     k1: seed.k1,
                 }),
-                seq: 0,
-                log: make_log(shard),
-                expire_cursor: 0,
-                evict_cursor: 0,
-                evicted: 0,
-            };
+                make_log(shard),
+            );
             // A fresh dict already costs its table, and the gauge is the sum
             // of what the dicts account — so it starts at the sum of the
             // empty ones rather than at zero.
@@ -1388,6 +1388,40 @@ struct ShardState<L> {
     evict_cursor: u64,
     /// How many entries this shard has evicted, for `INFO`'s `evicted_keys`.
     evicted: u64,
+    /// Keyed lookups that found a live entry, for `INFO`'s `keyspace_hits`.
+    hits: u64,
+    /// Keyed lookups that found nothing, for `INFO`'s `keyspace_misses`.
+    misses: u64,
+    /// Entries reclaimed because their deadline had passed, by either half of
+    /// expiration, for `INFO`'s `expired_keys`.
+    expired: u64,
+    /// How many commands of each [`Command::kind`] this shard has run, indexed
+    /// by the tag itself; slot `0` is no command and stays zero.
+    ///
+    /// Plain `u64`s rather than atomics because one executor task owns this
+    /// shard and nothing else may touch it — the counters a scrape reads are
+    /// gathered by a [`Command::Stats`] like any other command, which is what
+    /// keeps `INFO` off the hot path entirely.
+    calls: [u64; 16],
+}
+
+impl<L> ShardState<L> {
+    /// A shard's state at the moment it starts: an empty keyspace, a log at
+    /// position zero, and every counter unspent.
+    const fn new(dict: Dict, log: L) -> Self {
+        Self {
+            dict,
+            seq: 0,
+            log,
+            expire_cursor: 0,
+            evict_cursor: 0,
+            evicted: 0,
+            hits: 0,
+            misses: 0,
+            expired: 0,
+            calls: [0; 16],
+        }
+    }
 }
 
 /// One executor task: own a contiguous range of shards, answer the inbox,
@@ -1492,15 +1526,7 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                         // than inside it: the handlers stay unaware there is
                         // a gauge at all.
                         let before = state.dict.used_bytes();
-                        let answer = apply(
-                            &mut state.dict,
-                            &mut state.log,
-                            &mut state.seq,
-                            *shard,
-                            cmd,
-                            now,
-                            &policy,
-                        );
+                        let answer = apply(state, *shard, cmd, now, &policy);
                         memory.gauge.apply(before, state.dict.used_bytes());
                         if memory.limit.mode == EvictionMode::AllKeysLru {
                             // The command's key survives this. `apply` takes
@@ -1514,6 +1540,7 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                         }
                         answer
                     };
+                    count_call(state, cmd, &answer);
                     trace.record(*shard, at, cmd, &answer);
                     replies.push(answer);
                 }
@@ -1597,6 +1624,9 @@ fn sweep_expired<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
             return;
         }
         state.dict.remove(&key);
+        // The active half of `expired_keys`; the lazy half is counted in
+        // [`apply`], in front of the command that met the key.
+        state.expired += 1;
         // The command an expiry is indistinguishable from. Built after the
         // removal because it takes the key, which is what keeps the sweep from
         // cloning it to say the same thing twice.
@@ -1692,7 +1722,60 @@ fn evict_until_fits<T: TraceSink, L: ReplicationLog, P: EvictionPolicy>(
 fn keyspace_stats(dict: &Dict) -> ShardStats {
     ShardStats {
         keys: u64::try_from(dict.len()).expect("a length is a usize"),
+        expires: u64::try_from(dict.with_deadline()).expect("a count is a usize"),
         ..ShardStats::default()
+    }
+}
+
+/// Counts one completed command against this shard's totals.
+///
+/// **A command that reaches every shard is not counted here**, and that is the
+/// difference between a figure and a multiple of one: `DBSIZE`, `FLUSHDB` and
+/// the [`Command::Stats`] an `INFO` gathers with are one request each, split
+/// into one command per shard by the edge, so counting them where they land
+/// would report a single `DBSIZE` as sixteen. The edge counts those, once, as
+/// the requests they were. Everything else reaches exactly one shard per
+/// request, so this is the only place that has to count it — and it is the
+/// cheap place, because these are plain `u64`s on a state one task owns.
+///
+/// The refusals are counted with the successes. A command the peer sent and
+/// the server answered is a call however it was answered, which is what Redis
+/// counts and what an operator comparing `commandstats` to a client's own
+/// tally is looking for.
+fn count_call<L>(state: &mut ShardState<L>, cmd: &Command, reply: &Reply) {
+    if !matches!(cmd.route(), Route::Every) {
+        state.calls[usize::from(cmd.kind())] += 1;
+    }
+    match read_outcome(&state.dict, cmd, reply) {
+        Some(true) => state.hits += 1,
+        Some(false) => state.misses += 1,
+        None => {}
+    }
+}
+
+/// Whether a command that *read* a key found one, or `None` if it read none.
+///
+/// Redis counts `keyspace_hits` and `keyspace_misses` over the lookups that
+/// read a value rather than over every command, which here is `GET`, `EXISTS`,
+/// `TTL`, `TYPE` and `STRLEN` — a write is not a lookup, and neither is a
+/// command that names no key.
+///
+/// Read off the reply wherever the reply says, so the classification costs
+/// nothing: four of the five answer differently for a key that was there.
+/// `STRLEN` is the exception — a stored empty value and an absent key both
+/// measure `0` — and that one case asks the dict, which is a second hash on a
+/// command nothing on the hot path issues, rather than a miss counted against
+/// a key that was present.
+fn read_outcome(dict: &Dict, cmd: &Command, reply: &Reply) -> Option<bool> {
+    match (cmd, reply) {
+        (Command::Get { .. }, Reply::Bulk(value)) => Some(value.is_some()),
+        (Command::Exists { .. }, Reply::Integer(found)) => Some(*found == 1),
+        // `-2` is `TTL`'s answer for a key that is not there; `-1` and every
+        // span above it are answers about a key that is.
+        (Command::Ttl { .. }, Reply::Integer(remaining)) => Some(*remaining != -2),
+        (Command::Type { .. }, Reply::Status(name)) => Some(*name != "none"),
+        (Command::StrLen { key }, Reply::Integer(len)) => Some(*len > 0 || dict.get(key).is_some()),
+        _ => None,
     }
 }
 
@@ -1704,6 +1787,10 @@ fn keyspace_stats(dict: &Dict) -> ShardStats {
 fn stats_of<L>(state: &ShardState<L>) -> ShardStats {
     ShardStats {
         evicted: state.evicted,
+        hits: state.hits,
+        misses: state.misses,
+        expired: state.expired,
+        calls: state.calls,
         ..keyspace_stats(&state.dict)
     }
 }
@@ -1753,14 +1840,24 @@ fn stats_of<L>(state: &ShardState<L>) -> ShardStats {
 /// [`evict_if_expired`], [`deadline`], [`remaining_seconds`], [`append`] —
 /// follow those handlers as their own group.
 fn apply<L: ReplicationLog, P: ShardPolicy>(
-    dict: &mut Dict,
-    log: &mut L,
-    seq: &mut u64,
+    state: &mut ShardState<L>,
     shard: u16,
     cmd: &mut Command,
     now: Instant,
     policy: &P,
 ) -> Reply {
+    // The three the handlers work on, plus the one counter a handler can
+    // move. Destructured rather than reached through `state` field by field so
+    // that the borrows stay disjoint, and taken as a whole rather than as four
+    // parameters because four more would put this function past the argument
+    // ceiling this workspace sets.
+    let ShardState {
+        dict,
+        log,
+        seq,
+        expired,
+        ..
+    } = state;
     // Lazy expiry, once, before any arm has looked at the key. Here rather
     // than in each arm on purpose: it makes "an expired key is dead to every
     // command" a property of the dispatch instead of a rule the handlers have
@@ -1771,10 +1868,13 @@ fn apply<L: ReplicationLog, P: ShardPolicy>(
     // That is not a gap in the guarantee: such a command addresses the shard
     // rather than an entry, so there is no single key whose deadline it could
     // be meeting.
-    if let Route::Key(key) = cmd.route()
-        && let Err(failed) = evict_if_expired(dict, log, seq, shard, key, now, policy)
-    {
-        return failed;
+    if let Route::Key(key) = cmd.route() {
+        match evict_if_expired(dict, log, seq, shard, key, now, policy) {
+            Err(failed) => return failed,
+            // The lazy half of `expired_keys`. The active half is
+            // [`sweep_expired`]'s, and Redis counts both under the one field.
+            Ok(reclaimed) => *expired += u64::from(reclaimed),
+        }
     }
 
     match cmd {
@@ -2187,6 +2287,9 @@ fn scan_step<P: ShardPolicy>(
 /// the honest [`Deadlines`] it comes due the instant `now` reaches it, not only
 /// once it is past.
 ///
+/// Answers whether an entry was reclaimed, which is what the shard counts as
+/// an expiration; the caller adds it to `expired_keys`.
+///
 /// Returns the reply to send instead when the record could not be written. A
 /// removal that cannot be logged must not happen, for the same reason a `Del`
 /// that cannot be logged does not: the alternative is a keyspace that has
@@ -2201,7 +2304,7 @@ fn evict_if_expired<L: ReplicationLog, P: ExpiryPolicy>(
     key: &[u8],
     now: Instant,
     expiry: &P,
-) -> Result<(), Reply> {
+) -> Result<bool, Reply> {
     // A keyspace with no deadlines in it — which is nearly every keyspace —
     // leaves here without hashing anything, so standing in front of every
     // command costs it a predictable branch and not a second lookup. The
@@ -2209,17 +2312,17 @@ fn evict_if_expired<L: ReplicationLog, P: ExpiryPolicy>(
     // holds can be expired. A policy that takes undated keys is the one case
     // where that shortcut would hide the answer, so it says so.
     if !dict.may_hold_deadlines() && !expiry.takes_undated() {
-        return Ok(());
+        return Ok(false);
     }
     let Some(entry) = dict.get(key) else {
-        return Ok(());
+        return Ok(false);
     };
     if !expiry.due_on_read(entry.expires_at, now) {
-        return Ok(());
+        return Ok(false);
     }
     append(log, seq, shard)?;
     dict.remove(key);
-    Ok(())
+    Ok(true)
 }
 
 /// The instant an expiry option lands on, or `None` for a key with no
@@ -2314,34 +2417,18 @@ mod tests {
     /// the `now` each command sees, which in production is the executor's to
     /// choose, and the dict a handler left behind — an expired entry has to be
     /// shown *gone*, not merely invisible to a read.
-    struct Shard {
-        dict: Dict,
-        log: NoopLog,
-        seq: u64,
-    }
+    type Shard = ShardState<NoopLog>;
 
     impl Shard {
-        fn new() -> Self {
-            Self {
-                dict: Dict::with_seed(DictSeed { k0: 5, k1: 7 }),
-                log: NoopLog,
-                seq: 0,
-            }
+        fn for_tests() -> Self {
+            Self::new(Dict::with_seed(DictSeed { k0: 5, k1: 7 }), NoopLog)
         }
 
         /// By value, because [`apply`] takes what it stores: a command that has
         /// been run has had its value moved out of it, so a caller cannot
         /// usefully hold one across two runs.
         fn run(&mut self, mut cmd: Command, now: Instant) -> Reply {
-            apply(
-                &mut self.dict,
-                &mut self.log,
-                &mut self.seq,
-                0,
-                &mut cmd,
-                now,
-                &Deadlines,
-            )
+            apply(self, 0, &mut cmd, now, &Deadlines)
         }
     }
 
@@ -2440,7 +2527,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn set_with_ex_expires_lazily() {
-        let mut shard = Shard::new();
+        let mut shard = Shard::for_tests();
         assert_eq!(shard.run(set_ex(b"k", b"v", 30), Instant::now()), Reply::Ok);
 
         tokio::time::advance(Duration::from_secs(29)).await;
@@ -2463,7 +2550,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn set_nx_xx_algebra() {
-        let mut shard = Shard::new();
+        let mut shard = Shard::for_tests();
         let conditional = |value: &[u8], cond: Cond| Command::Set {
             key: b"k".to_vec(),
             value: value.to_vec(),
@@ -2527,7 +2614,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn expire_and_ttl() {
-        let mut shard = Shard::new();
+        let mut shard = Shard::for_tests();
         let ttl = |key: &[u8]| Command::Ttl { key: key.to_vec() };
         let expire = |key: &[u8], seconds: i64| Command::Expire {
             key: key.to_vec(),
@@ -2591,7 +2678,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn expired_keys_are_dead_to_every_command() {
-        let mut shard = Shard::new();
+        let mut shard = Shard::for_tests();
         // One key per command, all past the same deadline: every arm meets an
         // entry that is still in the dict and already gone, which is the state
         // a handler that skipped the liveness check would answer from.
@@ -2722,21 +2809,11 @@ mod tests {
         }
 
         let log = Recording::default();
-        let mut dict = Dict::with_seed(DictSeed { k0: 5, k1: 7 });
-        let mut seq = 0;
-        let mut shard_log = log.clone();
+        let mut state = ShardState::new(Dict::with_seed(DictSeed { k0: 5, k1: 7 }), log.clone());
 
         let mut set = set_ex(b"k", b"v", 30);
         assert_eq!(
-            apply(
-                &mut dict,
-                &mut shard_log,
-                &mut seq,
-                3,
-                &mut set,
-                Instant::now(),
-                &Deadlines
-            ),
+            apply(&mut state, 3, &mut set, Instant::now(), &Deadlines),
             Reply::Ok
         );
         tokio::time::advance(Duration::from_secs(31)).await;
@@ -2745,19 +2822,15 @@ mod tests {
         // expiry's and nothing else.
         let mut read = get(b"k");
         assert_eq!(
-            apply(
-                &mut dict,
-                &mut shard_log,
-                &mut seq,
-                3,
-                &mut read,
-                Instant::now(),
-                &Deadlines
-            ),
+            apply(&mut state, 3, &mut read, Instant::now(), &Deadlines),
             Reply::Bulk(None)
         );
         assert_eq!(*log.0.lock().expect("log mutex"), vec![(3, 0), (3, 1)]);
-        assert_eq!(seq, 2, "the expiry did not consume a replication position");
+        assert_eq!(
+            state.seq, 2,
+            "the expiry did not consume a replication position"
+        );
+        assert_eq!(state.expired, 1, "the lazy half counted the expiration");
     }
 
     /// `PEXPIRE` and `PERSIST` reach the log exactly when they change
@@ -2772,7 +2845,7 @@ mod tests {
     /// replays to nothing.
     #[tokio::test(start_paused = true)]
     async fn pexpire_and_persist_reach_the_log_only_when_they_change_something() {
-        let mut shard = Shard::new();
+        let mut shard = Shard::for_tests();
         let ttl = |key: &[u8]| Command::Ttl { key: key.to_vec() };
         let persist = |key: &[u8]| Command::Persist { key: key.to_vec() };
         let pexpire = |key: &[u8], millis: i64| Command::PExpire {
@@ -3118,6 +3191,115 @@ mod tests {
         assert_eq!(gauge.used(), empty);
     }
 
+    /// The counters `INFO` reports, gathered the way `INFO` gathers them.
+    ///
+    /// Two things are pinned here that nothing else pins. The reads are
+    /// classified as Redis classifies them — `GET`, `EXISTS`, `TTL`, `TYPE`
+    /// and `STRLEN` count, a write does not, and `STRLEN` of a stored empty
+    /// value is a hit rather than the miss its `0` would suggest. And a
+    /// command that reaches every shard is counted **once by the edge and not
+    /// at all here**: a `DBSIZE` that landed in `calls` would be reported as
+    /// one call per shard.
+    #[tokio::test]
+    async fn a_shard_counts_the_lookups_and_the_calls_info_reports() {
+        let pool = ShardPool::spawn(2, 1, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        assert_eq!(pool.dispatch(set(b"present", b"v")).await, Reply::Ok);
+        assert_eq!(pool.dispatch(set(b"empty", b"")).await, Reply::Ok);
+
+        // Two hits and two misses from the two commands that answer plainly.
+        pool.dispatch(get(b"present")).await;
+        pool.dispatch(get(b"absent")).await;
+        pool.dispatch(Command::Exists {
+            key: b"present".to_vec(),
+        })
+        .await;
+        pool.dispatch(Command::Exists {
+            key: b"absent".to_vec(),
+        })
+        .await;
+        // And one of each from the three that do not.
+        pool.dispatch(Command::Ttl {
+            key: b"present".to_vec(),
+        })
+        .await;
+        pool.dispatch(Command::Ttl {
+            key: b"absent".to_vec(),
+        })
+        .await;
+        pool.dispatch(Command::Type {
+            key: b"present".to_vec(),
+        })
+        .await;
+        pool.dispatch(Command::Type {
+            key: b"absent".to_vec(),
+        })
+        .await;
+        pool.dispatch(Command::StrLen {
+            key: b"empty".to_vec(),
+        })
+        .await;
+        pool.dispatch(Command::StrLen {
+            key: b"absent".to_vec(),
+        })
+        .await;
+        // A broadcast, which no shard may count.
+        pool.dispatch_every(Command::DbSize).await;
+
+        let stats = gathered(&pool).await;
+        assert_eq!(stats.hits, 5, "one hit from each of the five read forms");
+        assert_eq!(stats.misses, 5, "and one miss from each");
+        assert_eq!(stats.keys, 2);
+        assert_eq!(stats.expires, 0);
+        assert_eq!(
+            stats.calls[usize::from(Command::Get { key: Vec::new() }.kind())],
+            2
+        );
+        assert_eq!(
+            stats.calls[usize::from(Command::DbSize.kind())],
+            0,
+            "a request the edge split across every shard is the edge's to count"
+        );
+        assert_eq!(
+            stats.calls[usize::from(Command::Stats.kind())],
+            0,
+            "and so is the gathering this very assertion did"
+        );
+    }
+
+    /// Expirations are counted by both halves under the one field.
+    #[tokio::test(start_paused = true)]
+    async fn expired_keys_counts_the_lazy_half_and_the_sweep() {
+        let pool = ShardPool::spawn(2, 1, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        assert_eq!(pool.dispatch(set_ex(b"lazy", b"v", 30)).await, Reply::Ok);
+        assert_eq!(gathered(&pool).await.expires, 1, "one dated key");
+        tokio::time::advance(Duration::from_secs(31)).await;
+        // A read in front of the key is the lazy half.
+        assert_eq!(pool.dispatch(get(b"lazy")).await, Reply::Bulk(None));
+        let stats = gathered(&pool).await;
+        assert_eq!(stats.expired, 1);
+        assert_eq!(stats.expires, 0, "and the deadline went with the key");
+    }
+
+    /// Every shard's counters, summed the way `INFO` sums them.
+    async fn gathered(pool: &ShardPool) -> ShardStats {
+        let mut total = ShardStats::default();
+        for reply in pool.dispatch_every(Command::Stats).await {
+            let Reply::Stats(stats) = reply else {
+                panic!("{reply:?}")
+            };
+            total.keys += stats.keys;
+            total.expires += stats.expires;
+            total.evicted += stats.evicted;
+            total.hits += stats.hits;
+            total.misses += stats.misses;
+            total.expired += stats.expired;
+            for (sum, count) in total.calls.iter_mut().zip(stats.calls) {
+                *sum += count;
+            }
+        }
+        total
+    }
+
     fn limited(ceiling: u64, mode: EvictionMode) -> ShardPool {
         ShardPool::spawn_limited(
             2,
@@ -3273,31 +3455,13 @@ mod tests {
     /// need a clock — or a runtime to hold one.
     #[test]
     fn a_handler_runs_to_completion_without_a_runtime() {
-        let mut dict = Dict::with_seed(DictSeed { k0: 7, k1: 9 });
-        let mut log = NoopLog;
-        let mut seq = 0;
+        let mut state = ShardState::new(Dict::with_seed(DictSeed { k0: 7, k1: 9 }), NoopLog);
         let now = Instant::now();
 
-        let stored = apply(
-            &mut dict,
-            &mut log,
-            &mut seq,
-            0,
-            &mut set(b"k", b"v"),
-            now,
-            &Deadlines,
-        );
+        let stored = apply(&mut state, 0, &mut set(b"k", b"v"), now, &Deadlines);
         assert_eq!(stored, Reply::Ok);
         assert_eq!(
-            apply(
-                &mut dict,
-                &mut log,
-                &mut seq,
-                0,
-                &mut get(b"k"),
-                now,
-                &Deadlines
-            ),
+            apply(&mut state, 0, &mut get(b"k"), now, &Deadlines),
             Reply::Bulk(Some(b"v".to_vec()))
         );
     }
@@ -3313,21 +3477,11 @@ mod tests {
     /// the keyspace back stayed green — which is the one failure this pins.
     #[test]
     fn a_handler_takes_the_value_and_leaves_what_the_trace_reads() {
-        let mut dict = Dict::with_seed(DictSeed { k0: 4, k1: 6 });
-        let mut log = NoopLog;
-        let mut seq = 0;
+        let mut state = ShardState::new(Dict::with_seed(DictSeed { k0: 4, k1: 6 }), NoopLog);
         let mut cmd = set(b"k", b"v");
 
         assert_eq!(
-            apply(
-                &mut dict,
-                &mut log,
-                &mut seq,
-                0,
-                &mut cmd,
-                Instant::now(),
-                &Deadlines
-            ),
+            apply(&mut state, 0, &mut cmd, Instant::now(), &Deadlines),
             Reply::Ok
         );
         assert_eq!(
@@ -3337,7 +3491,7 @@ mod tests {
         );
         assert_eq!(cmd.kind(), set(b"k", b"v").kind());
         assert_eq!(
-            dict.get(b"k").map(|entry| entry.value.clone()),
+            state.dict.get(b"k").map(|entry| entry.value.clone()),
             Some(b"v".to_vec())
         );
         // The other half of the same fact: the dict holds the only copy of the
@@ -3351,59 +3505,60 @@ mod tests {
 
     #[test]
     fn seq_advances_only_for_commands_that_change_something() {
-        let mut dict = Dict::with_seed(DictSeed { k0: 1, k1: 1 });
-        let mut log = NoopLog;
-        let mut seq = 0;
+        let mut state = ShardState::new(Dict::with_seed(DictSeed { k0: 1, k1: 1 }), NoopLog);
         let now = Instant::now();
-        let mut run = |mut cmd: Command, seq: &mut u64| {
-            apply(&mut dict, &mut log, seq, 3, &mut cmd, now, &Deadlines)
+        let run = |state: &mut ShardState<NoopLog>, mut cmd: Command| {
+            apply(state, 3, &mut cmd, now, &Deadlines)
         };
 
         // A read moves nothing.
-        run(Command::Get { key: b"a".to_vec() }, &mut seq);
-        assert_eq!(seq, 0);
+        run(&mut state, Command::Get { key: b"a".to_vec() });
+        assert_eq!(state.seq, 0);
 
         // A write does.
-        run(set(b"a", b"1"), &mut seq);
-        assert_eq!(seq, 1);
+        run(&mut state, set(b"a", b"1"));
+        assert_eq!(state.seq, 1);
 
         // A delete that removes nothing writes no record: replaying it would
         // be a no-op, so the log should not carry it.
         run(
+            &mut state,
             Command::Del {
                 key: b"absent".to_vec(),
             },
-            &mut seq,
         );
-        assert_eq!(seq, 1);
+        assert_eq!(state.seq, 1);
 
         // A rejected IncrBy likewise.
         run(
+            &mut state,
             Command::IncrBy {
                 key: b"a".to_vec(),
                 delta: 1,
             },
-            &mut seq,
         );
-        assert_eq!(seq, 2, "'1' is a valid integer, so this one does count");
+        assert_eq!(
+            state.seq, 2,
+            "'1' is a valid integer, so this one does count"
+        );
 
-        run(set(b"txt", b"abc"), &mut seq);
-        assert_eq!(seq, 3);
+        run(&mut state, set(b"txt", b"abc"));
+        assert_eq!(state.seq, 3);
         run(
+            &mut state,
             Command::IncrBy {
                 key: b"txt".to_vec(),
                 delta: 1,
             },
-            &mut seq,
         );
         assert_eq!(
-            seq, 3,
+            state.seq, 3,
             "a rejected IncrBy must not consume a sequence number"
         );
 
         // And a delete that does remove something.
-        run(Command::Del { key: b"a".to_vec() }, &mut seq);
-        assert_eq!(seq, 4);
+        run(&mut state, Command::Del { key: b"a".to_vec() });
+        assert_eq!(state.seq, 4);
     }
 
     #[test]

@@ -181,6 +181,17 @@ pub struct Dict {
     /// tests hold it to a full recount after every mutation, which is what
     /// makes maintaining it in five places defensible.
     used_bytes: u64,
+    /// How many entries currently carry a deadline.
+    ///
+    /// Exact, unlike [`may_hold_deadlines`](Self::may_hold_deadlines) beside
+    /// it, and the two are not the same question: that flag is a fast path and
+    /// is allowed to be conservative, while this is a figure `INFO`'s
+    /// `# Keyspace` section prints as `expires=`, and a conservative count is
+    /// a wrong one. Maintained by the four operations that can move it —
+    /// insert, overwrite, `set_deadline`, remove — for the reason
+    /// [`used_bytes`](Self::used_bytes) is maintained rather than derived: the
+    /// alternative is a walk of the keyspace per scrape.
+    with_deadline: usize,
     /// What [`Dict::touch`] stamps entries with, advanced once per touch.
     ///
     /// A command counter rather than a clock reading, for the reason
@@ -202,6 +213,7 @@ impl Dict {
             len: 0,
             may_hold_deadlines: false,
             used_bytes: table_bytes(INITIAL_BUCKETS),
+            with_deadline: 0,
             clock: 0,
         }
     }
@@ -248,20 +260,18 @@ impl Dict {
     pub fn set_deadline(&mut self, key: &[u8], expires_at: Option<Instant>) -> bool {
         self.may_hold_deadlines |= expires_at.is_some();
         let hash = hash_key(self.seed, key);
-        if let Some(entry) = find_mut(&mut self.old, hash, key) {
-            entry.expires_at = expires_at;
-            return true;
-        }
-        let Some(new) = self.new.as_mut() else {
-            return false;
+        let entry = match find_mut(&mut self.old, hash, key) {
+            Some(entry) => entry,
+            None => match self.new.as_mut().and_then(|new| find_mut(new, hash, key)) {
+                Some(entry) => entry,
+                None => return false,
+            },
         };
-        match find_mut(new, hash, key) {
-            Some(entry) => {
-                entry.expires_at = expires_at;
-                true
-            }
-            None => false,
-        }
+        // The delta before the write, since the field is about to be replaced.
+        self.with_deadline = self.with_deadline + usize::from(expires_at.is_some())
+            - usize::from(entry.expires_at.is_some());
+        entry.expires_at = expires_at;
+        true
     }
 
     /// Stamps `key` as touched now and advances the counter.
@@ -369,8 +379,11 @@ impl Dict {
         // The new size is computed before the move, since `entry` goes into
         // the table and the old entry's is read off what is still there.
         let after = entry_bytes(&key, &entry.value);
+        let dated = usize::from(entry.expires_at.is_some());
         if let Some(existing) = find_mut(&mut self.old, hash, &key) {
             self.used_bytes = self.used_bytes - entry_bytes(&key, &existing.value) + after;
+            self.with_deadline =
+                self.with_deadline + dated - usize::from(existing.expires_at.is_some());
             *existing = entry;
             return;
         }
@@ -378,6 +391,8 @@ impl Dict {
             && let Some(existing) = find_mut(new, hash, &key)
         {
             self.used_bytes = self.used_bytes - entry_bytes(&key, &existing.value) + after;
+            self.with_deadline =
+                self.with_deadline + dated - usize::from(existing.expires_at.is_some());
             *existing = entry;
             return;
         }
@@ -385,6 +400,7 @@ impl Dict {
         // A key that is not present yet goes straight into the table that will
         // survive the rehash, so it never has to be migrated.
         self.used_bytes += after;
+        self.with_deadline += dated;
         let table = self.new.as_mut().unwrap_or(&mut self.old);
         let index = bucket_index(hash, table.len());
         table[index].push((hash, key, entry));
@@ -404,6 +420,7 @@ impl Dict {
         });
         if let Some(removed) = &removed {
             self.used_bytes -= entry_bytes(key, &removed.value);
+            self.with_deadline -= usize::from(removed.expires_at.is_some());
             self.len -= 1;
             // The one place the flag can honestly go back down: a dict holding
             // nothing holds no deadlines. Everything short of empty stays
@@ -440,6 +457,17 @@ impl Dict {
     #[must_use]
     pub const fn len(&self) -> usize {
         self.len
+    }
+
+    /// How many of those entries carry a deadline — `INFO`'s `expires=`.
+    ///
+    /// Counted, not sampled, and it counts entries whose deadline has already
+    /// passed but which neither half of expiration has reached yet, for the
+    /// reason [`len`](Self::len) counts them: they are still in the table, and
+    /// a figure that excluded them would have to walk the keyspace to find out.
+    #[must_use]
+    pub const fn with_deadline(&self) -> usize {
+        self.with_deadline
     }
 
     /// The bytes this dict is accounted at: every entry through
@@ -1886,6 +1914,88 @@ mod tests {
             dict.used_bytes(),
             u64::try_from(INITIAL_BUCKETS).expect("a small constant") * BUCKET_OVERHEAD
         );
+    }
+
+    /// Recomputes what `with_deadline` claims, the way [`recount`] does for
+    /// the byte figure: from the entries alone.
+    fn recount_deadlines(dict: &Dict) -> usize {
+        let mut total = 0;
+        for table in std::iter::once(&dict.old).chain(dict.new.iter()) {
+            for bucket in table {
+                for (_, _, entry) in bucket {
+                    total += usize::from(entry.expires_at.is_some());
+                }
+            }
+        }
+        total
+    }
+
+    /// The four operations that can move the count, each in both directions:
+    /// a dated insert, an overwrite that drops the deadline and one that adds
+    /// one, `set_deadline` both ways, a removal of a dated key and of an
+    /// undated one, and the flush that takes the lot.
+    #[test]
+    fn with_deadline_counts_the_dated_entries_through_every_mutation() {
+        let now = Instant::now();
+        let later = now + Duration::from_mins(1);
+        let mut dict = Dict::with_seed(DictSeed { k0: 3, k1: 4 });
+        let dated = |at: Option<Instant>| Entry {
+            value: b"v".to_vec(),
+            expires_at: at,
+            touched: 0,
+        };
+        assert_eq!(dict.with_deadline(), 0);
+
+        dict.insert(b"a".to_vec(), dated(Some(later)));
+        dict.insert(b"b".to_vec(), dated(None));
+        assert_eq!(dict.with_deadline(), 1, "one of the two carries a deadline");
+        assert_eq!(dict.with_deadline(), recount_deadlines(&dict));
+
+        // Overwrite in both directions: the count follows the entry that is
+        // there now, not the one that was.
+        dict.insert(b"a".to_vec(), dated(None));
+        assert_eq!(dict.with_deadline(), 0);
+        dict.insert(b"b".to_vec(), dated(Some(later)));
+        assert_eq!(dict.with_deadline(), 1);
+
+        // `set_deadline` is the other way a deadline enters or leaves.
+        assert!(dict.set_deadline(b"a", Some(later)));
+        assert_eq!(dict.with_deadline(), 2);
+        assert!(dict.set_deadline(b"a", Some(later)), "already dated");
+        assert_eq!(dict.with_deadline(), 2, "re-dating moves nothing");
+        assert!(dict.set_deadline(b"b", None));
+        assert_eq!(dict.with_deadline(), 1);
+        assert!(!dict.set_deadline(b"nosuch", Some(later)));
+        assert_eq!(dict.with_deadline(), 1, "a key that is not there");
+
+        // Removal, of a dated key and of an undated one.
+        dict.remove(b"b");
+        assert_eq!(dict.with_deadline(), 1);
+        dict.remove(b"a");
+        assert_eq!(dict.with_deadline(), 0);
+
+        // And across a rehash, where entries live in two tables at once.
+        for i in 0..200u32 {
+            dict.insert(
+                format!("k{i}").into_bytes(),
+                dated((i % 3 == 0).then_some(later)),
+            );
+            assert_eq!(
+                dict.with_deadline(),
+                recount_deadlines(&dict),
+                "after insert {i}"
+            );
+        }
+        for i in (0..200u32).step_by(2) {
+            dict.remove(format!("k{i}").as_bytes());
+            assert_eq!(
+                dict.with_deadline(),
+                recount_deadlines(&dict),
+                "after remove {i}"
+            );
+        }
+        dict.clear();
+        assert_eq!(dict.with_deadline(), 0, "a flush takes the deadlines too");
     }
 
     /// Every interleaving of four operations over two keys, so a pair that

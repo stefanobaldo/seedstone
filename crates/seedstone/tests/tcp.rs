@@ -9,7 +9,7 @@
 use seedstone::server::{Config, MAX_CLIENTS_REACHED, Server};
 use seedstone_core::dict::DictSeed;
 use seedstone_resp::{Frame, encode, parse};
-use seedstone_service::Secret;
+use seedstone_service::{RUN_ID_HEX, Secret};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -148,6 +148,73 @@ async fn info_reports_the_bound_port_and_the_live_connection_count() {
     );
 }
 
+/// The connection counters are the accept loop's, and it is the only party
+/// that can maintain either.
+///
+/// `total_connections_received` counts every connection this loop took off the
+/// listener, and `rejected_connections` counts the ones it then had no permit
+/// for — so the second is a subset of the first, and a refusal that was not
+/// also counted as an arrival would leave a monitor with a refusal rate above
+/// one. The setup is the one-permit setup of
+/// `over_limit_connections_are_told_and_closed`, for the same reason: the
+/// round trip proves the permit is spent before the refusal is provoked.
+#[tokio::test(flavor = "multi_thread")]
+async fn info_counts_the_connections_accepted_and_the_ones_refused() {
+    let addr = started(1, None).await;
+
+    let mut holder = TcpStream::connect(addr).await.unwrap();
+    assert_eq!(
+        round_trip(&mut holder, &["PING"]).await,
+        Frame::Simple("PONG".into())
+    );
+    assert_eq!(
+        info_field(&mut holder, "rejected_connections").await,
+        0,
+        "nothing has been refused yet"
+    );
+
+    let mut refused = TcpStream::connect(addr).await.unwrap();
+    assert_eq!(
+        read_frames(&mut refused, 1).await[0],
+        Frame::Error(MAX_CLIENTS_REACHED.to_owned())
+    );
+    drop(refused);
+
+    // Both counters move on the accept loop's task, so they are a yield away
+    // rather than an instant away — the shape every assertion in this file
+    // about that loop has.
+    let mut settled = false;
+    for _ in 0..100 {
+        if info_field(&mut holder, "rejected_connections").await == 1 {
+            settled = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(settled, "the refusal was never counted");
+    assert_eq!(
+        info_field(&mut holder, "total_connections_received").await,
+        2,
+        "both the served connection and the refused one arrived"
+    );
+}
+
+/// The bytes read and written are counted where they cross the socket.
+#[tokio::test(flavor = "multi_thread")]
+async fn info_counts_the_bytes_the_connection_carried() {
+    let addr = started(4, None).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    round_trip(&mut stream, &["SET", "k", "0123456789"]).await;
+    assert!(
+        info_field(&mut stream, "total_net_input_bytes").await > 0,
+        "the commands this connection sent were not counted"
+    );
+    assert!(
+        info_field(&mut stream, "total_net_output_bytes").await > 0,
+        "the replies it received were not counted"
+    );
+}
+
 /// `used_memory` is the pool's figure, read through a real socket.
 #[tokio::test(flavor = "multi_thread")]
 async fn info_reports_used_memory_that_moves_with_the_keyspace() {
@@ -195,7 +262,9 @@ async fn started(max_clients: usize, password: Option<&str>) -> std::net::Socket
         password: password.map(|pw| Secret::new(pw.as_bytes().to_vec())),
         ..Config::default()
     };
-    let server = Server::bind(cfg, DictSeed { k0: 1, k1: 2 }).await.unwrap();
+    let server = Server::bind(cfg, DictSeed { k0: 1, k1: 2 }, "t".repeat(RUN_ID_HEX))
+        .await
+        .unwrap();
     let addr = server.local_addr();
     tokio::spawn(server.run());
     addr

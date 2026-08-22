@@ -311,6 +311,9 @@ pub struct Server {
     max_clients: usize,
     pool: ShardPool,
     password: Option<Secret>,
+    /// What this run of the process calls itself in `INFO`. Drawn where the
+    /// keyspace seed is drawn, for the reason stated there.
+    run_id: String,
 }
 
 impl Server {
@@ -325,7 +328,7 @@ impl Server {
     ///
     /// Whatever binding the address failed with: in practice the port already
     /// being in use, or an address this host does not own.
-    pub async fn bind(cfg: Config, seed: DictSeed) -> std::io::Result<Self> {
+    pub async fn bind(cfg: Config, seed: DictSeed, run_id: String) -> std::io::Result<Self> {
         let listener = TcpListener::bind(cfg.bind).await?;
         // Asked of the socket rather than copied from the config: with port 0
         // the kernel chose, and the caller needs to learn what it chose.
@@ -336,6 +339,7 @@ impl Server {
             max_clients: cfg.max_clients,
             pool: ShardPool::spawn_limited(SHARDS, executors(), seed, NoTrace, cfg.limit),
             password: cfg.password,
+            run_id,
         })
     }
 
@@ -371,6 +375,19 @@ impl Server {
             memory: self.pool.memory(),
             limit: self.pool.limit(),
             password: self.password.clone(),
+            run_id: self.run_id.clone(),
+            process_id: std::process::id(),
+            // A path this process cannot name is reported as unknown rather
+            // than as an empty field: `INFO`'s contract is its field names,
+            // and a name with nothing after it reads as a path of no
+            // characters to whatever parses it.
+            executable: std::env::current_exe()
+                .map_or_else(|_| "unknown".to_owned(), |path| path.display().to_string()),
+            total_connections: Arc::new(AtomicU64::new(0)),
+            rejected_connections: Arc::new(AtomicU64::new(0)),
+            net_in: Arc::new(AtomicU64::new(0)),
+            net_out: Arc::new(AtomicU64::new(0)),
+            edge_calls: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
         };
         loop {
             tokio::select! {
@@ -388,19 +405,24 @@ impl Server {
                     // descriptors. Neither is a reason to stop serving the
                     // connections that did get in.
                     let Ok((stream, _peer)) = accepted else { continue };
-                    match Arc::clone(&clients).try_acquire_owned() {
-                        Ok(permit) => {
-                            let router = self.pool.clone();
-                            let node = node.clone();
-                            tokio::spawn(async move {
-                                // Held for exactly as long as the connection
-                                // is, the same way the permit beside it is.
-                                let _attached = Attached::count(&node.connected);
-                                serve_connection(stream, router, node).await;
-                                drop(permit);
-                            });
-                        }
-                        Err(_) => refuse(stream).await,
+                    // Counted before the permit is asked for, so the total and
+                    // the refusals describe the same population: every
+                    // connection this loop took off the listener is one or the
+                    // other, and Redis counts them the same way.
+                    node.total_connections.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(permit) = Arc::clone(&clients).try_acquire_owned() {
+                        let router = self.pool.clone();
+                        let node = node.clone();
+                        tokio::spawn(async move {
+                            // Held for exactly as long as the connection is,
+                            // the same way the permit beside it is.
+                            let _attached = Attached::count(&node.connected);
+                            serve_connection(stream, router, node).await;
+                            drop(permit);
+                        });
+                    } else {
+                        node.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                        refuse(stream).await;
                     }
                 }
             }
