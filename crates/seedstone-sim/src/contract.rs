@@ -205,6 +205,24 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
         },
     ),
     (
+        b"SLOWLOG",
+        Coverage::NotEmitted {
+            reason: "the slow log is empty by construction: no handler here \
+                     is timed, so no command can ever be recorded in it and \
+                     every reply is the same constant whatever the client \
+                     did before it.",
+        },
+    ),
+    (
+        b"LATENCY",
+        Coverage::NotEmitted {
+            reason: "the latency monitor is disabled by construction, and \
+                     the readings it would report are measurements this \
+                     server does not take — so there is nothing a client \
+                     could do that a later reply would reflect.",
+        },
+    ),
+    (
         b"QUIT",
         Coverage::NotEmitted {
             reason: "it closes the connection the rest of the burst is being \

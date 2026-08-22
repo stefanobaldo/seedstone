@@ -440,9 +440,9 @@ const KIND_NAMES: [&str; 16] = [
 ///
 /// Order is the order `# Commandstats` prints them in, after the keyed
 /// commands.
-pub const EDGE_NAMES: [&str; 13] = [
+pub const EDGE_NAMES: [&str; 15] = [
     "mget", "keys", "dbsize", "flushdb", "ping", "echo", "auth", "hello", "info", "command",
-    "client", "quit", "config",
+    "client", "quit", "config", "slowlog", "latency",
 ];
 
 /// The wall-clock reading a node with no wall clock reports: 2023-11-14
@@ -2031,6 +2031,14 @@ const COMMANDS: &[(&[u8], Handler)] = &[
         [] => Err(wrong_arity("config")),
         [sub, globs @ ..] => config(sub, globs, node),
     }),
+    (b"SLOWLOG", |args, _| match args {
+        [] => Err(wrong_arity("slowlog")),
+        [sub, rest @ ..] => slowlog(sub, rest),
+    }),
+    (b"LATENCY", |args, _| match args {
+        [] => Err(wrong_arity("latency")),
+        [sub, rest @ ..] => latency(sub, rest),
+    }),
     (b"QUIT", |args, _| match args {
         [] => Ok(Action::ReplyThenClose(Frame::Simple("OK".into()))),
         _ => Err(wrong_arity("quit")),
@@ -2241,6 +2249,85 @@ fn config_value(name: &str, node: &NodeInfo) -> String {
         "port" => node.tcp_port.to_string(),
         other => unreachable!("{other} is in CONFIG_PARAMETERS with no value beside it"),
     }
+}
+
+/// Answers `SLOWLOG` on a node whose slow log is empty and stays that way.
+///
+/// Nothing here times a handler, so there is no threshold at which a command
+/// would be recorded — which is what `CONFIG GET slowlog-log-slower-than`
+/// reports as `-1`. The alternative to answering is refusing, and a refusal
+/// carries a different fact: that the command does not exist. An exporter
+/// reads the first as the node's answer and the second as a failed scrape.
+fn slowlog(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
+    if sub.eq_ignore_ascii_case(b"GET") {
+        match rest {
+            [] => {}
+            // Redis reads the count before it reads the log and refuses a
+            // non-integer whatever the log holds. What the count then selects
+            // is a prefix of nothing, so it is parsed and dropped.
+            [count] => {
+                parse_i64(count).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
+            }
+            _ => return Err(wrong_arity("slowlog|get")),
+        }
+        return Ok(Action::Reply(Frame::Array(Vec::new())));
+    }
+    if sub.eq_ignore_ascii_case(b"LEN") {
+        if !rest.is_empty() {
+            return Err(wrong_arity("slowlog|len"));
+        }
+        return Ok(Action::Reply(Frame::Integer(0)));
+    }
+    if sub.eq_ignore_ascii_case(b"RESET") {
+        if !rest.is_empty() {
+            return Err(wrong_arity("slowlog|reset"));
+        }
+        // Nothing to clear, and `OK` is what Redis answers to clearing a log
+        // that was already empty: a runbook step that succeeds rather than
+        // one with an exception written beside it.
+        return Ok(Action::Reply(Frame::Simple("OK".into())));
+    }
+    Err(unknown_subcommand("SLOWLOG", sub))
+}
+
+/// Answers `LATENCY` on a node whose latency monitor is off.
+///
+/// `CONFIG GET latency-monitor-threshold` reports `0`, Redis's spelling for
+/// disabled, and these are the readings that belong beside it: nothing was
+/// sampled, so there is no latest reading, no history for any event, and no
+/// event a reset can remove. The argument for answering rather than refusing
+/// is [`slowlog`]'s.
+fn latency(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
+    if sub.eq_ignore_ascii_case(b"LATEST") {
+        if !rest.is_empty() {
+            return Err(wrong_arity("latency|latest"));
+        }
+        return Ok(Action::Reply(Frame::Array(Vec::new())));
+    }
+    if sub.eq_ignore_ascii_case(b"HISTORY") {
+        // One event name, as Redis takes it — the reply is that event's
+        // samples and there is nowhere in it for a second event's.
+        if rest.len() != 1 {
+            return Err(wrong_arity("latency|history"));
+        }
+        return Ok(Action::Reply(Frame::Array(Vec::new())));
+    }
+    if sub.eq_ignore_ascii_case(b"RESET") {
+        // Any number of event names, and the reply is how many events were
+        // cleared: none, whichever were named.
+        return Ok(Action::Reply(Frame::Integer(0)));
+    }
+    // `HISTOGRAM` is answered because it is scraped, not because there is a
+    // histogram to report: a stock Prometheus exporter asks for it beside
+    // `LATENCY LATEST` on every pass, and a refusal would be an error line
+    // per scrape for a command whose honest answer is already known. Redis
+    // answers a map keyed by command name and omits every command it has not
+    // tracked; with none tracked the map is empty, which is an empty array on
+    // this protocol.
+    if sub.eq_ignore_ascii_case(b"HISTOGRAM") {
+        return Ok(Action::Reply(Frame::Array(Vec::new())));
+    }
+    Err(unknown_subcommand("LATENCY", sub))
 }
 
 /// The unknown-subcommand message, byte-exact to Redis down to the full stop
@@ -5471,6 +5558,168 @@ mod tests {
         let frames = read_frames(&mut r, 2).await;
         assert_eq!(frames[0], Frame::Simple("OK".into()));
         assert_eq!(frames[1], pairs(&[("requirepass", "")]));
+    }
+
+    /// `SLOWLOG`, on a node whose slow log recorded nothing and never will.
+    ///
+    /// The distinction the assertions are about is between empty and absent.
+    /// An exporter scrapes `SLOWLOG LEN` on every pass and reads an error as
+    /// a node it could not talk to, while a zero is the node answering that
+    /// it has nothing slow to show — which, with no handler timed anywhere,
+    /// is the true reading and not a placeholder.
+    #[tokio::test]
+    async fn slowlog_answers_as_a_disabled_slow_log() {
+        let (mut r, mut w, _pool) = connected(1);
+        let mut out = Vec::new();
+        let requests: [&[&str]; 11] = [
+            &["SLOWLOG", "GET"],
+            &["SLOWLOG", "GET", "128"],
+            &["slowlog", "get", "-1"],
+            &["SLOWLOG", "LEN"],
+            &["SLOWLOG", "RESET"],
+            &["SLOWLOG", "HELP"],
+            &["SLOWLOG"],
+            &["SLOWLOG", "GET", "128", "more"],
+            &["SLOWLOG", "GET", "soon"],
+            &["SLOWLOG", "LEN", "more"],
+            &["SLOWLOG", "RESET", "more"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        let empty = Frame::Array(Vec::new());
+        assert_eq!(frames[0], empty);
+        assert_eq!(
+            frames[1], empty,
+            "a count selects a prefix of a log with nothing in it"
+        );
+        assert_eq!(
+            frames[2], empty,
+            "and so does Redis's spelling of all of it"
+        );
+        assert_eq!(frames[3], Frame::Integer(0));
+        assert_eq!(frames[4], Frame::Simple("OK".into()));
+        assert_eq!(
+            frames[5],
+            Frame::Error("ERR unknown subcommand 'HELP'. Try SLOWLOG HELP.".into())
+        );
+        assert_eq!(
+            frames[6],
+            Frame::Error("ERR wrong number of arguments for 'slowlog' command".into())
+        );
+        assert_eq!(
+            frames[7],
+            Frame::Error("ERR wrong number of arguments for 'slowlog|get' command".into())
+        );
+        assert_eq!(
+            frames[8],
+            Frame::Error(ReplyError::NotAnInteger.wire_text().to_owned()),
+            "the count is refused for what it is, before the log it would read"
+        );
+        assert_eq!(
+            frames[9],
+            Frame::Error("ERR wrong number of arguments for 'slowlog|len' command".into())
+        );
+        assert_eq!(
+            frames[10],
+            Frame::Error("ERR wrong number of arguments for 'slowlog|reset' command".into())
+        );
+    }
+
+    /// `LATENCY`, on a node whose latency monitor is off.
+    ///
+    /// `CONFIG GET latency-monitor-threshold` already reports `0`, which is
+    /// how Redis spells a monitor that is disabled, and these are the
+    /// readings that belong beside it: nothing sampled, so no latest reading,
+    /// no history for any event, and no event a reset can remove.
+    #[tokio::test]
+    async fn latency_answers_as_a_disabled_monitor() {
+        let (mut r, mut w, _pool) = connected(1);
+        let mut out = Vec::new();
+        let requests: [&[&str]; 9] = [
+            &["LATENCY", "LATEST"],
+            &["latency", "history", "command"],
+            &["LATENCY", "RESET"],
+            &["LATENCY", "RESET", "command", "fork"],
+            &["LATENCY", "DOCTOR"],
+            &["LATENCY"],
+            &["LATENCY", "LATEST", "more"],
+            &["LATENCY", "HISTORY"],
+            &["LATENCY", "HISTORY", "command", "fork"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        let empty = Frame::Array(Vec::new());
+        assert_eq!(frames[0], empty);
+        assert_eq!(frames[1], empty, "no event has a history to answer with");
+        assert_eq!(
+            frames[2],
+            Frame::Integer(0),
+            "the reply counts the events cleared, and none were recorded"
+        );
+        assert_eq!(frames[3], Frame::Integer(0), "naming events clears no more");
+        assert_eq!(
+            frames[4],
+            Frame::Error("ERR unknown subcommand 'DOCTOR'. Try LATENCY HELP.".into())
+        );
+        assert_eq!(
+            frames[5],
+            Frame::Error("ERR wrong number of arguments for 'latency' command".into())
+        );
+        assert_eq!(
+            frames[6],
+            Frame::Error("ERR wrong number of arguments for 'latency|latest' command".into())
+        );
+        assert_eq!(
+            frames[7],
+            Frame::Error("ERR wrong number of arguments for 'latency|history' command".into())
+        );
+        assert_eq!(
+            frames[8],
+            Frame::Error("ERR wrong number of arguments for 'latency|history' command".into()),
+            "one event per request, as Redis takes it"
+        );
+    }
+
+    /// `LATENCY HISTOGRAM` is answered because it is scraped, not because
+    /// this node has a histogram to report.
+    ///
+    /// A stock Prometheus exporter asks for it beside `LATENCY LATEST` on
+    /// every pass, so a refusal here is an error line per scrape for a
+    /// command whose honest answer this server already knows. Redis answers a
+    /// map keyed by command name and leaves out every command it has not
+    /// tracked; with none tracked the map is empty, which in this protocol is
+    /// an empty array.
+    #[tokio::test]
+    async fn latency_histogram_answers_an_empty_map() {
+        let (mut r, mut w, _pool) = connected(1);
+        let mut out = Vec::new();
+        let requests: [&[&str]; 2] = [
+            &["LATENCY", "HISTOGRAM"],
+            &["latency", "histogram", "get", "set"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        let empty = Frame::Array(Vec::new());
+        assert_eq!(frames[0], empty);
+        assert_eq!(
+            frames[1], empty,
+            "naming commands narrows a map that is already empty"
+        );
     }
 
     /// A connection command sits in the same stream as a keyed one, and the
