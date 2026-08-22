@@ -224,6 +224,15 @@ the refusal. Under `allkeys-lru` the crossing is reclaimed immediately and the
 figure is back under before the reply goes out; under `noeviction` the node
 sits marginally over its ceiling until something is deleted or expires.
 
+**The slow log and the latency monitor are disabled, by construction.**
+`SLOWLOG GET` is empty, `LATENCY LATEST` is empty, and `CONFIG GET` reports
+`slowlog-log-slower-than -1` and `latency-monitor-threshold 0` — which is what
+Redis itself reports with both monitors off, so the readings and the
+configuration agree. Nothing here times a handler, so `commandstats` carries
+call counts and no `usec` fields; a zero there would be a measurement this
+server does not take, printed as if it did. Per-command timing is a measurement
+campaign's to add, with a cost stated, not a field to fill in.
+
 **The surface is a named list, and anything outside it is refused.** A command
 this server does not implement is answered with an error naming it, rather than
 with an approximation of what it might have meant. The list is chosen for the
