@@ -32,7 +32,7 @@ reason the linked code documents in place.
   `#[allow(clippy::…, reason = "…")]` — the reason is mandatory.
 - Workspace-level allows exist only for lints that are noise as a class;
   each would carry a comment in `Cargo.toml` and an entry here. **There are
-  none.** Every deviation in the tree is site-local, and there are six:
+  none.** Every deviation in the tree is site-local, and there are seven:
   `slot.rs` narrowing a quotient it has just bounded, `shard.rs` taking its
   trace sink, log factory and shard policy — the policy decides expiry and
   the walk's order both — by value so a caller can move them in, `main.rs`
@@ -43,10 +43,13 @@ reason the linked code documents in place.
   the service layer as a dependency so a simulated node is handed its own,
   `crates/seedstone-sim/src/sweep.rs` spawning its workers past the same
   prohibition, since it starts whole simulated runs and never reaches inside
-  one, which is what that prohibition protects — and one `unreachable_code` in
-  a test whose loop can only end by returning. Each carries its `reason`, and
+  one, which is what that prohibition protects — `seedstone-service`'s
+  `human_bytes` dividing a byte count by a binary unit in `f64` to print
+  `INFO`'s `_human` spelling, which is a display string rounded to two
+  decimals and never a figure anything computes from — and one
+  `unreachable_code` in a test whose loop can only end by returning. Each carries its `reason`, and
   the count belongs here because a guide that undercounts its own exceptions
-  is how a seventh one arrives unremarked.
+  is how an eighth one arrives unremarked.
 - `clippy.toml` carries the two settings a lint reads rather than a lint
   being switched off. `doc-valid-idents` lists the proper nouns
   `doc_markdown` would otherwise demand backticks around — `SeedStone`,

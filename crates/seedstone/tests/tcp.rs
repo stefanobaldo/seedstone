@@ -147,6 +147,20 @@ async fn info_reports_the_bound_port_and_the_live_connection_count() {
     );
 }
 
+/// `used_memory` is the pool's figure, read through a real socket.
+#[tokio::test(flavor = "multi_thread")]
+async fn info_reports_used_memory_that_moves_with_the_keyspace() {
+    let addr = started(4).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let before = info_field(&mut stream, "used_memory").await;
+    round_trip(&mut stream, &["SET", "k", "0123456789"]).await;
+    let after = info_field(&mut stream, "used_memory").await;
+    assert!(
+        after > before,
+        "a write did not move used_memory: {before} -> {after}"
+    );
+}
+
 // --- helpers ---
 
 /// Binds an ephemeral port, spawns the accept loop, returns the address.
@@ -178,14 +192,20 @@ async fn info_text(stream: &mut TcpStream) -> String {
     }
 }
 
+/// What `INFO` currently says the numeric field `name` is.
+async fn info_field(stream: &mut TcpStream, name: &str) -> u64 {
+    let text = info_text(stream).await;
+    let prefix = format!("{name}:");
+    text.lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("INFO has no {name}: {text:?}"))
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} is not a number: {text:?}"))
+}
+
 /// What `INFO` currently says `connected_clients` is.
 async fn connected_clients(stream: &mut TcpStream) -> u64 {
-    let text = info_text(stream).await;
-    text.lines()
-        .find_map(|line| line.strip_prefix("connected_clients:"))
-        .unwrap_or_else(|| panic!("INFO has no connected_clients: {text:?}"))
-        .parse()
-        .expect("connected_clients is not a number")
+    info_field(stream, "connected_clients").await
 }
 
 fn req(parts: &[&str]) -> Frame {

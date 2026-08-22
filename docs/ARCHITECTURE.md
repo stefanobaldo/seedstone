@@ -181,6 +181,21 @@ continuing into it: walking a thousand keys costs about a thousand calls, where
 Redis answers the same walk in about a hundred at its default `COUNT`. That is
 a floor on round trips, not on work — each call still costs what a `GET` costs.
 
+**`used_memory` is an accounting formula, not an allocator reading.** Each
+shard's keyspace reports what it is accounted at — a fixed overhead per entry
+plus the lengths of its key and value, plus a fixed cost per bucket of every
+table it holds — and the node's figure is the sum, kept current by the shard
+executors as they run commands. Nothing asks the allocator. The reason is the
+one behind everything else here: an allocator's answer depends on the
+allocator, the platform and the fragmentation history of the process, so a
+replayed run would not reproduce it, and a memory ceiling derived from it
+would be a different ceiling on every machine. What the formula costs is
+exactness: it counts the bytes a value has, not the bytes the allocator
+rounded them up to, and it does not count what the process spends outside the
+keyspace. `mem_fragmentation_ratio` is therefore always `1.00` — the honest
+answer for a figure that is not measured against an allocator at all, rather
+than a ratio invented to fill the field.
+
 **The surface is a named list, and anything outside it is refused.** A command
 this server does not implement is answered with an error naming it, rather than
 with an approximation of what it might have meant. The list is chosen for the

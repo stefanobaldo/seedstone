@@ -1130,7 +1130,11 @@ async fn server(
     // One per host, as it is in production: it describes the node, not the
     // connection. No workload here asks a host about itself, so nothing reads
     // it — it is here because the connection code takes one.
-    let node = NodeInfo::for_tests();
+    let mut node = NodeInfo::for_tests();
+    // The simulated node's `INFO` reads the same word its executors keep, for
+    // the reason the field states: a scrape and an eviction decision must not
+    // be able to disagree.
+    node.memory = pool.memory();
     loop {
         let (stream, _peer) = listener.accept().await?;
         // Only one plant is a router now. The other two are inside the server,

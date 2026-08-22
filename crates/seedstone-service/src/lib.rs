@@ -61,6 +61,7 @@
 //!   the [`ReplyError`] set, and `every_error_constant_is_frame_safe` for the
 //!   constants and the status texts.
 
+use seedstone_core::memory::MemoryGauge;
 use seedstone_core::shard::{Command, Cond, Expiry, Reply, ReplyError, Router, parse_i64};
 use seedstone_resp::{Decoder, DecoderLimits, Frame, ParseError, encode};
 use std::future::{Future, poll_fn};
@@ -456,6 +457,11 @@ pub struct NodeInfo {
     /// the real node is handed the real one, so a client's `EXAT` means what
     /// it means everywhere else.
     pub now_unix_millis: fn() -> u64,
+    /// The node-wide memory figure, kept current by the shard executors and
+    /// read here for `INFO`. Cloned from the pool at the composition root —
+    /// and in the simulator from its pool — so the number a scrape reads is
+    /// the number the eviction decision is taken against.
+    pub memory: MemoryGauge,
 }
 
 impl NodeInfo {
@@ -481,6 +487,7 @@ impl NodeInfo {
             started: Instant::now(),
             connected: Arc::new(AtomicU64::new(0)),
             now_unix_millis: || FIXED_UNIX_MILLIS,
+            memory: MemoryGauge::default(),
         }
     }
 }
@@ -544,6 +551,16 @@ enum Unbatched {
         /// `COUNT`, already bounded by [`WALK_STEP_BUCKETS`].
         count: usize,
     },
+    /// The sections a peer asked `INFO` for, rendered once the chunk in front
+    /// of it has run.
+    ///
+    /// It reaches no shard, and it is here for the ordering alone. `INFO`
+    /// reports the keyspace — `used_memory` is the node's accounting of it —
+    /// so a document rendered while the writes the peer pipelined ahead of it
+    /// were still in flight would describe a keyspace from before them. That
+    /// is the same hazard [`Keys`](Unbatched::Keys) is here for, and the
+    /// answer is the same one.
+    Info(Vec<Vec<u8>>),
 }
 
 /// What a fan-out's replies are folded into.
@@ -585,7 +602,7 @@ impl Fold {
 
 impl Unbatched {
     /// Runs the request and answers with the single frame it earns.
-    async fn answer<R: Router>(self, router: &R) -> Frame {
+    async fn answer<R: Router>(self, router: &R, node: &NodeInfo) -> Frame {
         match self {
             Self::FanOut { cmds, fold } => fan_out(router, cmds, fold).await,
             Self::Every(cmd) => broadcast(router, cmd).await,
@@ -595,6 +612,7 @@ impl Unbatched {
                 pattern,
                 count,
             } => scan(router, cursor, pattern, count).await,
+            Self::Info(wanted) => Frame::Bulk(info(node, &wanted).into_bytes()),
         }
     }
 }
@@ -751,7 +769,7 @@ async fn serve_connection_limited<S, R>(
                         {
                             return;
                         }
-                        slots.push(Slot::Ready(request.answer(&router).await));
+                        slots.push(Slot::Ready(request.answer(&router, &node).await));
                     }
                     Action::Reply(frame) => slots.push(Slot::Ready(frame)),
                     Action::ReplyThenClose(frame) => {
@@ -1697,8 +1715,13 @@ const COMMANDS: &[(&[u8], Handler)] = &[
         _ => Err(wrong_arity("echo")),
     }),
     (b"HELLO", |args, node| hello(args, node)),
-    (b"INFO", |args, node| {
-        Ok(Action::Reply(Frame::Bulk(info(node, args).into_bytes())))
+    (b"INFO", |args, _| {
+        // Unbatched rather than answered here: see [`Unbatched::Info`] — the
+        // document describes the keyspace, so it is rendered after the writes
+        // the peer pipelined in front of it, not before them.
+        Ok(Action::Unbatched(Unbatched::Info(
+            args.iter_mut().map(take).collect(),
+        )))
     }),
     (b"COMMAND", |args, _| match args {
         // Redis answers with a description of every command it has. This one
@@ -1897,7 +1920,37 @@ fn info(node: &NodeInfo, wanted: &[Vec<u8>]) -> String {
             node.connected.load(Ordering::Relaxed),
         );
     }
+    if asked_for(b"memory") {
+        let used = node.memory.used();
+        let _ = write!(
+            text,
+            "# Memory\r\n\
+             used_memory:{used}\r\n\
+             used_memory_human:{}\r\n\
+             mem_fragmentation_ratio:1.00\r\n\r\n",
+            human_bytes(used),
+        );
+    }
     text
+}
+
+/// Redis's `_human` spelling: two decimals and a binary unit, `1.23K`,
+/// `4.56M`, `7.89G`, and bare bytes below a kilobyte.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [(1 << 30, "G"), (1 << 20, "M"), (1 << 10, "K")];
+    for (unit, suffix) in UNITS {
+        if bytes >= unit {
+            // Two decimals of a ratio below 2^34: f64 holds it exactly enough
+            // for a display string, which is all this is.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "a display figure, rounded to two decimals"
+            )]
+            let value = bytes as f64 / unit as f64;
+            return format!("{value:.2}{suffix}");
+        }
+    }
+    format!("{bytes}B")
 }
 
 /// Answers `HELLO`, which is how a client asks what it is talking to.
@@ -2388,6 +2441,40 @@ mod tests {
         assert_eq!(frames[0], Frame::Simple("OK".into()));
         assert_eq!(frames[1], Frame::Bulk(b"v".to_vec()));
         assert!(matches!(&frames[2], Frame::Error(e) if e.contains("unknown command")));
+    }
+
+    #[tokio::test]
+    async fn info_memory_reports_what_the_pool_accounts() {
+        let pool = ShardPool::spawn(16, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let gauge = pool.memory();
+        let mut node = NodeInfo::for_tests();
+        node.memory = gauge.clone();
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server, pool, node));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        encode(&req(&["SET", "k", "0123456789"]), &mut out);
+        encode(&req(&["INFO", "memory"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 2).await;
+        let Frame::Bulk(text) = &frames[1] else {
+            panic!("INFO answered {:?}", frames[1])
+        };
+        let text = String::from_utf8(text.clone()).unwrap();
+        assert!(text.starts_with("# Memory\r\n"), "{text}");
+        let used: u64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("used_memory:"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(used, gauge.used());
+        assert!(
+            text.contains("\r\nmem_fragmentation_ratio:1.00\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("used_memory_human:"), "{text}");
     }
 
     #[tokio::test]
