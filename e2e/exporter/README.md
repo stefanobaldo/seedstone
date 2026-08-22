@@ -16,6 +16,21 @@ small keyspace, runs the exporter in a container and scrapes it once.
    server refused, so an empty error log is what "without adjustment" means
    mechanically.
 
+## The password is a literal
+
+The server this lane starts requires one, and the exporter authenticates with
+it the way it would against a Redis deployment with a `requirepass` — which is
+the configuration these metrics are usually scraped from. **The password is
+`lane-password` and it protects nothing**: it is written beside the lane when
+CI has not handed one over.
+
+`--redis.password-file` is not a file holding a password. It reads a JSON
+object mapping each `--redis.addr` the exporter was given to that server's
+password, and a file holding the bare password is refused at startup with
+`password file format error`. The lane therefore writes that map itself, keyed
+by the address it is about to pass, and derives it from the same file the
+server is started with — so the two secrets cannot drift apart.
+
 ## The pin
 
 The container is selected by its **manifest-list digest** — the digest of the

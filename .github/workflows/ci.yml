@@ -177,6 +177,16 @@ jobs:
       - name: build the server
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: cargo build --release -p seedstone --locked
+      # Every client lane but redis-cli authenticates. The password is a
+      # literal: it protects nothing and exists so the authenticated path is
+      # the one these lanes exercise. The redis-cli lane runs open on purpose,
+      # so the other path stays exercised too.
+      - name: the lanes' password
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: |
+          printf 'lane-password\n' > "$RUNNER_TEMP/seedstone-password"
+          echo "SEEDSTONE_PASSWORD_FILE=$RUNNER_TEMP/seedstone-password" >> "$GITHUB_ENV"
+          echo "SEEDSTONE_PASSWORD=lane-password" >> "$GITHUB_ENV"
       # Bounded and retried, for the reason the `perf` job's copy states: an
       # unbounded `apt-get update` on a runner occasionally stops answering
       # rather than failing, and burns the job's whole budget ending red for a
@@ -206,19 +216,19 @@ jobs:
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: |
           set -euo pipefail
-          target/release/seedstone --bind 127.0.0.1:6390 &
+          target/release/seedstone --bind 127.0.0.1:6390 --requirepass-file "$SEEDSTONE_PASSWORD_FILE" &
           server=$!
           trap 'kill "$server" 2>/dev/null || true' EXIT
-          for _ in $(seq 50); do redis-cli -p 6390 ping >/dev/null 2>&1 && break; sleep 0.1; done
+          for _ in $(seq 50); do redis-cli -p 6390 -a "$SEEDSTONE_PASSWORD" --no-auth-warning ping >/dev/null 2>&1 && break; sleep 0.1; done
           python -m pytest e2e/python -q
       - name: go-redis
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: |
           set -euo pipefail
-          target/release/seedstone --bind 127.0.0.1:6390 &
+          target/release/seedstone --bind 127.0.0.1:6390 --requirepass-file "$SEEDSTONE_PASSWORD_FILE" &
           server=$!
           trap 'kill "$server" 2>/dev/null || true' EXIT
-          for _ in $(seq 50); do redis-cli -p 6390 ping >/dev/null 2>&1 && break; sleep 0.1; done
+          for _ in $(seq 50); do redis-cli -p 6390 -a "$SEEDSTONE_PASSWORD" --no-auth-warning ping >/dev/null 2>&1 && break; sleep 0.1; done
           cd e2e/go && go test ./...
       # The compatibility lane. It runs in a container rather than on the
       # runner's Python because the client pair it exercises is pinned and the

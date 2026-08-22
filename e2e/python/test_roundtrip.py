@@ -12,6 +12,10 @@ import pytest
 import redis
 
 PORT = int(os.environ.get("SEEDSTONE_PORT", "6390"))
+# The lane's password, or nothing when the server was started open. A literal
+# in CI that protects nothing: it exists so this lane exercises the
+# authenticated path rather than the open one.
+PASSWORD = os.environ.get("SEEDSTONE_PASSWORD")
 
 
 KEYS = ("k", "k2", "n", "fresh", "brief", "missing")
@@ -19,7 +23,7 @@ KEYS = ("k", "k2", "n", "fresh", "brief", "missing")
 
 @pytest.fixture(scope="module")
 def r():
-    client = redis.Redis(port=PORT, decode_responses=True)
+    client = redis.Redis(port=PORT, password=PASSWORD, decode_responses=True)
     # The server has no FLUSHALL and this gate does not need one, but a
     # counter that survives a re-run against a server someone left up would
     # fail the second run and pass the first. Clearing what these tests own is

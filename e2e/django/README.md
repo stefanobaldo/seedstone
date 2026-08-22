@@ -64,6 +64,18 @@ Moving a row from `not-yet` to `out-of-rule` to make the lane green is a
 defect, not a fix. A review that sees a row change category without naming a
 command this server refuses on purpose should stop.
 
+## The lane authenticates
+
+The server this lane starts requires a password, and the settings module
+carries it in the cache URL — no username, so the client sends the
+one-argument `AUTH <password>` that a Redis deployment with a `requirepass`
+and no ACL user receives. **The password is a literal, `lane-password`, and it
+protects nothing**: it is written into a file beside the lane when CI has not
+handed one over, and it exists so that the path under test is the
+authenticated one rather than the open one. Every other lane here does the
+same; `redis-cli.sh` is the exception, and it runs open on purpose so that
+path keeps its coverage too.
+
 ## Running it
 
 ```console

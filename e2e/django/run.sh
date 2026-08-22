@@ -39,9 +39,20 @@ else
   network=(--add-host "host.docker.internal:host-gateway")
 fi
 
-"$server_binary" --bind "${bind_address}:${port}" &
+# This lane always authenticates. In CI the password file is handed to it; a
+# developer running the lane bare gets one written here, so the path under test
+# is the same either way. The literal protects nothing — it exists so the
+# authenticated path is the one this suite drives.
+password_file="${SEEDSTONE_PASSWORD_FILE:-}"
+if [ -z "$password_file" ]; then
+  password_file="${here}/.password"
+  printf 'lane-password\n' > "$password_file"
+fi
+password="$(cat "$password_file")"
+
+"$server_binary" --bind "${bind_address}:${port}" --requirepass-file "$password_file" &
 server=$!
-trap 'kill "$server" 2>/dev/null || true' EXIT
+trap 'kill "$server" 2>/dev/null || true; rm -f "${here}/.password"' EXIT
 
 for _ in $(seq 100); do
   if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then break; fi
@@ -52,6 +63,7 @@ docker run --rm "${network[@]}" \
   -v "${here}:/lane" -w /lane \
   -e SEEDSTONE_HOST="$server_host" \
   -e SEEDSTONE_PORT="$port" \
+  -e SEEDSTONE_PASSWORD="$password" \
   -e DJANGO_REDIS_SHA256 \
   "$image" sh -euc '
     pip install --quiet --no-cache-dir --disable-pip-version-check --root-user-action=ignore -r requirements.txt
