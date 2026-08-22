@@ -12,9 +12,11 @@ small keyspace, runs the exporter in a container and scrapes it once.
 1. `redis_up 1` — the exporter reached the server and read `INFO`.
 2. A named list of metrics is present with the values this lane can predict
    from what it wrote and how it started the server.
-3. **The exporter logged no error.** An exporter logs every command the
-   server refused, so an empty error log is what "without adjustment" means
-   mechanically.
+3. **The exporter logged no error.** A command this server refuses is
+   something an exporter reports, so an empty error log is one half of what
+   "without adjustment" means mechanically. Only one half: it does not report
+   every one of them, which is why the second assertion exists beside this —
+   see "What the error log does not say" below.
 
 ## The password is a literal
 
