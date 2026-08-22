@@ -9,12 +9,13 @@
 use seedstone::server::{Config, MAX_CLIENTS_REACHED, Server};
 use seedstone_core::dict::DictSeed;
 use seedstone_resp::{Frame, encode, parse};
+use seedstone_service::Secret;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn serves_get_set_over_real_tcp() {
-    let addr = started(4).await;
+    let addr = started(4, None).await;
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut out = Vec::new();
@@ -33,7 +34,7 @@ async fn serves_get_set_over_real_tcp() {
 /// rather than on the accept.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_connection_reads_what_the_first_wrote() {
-    let addr = started(4).await;
+    let addr = started(4, None).await;
 
     let mut first = TcpStream::connect(addr).await.unwrap();
     round_trip(&mut first, &["SET", "shared", "value"]).await;
@@ -52,7 +53,7 @@ async fn over_limit_connections_are_told_and_closed() {
     // below is what proves the connection is being served, so the permit is
     // certainly spent by the time the second one arrives. Without that proof
     // this test would race the accept loop and pass for the wrong reason.
-    let addr = started(1).await;
+    let addr = started(1, None).await;
 
     let mut holder = TcpStream::connect(addr).await.unwrap();
     assert_eq!(
@@ -99,7 +100,7 @@ async fn over_limit_connections_are_told_and_closed() {
 /// peer that simply vanishes.
 #[tokio::test(flavor = "multi_thread")]
 async fn info_reports_the_bound_port_and_the_live_connection_count() {
-    let addr = started(4).await;
+    let addr = started(4, None).await;
 
     let mut observer = TcpStream::connect(addr).await.unwrap();
     assert!(
@@ -150,7 +151,7 @@ async fn info_reports_the_bound_port_and_the_live_connection_count() {
 /// `used_memory` is the pool's figure, read through a real socket.
 #[tokio::test(flavor = "multi_thread")]
 async fn info_reports_used_memory_that_moves_with_the_keyspace() {
-    let addr = started(4).await;
+    let addr = started(4, None).await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let before = info_field(&mut stream, "used_memory").await;
     round_trip(&mut stream, &["SET", "k", "0123456789"]).await;
@@ -161,13 +162,37 @@ async fn info_reports_used_memory_that_moves_with_the_keyspace() {
     );
 }
 
+/// The gate over a kernel socket, which is the one place it has never been
+/// exercised: everything below this crate authenticates over a duplex pipe.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_is_required_over_a_real_socket() {
+    let addr = started(4, Some("pw")).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    assert_eq!(
+        round_trip(&mut stream, &["PING"]).await,
+        Frame::Error("NOAUTH Authentication required.".into())
+    );
+    assert_eq!(
+        round_trip(&mut stream, &["AUTH", "pw"]).await,
+        Frame::Simple("OK".into())
+    );
+    assert_eq!(
+        round_trip(&mut stream, &["PING"]).await,
+        Frame::Simple("PONG".into())
+    );
+}
+
 // --- helpers ---
 
 /// Binds an ephemeral port, spawns the accept loop, returns the address.
-async fn started(max_clients: usize) -> std::net::SocketAddr {
+///
+/// `password` is what a connection must present, or `None` for a node that
+/// asks for none — which is what every test here but one wants.
+async fn started(max_clients: usize, password: Option<&str>) -> std::net::SocketAddr {
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         max_clients,
+        password: password.map(|pw| Secret::new(pw.as_bytes().to_vec())),
         ..Config::default()
     };
     let server = Server::bind(cfg, DictSeed { k0: 1, k1: 2 }).await.unwrap();

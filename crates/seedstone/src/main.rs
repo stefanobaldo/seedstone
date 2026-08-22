@@ -10,7 +10,11 @@ use seedstone::server::{Config, Server};
 use seedstone_core::dict::DictSeed;
 
 fn main() {
-    let cfg = match Config::from_args(std::env::args().skip(1)) {
+    // The one place the process environment is read. Every layer below takes
+    // it as a parameter, for the reason `from_args_and_env` states.
+    let cfg = match Config::from_args_and_env(std::env::args().skip(1), |name| {
+        std::env::var(name).ok()
+    }) {
         Ok(cfg) => cfg,
         Err(usage) => {
             eprintln!("{usage}");
