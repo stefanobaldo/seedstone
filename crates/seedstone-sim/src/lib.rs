@@ -1039,11 +1039,27 @@ fn fold_reply(h: u64, reply: &Reply) -> u64 {
             }
             acc
         }
-        // Both fields the eviction shape asserts over, and only those: the
-        // counters the operational surface adds later join this fold on the
-        // commit that starts maintaining them, since a field folded while it
-        // is always zero is a field whose first real value moves every hash.
-        Reply::Stats(stats) => mix(mix(mix(h, 9), stats.keys), stats.evicted),
+        // Every field, in declaration order, now that every field is
+        // maintained. It is one reply, and its whole content is what a
+        // divergence between two runs would show in — a shard that counted a
+        // hit the replay counted as a miss has diverged, whether or not any
+        // assertion happens to read that field.
+        Reply::Stats(stats) => {
+            let mut acc = mix(mix(h, 9), stats.keys);
+            for field in [
+                stats.expires,
+                stats.evicted,
+                stats.hits,
+                stats.misses,
+                stats.expired,
+            ] {
+                acc = mix(acc, field);
+            }
+            for calls in stats.calls {
+                acc = mix(acc, calls);
+            }
+            acc
+        }
         // Folds the wire text, not the variant tag: the recorded hashes
         // predate the enum and must not move for a change that renamed
         // nothing a client can see.

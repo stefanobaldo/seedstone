@@ -406,6 +406,44 @@ const SERVER_NAME: &str = "seedstone";
 /// drift a second literal invites.
 const SERVER_MODE: &str = "standalone";
 
+/// How many hexadecimal characters a `run_id` is. Redis's width, because a
+/// monitor that stores the field stores it at Redis's size.
+pub const RUN_ID_HEX: usize = 40;
+
+/// What each [`Command::kind`] is called on the wire, indexed by the tag.
+///
+/// `commandstats` reports a count per command name, and the shards count per
+/// command *kind* — so this is the one place the two vocabularies meet.
+/// Slot `0` is no command; slot `15` is [`Command::Stats`], which is how the
+/// shards answer an `INFO` and never something a peer sent, so it is counted
+/// at the edge as `info` and the shards leave it alone.
+///
+/// `ScanStep` is `scan` because that is the command a peer sends to produce
+/// one. A `KEYS` walk also runs steps, and is counted separately in
+/// [`EDGE_NAMES`] as the one request it was.
+const KIND_NAMES: [&str; 16] = [
+    "", "get", "set", "del", "incrby", "expire", "ttl", "exists", "flushdb", "dbsize", "scan",
+    "pexpire", "persist", "type", "strlen", "info",
+];
+
+/// The commands this layer answers or splits itself, counted here because no
+/// shard can count them.
+///
+/// Three kinds of thing are here. The connection's own business — `PING`,
+/// `AUTH`, `HELLO` and the rest — reaches no shard at all. `MGET` and `KEYS`
+/// reach shards under other names: an `MGET` is a pile of `GET`s and a `KEYS`
+/// is a pile of scan steps, so the shards count what they ran and this counts
+/// the request the peer actually made. `DBSIZE` and `FLUSHDB` reach *every*
+/// shard, so counting them where they land would report one request as one
+/// per shard.
+///
+/// Order is the order `# Commandstats` prints them in, after the keyed
+/// commands.
+pub const EDGE_NAMES: [&str; 12] = [
+    "mget", "keys", "dbsize", "flushdb", "ping", "echo", "auth", "hello", "info", "command",
+    "client", "quit",
+];
+
 /// The wall-clock reading a node with no wall clock reports: 2023-11-14
 /// 22:13:20 UTC, in milliseconds.
 ///
@@ -484,6 +522,36 @@ pub struct NodeInfo {
     /// connection loop will run. `None` is an open node, which is why the
     /// edge refuses to configure one on an address a network can reach.
     pub password: Option<Secret>,
+    /// Forty hexadecimal characters identifying this run of the process,
+    /// drawn once at the composition root beside the keyspace seed.
+    ///
+    /// It exists so that a monitor can tell a node that has been restarted
+    /// from one that has not: every counter below resets when this changes,
+    /// and a rate computed across the boundary without noticing is a rate
+    /// computed from a fall to zero. Redis's own field, spelling and width
+    /// included, because that is what reads it.
+    pub run_id: String,
+    /// The operating system's identifier for this process.
+    pub process_id: u32,
+    /// The path this process was started from, or `unknown` where there is
+    /// none to report.
+    pub executable: String,
+    /// Connections accepted since the node started — a running total, unlike
+    /// [`connected`](Self::connected) beside it, which is a gauge.
+    pub total_connections: Arc<AtomicU64>,
+    /// Connections refused because the limit was already spent.
+    pub rejected_connections: Arc<AtomicU64>,
+    /// Bytes read from peers, counted where they are read.
+    pub net_in: Arc<AtomicU64>,
+    /// Bytes written to peers, counted where they are flushed.
+    pub net_out: Arc<AtomicU64>,
+    /// How many of each [`EDGE_NAMES`] command peers have sent, in that
+    /// order.
+    ///
+    /// The commands this layer answers or splits itself, which for that
+    /// reason no shard can count: see [`EDGE_NAMES`] for what belongs here
+    /// and what is counted by the shard that runs it instead.
+    pub edge_calls: Arc<[AtomicU64; EDGE_NAMES.len()]>,
 }
 
 impl NodeInfo {
@@ -512,6 +580,17 @@ impl NodeInfo {
             memory: MemoryGauge::default(),
             limit: MemoryLimit::default(),
             password: None,
+            // A node with no process to describe says so: forty zeros is not
+            // a run identifier any process would draw, so a document carrying
+            // it is recognisably a test's rather than a node's.
+            run_id: "0".repeat(RUN_ID_HEX),
+            process_id: 0,
+            executable: "unknown".to_owned(),
+            total_connections: Arc::new(AtomicU64::new(0)),
+            rejected_connections: Arc::new(AtomicU64::new(0)),
+            net_in: Arc::new(AtomicU64::new(0)),
+            net_out: Arc::new(AtomicU64::new(0)),
+            edge_calls: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
         }
     }
 
@@ -791,10 +870,10 @@ async fn serve_connection_limited<S, R>(
     let mut read_buf = vec![0u8; READ_FLOOR];
     let mut quiet_reads = 0u32;
     let mut out: Vec<u8> = Vec::new();
-    // The chunk under construction. Both live outside the loop so their
-    // capacity survives a chunk boundary instead of being rebuilt per drain.
-    let mut slots: Vec<Slot> = Vec::new();
-    let mut batch: Vec<Command> = Vec::new();
+    // The chunk under construction. It lives outside the loop so its two
+    // buffers keep their capacity across a chunk boundary instead of being
+    // rebuilt per drain.
+    let mut chunk = Chunk::default();
 
     let idle = tokio::time::sleep(idle_shed);
     tokio::pin!(idle);
@@ -813,82 +892,30 @@ async fn serve_connection_limited<S, R>(
         // Drain every complete frame the decoder already holds before asking
         // the transport for more. The replies accumulate in `out`; the write
         // happens once, at the drain's end.
-        let mut hang_up = false;
-        let mut drained = false;
-        while !drained && !hang_up {
-            match decoder.try_next() {
-                Ok(Some(frame)) => match gated(frame_to_action(frame, &node), authenticated) {
-                    Action::Dispatch(cmd) => {
-                        slots.push(Slot::Pending(batch.len()));
-                        batch.push(cmd);
-                        // A batch at the mark is dispatched here rather than
-                        // held until the decoder runs dry — see
-                        // [`CHUNK_COMMANDS`]. The peer sees the same frames in
-                        // the same order, so no ordering this loop guarantees
-                        // moves; only how many commands one message carries.
-                        if batch.len() >= CHUNK_COMMANDS
-                            && !emit_chunk(&mut stream, &mut out, &router, &mut slots, &mut batch)
-                                .await
-                        {
-                            return;
-                        }
-                    }
-                    Action::Unbatched(request) => {
-                        // The chunk closes *before* the request runs, and that
-                        // is an ordering requirement rather than tidiness: the
-                        // commands already batched were written by the peer
-                        // ahead of this one, and dispatching this while those
-                        // wait would run a `DEL k` before the `SET k v` the
-                        // peer pipelined in front of it, empty the keyspace in
-                        // front of the writes that filled it, or answer a
-                        // `KEYS` without the key a `SET` just wrote.
-                        if !emit_chunk(&mut stream, &mut out, &router, &mut slots, &mut batch).await
-                        {
-                            return;
-                        }
-                        slots.push(Slot::Ready(request.answer(&router, &node).await));
-                    }
-                    Action::Reply(frame) | Action::Hello(frame) => slots.push(Slot::Ready(frame)),
-                    Action::Authenticate(outcome) => {
-                        slots.push(Slot::Ready(settle_auth(outcome, &mut authenticated)));
-                    }
-                    Action::ReplyThenClose(frame) => {
-                        slots.push(Slot::Ready(frame));
-                        hang_up = true;
-                    }
-                },
-                // A proper prefix of a valid frame: read more.
-                Ok(None) => drained = true,
-                Err(error) => {
-                    // Terminal, and that now covers the accumulation ceiling
-                    // as well as malformed bytes: either way the decoder holds
-                    // a half-read frame with no resync point. Report it and
-                    // go, without draining.
-                    //
-                    // The chunk closes *first*, so the error frame is appended
-                    // behind whatever this drain already earned — the same
-                    // order the peer would have seen from a flush per reply:
-                    // the replies, then the refusal. A chunk that could not be
-                    // emitted means the peer is already gone, and there is
-                    // nobody left to refuse.
-                    if !emit_chunk(&mut stream, &mut out, &router, &mut slots, &mut batch).await {
-                        return;
-                    }
-                    append_frame(&mut out, &safe_error(&protocol_error(&error)));
-                    flush_replies(&mut stream, &mut out).await;
-                    return;
-                }
-            }
-        }
+        let hang_up = match drain_decoder(
+            &mut stream,
+            &mut out,
+            &mut decoder,
+            &mut chunk,
+            &router,
+            &node,
+            &mut authenticated,
+        )
+        .await
+        {
+            Drained::Dry => false,
+            Drained::HangUp => true,
+            Drained::Over => return,
+        };
 
         // The drain is over — either dry or hung up — so the open chunk closes
         // before anything is written or read. `QUIT` takes this path too: its
         // `OK` is the last slot of the last chunk, and nothing pipelined
         // behind it was ever decoded.
-        if !emit_chunk(&mut stream, &mut out, &router, &mut slots, &mut batch).await {
+        if !emit_chunk(&mut stream, &mut out, &router, &mut chunk, &node.net_out).await {
             return;
         }
-        if !flush_replies(&mut stream, &mut out).await || hang_up {
+        if !flush_replies(&mut stream, &mut out, &node.net_out).await || hang_up {
             return;
         }
 
@@ -922,6 +949,8 @@ async fn serve_connection_limited<S, R>(
             }
         };
         reads += 1;
+        node.net_in
+            .fetch_add(got.try_into().unwrap_or(u64::MAX), Ordering::Relaxed);
         decoder.feed(&read_buf[..got]);
         resize_connection_buffers(&mut read_buf, &mut decoder, &mut out, &mut quiet_reads, got);
         // The read buffer standing above its floor is the evidence that this
@@ -1016,6 +1045,126 @@ fn shed_connection_buffers(read_buf: &mut Vec<u8>, decoder: &mut Decoder, out: &
     out.shrink_to(READ_FLOOR);
 }
 
+/// The chunk under construction: the replies decided so far, and the commands
+/// still to be run for the ones that are waiting on a shard.
+///
+/// One type rather than two vectors passed side by side, because they are one
+/// thing with one invariant — every [`Slot::Pending`] indexes this batch — and
+/// a pair of parameters is a pair that can be handed to a call in the wrong
+/// order or reset one at a time.
+#[derive(Default)]
+struct Chunk {
+    /// One entry per request decoded in this chunk, in the order the peer sent
+    /// them.
+    slots: Vec<Slot>,
+    /// The commands the pending slots are waiting on, in dispatch order.
+    batch: Vec<Command>,
+}
+
+/// Why a pass over the decoder stopped.
+enum Drained {
+    /// Nothing complete is left: the caller may write what the pass earned and
+    /// then ask the transport for more bytes.
+    Dry,
+    /// The peer asked to be disconnected. What the pass earned is still owed
+    /// it, so the caller writes and then stops.
+    HangUp,
+    /// The connection is over and nothing further is owed — the peer is gone,
+    /// or the stream desynchronised and has already been told so.
+    Over,
+}
+
+/// Runs every complete frame the decoder is already holding.
+///
+/// Split from the connection loop so that each has one job: this one turns
+/// bytes that have arrived into replies, and the loop around it decides when
+/// to write and when to read. The replies accumulate in `out` rather than
+/// being written here — with the one exception the error path states, which
+/// has to write because it is not coming back.
+async fn drain_decoder<S, R>(
+    stream: &mut S,
+    out: &mut Vec<u8>,
+    decoder: &mut Decoder,
+    chunk: &mut Chunk,
+    router: &R,
+    node: &NodeInfo,
+    authenticated: &mut bool,
+) -> Drained
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    R: Router,
+{
+    loop {
+        match decoder.try_next() {
+            Ok(Some(frame)) => match gated(frame_to_action(frame, node), *authenticated) {
+                Action::Dispatch(cmd) => {
+                    chunk.slots.push(Slot::Pending(chunk.batch.len()));
+                    chunk.batch.push(cmd);
+                    // A batch at the mark is dispatched here rather than held
+                    // until the decoder runs dry — see [`CHUNK_COMMANDS`]. The
+                    // peer sees the same frames in the same order, so no
+                    // ordering this loop guarantees moves; only how many
+                    // commands one message carries.
+                    if chunk.batch.len() >= CHUNK_COMMANDS
+                        && !emit_chunk(stream, out, router, chunk, &node.net_out).await
+                    {
+                        return Drained::Over;
+                    }
+                }
+                Action::Unbatched(request) => {
+                    // The chunk closes *before* the request runs, and that is
+                    // an ordering requirement rather than tidiness: the
+                    // commands already batched were written by the peer ahead
+                    // of this one, and dispatching this while those wait would
+                    // run a `DEL k` before the `SET k v` the peer pipelined in
+                    // front of it, empty the keyspace in front of the writes
+                    // that filled it, or answer a `KEYS` without the key a
+                    // `SET` just wrote.
+                    if !emit_chunk(stream, out, router, chunk, &node.net_out).await {
+                        return Drained::Over;
+                    }
+                    chunk
+                        .slots
+                        .push(Slot::Ready(request.answer(router, node).await));
+                }
+                Action::Reply(frame) | Action::Hello(frame) => {
+                    chunk.slots.push(Slot::Ready(frame));
+                }
+                Action::Authenticate(outcome) => {
+                    chunk
+                        .slots
+                        .push(Slot::Ready(settle_auth(outcome, authenticated)));
+                }
+                Action::ReplyThenClose(frame) => {
+                    chunk.slots.push(Slot::Ready(frame));
+                    return Drained::HangUp;
+                }
+            },
+            // A proper prefix of a valid frame: read more.
+            Ok(None) => return Drained::Dry,
+            Err(error) => {
+                // Terminal, and that covers the accumulation ceiling as well
+                // as malformed bytes: either way the decoder holds a half-read
+                // frame with no resync point. Report it and go, without
+                // draining.
+                //
+                // The chunk closes *first*, so the error frame is appended
+                // behind whatever this drain already earned — the same order
+                // the peer would have seen from a flush per reply: the
+                // replies, then the refusal. A chunk that could not be emitted
+                // means the peer is already gone, and there is nobody left to
+                // refuse.
+                if !emit_chunk(stream, out, router, chunk, &node.net_out).await {
+                    return Drained::Over;
+                }
+                append_frame(out, &safe_error(&protocol_error(&error)));
+                flush_replies(stream, out, &node.net_out).await;
+                return Drained::Over;
+            }
+        }
+    }
+}
+
 /// Closes one chunk: dispatches its batch and appends every slot's frame to
 /// `out`, in request order.
 ///
@@ -1040,30 +1189,30 @@ async fn emit_chunk<S, R>(
     stream: &mut S,
     out: &mut Vec<u8>,
     router: &R,
-    slots: &mut Vec<Slot>,
-    batch: &mut Vec<Command>,
+    chunk: &mut Chunk,
+    net_out: &AtomicU64,
 ) -> bool
 where
     S: AsyncWrite + Unpin,
     R: Router,
 {
-    if slots.is_empty() {
+    if chunk.slots.is_empty() {
         return true;
     }
-    let mut replies: Vec<Option<Reply>> = if batch.is_empty() {
+    let mut replies: Vec<Option<Reply>> = if chunk.batch.is_empty() {
         Vec::new()
     } else {
         // By value: the batch's buffer travels on into the router rather than
         // being copied out of it. `slots` keeps its capacity across chunks;
         // this one is handed over and regrown.
         router
-            .dispatch_many(take(batch))
+            .dispatch_many(take(&mut chunk.batch))
             .await
             .into_iter()
             .map(Some)
             .collect()
     };
-    for slot in slots.drain(..) {
+    for slot in chunk.slots.drain(..) {
         let frame = match slot {
             Slot::Ready(frame) => frame,
             Slot::Pending(index) => reply_to_frame(
@@ -1080,7 +1229,7 @@ where
         // order, only sooner, so none of the orderings the drain guarantees
         // moves: the write happens *between* two replies, never inside one,
         // and never while a frame is half-decoded.
-        if out.len() >= REPLY_HIGH_WATER && !flush_replies(stream, out).await {
+        if out.len() >= REPLY_HIGH_WATER && !flush_replies(stream, out, net_out).await {
             return false;
         }
     }
@@ -1100,7 +1249,7 @@ fn append_frame(out: &mut Vec<u8>, frame: &Frame) {
 /// An empty buffer is not a write: a drain that answered nothing — the first
 /// turn of the loop, or a read that completed no frame — must not spend a
 /// syscall pair saying so.
-async fn flush_replies<S>(stream: &mut S, out: &mut Vec<u8>) -> bool
+async fn flush_replies<S>(stream: &mut S, out: &mut Vec<u8>, net_out: &AtomicU64) -> bool
 where
     S: AsyncWrite + Unpin,
 {
@@ -1108,6 +1257,10 @@ where
         return true;
     }
     let delivered = stream.write_all(out).await.is_ok() && stream.flush().await.is_ok();
+    // Counted whether or not the write landed: `total_net_output_bytes` is
+    // what this node produced for its peers, and a peer that vanished
+    // mid-write was still served.
+    net_out.fetch_add(out.len().try_into().unwrap_or(u64::MAX), Ordering::Relaxed);
     // Cleared *before* the shed, not after the next `encode`. `Vec::shrink_to`
     // never shrinks below the length, so clearing at the top of the call only
     // would make this a no-op on precisely the write that just grew the
@@ -1904,7 +2057,19 @@ fn action_for(frame: Frame, node: &NodeInfo) -> Result<Action, String> {
         // The name is peer-supplied. It is quoted, not echoed.
         return Err(format!("ERR unknown command '{}'", quote(name)));
     };
-    handler(args, node)
+    let action = handler(args, node)?;
+    // A command that travels is counted by the shard that runs it, so the
+    // search below is reached only by the ones answered or split here —
+    // which keeps it off the path `GET` and `SET` take. A refusal the handler
+    // returned is not counted at all: it never became a command.
+    if !matches!(action, Action::Dispatch(_))
+        && let Some(index) = EDGE_NAMES
+            .iter()
+            .position(|edge| edge.as_bytes().eq_ignore_ascii_case(&upper))
+    {
+        node.edge_calls[index].fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(action)
 }
 
 /// Answers `COMMAND` and the subcommands a client sends before it sends
@@ -2028,14 +2193,20 @@ async fn info<R: Router>(router: &R, node: &NodeInfo, wanted: &[Vec<u8>]) -> Str
             "# Server\r\n\
              redis_version:{}\r\n\
              redis_mode:{SERVER_MODE}\r\n\
+             process_id:{}\r\n\
+             run_id:{}\r\n\
              tcp_port:{}\r\n\
-             uptime_in_seconds:{}\r\n\r\n",
+             uptime_in_seconds:{}\r\n\
+             executable:{}\r\n\r\n",
             node.version,
+            node.process_id,
+            node.run_id,
             node.tcp_port,
             // Whole seconds on the monotonic clock, and saturating at zero:
             // subtracting instants this way cannot go negative however the
             // clock behaved.
             node.started.elapsed().as_secs(),
+            node.executable,
         );
     }
     if asked_for(b"clients") {
@@ -2072,14 +2243,134 @@ async fn info<R: Router>(router: &R, node: &NodeInfo, wanted: &[Vec<u8>]) -> Str
             policy.name(),
         );
     }
+    // The broadcast is paid for only by a request that asks for one of the
+    // three sections built from it — `INFO memory` reaches no shard at all —
+    // and a scrape that wants everything pays it once rather than three times.
+    let from_shards = [&b"stats"[..], b"keyspace", b"commandstats"];
+    let stats = if from_shards.iter().any(|section| asked_for(section)) {
+        gather_stats(router).await
+    } else {
+        ShardStats::default()
+    };
     if asked_for(b"stats") {
-        // The broadcast is paid for only by a request that asks for this
-        // section: `INFO memory` reaches no shard at all, and a scrape that
-        // wants everything pays it once.
-        let stats = gather_stats(router).await;
-        let _ = write!(text, "# Stats\r\nevicted_keys:{}\r\n\r\n", stats.evicted);
+        text.push_str(&stats_section(node, &stats));
+    }
+    if asked_for(b"keyspace") {
+        text.push_str(&keyspace_section(&stats));
+    }
+    if asked_for(b"commandstats") {
+        text.push_str(&commandstats_section(node, &stats));
     }
     text
+}
+
+/// The running totals an operator watches: what the node has done since it
+/// started, half of it counted by the shards and half at the edge.
+fn stats_section(node: &NodeInfo, stats: &ShardStats) -> String {
+    format!(
+        "# Stats\r\n\
+         total_connections_received:{}\r\n\
+         total_commands_processed:{}\r\n\
+         rejected_connections:{}\r\n\
+         expired_keys:{}\r\n\
+         evicted_keys:{}\r\n\
+         keyspace_hits:{}\r\n\
+         keyspace_misses:{}\r\n\
+         total_net_input_bytes:{}\r\n\
+         total_net_output_bytes:{}\r\n\r\n",
+        node.total_connections.load(Ordering::Relaxed),
+        commands_processed(node, stats),
+        node.rejected_connections.load(Ordering::Relaxed),
+        stats.expired,
+        stats.evicted,
+        stats.hits,
+        stats.misses,
+        node.net_in.load(Ordering::Relaxed),
+        node.net_out.load(Ordering::Relaxed),
+    )
+}
+
+/// The keyspace as it stands, in the one database this server has.
+///
+/// Redis prints a line per database that holds something and nothing at all
+/// for one that is empty, so an empty keyspace is a section with no rows
+/// rather than a row of zeros — an exporter that meets a `db0` line is being
+/// told there is a keyspace to describe.
+///
+/// `avg_ttl` is `0`, which is what Redis reports until its own sampler has an
+/// estimate. Nothing here samples deadlines, so `0` is the standing answer and
+/// not a placeholder.
+fn keyspace_section(stats: &ShardStats) -> String {
+    let mut text = String::from("# Keyspace\r\n");
+    if stats.keys > 0 {
+        use std::fmt::Write as _;
+        let _ = write!(
+            text,
+            "db0:keys={},expires={},avg_ttl=0\r\n",
+            stats.keys, stats.expires,
+        );
+    }
+    text.push('\r');
+    text.push('\n');
+    text
+}
+
+/// How many of each command the node has run.
+///
+/// **No `usec` and no `usec_per_call`.** Nothing here times a handler, and a
+/// zero in those fields would be a measurement this server does not take,
+/// printed as though it did.
+///
+/// A command nobody has sent has no line, which is Redis's behaviour: the
+/// section describes what has happened, not what could.
+fn commandstats_section(node: &NodeInfo, stats: &ShardStats) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::from("# Commandstats\r\n");
+    for (name, calls) in command_calls(node, stats) {
+        if calls > 0 {
+            let _ = write!(text, "cmdstat_{name}:calls={calls}\r\n");
+        }
+    }
+    text.push('\r');
+    text.push('\n');
+    text
+}
+
+/// Every command name this node can report a count for, with its count.
+///
+/// Two halves summed under one name: what the shards counted, by
+/// [`KIND_NAMES`], and what the edge counted, by [`EDGE_NAMES`]. They overlap
+/// in exactly one place — `info`, which the shards leave to the edge — and
+/// the sum is taken rather than assumed, so a later command that lands in both
+/// prints one line and not two.
+fn command_calls(node: &NodeInfo, stats: &ShardStats) -> Vec<(&'static str, u64)> {
+    let mut counts: Vec<(&'static str, u64)> = KIND_NAMES
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(kind, name)| (*name, stats.calls[kind]))
+        .collect();
+    for (name, counter) in EDGE_NAMES.iter().zip(node.edge_calls.iter()) {
+        let calls = counter.load(Ordering::Relaxed);
+        match counts.iter_mut().find(|(known, _)| known == name) {
+            Some((_, total)) => *total += calls,
+            None => counts.push((name, calls)),
+        }
+    }
+    counts
+}
+
+/// What `total_commands_processed` reports: every command counted anywhere.
+///
+/// The same two halves [`command_calls`] sums, added rather than listed. A
+/// request the edge split — an `MGET` over four keys — is counted once here
+/// and four times by the shards, which is what Redis's own figure does with a
+/// command that expands into others.
+fn commands_processed(node: &NodeInfo, stats: &ShardStats) -> u64 {
+    command_calls(node, stats)
+        .into_iter()
+        .map(|(_, calls)| calls)
+        .sum()
 }
 
 /// Sums every shard's counters into the node's.
@@ -2764,6 +3055,136 @@ mod tests {
             .parse()
             .unwrap();
         assert!(evicted > 0, "nothing was evicted under a ceiling: {text}");
+    }
+
+    /// Every section a stock Prometheus exporter reads, in one document.
+    ///
+    /// Written as one test rather than one per section on purpose: the
+    /// exporter asks for the whole document once and builds its metric
+    /// families from whatever it finds, so what has to hold is that a single
+    /// `INFO` carries all of it at once — a section that is right on its own
+    /// and missing from the whole is a metric family that never appears.
+    #[tokio::test]
+    async fn info_reports_every_section_the_exporter_reads() {
+        let pool = ShardPool::spawn(16, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let mut node = NodeInfo::for_tests();
+        node.memory = pool.memory();
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server, pool, node));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        encode(&req(&["SET", "a", "1"]), &mut out);
+        encode(&req(&["SET", "b", "2"]), &mut out);
+        encode(&req(&["SET", "c", "3", "EX", "600"]), &mut out);
+        encode(&req(&["GET", "a"]), &mut out);
+        encode(&req(&["GET", "nosuch"]), &mut out);
+        encode(&req(&["INFO"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 6).await;
+        let Frame::Bulk(text) = &frames[5] else {
+            panic!("INFO answered {:?}", frames[5])
+        };
+        let text = String::from_utf8(text.clone()).unwrap();
+        let has = |line: &str| {
+            assert!(
+                text.lines().any(|written| written == line),
+                "no {line:?} in {text}"
+            );
+        };
+        let field = |name: &str| {
+            let prefix = format!("{name}:");
+            text.lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .unwrap_or_else(|| panic!("no {name} in {text}"))
+        };
+
+        has("# Server");
+        assert!(!field("redis_version").is_empty());
+        has("redis_mode:standalone");
+        let run_id = field("run_id");
+        assert_eq!(run_id.len(), RUN_ID_HEX, "run_id is {run_id:?}");
+        assert!(
+            run_id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "run_id is {run_id:?}"
+        );
+        field("process_id").parse::<u32>().unwrap();
+        assert!(!field("executable").is_empty());
+
+        has("# Clients");
+        has("# Memory");
+        has("mem_fragmentation_ratio:1.00");
+
+        has("# Stats");
+        has("keyspace_hits:1");
+        has("keyspace_misses:1");
+        has("expired_keys:0");
+        has("evicted_keys:0");
+        has("rejected_connections:0");
+        field("total_connections_received").parse::<u64>().unwrap();
+        field("total_commands_processed").parse::<u64>().unwrap();
+        assert!(
+            field("total_net_input_bytes").parse::<u64>().unwrap() > 0,
+            "the commands this connection sent were not counted"
+        );
+        field("total_net_output_bytes").parse::<u64>().unwrap();
+
+        has("# Keyspace");
+        has("db0:keys=3,expires=1,avg_ttl=0");
+
+        has("# Commandstats");
+        has("cmdstat_set:calls=3");
+        has("cmdstat_get:calls=2");
+        assert!(
+            !text.contains("usec"),
+            "commandstats carries a timing this server does not take: {text}"
+        );
+    }
+
+    /// An empty keyspace is a section with no rows, which is what Redis
+    /// answers and what tells an exporter there is no database to describe.
+    #[tokio::test]
+    async fn info_keyspace_on_an_empty_node_has_no_db_line() {
+        let router = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let text = info(&router, &NodeInfo::for_tests(), &[b"keyspace".to_vec()]).await;
+        assert_eq!(text, "# Keyspace\r\n\r\n");
+    }
+
+    /// `commandstats` counts the request the peer made, not the commands the
+    /// edge split it into — and counts a broadcast once rather than once per
+    /// shard.
+    #[tokio::test]
+    async fn commandstats_counts_requests_rather_than_the_commands_they_became() {
+        let pool = ShardPool::spawn(16, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server, pool, NodeInfo::for_tests()));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        encode(&req(&["MGET", "a", "b", "c"]), &mut out);
+        encode(&req(&["DBSIZE"]), &mut out);
+        encode(&req(&["PING"]), &mut out);
+        encode(&req(&["INFO", "commandstats"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 4).await;
+        let Frame::Bulk(text) = &frames[3] else {
+            panic!("INFO answered {:?}", frames[3])
+        };
+        let text = String::from_utf8(text.clone()).unwrap();
+        assert!(text.contains("cmdstat_mget:calls=1\r\n"), "{text}");
+        assert!(
+            text.contains("cmdstat_get:calls=3\r\n"),
+            "the three GETs the fan-out ran are the shards' to count: {text}"
+        );
+        assert!(
+            text.contains("cmdstat_dbsize:calls=1\r\n"),
+            "one DBSIZE reached sixteen shards and is still one call: {text}"
+        );
+        assert!(text.contains("cmdstat_ping:calls=1\r\n"), "{text}");
+        assert!(
+            !text.contains("cmdstat_ttl"),
+            "a command nobody sent has no line: {text}"
+        );
     }
 
     /// A shard's counters are not a wire answer: an operator asks about the
@@ -5507,7 +5928,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
 
         append_frame(&mut out, &Frame::Bulk(vec![b'v'; 4 * REPLY_SHED]));
-        assert!(flush_replies(&mut sink, &mut out).await);
+        assert!(flush_replies(&mut sink, &mut out, &AtomicU64::new(0)).await);
         assert!(sink.len() > 4 * REPLY_SHED, "the reply was truncated");
         assert!(
             out.capacity() <= REPLY_SHED,
@@ -5519,7 +5940,7 @@ mod tests {
         // into the shrunken buffer.
         sink.clear();
         append_frame(&mut out, &Frame::Simple("OK".into()));
-        assert!(flush_replies(&mut sink, &mut out).await);
+        assert!(flush_replies(&mut sink, &mut out, &AtomicU64::new(0)).await);
         assert_eq!(sink, b"+OK\r\n");
     }
 
@@ -5539,7 +5960,7 @@ mod tests {
         };
         let mut out: Vec<u8> = Vec::new();
 
-        assert!(flush_replies(&mut sink, &mut out).await);
+        assert!(flush_replies(&mut sink, &mut out, &AtomicU64::new(0)).await);
         assert!(sink.inner.is_empty(), "an empty drain wrote bytes");
         assert_eq!(
             flushes.load(std::sync::atomic::Ordering::Relaxed),
@@ -5573,7 +5994,7 @@ mod tests {
         while matches!(decoder.try_next(), Ok(Some(_))) {}
         let mut sink: Vec<u8> = Vec::new();
         append_frame(&mut out, &Frame::Bulk(big));
-        assert!(flush_replies(&mut sink, &mut out).await);
+        assert!(flush_replies(&mut sink, &mut out, &AtomicU64::new(0)).await);
         for _ in 0..32 {
             let got = read_buf.len();
             resize_connection_buffers(&mut read_buf, &mut decoder, &mut out, &mut quiet, got);

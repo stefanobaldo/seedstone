@@ -1,4 +1,5 @@
-//! The composition root: parse the command line, draw a seed, bind, serve.
+//! The composition root: parse the command line, draw what only the
+//! operating system can supply, bind, serve.
 //!
 //! Everything this file does is a decision the layers below refuse to make for
 //! themselves — where to listen, how many peers to accept, and what the
@@ -8,6 +9,7 @@
 
 use seedstone::server::{Config, Server};
 use seedstone_core::dict::DictSeed;
+use seedstone_service::RUN_ID_HEX;
 
 fn main() {
     // The one place the process environment is read. Every layer below takes
@@ -22,9 +24,10 @@ fn main() {
         }
     };
 
+    let Entropy { seed, run_id } = entropy();
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
-        let server = match Server::bind(cfg, entropy_seed()).await {
+        let server = match Server::bind(cfg, seed, run_id).await {
             Ok(server) => server,
             Err(error) => {
                 eprintln!("bind failed: {error}");
@@ -40,22 +43,50 @@ fn main() {
     });
 }
 
-/// Draws the node's keyspace hashing seed from the operating system.
+/// Everything this process asks the operating system for entropy.
 ///
-/// The one place in the workspace where entropy enters. A predictable SipHash
-/// seed is an invitation to collide a shard's buckets on purpose, and the
-/// keyspace dict is hand-written precisely so the seed is explicit — so it is
-/// drawn here, once, and injected. Everything below receives it and stays
-/// reproducible from it.
+/// One function and one exception, because there is one reason: the
+/// composition root is the only place a value may be drawn that no seed can
+/// reproduce. Both of these are that, and splitting them would split the
+/// exception too — two sites where the guide counts one, and the second is
+/// how a third arrives unremarked.
+struct Entropy {
+    /// What the keyspace dict hashes under. A predictable SipHash seed is an
+    /// invitation to collide a shard's buckets on purpose, and the dict is
+    /// hand-written precisely so the seed is explicit — so it is drawn here,
+    /// once, and injected. Everything below receives it and stays
+    /// reproducible from it.
+    seed: DictSeed,
+    /// What this run of the process calls itself in `INFO`, forty lowercase
+    /// hexadecimal characters — Redis's width.
+    ///
+    /// Its job is to differ between two starts of the same binary: a monitor
+    /// reading counters that both begin at zero cannot otherwise tell a node
+    /// that restarted from one that has been up, and a rate computed across
+    /// that boundary is computed from a fall to zero.
+    run_id: String,
+}
+
 #[allow(
     clippy::disallowed_methods,
     reason = "the composition root is the one place entropy may enter: a \
-              predictable SipHash seed is a HashDoS invitation, and the core \
-              receives the seed injected, staying deterministic"
+              predictable SipHash seed is a HashDoS invitation and two starts \
+              of one binary must not report the same run id, and the layers \
+              below receive both injected, staying deterministic"
 )]
-fn entropy_seed() -> DictSeed {
-    DictSeed {
+fn entropy() -> Entropy {
+    use std::fmt::Write as _;
+    let seed = DictSeed {
         k0: getrandom::u64().expect("OS entropy unavailable"),
         k1: getrandom::u64().expect("OS entropy unavailable"),
+    };
+    // Three draws render forty-eight characters; the tail is dropped.
+    let mut run_id = String::with_capacity(48);
+    for _ in 0..3 {
+        let word = getrandom::u64().expect("OS entropy unavailable");
+        // Writing into a `String` cannot fail.
+        let _ = write!(run_id, "{word:016x}");
     }
+    run_id.truncate(RUN_ID_HEX);
+    Entropy { seed, run_id }
 }

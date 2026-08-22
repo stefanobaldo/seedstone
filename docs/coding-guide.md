@@ -36,8 +36,9 @@ reason the linked code documents in place.
   `slot.rs` narrowing a quotient it has just bounded, `shard.rs` taking its
   trace sink, log factory and shard policy — the policy decides expiry and
   the walk's order both — by value so a caller can move them in, `main.rs`
-  drawing the hash seed from the OS — the composition root is the one place
-  entropy may enter — `server.rs` reading `SystemTime::now` past
+  drawing the hash seed and the run id from the OS — the composition root is
+  the one place entropy may enter, and both are drawn in one function so the
+  exception is one site — `server.rs` reading `SystemTime::now` past
   `clippy::disallowed_methods` for the node's wall clock, which a client
   naming an absolute deadline can only be answered from and which is handed to
   the service layer as a dependency so a simulated node is handed its own,
