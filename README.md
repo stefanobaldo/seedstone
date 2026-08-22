@@ -83,7 +83,9 @@ every one of them but `redis-cli` against a server that requires a password,
 so the authenticated path is the one the gate exercises and the open one stays
 exercised too — and finishes by pointing a third party's cache-backend test
 suite at it, run against a digest-verified archive in a container pinned by
-digest to the interpreter that client pair needs.
+digest to the interpreter that client pair needs. A stock Prometheus exporter
+scrapes the server in the same job, from a container pinned the same way, and
+must log no refused command.
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains the decisions and why
 they were made; [docs/coding-guide.md](docs/coding-guide.md) is what a reviewer

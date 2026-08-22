@@ -39,11 +39,13 @@ is developed on one architecture and gated on another, and a platform digest
 would pin the lane to whichever one resolved it. The tag is recorded beside
 the digest so a human can read which release it is; the digest is what runs.
 
-`expected-errors.txt` lists error lines the exporter is expected to log today,
+`expected-errors.txt` lists error lines the exporter is tolerated in logging,
 one per line, matched as substrings. It exists so the lane can be red-honest
 without being red: an error listed there is tolerated, an error not listed
 fails the lane, and a listed error that stops appearing fails the lane until
-its line is removed. The lane's gate is that file being empty.
+its line is removed. **It is empty**, which is the lane's gate — the exporter
+asks this server for nothing it will not answer — and it is what activates the
+value assertions in `check.sh`, which are inert while anything is tolerated.
 
 ## What the error log does not say
 
@@ -53,3 +55,14 @@ depended on the rest — a scrape can therefore be missing whole families of
 metrics while the log stays quiet. That is why the second assertion exists and
 why it names the metrics it wants: the log catches the refusals the exporter
 chooses to report, and the named values catch the ones it does not.
+
+One family is missing on purpose. This exporter reads a `cmdstat_` line by
+position rather than by name: it drops any line carrying fewer than three
+comma-separated fields, and otherwise takes whatever sits in the second field
+as microseconds, whatever that field is called. `INFO commandstats` here
+carries a call count and nothing else, because nothing in this server times a
+handler — so the line is dropped, and `redis_commands_total` never appears.
+Padding it to three fields would make the exporter publish a
+`redis_commands_duration_seconds_total` derived from a number that is not a
+duration, which is a worse answer than none. `check.sh` asserts that metric is
+**absent**, so the day someone pads the line, this lane says so.
