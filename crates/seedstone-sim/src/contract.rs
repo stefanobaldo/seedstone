@@ -156,6 +156,15 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
         },
     ),
     (
+        b"AUTH",
+        Coverage::NotEmitted {
+            reason: "the simulated node is configured with no password, and \
+                     an AUTH against such a node is an error the client would \
+                     have nothing to assert about; the connection layer's own \
+                     tests hold the state machine.",
+        },
+    ),
+    (
         b"HELLO",
         Coverage::NotEmitted {
             reason: "it negotiates a protocol version and describes the node. \
