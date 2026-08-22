@@ -24,29 +24,45 @@ OK
 
 `--bind <addr:port>`, `--max-clients <n>`, `--maxmemory <size>`,
 `--maxmemory-policy allkeys-lru|noeviction`, `--requirepass-file <path>` and
-`--no-auth` are the only options; the password may also arrive in
-`SEEDSTONE_REQUIREPASS`. It is never an argument — a command line is readable
-by every other process on the host. A bind outside loopback refuses to start
-without one of the two, unless `--no-auth` says so deliberately.
+`--no-auth` are the only options a server takes; `--version` and `--help`
+answer and exit, in first position and nowhere else. The password may
+also arrive in `SEEDSTONE_REQUIREPASS`. It is never an argument — a command
+line is readable by every other process on the host. A bind outside loopback
+refuses to start without one of the two, unless `--no-auth` says so
+deliberately.
 
 **What it answers:** `GET`, `SET` (with `EX`, `PX`, `EXAT`, `PXAT`, `NX`, `XX`,
 `KEEPTTL`, `GET`), `MGET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `PERSIST`,
 `TTL`, `TYPE`, `STRLEN`, `INCRBY`, `SCAN`, `KEYS`, `DBSIZE`, `FLUSHDB`,
-`PING`, `ECHO`, `AUTH`, `HELLO`, `INFO`, `COMMAND`, `CLIENT`, `QUIT`. `DEL`, `EXISTS`
-and `MGET` take several keys. Keys with a deadline are removed when touched and
-by a background sweep that does not wait to be asked. With `--maxmemory`, the
-keyspace is held under a ceiling by evicting least-recently-used keys, or by
-refusing writes under `noeviction`.
+`PING`, `ECHO`, `AUTH`, `HELLO`, `INFO`, `CONFIG GET`, `SLOWLOG`, `LATENCY`,
+`COMMAND`, `CLIENT`, `QUIT`. `DEL`, `EXISTS` and `MGET` take several keys. Keys
+with a deadline are removed when touched and by a background sweep that does
+not wait to be asked. With `--maxmemory`, the keyspace is held under a ceiling
+by evicting least-recently-used keys, or by refusing writes under
+`noeviction`.
+
+`INFO`, `CONFIG GET`, `SLOWLOG` and `LATENCY` are the operational surface a
+monitoring agent reads: `INFO` in sections — `server`, `clients`, `memory`,
+`stats`, `keyspace` and `commandstats`, carrying only fields this node can
+state truthfully — `CONFIG GET` over the parameters that describe how it was
+started, and `SLOWLOG` and `LATENCY` answering as the switched-off monitors
+they are, so that a scrape completes rather than logging a refusal on every
+pass.
 
 **What it does not have yet:** persistence — a restart is an empty keyspace —
 along with RESP3, replication, clustering, and every data type except strings.
-Authentication is one password for the `default` user; there are no ACL users
-beside it and no TLS. There are no benchmarks published.
+There are no benchmarks published.
 
 **What it deliberately does not answer:** the inline command protocol, server-
-side scripting, and transactions. The surface is a named list chosen for the
-workloads this project targets; anything outside it is refused with an error
-naming the command, rather than answered approximately.
+side scripting, transactions, and `CONFIG SET` — every parameter `CONFIG GET`
+reports is a fact about a node that is already running, and accepting a new
+ceiling at runtime would mean moving a keyspace under one. The surface is a
+named list chosen for the workloads this project targets; anything outside it
+is refused with an error naming the command, rather than answered
+approximately. The same line is drawn outside the command set: authentication
+is one password for the `default` user, with no ACL users beside it and no TLS
+— access control this server does not model, rather than work waiting its
+turn.
 
 **Releases:** a tag publishes a GitHub Release carrying an x86_64 Linux binary
 and its `sha256`. [CHANGELOG.md](CHANGELOG.md) is what changed;
@@ -86,11 +102,11 @@ be caught and a second process to replay it byte for byte — then drives the
 release binary with `redis-cli`, `redis-benchmark`, redis-py and go-redis —
 every one of them but `redis-cli` against a server that requires a password,
 so the authenticated path is the one the gate exercises and the open one stays
-exercised too — and finishes by pointing a third party's cache-backend test
-suite at it, run against a digest-verified archive in a container pinned by
-digest to the interpreter that client pair needs. A stock Prometheus exporter
-scrapes the server in the same job, from a container pinned the same way, and
-must log no refused command.
+exercised too — and then points a third party's cache-backend test suite at
+it, run against a digest-verified archive in a container pinned by digest to
+the interpreter that client pair needs. A stock Prometheus exporter finishes
+the job, from a container pinned the same way, and must log no refused
+command.
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains the decisions and why
 they were made; [docs/coding-guide.md](docs/coding-guide.md) is what a reviewer
