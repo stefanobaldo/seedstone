@@ -197,6 +197,7 @@ impl Server {
             started: tokio::time::Instant::now(),
             connected: Arc::new(AtomicU64::new(0)),
             now_unix_millis: wall_clock,
+            memory: self.pool.memory(),
         };
         loop {
             tokio::select! {
