@@ -82,7 +82,7 @@ fn main() -> ExitCode {
                 // found up to that point.
                 println!(
                     "FAIL seed={} trace=0x{:016x} expected={} actual={} stale={} spurious={} \
-                     plain={} walk={}",
+                     plain={} walk={} breaches={} evicted={} observed={}",
                     sim_seed,
                     outcome.trace_hash,
                     outcome.expected_sum,
@@ -90,7 +90,10 @@ fn main() -> ExitCode {
                     outcome.stale_reads,
                     outcome.spurious_deaths,
                     outcome.plain_mismatches,
-                    outcome.walk_mismatches
+                    outcome.walk_mismatches,
+                    outcome.ceiling_breaches,
+                    outcome.evicted_keys,
+                    outcome.evictions_observed
                 );
             }
         },

@@ -361,6 +361,11 @@ mod tests {
             plain_checks: 0,
             walk_mismatches: 0,
             walk_checks: 0,
+            evictions_observed: 0,
+            evicted_keys: 0,
+            ceiling_breaches: 0,
+            ceiling_checks: 0,
+            evictable: false,
             forms_emitted: BTreeSet::new(),
         }
     }

@@ -26,17 +26,23 @@ const SEEDS: u64 = 32;
 
 /// The shape the coverage sweep runs.
 ///
-/// The mini shape with the quiescent walk switched on, which is what makes it
-/// different from the shape the gate sweeps: the complete `SCAN` cycle costs a
-/// round trip per shard and is a test's to ask for, so the swept shapes leave
-/// it off and never emit the forms only that cycle sends. Coverage is a
-/// property of the generator rather than of the shape, and this is the shape
-/// that lets the generator reach everything it can.
+/// The eviction shape with the quiescent walk switched on, and both halves of
+/// that are what make it different from the shape the gate sweeps. The
+/// complete `SCAN` cycle costs a round trip per shard and is a test's to ask
+/// for, so the swept shapes leave it off and never emit the forms only that
+/// cycle sends; and `INFO` is emitted only where there is a ceiling to hold
+/// the node to, which is this shape and no other. Coverage is a property of
+/// the generator rather than of the shape, and this is the shape that lets
+/// the generator reach everything it can.
+///
+/// Sixteen shards rather than a thousand, so the cycle it asks for costs
+/// sixteen round trips rather than a thousand — the shape is cheaper here
+/// than the one this sweep used to run, not dearer.
 ///
 /// The gate's own sweep prints what its shape did not reach, so the difference
 /// is stated there rather than hidden here.
 const fn coverage_shape(sim_seed: u64) -> SimConfig {
-    let mut cfg = SimConfig::mini(1, sim_seed);
+    let mut cfg = SimConfig::eviction(1, sim_seed);
     cfg.quiescent_walk = true;
     cfg
 }
