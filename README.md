@@ -25,11 +25,11 @@ OK
 `--bind <addr:port>`, `--max-clients <n>`, `--maxmemory <size>`,
 `--maxmemory-policy allkeys-lru|noeviction`, `--requirepass-file <path>` and
 `--no-auth` are the only options a server takes; `--version` and `--help`
-answer and exit, in first position and nowhere else. The password may
-also arrive in `SEEDSTONE_REQUIREPASS`. It is never an argument — a command
-line is readable by every other process on the host. A bind outside loopback
-refuses to start without one of the two, unless `--no-auth` says so
-deliberately.
+answer and exit, in first position and nowhere else. The password may also
+arrive in `SEEDSTONE_REQUIREPASS`. It is never an argument — a command line is
+readable by every other process on the host. A bind outside loopback
+refuses to start without a password from either source, unless `--no-auth`
+says so deliberately.
 
 **What it answers:** `GET`, `SET` (with `EX`, `PX`, `EXAT`, `PXAT`, `NX`, `XX`,
 `KEEPTTL`, `GET`), `MGET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `PERSIST`,
@@ -60,9 +60,9 @@ ceiling at runtime would mean moving a keyspace under one. The surface is a
 named list chosen for the workloads this project targets; anything outside it
 is refused with an error naming the command, rather than answered
 approximately. The same line is drawn outside the command set: authentication
-is one password for the `default` user, with no ACL users beside it and no TLS
-— access control this server does not model, rather than work waiting its
-turn.
+is one password for the `default` user, with no ACL users beside it — access
+control this server does not model. Nor does it terminate TLS: transport
+security belongs to the deployment, in front of the node.
 
 **Releases:** a tag publishes a GitHub Release carrying an x86_64 Linux binary
 and its `sha256`. [CHANGELOG.md](CHANGELOG.md) is what changed;
@@ -104,9 +104,10 @@ every one of them but `redis-cli` against a server that requires a password,
 so the authenticated path is the one the gate exercises and the open one stays
 exercised too — and then points a third party's cache-backend test suite at
 it, run against a digest-verified archive in a container pinned by digest to
-the interpreter that client pair needs. A stock Prometheus exporter finishes
-the job, from a container pinned the same way, and must log no refused
-command.
+the interpreter that client pair needs. A stock Prometheus exporter scrapes
+the server last, from a container pinned the same way: it must log no refused
+command, and the metrics it publishes must carry the values this gate
+predicts.
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains the decisions and why
 they were made; [docs/coding-guide.md](docs/coding-guide.md) is what a reviewer

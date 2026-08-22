@@ -243,13 +243,14 @@ recorded and no sample a reading could be drawn from. `SLOWLOG GET` is empty,
 `LATENCY LATEST` is empty, and `CONFIG GET` reports
 `slowlog-log-slower-than -1` and `latency-monitor-threshold 0` — which is what
 Redis itself reports with both monitors off, so the readings and the
-configuration agree. Answering rather than refusing is the deliberate half: a
-refusal carries a different fact — that the command does not exist — and an
-exporter reads the first as the node's answer and the second as a failed
-scrape. The exceptions are the subcommands Redis serves *from* a monitor this
-server has no reading for — `LATENCY DOCTOR`, `LATENCY GRAPH`, `SLOWLOG HELP`
-— which are refused as unknown subcommands rather than given a sentence nobody
-measured.
+configuration agree. Answering rather than refusing is deliberate: a refusal
+carries a different fact — that the command does not exist — and an exporter
+reads the first as the node's answer and the second as a failed scrape. Only
+a named list of subcommands is answered, though, and anything outside it —
+`LATENCY DOCTOR` and `LATENCY GRAPH`, which Redis serves from a monitor this
+server has no reading for, the `HELP` texts beside them, any other spelling a
+client tries — is refused as an unknown subcommand rather than given a
+sentence nobody measured.
 
 The same absence of timing shapes `commandstats`, which carries call counts and
 no `usec` fields; a zero there would be a measurement this server does not take,
@@ -315,11 +316,15 @@ true.
   third party's cache-backend test suite runs against it from an archive
   checked against a pinned digest, in a container pinned by the digest of its
   multi-architecture image, so the interpreter that client pair needs is the
-  same bytes on every machine. A stock Prometheus exporter finishes the
-  pipeline, pinned the same way, given no flag it would not be given for
-  Redis and held to one standard: it must log no refused command. An exporter
-  logs every command a server refuses, so an empty error log is what scraping
-  this node without adjustment means mechanically. They are the only judges in
-  the pipeline that this project did not write, and the last two judge what
-  they are — one pinned client pair, one pinned exporter — rather than the
-  protocol in the abstract.
+  same bytes on every machine. A stock Prometheus exporter scrapes the server
+  last, pinned the same way and given no flag it would not be given for Redis,
+  and it is held to two things rather than one: an error log with nothing in it,
+  and the metric values the lane can predict from what it wrote and how it
+  started the server. One of those alone would not do. An exporter reports
+  the refusals it chooses to report and silently drops the metric families
+  that depended on the rest, so a quiet log is not the same as a complete
+  scrape, and the predicted values are what catches a family that went
+  missing without a word. They are the only judges in the pipeline that this
+  project did not write, and the last two judge what they are — one pinned
+  client pair, one pinned exporter — rather than the protocol in the
+  abstract.
