@@ -65,6 +65,7 @@ mod auth;
 
 pub use auth::{AUTH_NOT_CONFIGURED, NOAUTH, Secret, WRONGPASS};
 
+use seedstone_core::glob;
 use seedstone_core::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use seedstone_core::shard::{
     Command, Cond, Expiry, Reply, ReplyError, Router, ShardStats, parse_i64,
@@ -439,9 +440,9 @@ const KIND_NAMES: [&str; 16] = [
 ///
 /// Order is the order `# Commandstats` prints them in, after the keyed
 /// commands.
-pub const EDGE_NAMES: [&str; 12] = [
+pub const EDGE_NAMES: [&str; 13] = [
     "mget", "keys", "dbsize", "flushdb", "ping", "echo", "auth", "hello", "info", "command",
-    "client", "quit",
+    "client", "quit", "config",
 ];
 
 /// The wall-clock reading a node with no wall clock reports: 2023-11-14
@@ -472,6 +473,18 @@ pub struct NodeInfo {
     /// The port the listener actually bound, which with an ephemeral port is
     /// not the port the configuration asked for.
     pub tcp_port: u16,
+    /// The address the listener bound, without the port beside it.
+    ///
+    /// A rendered string rather than an `IpAddr` because the only thing this
+    /// layer does with it is print it: `CONFIG GET bind` answers whatever
+    /// the socket was actually given, which with an unspecified address is
+    /// not the address the configuration named.
+    pub bind: String,
+    /// How many connections the node will serve at once.
+    ///
+    /// Maintained nowhere here — the accept loop holds the semaphore this
+    /// counts — so it travels as a plain number a report can quote.
+    pub max_clients: usize,
     /// When the node started, on the monotonic clock.
     ///
     /// A [`tokio::time::Instant`] and never a `SystemTime`: uptime is a span,
@@ -558,10 +571,10 @@ impl NodeInfo {
     /// A node description for callers that have no node to describe: the tests
     /// here, and the simulator.
     ///
-    /// The port is Redis's default, so that the value is recognisable rather
-    /// than arbitrary. The count starts at zero and stays there: maintaining it
-    /// belongs to whoever accepts connections, and neither caller has a
-    /// workload that asks.
+    /// The port, the address and the client ceiling are Redis's own defaults,
+    /// so that each value is recognisable rather than arbitrary. The count
+    /// starts at zero and stays there: maintaining it belongs to whoever
+    /// accepts connections, and neither caller has a workload that asks.
     ///
     /// The wall clock stands still, at [`FIXED_UNIX_MILLIS`]. Neither caller
     /// has a real one to offer — there is no simulated `SystemTime`, and the
@@ -574,6 +587,8 @@ impl NodeInfo {
         Self {
             version: env!("CARGO_PKG_VERSION"),
             tcp_port: 6379,
+            bind: "127.0.0.1".to_owned(),
+            max_clients: 10_000,
             started: Instant::now(),
             connected: Arc::new(AtomicU64::new(0)),
             now_unix_millis: || FIXED_UNIX_MILLIS,
@@ -2012,6 +2027,10 @@ const COMMANDS: &[(&[u8], Handler)] = &[
         [] => Err(wrong_arity("client")),
         [sub, rest @ ..] => client(sub, rest),
     }),
+    (b"CONFIG", |args, node| match args {
+        [] => Err(wrong_arity("config")),
+        [sub, globs @ ..] => config(sub, globs, node),
+    }),
     (b"QUIT", |args, _| match args {
         [] => Ok(Action::ReplyThenClose(Frame::Simple("OK".into()))),
         _ => Err(wrong_arity("quit")),
@@ -2120,6 +2139,110 @@ fn client(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
     }
 }
 
+/// The parameters `CONFIG GET` will answer for, in the order it reports them.
+///
+/// A fixed table and not a configuration store: this server has no `CONFIG
+/// SET`, so every value below is read from the node that is already running
+/// rather than from something an operator could have written and this could
+/// have forgotten. The list is the one an exporter and an operator's `redis-cli
+/// CONFIG GET maxmemory` reach for — the memory ceiling and its policy, the
+/// connection ceiling, and the handful of fields a client library checks on
+/// connect and would otherwise treat as a node it cannot talk to.
+///
+/// Four of them describe a feature this server does not have, and each is
+/// answered with the value Redis reports when the feature is switched off:
+/// `databases` is `1` because there is one keyspace, `requirepass` is empty
+/// because Redis never reports a password, and the two latency fields are the
+/// disabled readings. See [`config_value`].
+const CONFIG_PARAMETERS: [&str; 9] = [
+    "maxmemory",
+    "maxmemory-policy",
+    "maxclients",
+    "databases",
+    "requirepass",
+    "slowlog-log-slower-than",
+    "latency-monitor-threshold",
+    "bind",
+    "port",
+];
+
+/// Answers `CONFIG GET`, and refuses every other subcommand.
+///
+/// Redis takes any number of globs and answers the union of what they select,
+/// so the table is walked once and each row offered to all of them — which is
+/// also what keeps the reply in table order rather than in the order the peer
+/// happened to ask.
+///
+/// There is no `CONFIG SET`: every parameter below is a fact about a node that
+/// is already running, and accepting a new ceiling at runtime would mean
+/// moving a keyspace under one. Refusing it as an unknown subcommand is the
+/// honest answer, and it is the one Redis gives for a subcommand it lacks.
+fn config(sub: &[u8], globs: &[Vec<u8>], node: &NodeInfo) -> Result<Action, String> {
+    if !sub.eq_ignore_ascii_case(b"GET") {
+        return Err(unknown_subcommand("CONFIG", sub));
+    }
+    if globs.is_empty() {
+        return Err(wrong_arity("config|get"));
+    }
+    let mut reply = Vec::new();
+    for name in CONFIG_PARAMETERS {
+        if globs
+            .iter()
+            .any(|glob| glob::matches(glob, name.as_bytes()))
+        {
+            reply.push(Frame::Bulk(name.as_bytes().to_vec()));
+            reply.push(Frame::Bulk(config_value(name, node).into_bytes()));
+        }
+    }
+    Ok(Action::Reply(Frame::Array(reply)))
+}
+
+/// The memory ceiling and the eviction policy as both `INFO` and `CONFIG GET`
+/// report them.
+///
+/// Redis reports an absent ceiling as `0`, and reports `noeviction` as the
+/// policy whenever there is no ceiling to reach — whatever the configuration
+/// nominally holds. Both are matched here rather than improved on: an
+/// operator's tooling reads these two fields together and already knows what
+/// that pair means.
+///
+/// One function and not the rule written twice, because the two commands are
+/// read by the same tooling: a `maxmemory` from `INFO` that disagreed with the
+/// one from `CONFIG GET` would be read as a node that had changed underneath.
+const fn reported_limit(limit: MemoryLimit) -> (u64, EvictionMode) {
+    match limit.ceiling {
+        Some(ceiling) => (ceiling, limit.mode),
+        None => (0, EvictionMode::NoEviction),
+    }
+}
+
+/// What one [`CONFIG_PARAMETERS`] entry reports.
+///
+/// `requirepass` is empty on a node that has a password and on one that does
+/// not. That is Redis's behaviour and it is the only safe one: the reply goes
+/// to whoever asked, and the field would otherwise put the secret on the wire
+/// on every scrape.
+fn config_value(name: &str, node: &NodeInfo) -> String {
+    let (ceiling, policy) = reported_limit(node.limit);
+    match name {
+        "maxmemory" => ceiling.to_string(),
+        "maxmemory-policy" => policy.name().to_owned(),
+        "maxclients" => node.max_clients.to_string(),
+        // One keyspace, so `SELECT 1` is out of range and a client that reads
+        // this field learns why before it tries.
+        "databases" => "1".to_owned(),
+        "requirepass" => String::new(),
+        // The two readings Redis gives when the feature is off: the slow log
+        // records nothing at a negative threshold, and the latency monitor is
+        // disabled at zero. Neither is sampled here.
+        "slowlog-log-slower-than" => "-1".to_owned(),
+        "latency-monitor-threshold" => "0".to_owned(),
+        "bind" => node.bind.clone(),
+        "port" => node.tcp_port.to_string(),
+        other => unreachable!("{other} is in CONFIG_PARAMETERS with no value beside it"),
+    }
+}
+
 /// The unknown-subcommand message, byte-exact to Redis down to the full stop
 /// and the pointer at the help text clients print back to their users.
 ///
@@ -2218,17 +2341,7 @@ async fn info<R: Router>(router: &R, node: &NodeInfo, wanted: &[Vec<u8>]) -> Str
     }
     if asked_for(b"memory") {
         let used = node.memory.used();
-        // Redis reports an absent ceiling as `0`, and reports `noeviction`
-        // as the policy whenever there is no ceiling to reach — whatever the
-        // configuration nominally holds. Both are matched here rather than
-        // improved on: an operator's tooling reads these two fields together
-        // and already knows what that pair means.
-        let ceiling = node.limit.ceiling.unwrap_or(0);
-        let policy = if node.limit.ceiling.is_some() {
-            node.limit.mode
-        } else {
-            EvictionMode::NoEviction
-        };
+        let (ceiling, policy) = reported_limit(node.limit);
         let _ = write!(
             text,
             "# Memory\r\n\
@@ -5260,6 +5373,106 @@ mod tests {
         );
     }
 
+    /// `CONFIG GET`, which is how an exporter reads the node's configuration
+    /// without being told it.
+    ///
+    /// Every assertion here is about the *set* of pairs a request selects,
+    /// because that is the whole of what the subcommand does: the globs pick
+    /// rows out of one fixed table, and the value beside each row is a fact
+    /// this node already reports elsewhere. `CONFIG GET *` is checked by
+    /// count against the table so that a parameter added without a value
+    /// cannot pass.
+    #[tokio::test]
+    async fn config_get_answers_the_parameters_a_glob_selects() {
+        let pool = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let mut node = NodeInfo::for_tests();
+        node.limit = MemoryLimit {
+            ceiling: Some(64 << 20),
+            mode: EvictionMode::AllKeysLru,
+        };
+        tokio::spawn(serve_connection(server, pool, node));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        let requests: [&[&str]; 8] = [
+            &["CONFIG", "GET", "maxmemory"],
+            &["CONFIG", "GET", "maxmemory*"],
+            &["CONFIG", "GET", "*"],
+            &["CONFIG", "GET", "nosuch"],
+            // Redis 7 takes several globs in one request, and a client that
+            // sends two expects the union of what they select.
+            &["config", "get", "port", "bind"],
+            &["CONFIG", "SET", "maxmemory", "1"],
+            &["CONFIG", "GET"],
+            &["CONFIG"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        assert_eq!(frames[0], pairs(&[("maxmemory", "67108864")]));
+        assert_eq!(
+            frames[1],
+            pairs(&[
+                ("maxmemory", "67108864"),
+                ("maxmemory-policy", "allkeys-lru")
+            ])
+        );
+        // Derived from the table, so a parameter with no value beside it
+        // fails here rather than in a number written out by hand.
+        let Frame::Array(all) = &frames[2] else {
+            panic!("CONFIG GET * answered {:?}", frames[2]);
+        };
+        assert_eq!(all.len(), CONFIG_PARAMETERS.len() * 2);
+        assert_eq!(frames[3], Frame::Array(Vec::new()));
+        assert_eq!(
+            frames[4],
+            pairs(&[("bind", "127.0.0.1"), ("port", "6379")]),
+            "two globs select two parameters, in table order"
+        );
+        assert_eq!(
+            frames[5],
+            Frame::Error("ERR unknown subcommand 'SET'. Try CONFIG HELP.".into())
+        );
+        assert_eq!(
+            frames[6],
+            Frame::Error("ERR wrong number of arguments for 'config|get' command".into())
+        );
+        assert_eq!(
+            frames[7],
+            Frame::Error("ERR wrong number of arguments for 'config' command".into())
+        );
+    }
+
+    /// The password is never in the reply. Redis reports `requirepass` as an
+    /// empty string on a node that has one, and an exporter reads the field
+    /// on every scrape — so the one thing this parameter must never do is
+    /// answer truthfully.
+    #[tokio::test]
+    async fn config_get_never_reports_the_password() {
+        let pool = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(
+            server,
+            pool,
+            node_with_password(b"hunter2"),
+        ));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        for parts in [&["AUTH", "hunter2"][..], &["CONFIG", "GET", "requirepass"]] {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, 2).await;
+        assert_eq!(frames[0], Frame::Simple("OK".into()));
+        assert_eq!(frames[1], pairs(&[("requirepass", "")]));
+    }
+
     /// A connection command sits in the same stream as a keyed one, and the
     /// pipeline must not reorder or lose either.
     #[tokio::test]
@@ -6578,6 +6791,22 @@ mod tests {
             Frame::Bulk(bytes) => String::from_utf8(bytes.clone()).expect("INFO is not UTF-8"),
             other => panic!("expected a bulk reply, got {other:?}"),
         }
+    }
+
+    /// A `CONFIG GET` reply written the way it reads: name and value
+    /// together, rather than a flat list a reader has to pair up by index.
+    fn pairs(entries: &[(&str, &str)]) -> Frame {
+        Frame::Array(
+            entries
+                .iter()
+                .flat_map(|(name, value)| {
+                    [
+                        Frame::Bulk(name.as_bytes().to_vec()),
+                        Frame::Bulk(value.as_bytes().to_vec()),
+                    ]
+                })
+                .collect(),
+        )
     }
 
     fn req(parts: &[&str]) -> Frame {
