@@ -84,8 +84,9 @@ with no benefit.
   carries every decision a shard executor consults that production has exactly
   one answer for: today, when a deadline comes due — asked by both halves of
   expiration, the check in front of every command and the housekeeping sweep —
-  and how a keyspace walk's cursor advances. They travel as one value because
-  the same executor holds both for the same span. Production links exactly one
+  how a keyspace walk's cursor advances, and whether the node must reclaim
+  memory now. They travel as one value because the same executor holds all
+  three for the same span. Production links exactly one
   policy, an honest zero-sized implementation; the harness supplies defective
   ones, so what an invariant catches is the defect itself rather than an
   imitation of what it would look like from outside. A cargo feature could not
@@ -247,7 +248,13 @@ true.
   failing against a deliberately broken server before being trusted. So is the
   walk's cursor — against a keyspace narrow and deep enough for a cursor to be
   caught between steps, which the swept shape deliberately is not, and the
-  test that plants it says so where it lives.
+  test that plants it says so where it lives. The memory ceiling is watched
+  the same way, from both sides: a node that reads its ceiling and never
+  reclaims, and one that reclaims whatever it holds. Each needs a shape with a
+  ceiling to be under, and that shape trades exactness for truth — where keys
+  may be reclaimed at any moment, a client's model of them becomes an upper
+  bound rather than an equality, and the shapes with no ceiling keep the
+  exact one.
 - **The simulator may not reach production.** One gate proves the simulation
   crate is absent from the production dependency graph — with a positive
   control, so it cannot pass by searching an empty graph — and another compiles
