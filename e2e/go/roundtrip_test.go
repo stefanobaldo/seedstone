@@ -25,7 +25,11 @@ func addr() string {
 
 func client(t *testing.T) (*redis.Client, context.Context) {
 	t.Helper()
-	c := redis.NewClient(&redis.Options{Addr: addr()})
+	// The lane's password, or the empty string when the server was started
+	// open — go-redis sends no AUTH for an empty one. A literal in CI that
+	// protects nothing: it exists so this lane exercises the authenticated
+	// path rather than the open one.
+	c := redis.NewClient(&redis.Options{Addr: addr(), Password: os.Getenv("SEEDSTONE_PASSWORD")})
 	t.Cleanup(func() { _ = c.Close() })
 	ctx := context.Background()
 	// These tests own these keys; a server left running from an earlier run

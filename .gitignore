@@ -4,3 +4,8 @@
 # beside the test it just ran. (`pytest` ignores its own cache directory from
 # the inside, so it needs no entry here.)
 __pycache__/
+# The lanes that authenticate write their password beside themselves when CI
+# has not handed them one. A literal that protects nothing, and still not a
+# file this repository carries.
+e2e/*/.password
+e2e/*/.passwords.json

@@ -21,7 +21,16 @@ import os
 
 _HOST = os.environ.get("SEEDSTONE_HOST", "127.0.0.1")
 _PORT = os.environ.get("SEEDSTONE_PORT", "6390")
-_SERVER = "redis://%s:%s?db=0" % (_HOST, _PORT)
+# The lane's password, carried in the URL as the client library expects it:
+# no username, so redis-py sends the one-argument `AUTH <password>` a Redis
+# deployment with a `requirepass` and no ACL user receives. A literal that
+# protects nothing — see this lane's README.
+_PASSWORD = os.environ.get("SEEDSTONE_PASSWORD")
+_SERVER = (
+    "redis://:%s@%s:%s?db=0" % (_PASSWORD, _HOST, _PORT)
+    if _PASSWORD
+    else "redis://%s:%s?db=0" % (_HOST, _PORT)
+)
 
 # Not a secret. Django refuses to configure without one, and this settings
 # module exists only to point a test suite at a server on loopback: nothing

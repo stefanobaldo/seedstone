@@ -15,7 +15,11 @@ set -euo pipefail
 BIN=${1:?usage: redis-cli.sh path/to/seedstone [port]}
 PORT=${2:-6390}
 
-"$BIN" --bind "127.0.0.1:$PORT" &
+# `--no-auth` rather than nothing: this is the one lane that runs open, and it
+# says so. Every other lane authenticates, so both paths through the edge are
+# exercised — and on an address the flag is not needed for, which keeps the
+# refusal an open bind gets out of this lane's way.
+"$BIN" --bind "127.0.0.1:$PORT" --no-auth &
 SERVER=$!
 trap 'kill "$SERVER" 2>/dev/null || true' EXIT
 

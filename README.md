@@ -22,21 +22,26 @@ OK
 "hello"
 ```
 
-`--bind <addr:port>`, `--max-clients <n>`, `--maxmemory <size>` and
-`--maxmemory-policy allkeys-lru|noeviction` are the only options.
+`--bind <addr:port>`, `--max-clients <n>`, `--maxmemory <size>`,
+`--maxmemory-policy allkeys-lru|noeviction`, `--requirepass-file <path>` and
+`--no-auth` are the only options; the password may also arrive in
+`SEEDSTONE_REQUIREPASS`. It is never an argument — a command line is readable
+by every other process on the host. A bind outside loopback refuses to start
+without one of the two, unless `--no-auth` says so deliberately.
 
 **What it answers:** `GET`, `SET` (with `EX`, `PX`, `EXAT`, `PXAT`, `NX`, `XX`,
 `KEEPTTL`, `GET`), `MGET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `PERSIST`,
 `TTL`, `TYPE`, `STRLEN`, `INCRBY`, `SCAN`, `KEYS`, `DBSIZE`, `FLUSHDB`,
-`PING`, `ECHO`, `HELLO`, `INFO`, `COMMAND`, `CLIENT`, `QUIT`. `DEL`, `EXISTS`
+`PING`, `ECHO`, `AUTH`, `HELLO`, `INFO`, `COMMAND`, `CLIENT`, `QUIT`. `DEL`, `EXISTS`
 and `MGET` take several keys. Keys with a deadline are removed when touched and
 by a background sweep that does not wait to be asked. With `--maxmemory`, the
 keyspace is held under a ceiling by evicting least-recently-used keys, or by
 refusing writes under `noeviction`.
 
 **What it does not have yet:** persistence — a restart is an empty keyspace —
-along with authentication, RESP3, replication, clustering, and every data type
-except strings. There are no benchmarks published.
+along with RESP3, replication, clustering, and every data type except strings.
+Authentication is one password for the `default` user; there are no ACL users
+beside it and no TLS. There are no benchmarks published.
 
 **What it deliberately does not answer:** the inline command protocol, server-
 side scripting, and transactions. The surface is a named list chosen for the
@@ -73,10 +78,12 @@ make that reproducibility possible — including a self-test that plants genuine
 defects inside the server itself, a lost-update race, two broken expiry
 decisions and a keyspace walk that outruns its own cursor, and requires each to
 be caught and a second process to replay it byte for byte — then drives the
-release binary with `redis-cli`, `redis-benchmark`, redis-py and go-redis, and
-finishes by pointing a third party's cache-backend test suite at it, run
-against a digest-verified archive in a container pinned by digest to the
-interpreter that client pair needs.
+release binary with `redis-cli`, `redis-benchmark`, redis-py and go-redis —
+every one of them but `redis-cli` against a server that requires a password,
+so the authenticated path is the one the gate exercises and the open one stays
+exercised too — and finishes by pointing a third party's cache-backend test
+suite at it, run against a digest-verified archive in a container pinned by
+digest to the interpreter that client pair needs.
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains the decisions and why
 they were made; [docs/coding-guide.md](docs/coding-guide.md) is what a reviewer
