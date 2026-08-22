@@ -106,7 +106,7 @@ use seedstone_core::dict::{DictSeed, WalkOrder};
 // indistinguishable from the honest one except in its atomicity, and these
 // strings enter the trace hash — a private copy that drifted would make a
 // planted trace differ for a reason unrelated to the race.
-use seedstone_core::memory::MemoryLimit;
+use seedstone_core::memory::{EvictionMode, MemoryLimit};
 use seedstone_core::shard::{
     Command, Deadlines, EvictionPolicy, ExpiryPolicy, Reply, ReplyError, Route, Router, ShardPool,
     TraceSink, parse_i64,
@@ -372,6 +372,15 @@ pub struct SimConfig {
     pub concurrent_scan_cycle: bool,
     /// Which deliberate defect, if any, to serve the workload through.
     pub planted: Option<Plant>,
+    /// The ceiling the node's keyspace is held under, or `None` for a node
+    /// with no ceiling at all.
+    ///
+    /// `None` on every shape but [`SimConfig::eviction`], and that is what
+    /// makes the plain model's tolerance safe: a shape with no ceiling cannot
+    /// legitimately lose a key, so `nil` for a written key stays a mismatch
+    /// there. Only the shape that set a ceiling excuses one — see
+    /// [`SimOutcome::evictions_observed`].
+    pub maxmemory: Option<u64>,
 }
 
 impl SimConfig {
@@ -393,6 +402,7 @@ impl SimConfig {
             quiescent_walk: false,
             concurrent_scan_cycle: false,
             planted: None,
+            maxmemory: None,
         }
     }
 
@@ -437,6 +447,7 @@ impl SimConfig {
             quiescent_walk: false,
             concurrent_scan_cycle: true,
             planted: None,
+            maxmemory: None,
         }
     }
 
@@ -458,6 +469,37 @@ impl SimConfig {
             quiescent_walk: false,
             concurrent_scan_cycle: false,
             planted: None,
+            maxmemory: None,
+        }
+    }
+
+    /// A shape narrow enough to cross a ceiling many times in one run.
+    ///
+    /// Sixteen shards, not a thousand: the table overhead of a thousand empty
+    /// dicts would be most of any small ceiling, and the shard dimension is
+    /// not what this shape is about. The keys are `mini`'s; the ceiling is
+    /// set so the steady-state keyspace is roughly twice what fits, which
+    /// makes eviction the common case rather than an edge the run brushes
+    /// once. Calibrated by `tests/planted_eviction.rs`, which requires every
+    /// honest seed to evict something and to decide plain checks all the
+    /// same.
+    #[must_use]
+    pub const fn eviction(workload_seed: u64, sim_seed: u64) -> Self {
+        Self {
+            shards: 16,
+            executors: 4,
+            clients: 16,
+            plain_keys: 256,
+            volatile_keys: 128,
+            counter_keys: 8,
+            ops_per_client: 40,
+            pipeline_depth: 8,
+            workload_seed,
+            sim_seed,
+            quiescent_walk: false,
+            concurrent_scan_cycle: false,
+            planted: None,
+            maxmemory: Some(24 * 1024),
         }
     }
 }
@@ -728,7 +770,10 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
     let shards = cfg.shards;
     let executors = cfg.executors;
     let planted = cfg.planted;
-    let limit = MemoryLimit::default();
+    let limit = MemoryLimit {
+        ceiling: cfg.maxmemory,
+        mode: EvictionMode::AllKeysLru,
+    };
 
     sim.host(SERVER, move || {
         // Cloned per invocation: turmoil may restart a host, and each start

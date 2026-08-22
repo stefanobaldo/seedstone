@@ -6,8 +6,8 @@
 //! seed on that line goes straight into `replay`.
 //!
 //! ```text
-//! sweep --seeds N [--seed-start S] [--workload-seed W] [--mini] [--plant NAME] [--hashes]
-//!       [--workers K]
+//! sweep --seeds N [--seed-start S] [--workload-seed W] [--mini | --eviction] [--plant NAME]
+//!       [--hashes] [--workers K]
 //! ```
 //!
 //! The range starts at seed 1 unless `--seed-start` says otherwise, which is
@@ -33,8 +33,8 @@ use std::process::ExitCode;
 #[path = "shared/args.rs"]
 mod args;
 
-const USAGE: &str = "usage: sweep --seeds N [--seed-start S] [--workload-seed W] [--mini] \
-                     [--plant NAME] [--hashes] [--workers K]";
+const USAGE: &str = "usage: sweep --seeds N [--seed-start S] [--workload-seed W] \
+                     [--mini | --eviction] [--plant NAME] [--hashes] [--workers K]";
 
 fn main() -> ExitCode {
     let args = match args::Args::from_env() {
@@ -167,7 +167,13 @@ fn range(seed_start: u64, seeds: u64) -> Result<RangeInclusive<u64>, String> {
 /// How the swept configuration is named in the summary, so a pasted line says
 /// which shape produced it.
 const fn shape(args: &args::Args) -> &'static str {
-    if args.mini { "mini" } else { "standard" }
+    if args.mini {
+        "mini"
+    } else if args.eviction {
+        "eviction"
+    } else {
+        "standard"
+    }
 }
 
 /// The warning a sweep owes its reader when the plant it was serving is one
@@ -229,6 +235,7 @@ mod tests {
             "--seed-start",
             "--workload-seed",
             "--mini",
+            "--eviction",
             "--plant",
             "--hashes",
             "--workers",
