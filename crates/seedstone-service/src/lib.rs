@@ -438,8 +438,11 @@ const KIND_NAMES: [&str; 16] = [
 /// shard, so counting them where they land would report one request as one
 /// per shard.
 ///
-/// Order is the order `# Commandstats` prints them in, after the keyed
-/// commands.
+/// The order is this array's own — it is what `# Commandstats` prints after
+/// the keyed commands, and nothing else reads it. It deliberately does not
+/// track [`COMMANDS`]: a name is appended here when a command is added there,
+/// and reordering the existing ones to match would move fields in a document
+/// operators already read for no reader's benefit.
 pub const EDGE_NAMES: [&str; 15] = [
     "mget", "keys", "dbsize", "flushdb", "ping", "echo", "auth", "hello", "info", "command",
     "client", "quit", "config", "slowlog", "latency",
@@ -2196,7 +2199,7 @@ fn config(sub: &[u8], globs: &[Vec<u8>], node: &NodeInfo) -> Result<Action, Stri
     for name in CONFIG_PARAMETERS {
         if globs
             .iter()
-            .any(|glob| glob::matches(glob, name.as_bytes()))
+            .any(|pattern| glob::matches(pattern, name.as_bytes()))
         {
             reply.push(Frame::Bulk(name.as_bytes().to_vec()));
             reply.push(Frame::Bulk(config_value(name, node).into_bytes()));
@@ -5467,8 +5470,8 @@ mod tests {
     /// because that is the whole of what the subcommand does: the globs pick
     /// rows out of one fixed table, and the value beside each row is a fact
     /// this node already reports elsewhere. `CONFIG GET *` is checked by
-    /// count against the table so that a parameter added without a value
-    /// cannot pass.
+    /// count against the table itself, so a parameter added there is one this
+    /// reply has to carry without anyone remembering to come back here.
     #[tokio::test]
     async fn config_get_answers_the_parameters_a_glob_selects() {
         let pool = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace);
@@ -5508,8 +5511,11 @@ mod tests {
                 ("maxmemory-policy", "allkeys-lru")
             ])
         );
-        // Derived from the table, so a parameter with no value beside it
-        // fails here rather than in a number written out by hand.
+        // Held against the table's own length rather than a number written
+        // out by hand: what it pins is that `*` selects every row. It does
+        // not pin the values — a row with no value beside it never reaches
+        // this assertion, because `config_value` has no arm for it and the
+        // connection dies on the panic first.
         let Frame::Array(all) = &frames[2] else {
             panic!("CONFIG GET * answered {:?}", frames[2]);
         };
@@ -6888,36 +6894,50 @@ mod tests {
         ));
         let (mut r, mut w) = tokio::io::split(client);
         let mut out = Vec::new();
-        for parts in [
-            &["PING"][..],
+        // One per kind of command this server answers: a connection command,
+        // a keyed one, and the three an exporter scrapes — which connects
+        // like any other client and is refused like any other client.
+        let refused: [&[&str]; 6] = [
+            &["PING"],
             &["SET", "k", "v"],
             &["INFO"],
+            &["CONFIG", "GET", "requirepass"],
+            &["SLOWLOG", "LEN"],
+            &["LATENCY", "LATEST"],
+        ];
+        let then: [&[&str]; 6] = [
             &["AUTH", "wrong"],
             &["AUTH", "admin", "s3cret"],
             &["AUTH", "s3cret"],
             &["SET", "k", "v"],
             &["GET", "k"],
             &["AUTH", "default", "s3cret"],
-        ] {
+        ];
+        for parts in refused.iter().chain(&then) {
             encode(&req(parts), &mut out);
         }
         w.write_all(&out).await.unwrap();
         w.flush().await.unwrap();
-        let frames = read_frames(&mut r, 9).await;
-        assert_eq!(frames[0], Frame::Error(NOAUTH.to_owned()));
-        assert_eq!(frames[1], Frame::Error(NOAUTH.to_owned()));
-        assert_eq!(frames[2], Frame::Error(NOAUTH.to_owned()));
-        assert_eq!(frames[3], Frame::Error(WRONGPASS.to_owned()));
+        let frames = read_frames(&mut r, refused.len() + then.len()).await;
+        for (parts, frame) in refused.iter().zip(&frames) {
+            assert_eq!(
+                *frame,
+                Frame::Error(NOAUTH.to_owned()),
+                "{parts:?} was answered before AUTH"
+            );
+        }
+        let after = &frames[refused.len()..];
+        assert_eq!(after[0], Frame::Error(WRONGPASS.to_owned()));
         assert_eq!(
-            frames[4],
+            after[1],
             Frame::Error(WRONGPASS.to_owned()),
             "a username other than default is refused with the same text as a wrong password"
         );
-        assert_eq!(frames[5], Frame::Simple("OK".into()));
-        assert_eq!(frames[6], Frame::Simple("OK".into()));
-        assert_eq!(frames[7], Frame::Bulk(b"v".to_vec()));
+        assert_eq!(after[2], Frame::Simple("OK".into()));
+        assert_eq!(after[3], Frame::Simple("OK".into()));
+        assert_eq!(after[4], Frame::Bulk(b"v".to_vec()));
         assert_eq!(
-            frames[8],
+            after[5],
             Frame::Simple("OK".into()),
             "AUTH again, authenticated, is fine"
         );
