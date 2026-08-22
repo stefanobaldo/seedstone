@@ -32,6 +32,14 @@ pub struct Args {
     pub workload_seed: u64,
     /// `--mini` — the small configuration, for tests and quick checks.
     pub mini: bool,
+    /// `--eviction` — the shape with a ceiling, where the memory invariants
+    /// decide.
+    ///
+    /// A shape of its own rather than a modifier on the others: the ceiling
+    /// changes what the plain model is allowed to excuse, and a flag that
+    /// could be combined with `--mini` would leave two shapes claiming to be
+    /// the one that ran.
+    pub eviction: bool,
     /// `--plant NAME` — serve the workload through one deliberate defect.
     ///
     /// Named rather than boolean: there are three of them now, one per
@@ -83,6 +91,7 @@ impl Args {
             seed_start: None,
             workload_seed: DEFAULT_WORKLOAD_SEED,
             mini: false,
+            eviction: false,
             plant: None,
             hashes: false,
             workers: None,
@@ -96,11 +105,16 @@ impl Args {
                 "--seed-start" => parsed.seed_start = Some(number(&arg, argv.next())?),
                 "--workload-seed" => parsed.workload_seed = number(&arg, argv.next())?,
                 "--mini" => parsed.mini = true,
+                "--eviction" => parsed.eviction = true,
                 "--plant" => parsed.plant = Some(plant(argv.next())?),
                 "--hashes" => parsed.hashes = true,
                 "--workers" => parsed.workers = Some(workers(&arg, argv.next())?),
                 other => return Err(format!("unknown argument `{other}`")),
             }
+        }
+
+        if parsed.mini && parsed.eviction {
+            return Err("one shape per sweep: --mini and --eviction are two".to_owned());
         }
 
         Ok(parsed)
@@ -110,6 +124,8 @@ impl Args {
     pub const fn config(&self, sim_seed: u64) -> SimConfig {
         let mut cfg = if self.mini {
             SimConfig::mini(self.workload_seed, sim_seed)
+        } else if self.eviction {
+            SimConfig::eviction(self.workload_seed, sim_seed)
         } else {
             SimConfig::standard(self.workload_seed, sim_seed)
         };
@@ -208,6 +224,22 @@ mod tests {
     fn an_unknown_or_missing_plant_is_refused() {
         assert!(parse(&["--seeds", "10", "--plant", "nonesuch"]).is_err());
         assert!(parse(&["--seeds", "10", "--plant"]).is_err());
+    }
+
+    /// A shape is a choice, and two shapes asked for at once is a sweep whose
+    /// summary line would name one while the other decided what the model
+    /// excused.
+    #[test]
+    fn the_two_shape_flags_are_refused_together() {
+        let args = parse(&["--seeds", "10", "--eviction"]).expect("--eviction parses");
+        assert!(args.eviction);
+        assert!(!args.mini);
+        assert_eq!(
+            args.seeds,
+            Some(10),
+            "the new flag must not swallow its neighbour"
+        );
+        assert!(parse(&["--seeds", "10", "--mini", "--eviction"]).is_err());
     }
 
     #[test]
