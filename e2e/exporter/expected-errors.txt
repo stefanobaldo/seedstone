@@ -1,5 +1,3 @@
 # Error lines the exporter is expected to log today, matched as substrings.
 # One per line. Each names a command this server does not answer yet; the
 # line leaves when the command arrives. An empty file is this lane's gate.
-cmd LATENCY LATEST, err: ERR unknown command 'LATENCY'
-cmd LATENCY HISTOGRAM, err: ERR unknown command 'LATENCY'
