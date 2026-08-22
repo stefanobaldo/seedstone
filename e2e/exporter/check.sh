@@ -24,15 +24,44 @@ want() {
   local name=$1 value=$2
   grep -Eq "^${name}(\{[^}]*\})? (${value})$" "$metrics" || fail "$name $value not in the scrape"
 }
+# The other kind of assertion, and the one a reader will not expect: a metric
+# that must be *absent*. Each names something the exporter would publish only
+# by deriving it from a figure this server does not have, so its appearance is
+# the failure, not its absence.
+absent() {
+  local name=$1 why=$2
+  if grep -Eq "^${name}" "$metrics"; then fail "$why"; fi
+}
 if [ -z "$expected_lines" ]; then
   want redis_memory_max_bytes '6\.7108864e\+07|67108864'
+  want redis_config_maxmemory '6\.7108864e\+07|67108864'
   want 'redis_db_keys\{db="db0"\}' 3
   want 'redis_db_keys_expiring\{db="db0"\}' 1
   want redis_evicted_keys_total 0
+  want redis_expired_keys_total 0
+  want redis_rejected_connections_total 0
   grep -Eq '^redis_memory_used_bytes [1-9]' "$metrics" || fail "redis_memory_used_bytes is missing or zero"
   grep -Eq '^redis_keyspace_hits_total ' "$metrics" || fail "redis_keyspace_hits_total is missing"
   grep -Eq '^redis_keyspace_misses_total ' "$metrics" || fail "redis_keyspace_misses_total is missing"
-  grep -Eq '^redis_commands_total\{cmd="set"\} 3$' "$metrics" || fail "commandstats did not count three SETs"
+  grep -Eq '^redis_connections_received_total [1-9]' "$metrics" \
+    || fail "redis_connections_received_total is missing or zero"
+  grep -Eq '^redis_net_input_bytes_total [1-9]' "$metrics" \
+    || fail "redis_net_input_bytes_total is missing or zero"
+  # One database, because `CONFIG GET databases` said so. Unanswered, this
+  # exporter falls back to sixteen and prints fifteen empty ones — which is
+  # what this scrape looked like before the configuration table existed, and
+  # what it would look like again if that row were lost.
+  absent 'redis_db_keys\{db="db1"\}' "the exporter is scraping sixteen databases again"
+  # Nothing here times a handler, so no per-command timing is published — and
+  # this asserts it rather than leaving it to be noticed. The exporter reads a
+  # `cmdstat_` line by position, not by name: it drops one with fewer than
+  # three comma-separated fields, and otherwise takes whatever sits in the
+  # second field as microseconds. So padding the line to be read at all would
+  # publish a duration derived from something that is not one. The whole
+  # command family is given up instead, and this is the line that fails if
+  # anyone pads it back.
+  absent redis_commands_duration_seconds_total \
+    "a per-command duration was published from a figure this server does not measure"
 fi
 
 # 3. The error log, against what is expected today.

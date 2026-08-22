@@ -228,10 +228,24 @@ sits marginally over its ceiling until something is deleted or expires.
 `SLOWLOG GET` is empty, `LATENCY LATEST` is empty, and `CONFIG GET` reports
 `slowlog-log-slower-than -1` and `latency-monitor-threshold 0` — which is what
 Redis itself reports with both monitors off, so the readings and the
-configuration agree. Nothing here times a handler, so `commandstats` carries
-call counts and no `usec` fields; a zero there would be a measurement this
-server does not take, printed as if it did. Per-command timing is a measurement
-campaign's to add, with a cost stated, not a field to fill in.
+configuration agree. Only the subcommands named here are answered: the ones
+Redis serves *from* a disabled monitor but this server has no reading for —
+`LATENCY DOCTOR`, `LATENCY GRAPH`, `SLOWLOG HELP` — are refused as unknown
+subcommands rather than given a sentence nobody measured.
+
+Nothing here times a handler, so `commandstats` carries call counts and no
+`usec` fields; a zero there would be a measurement this server does not take,
+printed as if it did. Per-command timing is a measurement campaign's to add,
+with a cost stated, not a field to fill in. **That omission costs a metric, and
+the cost is taken deliberately.** The exporter this project is gated on parses
+a `cmdstat_` line by position: it drops one carrying fewer than three
+comma-separated fields, and otherwise reads whatever sits in the second field
+as microseconds, whatever that field is named. A line of `calls=N` alone is
+therefore dropped and no per-command metric is published at all. Padding it
+would publish a duration derived from a number that is not one — the same
+fabrication moved from this server's output into the monitoring system, where
+it is harder to see. The family is given up instead, and the lane asserts the
+duration metric is absent so that a later change cannot quietly buy it back.
 
 **The surface is a named list, and anything outside it is refused.** A command
 this server does not implement is answered with an error naming it, rather than

@@ -2297,9 +2297,9 @@ fn slowlog(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
 ///
 /// `CONFIG GET latency-monitor-threshold` reports `0`, Redis's spelling for
 /// disabled, and these are the readings that belong beside it: nothing was
-/// sampled, so there is no latest reading, no history for any event, and no
-/// event a reset can remove. The argument for answering rather than refusing
-/// is [`slowlog`]'s.
+/// sampled, so there is no latest reading, no history for any event, no event
+/// a reset can remove, and no command with a histogram of its own. The
+/// argument for answering rather than refusing is [`slowlog`]'s.
 fn latency(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
     if sub.eq_ignore_ascii_case(b"LATEST") {
         if !rest.is_empty() {
@@ -6895,7 +6895,7 @@ mod tests {
         let (mut r, mut w) = tokio::io::split(client);
         let mut out = Vec::new();
         // One per kind of command this server answers: a connection command,
-        // a keyed one, and the three an exporter scrapes — which connects
+        // a keyed one, and the four an exporter scrapes — which connects
         // like any other client and is refused like any other client.
         let refused: [&[&str]; 6] = [
             &["PING"],
