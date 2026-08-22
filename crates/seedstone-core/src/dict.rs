@@ -56,10 +56,13 @@ pub struct DictSeed {
 /// The deadline is stored inline on every entry, whether or not that entry has
 /// one, and an `Option<Instant>` is 16 bytes — `Instant` is 16 and the niche
 /// absorbs the discriminant, so `None` is not cheaper. A bucket slot,
-/// `(u64, Vec<u8>, Entry)` — see [`Bucket`] — is therefore 72 bytes against
+/// `(u64, Vec<u8>, Entry)` — see [`Bucket`] — is therefore 80 bytes against
 /// the 48 a plain `(Vec<u8>, Vec<u8>)` would take: 8 for the stored hash,
-/// which is a deliberate trade of space for a cheaper chain scan, and 16 for
-/// this field, which the great majority of keys in a real keyspace never use.
+/// which is a deliberate trade of space for a cheaper chain scan, 16 for this
+/// field, which the great majority of keys in a real keyspace never use, and
+/// 8 more for the four-byte [`touched`](Self::touched) stamp and the padding
+/// that rounds it up. `the_slot_layout_is_what_entry_overhead_prices` holds
+/// that figure to what the compiler actually lays out.
 ///
 /// Stated here so nobody has to derive it from the layout. Whether it is the
 /// right trade — against a side table of deadlines, or a packed representation
@@ -70,6 +73,13 @@ pub struct Entry {
     pub value: Vec<u8>,
     /// When the entry expires, or `None` if it never does.
     pub expires_at: Option<Instant>,
+    /// When the entry was last touched, on the dict's own command counter.
+    ///
+    /// A counter and not a clock, so that which key is oldest is a function
+    /// of the command sequence and replays identically; the resolution is one
+    /// command, which is finer than a clock's. Set by [`Dict::touch`], which
+    /// the read and write paths call; `0` on an entry nothing has touched yet.
+    pub touched: u32,
 }
 
 /// One hash bucket: the entries whose hash selected it, in insertion order.
@@ -104,9 +114,9 @@ const INITIAL_BUCKETS: usize = 8;
 /// What one entry costs beyond its key and value bytes.
 ///
 /// A bucket slot is `(u64, Vec<u8>, Entry)` — 8 for the stored hash, 24 for
-/// the key's `Vec` header, and `Entry` at 40 (a 24-byte `Vec` header for the
-/// value and a 16-byte `Option<Instant>`) — 72 bytes, as the [`Entry`] doc
-/// derives. The LRU stamp added later widens `Entry` by 8 through padding.
+/// the key's `Vec` header, and `Entry` at 48 (a 24-byte `Vec` header for the
+/// value, a 16-byte `Option<Instant>`, and the 4-byte LRU stamp padded to 8)
+/// — 80 bytes, as the [`Entry`] doc derives.
 /// The two heap allocations the headers point at are counted through their
 /// lengths by [`entry_bytes`]; their allocator rounding is not, and that is
 /// deliberate: this is a formula the simulator can replay, not a reading.
@@ -171,6 +181,13 @@ pub struct Dict {
     /// tests hold it to a full recount after every mutation, which is what
     /// makes maintaining it in five places defensible.
     used_bytes: u64,
+    /// What [`Dict::touch`] stamps entries with, advanced once per touch.
+    ///
+    /// A command counter rather than a clock reading, for the reason
+    /// [`Entry::touched`] states: the order two keys were last used in has to
+    /// be a function of the command sequence, so that a replay of that
+    /// sequence picks the same eviction victim.
+    clock: u32,
 }
 
 impl Dict {
@@ -185,6 +202,7 @@ impl Dict {
             len: 0,
             may_hold_deadlines: false,
             used_bytes: table_bytes(INITIAL_BUCKETS),
+            clock: 0,
         }
     }
 
@@ -244,6 +262,77 @@ impl Dict {
             }
             None => false,
         }
+    }
+
+    /// Stamps `key` as touched now and advances the counter.
+    ///
+    /// Wrapping: after four billion touches the stamps fold over and a key
+    /// touched just after the fold reads as older than one touched just
+    /// before it. The sampled comparison tolerates it — a victim chosen wrong
+    /// for the span of one wrap is a cache miss, not a correctness failure —
+    /// and a monotone 64-bit stamp would cost every entry eight bytes to avoid
+    /// a miss nobody could measure.
+    ///
+    /// A key that is not there is not an error: a read that missed and a
+    /// write that has not landed yet both reach this, and neither has an
+    /// entry to stamp.
+    pub fn touch(&mut self, key: &[u8]) {
+        self.clock = self.clock.wrapping_add(1);
+        let stamp = self.clock;
+        let hash = hash_key(self.seed, key);
+        if let Some(entry) = find_mut(&mut self.old, hash, key) {
+            entry.touched = stamp;
+        } else if let Some(new) = self.new.as_mut()
+            && let Some(entry) = find_mut(new, hash, key)
+        {
+            entry.touched = stamp;
+        }
+    }
+
+    /// The least recently touched of up to `samples` live entries met by
+    /// walking from `cursor`, or `None` if the dict is empty.
+    ///
+    /// A walk rather than a random draw: the walk order is a function of the
+    /// seed and the cursor, so an eviction replays, and the cursor the caller
+    /// keeps means successive samples cover the table instead of re-reading
+    /// one corner of it. It takes as many steps as it needs to meet
+    /// `samples` entries, bounded by one full cycle, so a sparse table does
+    /// not answer from a single bucket.
+    ///
+    /// The comparison is a plain `<` on stamps that wrap, so the fold
+    /// [`touch`](Dict::touch) documents makes one sample's worth of victims
+    /// misjudged every four billion touches. A wrapping comparison would
+    /// misjudge a different set — the one where the sample straddles the fold
+    /// in the other direction — rather than none, and neither costs anything
+    /// but a cache miss.
+    #[must_use]
+    pub fn sample_oldest(&self, cursor: &mut u64, samples: usize) -> Option<Vec<u8>> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut oldest: Option<(u32, Vec<u8>)> = None;
+        let mut seen = 0usize;
+        let mut steps = 0usize;
+        // One full cycle of the walk, in the widest table there is: the bound
+        // is what keeps a sparse keyspace — many buckets, few entries — from
+        // spinning here when it cannot produce `samples` at all.
+        let bound = self.old.len() + self.new.as_ref().map_or(0, Vec::len);
+        while seen < samples && steps < bound {
+            *cursor = self.scan(*cursor, |key, entry| {
+                seen += 1;
+                // The key is cloned only when it becomes the candidate, not
+                // once per entry met: a sample of five over a chained bucket
+                // would otherwise allocate for every entry it discards.
+                if oldest
+                    .as_ref()
+                    .is_none_or(|(stamp, _)| entry.touched < *stamp)
+                {
+                    oldest = Some((entry.touched, key.to_vec()));
+                }
+            });
+            steps += 1;
+        }
+        oldest.map(|(_, key)| key)
     }
 
     /// Stores `entry` under `key`, replacing any entry already there.
@@ -798,6 +887,7 @@ mod tests {
         Entry {
             value: value.to_vec(),
             expires_at: None,
+            touched: 0,
         }
     }
 
@@ -905,6 +995,7 @@ mod tests {
             Entry {
                 value: b"v".to_vec(),
                 expires_at: Some(Instant::now()),
+                touched: 0,
             },
         );
         assert!(d.may_hold_deadlines());
@@ -1523,6 +1614,7 @@ mod tests {
         Entry {
             value: value.to_vec(),
             expires_at: Some(expires_at),
+            touched: 0,
         }
     }
 
@@ -1756,6 +1848,7 @@ mod tests {
                 Entry {
                     value: vec![b'v'; (i % 17) as usize],
                     expires_at: None,
+                    touched: 0,
                 },
             );
             assert_eq!(dict.used_bytes(), recount(&dict), "after insert {i}");
@@ -1766,6 +1859,7 @@ mod tests {
             Entry {
                 value: vec![0; 1000],
                 expires_at: None,
+                touched: 0,
             },
         );
         assert_eq!(dict.used_bytes(), recount(&dict));
@@ -1774,6 +1868,7 @@ mod tests {
             Entry {
                 value: vec![0; 1],
                 expires_at: None,
+                touched: 0,
             },
         );
         assert_eq!(dict.used_bytes(), recount(&dict));
@@ -1823,6 +1918,7 @@ mod tests {
                                     Entry {
                                         value: vec![1; len],
                                         expires_at: None,
+                                        touched: 0,
                                     },
                                 ),
                                 Op::Del(k) => {
@@ -1836,5 +1932,90 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The stamp is a per-dict counter, not a clock: a key touched later
+    /// carries a larger stamp, and a read touches as a write does.
+    #[test]
+    fn touching_a_key_stamps_it_later_than_every_key_touched_before() {
+        let mut dict = Dict::with_seed(DictSeed { k0: 1, k1: 2 });
+        for k in 0..10u8 {
+            dict.insert(
+                vec![k],
+                Entry {
+                    value: vec![],
+                    expires_at: None,
+                    touched: 0,
+                },
+            );
+        }
+        dict.touch(&[3]);
+        let newest = dict.get(&[3]).unwrap().touched;
+        for k in (0..10u8).filter(|k| *k != 3) {
+            assert!(
+                dict.get(&[k]).unwrap().touched < newest,
+                "key {k} is not older than the touched one"
+            );
+        }
+    }
+
+    /// Sampled LRU from a cursor walk: over a thousand keys of which the last
+    /// two hundred were touched again, a hundred evictions pick at most two
+    /// victims from the recent fifth. With five samples the chance one
+    /// eviction lands entirely inside the recent fifth is 0.2^5 = 0.00032, so
+    /// a hundred of them expect 0.03; the bound of two is wide, and the walk
+    /// is deterministic from the seed so this is not a coin toss.
+    #[test]
+    fn sampled_eviction_rarely_takes_a_recently_touched_key() {
+        let mut dict = Dict::with_seed(DictSeed { k0: 7, k1: 11 });
+        for i in 0..1000u32 {
+            dict.insert(
+                format!("k{i}").into_bytes(),
+                Entry {
+                    value: vec![],
+                    expires_at: None,
+                    touched: 0,
+                },
+            );
+            dict.touch(format!("k{i}").as_bytes());
+        }
+        for i in 800..1000u32 {
+            dict.touch(format!("k{i}").as_bytes());
+        }
+        let mut cursor = 0u64;
+        let mut recent_victims = 0;
+        for _ in 0..100 {
+            let victim = dict
+                .sample_oldest(&mut cursor, 5)
+                .expect("a non-empty dict has a victim");
+            let index: u32 = std::str::from_utf8(&victim[1..]).unwrap().parse().unwrap();
+            if index >= 800 {
+                recent_victims += 1;
+            }
+            dict.remove(&victim);
+        }
+        assert!(
+            recent_victims <= 2,
+            "{recent_victims} of 100 victims were recently touched"
+        );
+    }
+
+    /// [`ENTRY_OVERHEAD`] is a claim about what the compiler lays out, and
+    /// the accounting is only honest while the claim holds. Checked here
+    /// rather than derived in a doc comment nobody runs: the stamp widened
+    /// `Entry` through padding, and the next field added to it may not.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn the_slot_layout_is_what_entry_overhead_prices() {
+        assert_eq!(
+            size_of::<(u64, Vec<u8>, Entry)>(),
+            usize::try_from(ENTRY_OVERHEAD).expect("a small constant"),
+        );
+    }
+
+    #[test]
+    fn an_empty_dict_offers_no_victim() {
+        let dict = Dict::with_seed(DictSeed { k0: 1, k1: 2 });
+        assert_eq!(dict.sample_oldest(&mut 0, 5), None);
     }
 }
