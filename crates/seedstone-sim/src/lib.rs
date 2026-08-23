@@ -3359,11 +3359,18 @@ mod tests {
         // `KEEPTTL` took four rolls in a hundred off the bare `SET` and the
         // plain `GET`, so this moved and `plain_checks` rose by two — the
         // conditions and the read-and-write decide one each where the rolls
-        // they took decided one each anyway. The trace folds every command's
-        // kind and every reply, so an added command changes it by
-        // construction. A change here with no workload change beside it is a
+        // they took decided one each anyway. And then when one `SCAN` call
+        // began crossing shards: the workload is unchanged and issues the
+        // same steps in the same order, but a step that used to answer from
+        // one shard now answers from as many as its budget crosses, so the
+        // replies it folds are different ones. That is the fourth kind of
+        // repin and the one this comment did not have — a change to *what a
+        // command answers*, with `expected_sum` holding still because the
+        // commands did not move. The trace folds every command's kind and
+        // every reply, so an added command changes it by construction. A
+        // change here with no workload or reply change beside it is a
         // regression, not a repin.
-        const MINI_1_42: u64 = 0xa308_5f64_4e73_d96a;
+        const MINI_1_42: u64 = 0x35bb_a61c_d6e9_0aac;
 
         let outcome = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(
