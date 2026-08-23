@@ -95,10 +95,12 @@ yet — for now the server is built from source, as above.
 The project is built around deterministic simulation testing, so a concurrency
 bug is meant to be reproducible from a seed. CI sweeps a range of simulator
 seeds on every change that touches code, enforces the determinism rules that
-make that reproducibility possible — including a self-test that plants genuine
-defects inside the server itself, a lost-update race, two broken expiry
-decisions and a keyspace walk that outruns its own cursor, and requires each to
-be caught and a second process to replay it byte for byte — then drives the
+make that reproducibility possible, and runs a self-test that plants six
+genuine defects inside the server itself: a lost-update race, two broken expiry
+decisions, a keyspace walk that outruns its own cursor, and two broken eviction
+decisions — a node that never reclaims, and one that reclaims what it should be
+keeping. Each has to be caught by the counter that owns it, and what the sweep
+runs has to replay byte for byte in a second process. CI then drives the
 release binary with `redis-cli`, `redis-benchmark`, redis-py and go-redis —
 every one of them but `redis-cli` against a server that requires a password,
 so the authenticated path is the one the gate exercises and the open one stays
