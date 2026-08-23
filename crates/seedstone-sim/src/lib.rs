@@ -792,6 +792,32 @@ pub struct SimOutcome {
     /// than each trusted alone: a node that reclaimed nothing cannot have
     /// been the reason a key went missing.
     pub evicted_keys: u64,
+    /// The microseconds the *shards* charged to the commands they ran, summed
+    /// over every command name the edge does not count for itself, from the
+    /// verifier's final `INFO`.
+    ///
+    /// **Always zero, and that is the claim.** A handler cannot `await`, so
+    /// no simulated instant passes between the reading an envelope takes on
+    /// arrival and the reading taken after each of its commands. It is what
+    /// keeps `usec` out of [`fold_reply`] and a replay byte-stable, and it is
+    /// a property of the runtime rather than of the code that reads it — so
+    /// `tests/command_timing.rs` asserts it, where a runtime that started
+    /// advancing the clock inside a handler fails loudly.
+    ///
+    /// The edge's own timings are excluded because they are not the same
+    /// claim: an `MGET` is timed across the wait for the shards it reached,
+    /// and simulated time passes during a wait by design.
+    ///
+    /// Zero on every shape whose verifier takes no final `INFO` — see
+    /// [`SimOutcome::executor_calls`], which is what tells that apart from a
+    /// measured zero.
+    pub executor_usec: u64,
+    /// The calls those microseconds were spent over, from the same document.
+    ///
+    /// The denominator [`SimOutcome::executor_usec`]'s zero is only a
+    /// measurement against: a run that read no document, or read one before
+    /// any command had run, reports zero for both.
+    pub executor_calls: u64,
     /// Readings of `used_memory` that were past `maxmemory`.
     pub ceiling_breaches: u64,
     /// Readings of `used_memory` taken at all — the denominator of
@@ -953,6 +979,8 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         walk_checks: tally.walk_checks,
         evictions_observed: tally.evictions_observed,
         evicted_keys: tally.evicted_keys,
+        executor_usec: tally.executor_usec,
+        executor_calls: tally.executor_calls,
         ceiling_breaches: tally.ceiling_breaches,
         ceiling_checks: tally.ceiling_checks,
         evictable: cfg.maxmemory.is_some(),
@@ -1008,6 +1036,8 @@ struct Tally {
     walk_checks: u64,
     evictions_observed: u64,
     evicted_keys: u64,
+    executor_usec: u64,
+    executor_calls: u64,
     ceiling_breaches: u64,
     ceiling_checks: u64,
 }
@@ -1143,24 +1173,38 @@ fn fold_reply(h: u64, reply: &Reply) -> u64 {
             }
             acc
         }
-        // Every field, in declaration order, now that every field is
-        // maintained. It is one reply, and its whole content is what a
-        // divergence between two runs would show in — a shard that counted a
-        // hit the replay counted as a miss has diverged, whether or not any
-        // assertion happens to read that field.
+        // Every field a replay must agree about, in declaration order. It is
+        // one reply, and its content is what a divergence between two runs
+        // would show in — a shard that counted a hit the replay counted as a
+        // miss has diverged, whether or not any assertion happens to read
+        // that field.
+        //
+        // `usec` is the one field deliberately left out, for the reason
+        // `visited` is left out above and a stronger one besides: it is a
+        // reading of a clock. Under this simulator it is exactly zero — a
+        // handler cannot `await`, so no simulated instant passes inside one,
+        // and `tests/command_timing.rs` holds the runtime to that — but a
+        // figure whose zero depends on the runtime is not a figure a recorded
+        // hash may be pinned to. The destructuring is exhaustive so that a
+        // field added to `ShardStats` later stops compiling here rather than
+        // being silently folded or silently skipped.
         Reply::Stats(stats) => {
-            let mut acc = mix(mix(h, 9), stats.keys);
-            for field in [
-                stats.expires,
-                stats.evicted,
-                stats.hits,
-                stats.misses,
-                stats.expired,
-            ] {
+            let seedstone_core::shard::ShardStats {
+                keys,
+                expires,
+                evicted,
+                hits,
+                misses,
+                expired,
+                calls,
+                usec: _,
+            } = **stats;
+            let mut acc = mix(mix(h, 9), keys);
+            for field in [expires, evicted, hits, misses, expired] {
                 acc = mix(acc, field);
             }
-            for calls in stats.calls {
-                acc = mix(acc, calls);
+            for count in calls {
+                acc = mix(acc, count);
             }
             acc
         }
@@ -3147,13 +3191,28 @@ async fn verifier(cfg: SimConfig, shared: Shared) -> turmoil::Result {
     if let Some(ceiling) = cfg.maxmemory {
         {
             let mut forms = lock(&shared.forms);
-            forms.insert(contract::FORM_INFO_STATS);
+            forms.insert(contract::FORM_INFO_STATS_COMMANDSTATS);
             forms.insert(contract::FORM_INFO_MEMORY);
         }
+        // Two sections in one request rather than two requests, and the
+        // difference is not tidiness: `stats` and `commandstats` are both
+        // built from a broadcast the server takes *once* per `INFO`, so
+        // asking for them together adds nothing to this shape's trace. A
+        // second `INFO` would add a command per shard, and the recorded
+        // hashes with it.
         let replies = conn
-            .request_many(&[command(&["INFO", "stats"]), command(&["INFO", "memory"])])
+            .request_many(&[
+                command(&["INFO", "stats", "commandstats"]),
+                command(&["INFO", "memory"]),
+            ])
             .await?;
-        lock(&shared.tally).evicted_keys = evicted_keys(&replies[0]).unwrap_or(0);
+        {
+            let (usec, calls) = executor_timing(&replies[0]);
+            let mut tally = lock(&shared.tally);
+            tally.evicted_keys = evicted_keys(&replies[0]).unwrap_or(0);
+            tally.executor_usec = usec;
+            tally.executor_calls = calls;
+        }
         check_ceiling(&replies[1], ceiling, &shared);
     }
 
@@ -3161,6 +3220,44 @@ async fn verifier(cfg: SimConfig, shared: Shared) -> turmoil::Result {
         walk_the_whole_family(&mut conn, &cfg, &shared).await?;
     }
     Ok(())
+}
+
+/// What the shards charged, over the `# Commandstats` lines of an `INFO`
+/// document: microseconds and the calls they were spent over.
+///
+/// The edge's own names are skipped, and that is the whole of the filtering:
+/// a line named in [`EDGE_NAMES`] carries a figure timed across a wait for
+/// shards, which is a real elapsed simulated time and not a handler's. What
+/// remains is exactly what the executors measured — see
+/// [`SimOutcome::executor_usec`].
+///
+/// A document with no such section reports `(0, 0)`, which the caller tells
+/// apart from a measured zero by the call count.
+fn executor_timing(info: &Frame) -> (u64, u64) {
+    let Frame::Bulk(body) = info else {
+        return (0, 0);
+    };
+    let mut usec = 0;
+    let mut calls = 0;
+    for line in String::from_utf8_lossy(body).lines() {
+        let Some(rest) = line.strip_prefix("cmdstat_") else {
+            continue;
+        };
+        let Some((name, fields)) = rest.split_once(':') else {
+            continue;
+        };
+        if seedstone_service::EDGE_NAMES.contains(&name) {
+            continue;
+        }
+        for field in fields.split(',') {
+            if let Some(value) = field.strip_prefix("usec=") {
+                usec += value.parse::<u64>().unwrap_or(0);
+            } else if let Some(value) = field.strip_prefix("calls=") {
+                calls += value.parse::<u64>().unwrap_or(0);
+            }
+        }
+    }
+    (usec, calls)
 }
 
 /// The `evicted_keys:` figure of an `INFO stats` document, if it holds one.

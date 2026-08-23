@@ -399,6 +399,7 @@ impl Server {
             net_in: Arc::new(AtomicU64::new(0)),
             net_out: Arc::new(AtomicU64::new(0)),
             edge_calls: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            edge_usec: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
         };
         loop {
             tokio::select! {

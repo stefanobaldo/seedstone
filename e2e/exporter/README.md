@@ -61,13 +61,14 @@ metrics while the log stays quiet. That is why the second assertion exists and
 why it names the metrics it wants: the log catches the refusals the exporter
 chooses to report, and the named values catch the ones it does not.
 
-One family is missing on purpose. This exporter reads a `cmdstat_` line by
-position rather than by name: it drops any line carrying fewer than three
+One family is read by position rather than by name, and that is why this lane
+asserts it. This exporter drops any `cmdstat_` line carrying fewer than three
 comma-separated fields, and otherwise takes whatever sits in the second field
 as microseconds, whatever that field is called. `INFO commandstats` here
-carries a call count and nothing else, because nothing in this server times a
-handler — so the line is dropped, and `redis_commands_total` never appears.
-Padding it to three fields would make the exporter publish a
-`redis_commands_duration_seconds_total` derived from a number that is not a
-duration, which is a worse answer than none. `check.sh` asserts that metric is
-**absent**, so the day someone pads the line, this lane says so.
+carries the three fields Redis carries, in Redis's order — `calls`, `usec`,
+`usec_per_call` — because the server times each command where it counts it. So
+`redis_commands_total` and `redis_commands_duration_seconds_total` both appear,
+and `check.sh` names both for the `set` the lane sent. A change that reordered
+the fields or dropped one would leave the parser reading a number that is not a
+duration, and the assertions are what catches it here rather than in somebody's
+dashboard.

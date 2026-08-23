@@ -52,16 +52,17 @@ if [ -z "$expected_lines" ]; then
   # what this scrape looked like before the configuration table existed, and
   # what it would look like again if that row were lost.
   absent 'redis_db_keys\{db="db1"\}' "the exporter is scraping sixteen databases again"
-  # Nothing here times a handler, so no per-command timing is published — and
-  # this asserts it rather than leaving it to be noticed. The exporter reads a
-  # `cmdstat_` line by position, not by name: it drops one with fewer than
-  # three comma-separated fields, and otherwise takes whatever sits in the
-  # second field as microseconds. So padding the line to be read at all would
-  # publish a duration derived from something that is not one. The whole
-  # command family is given up instead, and this is the line that fails if
-  # anyone pads it back.
-  absent redis_commands_duration_seconds_total \
-    "a per-command duration was published from a figure this server does not measure"
+  # The per-command family, which exists because the server now times each
+  # command and prints the three fields Redis prints in Redis's order. The
+  # exporter reads a `cmdstat_` line by position, not by name — it drops one
+  # with fewer than three comma-separated fields and takes the second as
+  # microseconds — so this pair of assertions is what says the line is still
+  # shaped the way that parser needs. A `SET` was sent above, so both metrics
+  # must carry it.
+  grep -Eq '^redis_commands_total\{cmd="set"\} [1-9]' "$metrics" \
+    || fail "redis_commands_total{cmd=\"set\"} is missing or zero"
+  grep -Eq '^redis_commands_duration_seconds_total\{cmd="set"\} [0-9]' "$metrics" \
+    || fail "redis_commands_duration_seconds_total{cmd=\"set\"} is missing"
 fi
 
 # 3. The error log, against what is expected today.

@@ -363,6 +363,8 @@ mod tests {
             walk_checks: 0,
             evictions_observed: 0,
             evicted_keys: 0,
+            executor_usec: 0,
+            executor_calls: 0,
             ceiling_breaches: 0,
             ceiling_checks: 0,
             evictable: false,

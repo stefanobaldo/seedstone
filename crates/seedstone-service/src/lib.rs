@@ -629,6 +629,20 @@ pub struct NodeInfo {
     /// reason no shard can count: see [`EDGE_NAMES`] for what belongs here
     /// and what is counted by the shard that runs it instead.
     pub edge_calls: Arc<[AtomicU64; EDGE_NAMES.len()]>,
+    /// Microseconds those commands spent here, in the same order.
+    ///
+    /// Timed where they are counted, and for the same reason: an `MGET` over
+    /// four keys is one request, and the four `GET`s it became are timed by
+    /// the shards that ran them. Adding those four to this would report the
+    /// same microseconds twice under two names.
+    ///
+    /// **This is not the shards' figure and does not behave like it.** A
+    /// command counted here is timed across the wait for the shards it
+    /// reached, so its reading includes time the executors spent on other
+    /// connections' work — it is what the request took, not what it cost. The
+    /// shards' [`usec`](seedstone_core::shard::ShardStats::usec) is the
+    /// second, and it is the one that reads zero under a simulated clock.
+    pub edge_usec: Arc<[AtomicU64; EDGE_NAMES.len()]>,
 }
 
 impl NodeInfo {
@@ -670,6 +684,7 @@ impl NodeInfo {
             net_in: Arc::new(AtomicU64::new(0)),
             net_out: Arc::new(AtomicU64::new(0)),
             edge_calls: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            edge_usec: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
         }
     }
 
@@ -779,6 +794,11 @@ enum Unbatched {
     FanOut {
         /// The commands, in the order the peer named their keys.
         cmds: Vec<Command>,
+        /// What the peer called the request, lower-cased: `mget`, `del`,
+        /// `exists`. Carried rather than inferred from the fold, so that
+        /// [`Unbatched::edge_name`] states which request this is instead of
+        /// guessing it from how its replies are put back together.
+        name: &'static str,
         /// What the replies are folded into.
         fold: Fold,
     },
@@ -854,10 +874,40 @@ impl Fold {
 }
 
 impl Unbatched {
-    /// Runs the request and answers with the single frame it earns.
-    async fn answer<R: Router>(self, router: &R, node: &NodeInfo) -> Frame {
+    /// What the peer called this request, lower-cased.
+    ///
+    /// The name `commandstats` reports it under, which is not always the name
+    /// of the commands it becomes: an `MGET` is a pile of `GET`s and a `KEYS`
+    /// is a pile of scan steps. Whether the name is one *this layer* counts is
+    /// [`edge_slot`]'s question and not this one's — a multi-key `DEL` is a
+    /// fan-out too, and the shards count every command it splits into.
+    fn edge_name(&self) -> &'static str {
         match self {
-            Self::FanOut { cmds, fold } => fan_out(router, cmds, fold).await,
+            Self::FanOut { name, .. } => name,
+            // Both of these are one command sent to every shard, and the
+            // command's own name is the request's: the table that names a
+            // kind for `commandstats` is the same table, so there is no
+            // second spelling to keep in step.
+            Self::Every(cmd) => KIND_NAMES[usize::from(cmd.kind())],
+            Self::Keys(_) => "keys",
+            Self::Scan { .. } => "scan",
+            Self::Info(_) => "info",
+        }
+    }
+
+    /// Runs the request and answers with the single frame it earns.
+    ///
+    /// Times itself where the edge counts it, and only there — see
+    /// [`NodeInfo::edge_usec`] for what that figure is and is not. A request
+    /// the shards count instead takes no reading at all: a fan-out `DEL` is
+    /// timed four times by the four shards that ran its four commands, and a
+    /// fifth reading here would be the same microseconds under a name that
+    /// already has its own.
+    async fn answer<R: Router>(self, router: &R, node: &NodeInfo) -> Frame {
+        let slot = edge_slot(self.edge_name().as_bytes());
+        let started = slot.map(|_| Instant::now());
+        let frame = match self {
+            Self::FanOut { cmds, fold, .. } => fan_out(router, cmds, fold).await,
             Self::Every(cmd) => broadcast(router, cmd).await,
             Self::Keys(pattern) => keys(router, pattern, KEYS_REPLY_BYTES).await,
             Self::Scan {
@@ -866,8 +916,32 @@ impl Unbatched {
                 count,
             } => scan(router, cursor, pattern, count).await,
             Self::Info(wanted) => Frame::Bulk(info(router, node, &wanted).await.into_bytes()),
+        };
+        if let (Some(slot), Some(started)) = (slot, started) {
+            node.edge_usec[slot].fetch_add(micros_since(started), Ordering::Relaxed);
         }
+        frame
     }
+}
+
+/// Which [`EDGE_NAMES`] slot a command name is counted and timed in, or
+/// `None` if it is a command the shard that runs it counts instead.
+///
+/// The one lookup both figures go through, on purpose: a name counted in one
+/// slot and timed in another would make `usec_per_call` a quotient of two
+/// different commands.
+fn edge_slot(name: &[u8]) -> Option<usize> {
+    EDGE_NAMES
+        .iter()
+        .position(|edge| edge.as_bytes().eq_ignore_ascii_case(name))
+}
+
+/// Whole microseconds since `started`.
+///
+/// Saturating rather than wrapping, and the ceiling is not reachable: a single
+/// command would have to run for half a million years to reach it.
+fn micros_since(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 /// One decoded request's place in a chunk.
@@ -2190,22 +2264,26 @@ fn action_for(frame: Frame, node: &NodeInfo) -> Result<Action, String> {
         // The name is peer-supplied. It is quoted, not echoed.
         return Err(format!("ERR unknown command '{}'", quote(name)));
     };
-    let action = handler(args, node)?;
-    // A command that travels is counted by the shard that runs it, so the
-    // search below is reached only by the ones answered or split here —
-    // which keeps it off the path `GET` and `SET` take. A refusal the handler
-    // returned is not counted at all: it never became an action.
+    // A command that travels is counted by the shard that runs it, so this
+    // search decides nothing for `GET` and `SET` beyond a miss — and a miss is
+    // what keeps the clock reading below off their path entirely. A refusal
+    // the handler returns is not counted at all: it never became an action.
     //
     // A refusal the *gate* returns is counted, though, because the gate runs
     // after this: on a node with a password, a `PING` answered `NOAUTH` lands
     // in the count below. See [`commandstats_section`], which states what that
     // makes the figure mean.
-    if !matches!(action, Action::Dispatch(_))
-        && let Some(index) = EDGE_NAMES
-            .iter()
-            .position(|edge| edge.as_bytes().eq_ignore_ascii_case(&upper))
+    let edge = edge_slot(&upper);
+    let started = edge.map(|_| Instant::now());
+    let action = handler(args, node)?;
+    if let (Some(index), Some(started)) = (edge, started)
+        && !matches!(action, Action::Dispatch(_))
     {
         node.edge_calls[index].fetch_add(1, Ordering::Relaxed);
+        // What building the action cost. For a command answered from here
+        // that is the whole of it; for one that still has to reach shards,
+        // [`Unbatched::answer`] adds what running it costs to the same slot.
+        node.edge_usec[index].fetch_add(micros_since(started), Ordering::Relaxed);
     }
     Ok(action)
 }
@@ -2649,18 +2727,42 @@ fn keyspace_section(stats: &ShardStats) -> String {
 /// never ran. A command whose own handler refused it — bad arity, an argument
 /// it could not read — is not counted either way; it never became an action.
 ///
-/// **No `usec` and no `usec_per_call`.** Nothing here times a handler, and a
-/// zero in those fields would be a measurement this server does not take,
-/// printed as though it did.
+/// **`usec` is measured, not estimated.** Each command is timed where it is
+/// counted: at the executor, by one clock reading differenced against the
+/// reading before it — the envelope's own for the first command of a batch —
+/// and at the edge for the requests no shard sees whole. `usec_per_call` is
+/// the quotient of the two figures beside it, taken over node totals rather
+/// than averaged across shards.
+///
+/// The three fields are printed in Redis's order because that order is a
+/// contract: the exporter this project is gated on reads a `cmdstat_` line by
+/// position and takes the second field as microseconds, whatever it is named.
+///
+/// The figures are not comparable between the two halves, and the section
+/// cannot say so in its own text. A shard's reading is what a command cost;
+/// an edge reading spans the wait for every shard the request reached, so it
+/// is what the request took — see [`NodeInfo::edge_usec`].
 ///
 /// A command nobody has sent has no line, which is Redis's behaviour: the
 /// section describes what has happened, not what could.
 fn commandstats_section(node: &NodeInfo, stats: &ShardStats) -> String {
     use std::fmt::Write as _;
     let mut text = String::from("# Commandstats\r\n");
-    for (name, calls) in command_calls(node, stats) {
+    for (name, calls, usec) in command_stats(node, stats) {
         if calls > 0 {
-            let _ = write!(text, "cmdstat_{name}:calls={calls}\r\n");
+            // A quotient of two counts, printed to two decimals. Both sides
+            // are exact in `f64` far past any figure a node produces, and
+            // what is printed is rounded to a hundredth of a microsecond
+            // regardless.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "a display figure, rounded to two decimals"
+            )]
+            let per_call = usec as f64 / calls as f64;
+            let _ = write!(
+                text,
+                "cmdstat_{name}:calls={calls},usec={usec},usec_per_call={per_call:.2}\r\n"
+            );
         }
     }
     text.push('\r');
@@ -2668,25 +2770,37 @@ fn commandstats_section(node: &NodeInfo, stats: &ShardStats) -> String {
     text
 }
 
-/// Every command name this node can report a count for, with its count.
+/// Every command name this node can report on, with its call count and the
+/// microseconds those calls spent.
 ///
 /// Two halves summed under one name: what the shards counted, by
 /// [`KIND_NAMES`], and what the edge counted, by [`EDGE_NAMES`]. They overlap
 /// in exactly one place — `info`, which the shards leave to the edge — and
 /// the sum is taken rather than assumed, so a later command that lands in both
 /// prints one line and not two.
-fn command_calls(node: &NodeInfo, stats: &ShardStats) -> Vec<(&'static str, u64)> {
-    let mut counts: Vec<(&'static str, u64)> = KIND_NAMES
+///
+/// The two figures move together through this, always as a pair: a name whose
+/// calls came from one half and whose microseconds came from the other would
+/// render a `usec_per_call` describing neither.
+fn command_stats(node: &NodeInfo, stats: &ShardStats) -> Vec<(&'static str, u64, u64)> {
+    let mut counts: Vec<(&'static str, u64, u64)> = KIND_NAMES
         .iter()
         .enumerate()
         .skip(1)
-        .map(|(kind, name)| (*name, stats.calls[kind]))
+        .map(|(kind, name)| (*name, stats.calls[kind], stats.usec[kind]))
         .collect();
-    for (name, counter) in EDGE_NAMES.iter().zip(node.edge_calls.iter()) {
-        let calls = counter.load(Ordering::Relaxed);
-        match counts.iter_mut().find(|(known, _)| known == name) {
-            Some((_, total)) => *total += calls,
-            None => counts.push((name, calls)),
+    for ((name, calls), usec) in EDGE_NAMES
+        .iter()
+        .zip(node.edge_calls.iter())
+        .zip(node.edge_usec.iter())
+    {
+        let (calls, usec) = (calls.load(Ordering::Relaxed), usec.load(Ordering::Relaxed));
+        match counts.iter_mut().find(|(known, _, _)| known == name) {
+            Some((_, total_calls, total_usec)) => {
+                *total_calls += calls;
+                *total_usec += usec;
+            }
+            None => counts.push((name, calls, usec)),
         }
     }
     counts
@@ -2694,14 +2808,14 @@ fn command_calls(node: &NodeInfo, stats: &ShardStats) -> Vec<(&'static str, u64)
 
 /// What `total_commands_processed` reports: every command counted anywhere.
 ///
-/// The same two halves [`command_calls`] sums, added rather than listed. A
+/// The same two halves [`command_stats`] sums, added rather than listed. A
 /// request the edge split — an `MGET` over four keys — is counted once here
 /// and four times by the shards, which is what Redis's own figure does with a
 /// command that expands into others.
 fn commands_processed(node: &NodeInfo, stats: &ShardStats) -> u64 {
-    command_calls(node, stats)
+    command_stats(node, stats)
         .into_iter()
-        .map(|(_, calls)| calls)
+        .map(|(_, calls, _)| calls)
         .sum()
 }
 
@@ -2726,6 +2840,9 @@ async fn gather_stats<R: Router>(router: &R) -> ShardStats {
             total.expired += stats.expired;
             for (sum, count) in total.calls.iter_mut().zip(stats.calls) {
                 *sum += count;
+            }
+            for (sum, spent) in total.usec.iter_mut().zip(stats.usec) {
+                *sum += spent;
             }
         }
     }
@@ -2863,7 +2980,7 @@ fn hello_frame(node: &NodeInfo) -> Frame {
 /// of one it is owed.
 fn per_key(
     args: &mut [Vec<u8>],
-    name: &str,
+    name: &'static str,
     fold: Fold,
     command: fn(Vec<u8>) -> Command,
 ) -> Result<Action, String> {
@@ -2872,6 +2989,7 @@ fn per_key(
         [key] if fold.is_identity_on_one() => Ok(Action::Dispatch(command(take(key)))),
         keys => Ok(Action::Unbatched(Unbatched::FanOut {
             cmds: keys.iter_mut().map(|key| command(take(key))).collect(),
+            name,
             fold,
         })),
     }
@@ -3483,12 +3601,16 @@ mod tests {
         has("db0:keys=3,expires=1,avg_ttl=0");
 
         has("# Commandstats");
-        has("cmdstat_set:calls=3");
-        has("cmdstat_get:calls=2");
-        assert!(
-            !text.contains("usec"),
-            "commandstats carries a timing this server does not take: {text}"
-        );
+        // A prefix, because what follows is a timing: the call count is the
+        // node's, the microseconds are the machine's.
+        let counted = |prefix: &str| {
+            assert!(
+                text.lines().any(|written| written.starts_with(prefix)),
+                "no line beginning {prefix:?} in {text}"
+            );
+        };
+        counted("cmdstat_set:calls=3,usec=");
+        counted("cmdstat_get:calls=2,usec=");
     }
 
     /// An empty keyspace is a section with no rows, which is what Redis
@@ -3521,20 +3643,74 @@ mod tests {
             panic!("INFO answered {:?}", frames[3])
         };
         let text = String::from_utf8(text.clone()).unwrap();
-        assert!(text.contains("cmdstat_mget:calls=1\r\n"), "{text}");
+        assert!(text.contains("cmdstat_mget:calls=1,"), "{text}");
         assert!(
-            text.contains("cmdstat_get:calls=3\r\n"),
+            text.contains("cmdstat_get:calls=3,"),
             "the three GETs the fan-out ran are the shards' to count: {text}"
         );
         assert!(
-            text.contains("cmdstat_dbsize:calls=1\r\n"),
+            text.contains("cmdstat_dbsize:calls=1,"),
             "one DBSIZE reached sixteen shards and is still one call: {text}"
         );
-        assert!(text.contains("cmdstat_ping:calls=1\r\n"), "{text}");
+        assert!(text.contains("cmdstat_ping:calls=1,"), "{text}");
         assert!(
             !text.contains("cmdstat_ttl"),
             "a command nobody sent has no line: {text}"
         );
+    }
+
+    /// The three fields Redis prints, in Redis's order — the exporter this
+    /// project is gated on reads them by position, so the order is a contract
+    /// and not a presentation choice.
+    ///
+    /// `usec_per_call` is asserted to parse rather than to hold a value: what
+    /// a `SET` costs on the machine running this test is not something a test
+    /// may pin. What it may pin is that the field is a number, computed from
+    /// the two beside it.
+    #[tokio::test]
+    async fn commandstats_carries_usec_and_usec_per_call_in_redis_order() {
+        let pool = ShardPool::spawn(16, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server, pool, NodeInfo::for_tests()));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        for key in ["a", "b", "c"] {
+            encode(&req(&["SET", key, "v"]), &mut out);
+        }
+        encode(&req(&["INFO", "commandstats"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 4).await;
+        let Frame::Bulk(text) = &frames[3] else {
+            panic!("INFO answered {:?}", frames[3])
+        };
+        let text = String::from_utf8(text.clone()).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("cmdstat_set:"))
+            .unwrap_or_else(|| panic!("no SET line: {text}"));
+        let fields: Vec<&str> = line.split(':').nth(1).unwrap().split(',').collect();
+        assert_eq!(fields.len(), 3, "{line}");
+        assert_eq!(fields[0], "calls=3", "{line}");
+        let usec: u64 = fields[1]
+            .strip_prefix("usec=")
+            .unwrap_or_else(|| panic!("{line}"))
+            .parse()
+            .unwrap();
+        let per_call: f64 = fields[2]
+            .strip_prefix("usec_per_call=")
+            .unwrap_or_else(|| panic!("{line}"))
+            .parse()
+            .unwrap();
+        assert!(per_call >= 0.0, "{line}");
+        // Two decimals of the quotient, which is what Redis prints and what an
+        // exporter reading the field back expects to be able to divide again.
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "the same quotient the renderer computes, over the same three calls"
+        )]
+        let expected = usec as f64 / 3.0;
+        assert!((per_call - expected).abs() < 0.01, "{line}");
     }
 
     /// A shard's counters are not a wire answer: an operator asks about the
