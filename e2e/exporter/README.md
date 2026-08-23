@@ -3,7 +3,10 @@
 Everything else in `e2e/` is a client this project chose. This lane is the
 other kind of third party: a metrics exporter the operators of a deployment
 already run, pointed at this server with no flag it would not be given for
-Redis, and held to one standard — it must scrape cleanly.
+Redis, and held to two things rather than one: an error log with nothing in
+it, and the metric values this lane can predict from what it wrote and how it
+started the server. One of those alone would not do — see "What the error log
+does not say".
 
 `run.sh` starts the server with a password and a memory ceiling, writes a
 small keyspace, runs the exporter in a container and scrapes it once.
