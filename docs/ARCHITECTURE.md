@@ -268,21 +268,30 @@ fabrication moved from this server's output into the monitoring system, where
 it is harder to see. The family is given up instead, and the lane asserts the
 duration metric is absent so that a later change cannot quietly buy it back.
 
-**`HELLO` is answered before a connection has authenticated.** Redis refuses
-it on an unauthenticated connection and tells the client to use `HELLO <proto>
-AUTH <user> <pass>` instead, so that a password-protected node says nothing at
-all until the password has been given. Here the command is answered either
-way. The inline form has to be reachable before authentication whatever else
-is decided — it is how the ordinary client libraries authenticate — and a
-client that cannot ask which protocol it is speaking has nothing correct to
-say next. The cost is that a peer which has not authenticated can read the
-node's own description: the server name, its version, the protocol version,
-the deployment mode and the role. That is metadata about the process and not
-about the keyspace — no key, no count and no hint of either, since every other
-command is refused before the router is reached — but it is a divergence taken
-with its cost, not an oversight. An operator who needs a node to say nothing
-whatever before a password is given should keep the port off untrusted
-networks, which is where transport security belongs here anyway.
+**A handler's refusal is not what an unauthenticated peer is told.** Every
+command's own error — a bad protocol version, a syntax error, a wrong number of
+arguments — is built as an ordinary reply, and on a connection that has not
+authenticated the gate answers all of them with `NOAUTH Authentication
+required.` instead. Redis is narrower: it decides a request's own mistakes
+first and only then asks whether the connection may be answered, so a client
+that sends `HELLO 3 AUTH default <password>` with the right password is told
+`NOPROTO`, where here it is told `NOAUTH`. That is a diagnostic loss and not an
+authorisation one — nothing about the node leaks either way — and the clients
+this server is gated on fall back on any handshake error rather than on a
+particular text. The one refusal that is exempt is the handshake's own, below.
+
+**`HELLO` without credentials is refused, as Redis refuses it.** A node with a
+password answers it with `NOAUTH HELLO must be called with the client already
+authenticated…`, naming the `HELLO AUTH <user> <pass>` form that would have
+worked; a node with no password answers the map, because there is nothing to
+authenticate against. The inline form stays reachable before authentication
+whatever else is decided — it is how redis-py 4 and go-redis authenticate at
+all — and it is a different request from the credential-less one, which asks a
+node that has told the peer nothing to describe itself. So the server name, the
+version, the protocol version, the deployment mode and the role are now unread
+until the password has been given. The text is byte-exact to `redis:6-alpine`
+(6.2.24), measured rather than quoted, because the part after the code is where
+a client library looks for the form it should have sent.
 
 **The surface is a named list, and anything outside it is refused.** A command
 this server does not implement is answered with an error naming it, rather than

@@ -9,6 +9,17 @@
 /// three that are allowed before it.
 pub const NOAUTH: &str = "NOAUTH Authentication required.";
 
+/// What `HELLO` without credentials is told on a node that has a password.
+///
+/// Redis's own sentence, measured against `redis:6-alpine` (6.2.24 — the image
+/// this project's environment runs) rather than quoted from memory, because
+/// the part after the code is where a client library looks for the form it
+/// should have sent. Note what it names: `HELLO AUTH <user> <pass>`, with no
+/// protocol version between the two words. Written out here it reads like a
+/// paragraph; on the wire it is the one thing a client needs, which is that
+/// the handshake carries the credentials rather than preceding them.
+pub const NOAUTH_HELLO: &str = "NOAUTH HELLO must be called with the client already authenticated, otherwise the HELLO AUTH <user> <pass> option can be used to authenticate the client and select the RESP protocol version at the same time";
+
 /// What a wrong password is answered with — and a wrong username, with the
 /// same text and after the same work, so that neither can be told from the
 /// other by what came back or by how long it took.

@@ -7,6 +7,7 @@ itself.
 """
 
 import os
+import socket
 
 import pytest
 import redis
@@ -76,3 +77,32 @@ def test_the_server_names_itself(r):
     assert info["redis_mode"] == "standalone"
     assert info["tcp_port"] == PORT
     assert info["connected_clients"] >= 1
+
+
+@pytest.mark.skipif(not PASSWORD, reason="the server was started open")
+def test_hello_without_credentials_is_refused():
+    """A node with a password does not describe itself to a peer that has not
+    given it, and the refusal names the form that would have worked.
+
+    A socket rather than the library, which is the exception in this file and
+    is why: redis-py 5 sends `CLIENT SETINFO` inside `connect()`, is refused
+    for want of a password and raises there, so a credential-less `HELLO` is
+    unreachable through its API. The bytes are what the server is being held
+    to here, and they are the bytes any client would read.
+    """
+    sock = socket.create_connection(("127.0.0.1", PORT), timeout=5)
+    try:
+        sock.sendall(b"*1\r\n$5\r\nHELLO\r\n*1\r\n$4\r\nPING\r\n")
+        replies = b""
+        while replies.count(b"\r\n") < 2:
+            chunk = sock.recv(4096)
+            assert chunk, "the server closed the connection"
+            replies += chunk
+        handshake, general = replies.split(b"\r\n")[:2]
+        assert handshake.startswith(b"-NOAUTH HELLO must be called")
+        assert b"HELLO AUTH <user> <pass>" in handshake
+        # The general refusal is a different text, and a client tells the two
+        # requests apart by them.
+        assert general == b"-NOAUTH Authentication required."
+    finally:
+        sock.close()
