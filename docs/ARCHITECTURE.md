@@ -196,8 +196,8 @@ what a cycle costs follows the keyspace rather than the shard count: about one
 call per `COUNT` keys, plus one for each shard whose table outlasts the budget
 the call had left when it arrived. `COUNT` is the client's key target and the
 bucket ceiling is the server's bound on how long one call may occupy the node;
-a call ends at whichever of the two comes first. Two consequences a client
-should expect from that: a call may answer with more keys than `COUNT` asked
+a call ends at whichever of the two comes first. Two things a client should
+expect from that: a call may answer with more keys than `COUNT` asked
 for, because the shard it was inside had them and the target is checked between
 shards rather than inside one; and a call may answer with none at all and a
 cursor that is not `0`, because a stretch of empty buckets or a `MATCH` that
