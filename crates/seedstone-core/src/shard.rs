@@ -705,8 +705,8 @@ pub trait EvictionPolicy: Clone + Send + 'static {
 /// answer is a unit struct.
 ///
 /// Blanket-implemented, so nothing implements this directly: a type that
-/// answers both questions is a shard policy, and there is no second thing to
-/// remember to do.
+/// answers all three questions is a shard policy, and there is no second thing
+/// to remember to do.
 pub trait ShardPolicy: ExpiryPolicy + WalkOrder + EvictionPolicy {}
 
 impl<T: ExpiryPolicy + WalkOrder + EvictionPolicy> ShardPolicy for T {}
