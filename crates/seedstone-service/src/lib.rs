@@ -151,12 +151,24 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// **It prices the key bytes and nothing else.** Not the `Vec` per key, not the
 /// `$<len>\r\n` each one costs on the wire, not the capacity the gathering
-/// vectors grew to hold them. The encoded reply is therefore larger than this
-/// by a per-key constant, and this is a bound on accumulation rather than a
+/// vectors grew to hold them. So this is a bound on accumulation rather than a
 /// measurement of the frame — the same undercounting [`MAX_REQUEST_BYTES`]
 /// admits to on the parsed side, and acceptable for the same reason: the
 /// figure is a ceiling on the worst case one peer can impose, not a memory
 /// budget.
+///
+/// **The per-key constant is worth writing out, because "a constant" reads as
+/// small and this one is not.** Every gathered key costs a `Frame` — 32 bytes,
+/// the `Vec` header inline in the enum — plus its own heap allocation, which
+/// no allocator serves below about 16 bytes however short the key is. Call it
+/// ~48 bytes of overhead against however many bytes of key name are counted
+/// here. At the short keys a cache actually holds that ratio is the whole
+/// story: **one-byte keys reach this ceiling only after ~67 million of them,
+/// whose headers and allocations alone are over 3 GB** — some fifty times the
+/// figure this constant names, and none of it counted. The reason that is
+/// tolerable is not the arithmetic but the keyspace: `maxmemory` bounds how
+/// many keys can exist to be gathered, and a node that could hold 67 million
+/// of them was configured to.
 pub const KEYS_REPLY_BYTES: usize = 64 * 1024 * 1024;
 
 /// What a peer whose `KEYS` reply outgrew [`KEYS_REPLY_BYTES`] is told.

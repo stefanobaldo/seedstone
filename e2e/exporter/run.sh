@@ -53,7 +53,11 @@ exporter_args=(--redis.addr="$server_uri"
 
 "$server_binary" "${server_args[@]}" &
 server=$!
-trap 'kill "$server" 2>/dev/null || true; docker rm -f seedstone-exporter >/dev/null 2>&1 || true; rm -f "${here}/.password" "${here}/.passwords.json"' EXIT
+# The two scrape artefacts are removed here rather than only after a passing
+# check: a failed run is exactly the run that leaves them behind, `.gitignore`
+# covers neither, and the next `git status` in this working tree is where they
+# would turn up.
+trap 'kill "$server" 2>/dev/null || true; docker rm -f seedstone-exporter >/dev/null 2>&1 || true; rm -f "${here}/.password" "${here}/.passwords.json" "${here}/.metrics.txt" "${here}/.exporter.log"' EXIT
 for _ in $(seq 100); do
   if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then break; fi
   sleep 0.1
@@ -78,5 +82,4 @@ sleep 1
 docker logs seedstone-exporter >"${here}/.exporter.log" 2>&1
 
 bash "${here}/check.sh" "${here}/.metrics.txt" "${here}/.exporter.log" "${here}/expected-errors.txt"
-rm -f "${here}/.metrics.txt" "${here}/.exporter.log"
 echo e2e-exporter-ok
