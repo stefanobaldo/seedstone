@@ -129,10 +129,11 @@ from how long a refusal took. Only the attempt itself, the handshake that can
 carry it — answered whether or not it does, which is a divergence from Redis
 and is stated below — and the goodbye are let through, and which side of the
 gate a command falls on is decided exhaustively, so one added later does not
-compile until somebody has said which. The secret is not that layer's to find: it is a
-dependency the composition root reads from a file or the environment and hands
-down, which is why a node configured without one starts every connection
-already through the gate, and why the simulated node is handed none at all.
+compile until somebody has said which. The secret is not that layer's to find:
+it is a dependency the composition root reads from a file or the environment
+and hands down, which is why a node configured without one starts every
+connection already through the gate, and why the simulated node is handed none
+at all.
 
 That layer is its own crate, and the dependency arrow is the reason. It depends
 on the core and on the codec; the core depends on neither. An adapter the core
