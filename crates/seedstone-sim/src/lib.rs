@@ -1964,14 +1964,34 @@ const WALK_CURSOR_SHARD_SHIFT: u32 = 48;
 /// later step instead of doubling the number of steps left — so the number of
 /// steps it needs is bounded even while the table is not.
 ///
-/// **The figures this was sized against are stale and the bound is not yet
-/// re-derived.** They were measured when a `COUNT` of one meant one bucket a
-/// step: 151 to 217 steps across six seeds of the shape that drives a cycle,
-/// with five times the widest of them the room a converging cursor cannot
-/// use. A call now crosses shards and spends a bucket ceiling of the server's
-/// own, so a cycle takes far fewer steps than that and the bound is loose
-/// rather than wrong. Re-measuring it is the walk's remaining simulator
-/// work.
+/// **Measured over seeds 1 to 6 of both shapes that drive a cycle, by the step
+/// count of every walk that completed one:** exactly 1 on
+/// [`SimConfig::narrow`], both walk forms and every seed, and 2 to 16 on
+/// [`SimConfig::crossing`] across its ninety-six walks. It used to be 151 to
+/// 217, back when a client's `COUNT` of one meant one bucket a call; a call
+/// now spends a bucket ceiling of the server's own and crosses shards on it,
+/// so `narrow`'s whole table falls inside a single call and `crossing`'s
+/// sixteen shards cost a call each at worst. The old figure's unsettled low end
+/// — 151 against a re-measurement's 167 — is settled by being obsolete: both
+/// walk forms cost the same now, so there is no longer a question of which
+/// clients were counted.
+///
+/// **What the bound is for has changed with them, and it is worth saying which
+/// of the two it is.** It is not a live detector any more. It was one for a
+/// cursor that advanced upwards instead of in reverse binary order — a walk
+/// that cannot arrive is caught by a step count and by nothing else — and that
+/// defect is no longer observable at this layer at all: the claim is proved at
+/// the dict now, by `an_upward_cursor_is_outrun_by_a_table_growing_under_it`.
+/// See [`Plant::ScanMissesRehash`].
+///
+/// So this is a loose ceiling, kept for the one thing a ceiling is still good
+/// for: a walk that does not finish wedges the run instead of reporting itself,
+/// and a harness that hangs says nothing at all. Sixty-four times the widest
+/// cycle measured is deliberate slack rather than a number missing its target —
+/// a shape with a smaller bucket ceiling or a deeper table would lengthen every
+/// cycle here, and a guard that has to be re-derived before a shape can be
+/// added is a guard that will be deleted instead. Five times the widest is the
+/// rule when it *is* a detector, and 5 × 16 is far under this, so nothing moves.
 const WALK_CYCLE_STEP_BOUND: u64 = 1024;
 
 /// Where the counter family's share of a hundred rolls ends and the plain
