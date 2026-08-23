@@ -1543,7 +1543,9 @@ async fn keys<R: Router>(router: &R, pattern: Vec<u8>, ceiling: usize) -> Frame 
                         )
                         .await;
                     match reply {
-                        Reply::Scan { cursor: next, keys } => {
+                        Reply::Scan {
+                            cursor: next, keys, ..
+                        } => {
                             // One add per step, not per key: the ceiling
                             // bounds an accumulation, and paying an atomic
                             // per key would price the bound at more than the
@@ -1678,7 +1680,9 @@ async fn scan<R: Router>(router: &R, cursor: u64, pattern: Option<Vec<u8>>, coun
         )
         .await;
     let (next, keys) = match reply {
-        Reply::Scan { cursor: next, keys } if next != 0 => (pack_cursor(shard, next), keys),
+        Reply::Scan {
+            cursor: next, keys, ..
+        } if next != 0 => (pack_cursor(shard, next), keys),
         // This shard is spent: hand back the next one's start, or 0 if it was
         // the last. `shard + 1` cannot overflow — `shard` is below `shards`,
         // which is a `u16`, so it is at most `u16::MAX - 1` here.
@@ -4556,7 +4560,7 @@ mod tests {
                 },
             )
             .await;
-        let Reply::Scan { cursor, keys } = at_zero else {
+        let Reply::Scan { cursor, keys, .. } = at_zero else {
             panic!("expected Reply::Scan");
         };
         assert_eq!(cursor, 0, "an unbounded count must finish the cycle");
