@@ -65,7 +65,6 @@ mod auth;
 mod walk;
 
 pub use auth::{AUTH_NOT_CONFIGURED, NOAUTH, NOAUTH_HELLO, Secret, WRONGPASS};
-use walk::{pack_cursor, unpack_cursor};
 
 use seedstone_core::glob;
 use seedstone_core::memory::{EvictionMode, MemoryGauge, MemoryLimit};
@@ -316,12 +315,13 @@ const CHUNK_COMMANDS: usize = 128;
 ///
 /// It serves the two walking commands differently, and deliberately with one
 /// number. `KEYS` carries no `COUNT` on the wire, so this *is* its step.
-/// `SCAN` takes a `COUNT` from a client, and this is the ceiling that request
-/// is clamped to — because occupancy is the server's to bound whoever asked,
-/// and a `COUNT` honoured literally would let one call walk an entire cycle
-/// and hold the shard for it. A clamped walk still returns every key; it takes
-/// the round trips this step size implies rather than the ones the client
-/// asked for.
+/// For `SCAN` it is the **per-call occupancy ceiling across shards**: one
+/// budget for the whole call, spent down by every shard the call crosses, so
+/// a shard answering after eight buckets leaves the rest to the next. It is
+/// not the client's number. `COUNT` is the client's, a key target, and the
+/// call ends at whichever of the two is reached first — occupancy is the
+/// server's to bound whoever asked, and a target honoured without a ceiling
+/// would let one call walk an entire cycle and hold the node for it.
 const WALK_STEP_BUCKETS: usize = 256;
 
 /// How much of a peer-supplied byte string an error message may quote.
@@ -793,7 +793,8 @@ enum Unbatched {
         cursor: u64,
         /// `MATCH`, filtered on the shard rather than here.
         pattern: Option<Vec<u8>>,
-        /// `COUNT`, already bounded by [`WALK_STEP_BUCKETS`].
+        /// `COUNT`: how many keys the client wants back, bounded when the
+        /// call runs by [`WALK_STEP_BUCKETS`] rather than when it is parsed.
         count: usize,
     },
     /// The sections a peer asked `INFO` for, rendered once the chunk in front
@@ -1595,81 +1596,79 @@ async fn keys<R: Router>(router: &R, pattern: Vec<u8>, ceiling: usize) -> Frame 
     Frame::Array(all.into_iter().map(Frame::Bulk).collect())
 }
 
-/// One `SCAN` call: one shard, one step, and the cursor the client resumes at.
+/// One `SCAN` call: as many shards as its budget crosses, and the cursor the
+/// client resumes at.
 ///
-/// A shard that finishes hands back the next shard's start rather than 0, so
-/// the client walks the whole keyspace without ever being told there is more
-/// than one. Only the last shard finishing produces 0.
+/// A shard that finishes is followed into the next while the call's bucket
+/// budget lasts, and the cursor the client gets back is wherever the call
+/// stopped — so the client walks the whole keyspace without ever being told
+/// there is more than one shard. Only the last shard finishing produces 0.
 ///
-/// One call costs what a `GET` costs: no fan-out, no barrier, one envelope to
-/// one shard. That is the difference from [`keys`], and the reason a client
-/// with a large keyspace should be walking it with this.
+/// **`COUNT` is the client's key target and [`WALK_STEP_BUCKETS`] is the
+/// server's occupancy ceiling.** The two numbers serve two parties and the
+/// call ends at whichever is reached first, which is what makes `COUNT` mean
+/// on this server what Redis documents it to mean. A cycle costs about
+/// `keys / COUNT` calls, plus one for each shard whose table is larger than
+/// the budget a call had left when it arrived. What one call spends is up to
+/// one envelope per shard it crosses, each the cost of a `GET`; each shard is
+/// occupied only for its own step, because crossing is a sequence of
+/// envelopes from here and never a shard reaching into its neighbour.
 ///
-/// **A full cycle costs at least one round trip per shard**, whatever the
-/// keyspace holds — 1024 of them at the shard count this server is built
-/// with. A spent shard hands back the *next* shard's start rather than
-/// continuing into it, so every shard costs a call even when it is empty, and
-/// a shard's table starts at eight buckets, well under [`WALK_STEP_BUCKETS`]:
-/// any shard holding fewer keys than one step covers finishes in exactly one
-/// call. Walking a thousand-key keyspace therefore costs about a thousand
-/// round trips, against the hundred or so Redis answers the same walk in at a
-/// default `COUNT`. It is a floor on *round trips*, not on work: the
-/// server-side cost is still proportional to the keyspace, and each call is
-/// still the cost of a `GET`. What it spends is the client's latency, once per
-/// shard, and a client that wraps `SCAN` in an iterator pays all of it.
+/// The completeness argument is unchanged and still stated per shard: the
+/// call resumes shard `s` at the cursor that shard issued, spends it, and
+/// starts shard `s + 1` at 0 — the same two cursors the client used to send
+/// in two calls, concatenated inside one.
 ///
-/// The shape of the fix is to let one call continue into the next shard while
-/// its bucket budget is unspent, so an empty or nearly-empty shard costs a
-/// step rather than a round trip. It is deliberately not made here: it changes
-/// what a cursor means across a shard boundary, and the completeness and
-/// at-least-once reasoning this walk rests on is stated per shard. That is its
-/// own change, with its own argument to make.
-///
-/// The step may legitimately answer no keys with a non-zero cursor — a stretch
-/// of empty buckets, or a `MATCH` that excluded everything. Redis behaves the
-/// same way and clients handle it; a server that looped until it had keys
-/// would be answering an unbounded call.
-async fn scan<R: Router>(router: &R, cursor: u64, pattern: Option<Vec<u8>>, count: usize) -> Frame {
-    let shards = router.shards();
-    let (shard, internal) = unpack_cursor(cursor);
-    // The shard came out of an integer the peer chose, so this is where it
-    // stops being trusted. `dispatch_at` would refuse it too; refusing it here
-    // is what makes the refusal say `invalid cursor` rather than name a shard
-    // to a client that has no idea this server has any.
-    if shard >= shards {
+/// The step may legitimately answer no keys with a non-zero cursor — a
+/// stretch of empty buckets, or a `MATCH` that excluded everything, in a call
+/// whose budget ran out before its target. Redis behaves the same way and
+/// clients handle it; a server that looped until it had keys would be
+/// answering an unbounded call.
+async fn scan<R: Router>(
+    router: &R,
+    cursor: u64,
+    pattern: Option<Vec<u8>>,
+    key_target: usize,
+) -> Frame {
+    // The cursor came out of an integer the peer chose, so this is where it
+    // stops being trusted. `dispatch_at` would refuse a shard it does not
+    // have too; refusing it here is what makes the refusal say `invalid
+    // cursor` rather than name a shard to a client that has no idea this
+    // server has any.
+    let Ok(mut crossing) =
+        walk::Crossing::begin(router.shards(), cursor, key_target, WALK_STEP_BUCKETS)
+    else {
         return Frame::Error(INVALID_CURSOR.to_owned());
-    }
-    let reply = router
-        .dispatch_at(
-            shard,
-            Command::ScanStep {
-                cursor: internal,
-                count,
-                pattern,
-            },
-        )
-        .await;
-    let (next, keys) = match reply {
-        Reply::Scan {
-            cursor: next, keys, ..
-        } if next != 0 => (pack_cursor(shard, next), keys),
-        // This shard is spent: hand back the next one's start, or 0 if it was
-        // the last. `shard + 1` cannot overflow — `shard` is below `shards`,
-        // which is a `u16`, so it is at most `u16::MAX - 1` here.
-        Reply::Scan { keys, .. } => {
-            let next = shard + 1;
-            let cursor = if next < shards {
-                pack_cursor(next, 0)
-            } else {
-                0
-            };
-            (cursor, keys)
-        }
-        Reply::Error(error) => return Frame::Error(error.wire_text().to_owned()),
-        // A router that answered something else did not run the step, which is
-        // the shard failing to answer — spelled the way [`keys`] spells it.
-        _ => return Frame::Error(ReplyError::ShardUnavailable.wire_text().to_owned()),
     };
+    while let Some(step) = crossing.wants_step() {
+        let reply = router
+            .dispatch_at(
+                step.shard,
+                Command::ScanStep {
+                    cursor: step.cursor,
+                    count: step.count,
+                    // Cloned once per shard the call crosses, which is the
+                    // same per-step cost the walk always paid: the command is
+                    // moved into the router and the reply does not hand the
+                    // pattern back, so there is nothing to carry forward.
+                    pattern: pattern.clone(),
+                },
+            )
+            .await;
+        match reply {
+            Reply::Scan {
+                cursor: next,
+                keys,
+                visited,
+            } => crossing.feed(next, keys, visited),
+            Reply::Error(error) => return Frame::Error(error.wire_text().to_owned()),
+            // A router that answered something else did not run the step,
+            // which is the shard failing to answer — spelled the way [`keys`]
+            // spells it.
+            _ => return Frame::Error(ReplyError::ShardUnavailable.wire_text().to_owned()),
+        }
+    }
+    let (next, keys) = crossing.finish();
     Frame::Array(vec![
         // A bulk string, not an integer: that is what Redis sends and what
         // clients parse. A client that fed an integer back would be sending a
@@ -2998,8 +2997,11 @@ fn claim(held: &mut Option<ExpiryOption>, option: ExpiryOption) -> Result<(), St
 ///
 /// `COUNT` must be positive: Redis answers a syntax error for zero and for a
 /// negative, which is a different failure from a `COUNT` that is not a number
-/// at all, and clients distinguish them. What it asks for is then bounded by
-/// [`WALK_STEP_BUCKETS`], which states why.
+/// at all, and clients distinguish them. What it asks for is passed through
+/// as the client's **key target** — no clamp. A huge `COUNT` is a target the
+/// server's own occupancy ceiling bounds anyway: [`WALK_STEP_BUCKETS`] ends
+/// the call whatever the target says, and one call dispatches at most one
+/// envelope per shard.
 fn scan_options(mut rest: &[Vec<u8>]) -> Result<(Option<Vec<u8>>, usize), String> {
     let mut pattern = None;
     let mut count = SCAN_DEFAULT_COUNT;
@@ -3018,9 +3020,11 @@ fn scan_options(mut rest: &[Vec<u8>]) -> Result<(Option<Vec<u8>>, usize), String
             // number too large for it — which is a number the clamp would have
             // brought down to the ceiling anyway, so the failure and the
             // success take the same branch.
-            count = usize::try_from(n)
-                .unwrap_or(WALK_STEP_BUCKETS)
-                .min(WALK_STEP_BUCKETS);
+            // `n` is positive here, so the only way the conversion fails
+            // is a `usize` narrower than an `i64` meeting a number too large
+            // for it — which is a target no keyspace could reach, and the
+            // widest one this server can hold is the same answer.
+            count = usize::try_from(n).unwrap_or(usize::MAX);
         } else {
             return Err(SYNTAX_ERROR.to_owned());
         }
@@ -3255,7 +3259,7 @@ fn wrong_arity(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::walk::CURSOR_INTERNAL_BITS;
+    use crate::walk::{CURSOR_INTERNAL_BITS, pack_cursor, unpack_cursor};
     use seedstone_core::dict::DictSeed;
     use seedstone_core::memory::{EvictionMode, MemoryLimit};
     use seedstone_core::shard::{NoTrace, ShardPool};
@@ -4271,19 +4275,28 @@ mod tests {
     /// cursor the server hands back, until it is `0` again.
     #[tokio::test]
     async fn a_full_scan_returns_every_key_and_ends_at_zero() {
-        const SHARDS: u16 = 4;
+        // Two shards rather than four for the same 2000 keys: a shard has to
+        // hold more of its own cursor space than one call's bucket budget
+        // before any call can stop in the middle of one, and that is the
+        // arrangement the assertions below are about.
+        const SHARDS: u16 = 2;
         let (mut r, mut w, _pool) = connected(SHARDS);
         let mut out = Vec::new();
-        for i in 0..300u32 {
+        // Enough keys that a shard's cursor space is larger than one call's
+        // whole bucket budget, which is what makes a call stop in the middle
+        // of a shard below — the case the cursor's shard-plus-internal shape
+        // exists for.
+        for i in 0..2000u32 {
             encode(&req(&["SET", &format!("s-{i}"), "v"]), &mut out);
         }
         w.write_all(&out).await.unwrap();
         w.flush().await.unwrap();
-        let _ = read_frames(&mut r, 300).await;
+        let _ = read_frames(&mut r, 2000).await;
 
         let mut seen: Vec<Vec<u8>> = Vec::new();
         let mut cursor = String::from("0");
         let mut calls = 0;
+        let mut resumed_mid_table = false;
         loop {
             let mut out = Vec::new();
             encode(&req(&["SCAN", &cursor, "COUNT", "16"]), &mut out);
@@ -4307,6 +4320,9 @@ mod tests {
                 seen.push(k.clone());
             }
             cursor = String::from_utf8(next.clone()).unwrap();
+            if unpack_cursor(cursor.parse().expect("this server issued this cursor")).1 != 0 {
+                resumed_mid_table = true;
+            }
             calls += 1;
             assert!(calls < 500, "the walk did not terminate");
             if cursor == "0" {
@@ -4315,14 +4331,89 @@ mod tests {
         }
         seen.sort();
         seen.dedup();
-        assert_eq!(seen.len(), 300);
-        // Every shard costs at least one call, so a walk that took exactly
-        // one per shard would prove only that the fan-out ran. Anything above
-        // that is a shard resumed mid-table, which is the part that needs the
-        // cursor to mean something.
+        assert_eq!(seen.len(), 2000);
+        // A call crosses shards now, so a cycle can cost fewer calls than the
+        // node has shards and a count alone proves nothing either way. The
+        // property is stated on the cursors themselves: some call stopped
+        // inside a shard rather than at a boundary, which is the only thing
+        // that needs the internal half of the cursor to mean something.
         assert!(
-            calls > usize::from(SHARDS),
-            "{calls} calls over {SHARDS} shards: no shard was ever resumed mid-table"
+            resumed_mid_table,
+            "{calls} calls over {SHARDS} shards, every one of them stopping at a shard boundary"
+        );
+    }
+
+    /// One call crosses shards until it has the keys the client asked for.
+    ///
+    /// The property the whole change exists for, stated on the wire where a
+    /// client can see it: `COUNT` is a number of keys, not a number of
+    /// buckets, and a shard too small to fill it is followed into the next
+    /// rather than costing a round trip of its own.
+    #[tokio::test]
+    async fn one_scan_call_crosses_shards_until_it_has_count_keys() {
+        const SHARDS: u16 = 16;
+        let (mut r, mut w, _pool) = connected(SHARDS);
+        // Two keys per shard on average, so every shard is spent in a single
+        // step and the old walk would have cost sixteen calls for thirty-two
+        // keys.
+        let mut out = Vec::new();
+        for i in 0..32u32 {
+            encode(&req(&["SET", &format!("k{i}"), "v"]), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let _ = read_frames(&mut r, 32).await;
+
+        let scan = |cursor: String| {
+            let mut out = Vec::new();
+            encode(&req(&["SCAN", &cursor, "COUNT", "10"]), &mut out);
+            out
+        };
+
+        w.write_all(&scan("0".to_owned())).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 1).await;
+        let Frame::Array(pair) = &frames[0] else {
+            panic!("SCAN must answer a two-element array, got {:?}", frames[0]);
+        };
+        let Frame::Array(keys) = &pair[1] else {
+            panic!("the keys must be an array");
+        };
+        assert!(
+            keys.len() >= 10,
+            "a COUNT of 10 gathers at least ten keys in one call when shards are small: {}",
+            keys.len()
+        );
+
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut cursor = String::from("0");
+        let mut calls = 0;
+        loop {
+            w.write_all(&scan(cursor)).await.unwrap();
+            w.flush().await.unwrap();
+            let frames = read_frames(&mut r, 1).await;
+            let Frame::Array(pair) = &frames[0] else {
+                panic!("SCAN must answer a two-element array, got {:?}", frames[0]);
+            };
+            let (Frame::Bulk(next), Frame::Array(keys)) = (&pair[0], &pair[1]) else {
+                panic!("SCAN answers a bulk cursor and an array of keys");
+            };
+            for key in keys {
+                let Frame::Bulk(k) = key else {
+                    panic!("keys are bulk strings")
+                };
+                seen.push(k.clone());
+            }
+            cursor = String::from_utf8(next.clone()).unwrap();
+            calls += 1;
+            if cursor == "0" {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 32, "a cycle must still return every key once");
+        assert!(
+            calls <= 6,
+            "32 keys at COUNT 10 over {SHARDS} shards is about four calls, not sixteen: {calls}"
         );
     }
 
@@ -4421,16 +4512,17 @@ mod tests {
 
     /// The two rules `scan_options` carries that the wire tests cannot see:
     /// a repeated option is its last occurrence, and a `COUNT` from the wire
-    /// is a request for work that this server bounds.
+    /// is passed through as the client's key target rather than clamped.
     ///
-    /// The bound is the point. `COUNT` is a client's hint everywhere else and
-    /// a shard's occupancy here: a step honoured literally at `u64::MAX` walks
-    /// a whole cycle inside one envelope and holds the shard for it, which is
-    /// the one thing the step primitive exists to prevent. A clamped walk
-    /// still returns every key — it just takes the round trips the server's
-    /// step size implies rather than the ones the client asked for.
+    /// The pass-through is the point. `COUNT` is a client's hint everywhere
+    /// else and this server no longer makes it anything else: the bound that
+    /// used to live here is the call's occupancy ceiling, and it lives in the
+    /// crossing kernel, where `every_budget_and_shard_count_terminates` pins
+    /// it against every target and every shard count. A target past what any
+    /// keyspace holds is answered by a cycle that ends, not by a smaller
+    /// number substituted at parse time.
     #[test]
-    fn scan_options_take_the_last_occurrence_and_bound_the_step() {
+    fn scan_options_take_the_last_occurrence_and_pass_count_through() {
         let opts = |parts: &[&str]| -> (Option<Vec<u8>>, usize) {
             let owned: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
             scan_options(&owned).expect("these options parse")
@@ -4446,12 +4538,13 @@ mod tests {
 
         assert_eq!(
             opts(&["COUNT", &i64::MAX.to_string()]).1,
-            WALK_STEP_BUCKETS,
-            "a COUNT past the step ceiling must be clamped to it"
+            usize::try_from(i64::MAX).expect("this gate's targets are 64-bit"),
+            "a COUNT past any keyspace is still the target the client asked for"
         );
         assert_eq!(
             opts(&["COUNT", &WALK_STEP_BUCKETS.to_string()]).1,
-            WALK_STEP_BUCKETS
+            WALK_STEP_BUCKETS,
+            "the occupancy ceiling is not a special number to a client"
         );
         // Past what an i64 spells is not a large COUNT, it is not a number —
         // the same answer Redis gives, and a different one from a COUNT of
