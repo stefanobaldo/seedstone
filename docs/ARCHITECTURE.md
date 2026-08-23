@@ -191,11 +191,19 @@ is fixed for the life of the process, so a cursor does not survive a restart. A
 cursor is accepted only in the canonical decimal it was issued in, so `SCAN
 007` is an error here where Redis reads cursor `7` — a cursor is not a number a
 person types, but one this server issued and the client hands straight back.
-And a full cycle costs at least one round trip per shard whatever the keyspace
-holds, because a spent shard hands back the next shard's start rather than
-continuing into it: walking a thousand keys costs about a thousand calls, where
-Redis answers the same walk in about a hundred at its default `COUNT`. That is
-a floor on round trips, not on work — each call still costs what a `GET` costs.
+And one call continues into the next shard while its bucket budget lasts, so
+what a cycle costs follows the keyspace rather than the shard count: about one
+call per `COUNT` keys, plus one for each shard whose table outlasts the budget
+the call had left when it arrived. `COUNT` is the client's key target and the
+bucket ceiling is the server's bound on how long one call may occupy the node;
+a call ends at whichever of the two comes first. Two consequences a client
+should expect from that: a call may answer with more keys than `COUNT` asked
+for, because the shard it was inside had them and the target is checked between
+shards rather than inside one; and a call may answer with none at all and a
+cursor that is not `0`, because a stretch of empty buckets or a `MATCH` that
+excluded everything can exhaust a budget. Neither is new to `SCAN` and neither
+needs anything of the client but the loop it already writes: keep calling until
+the cursor comes back `0`.
 
 **`used_memory` is an accounting formula, not an allocator reading.** Each
 shard's keyspace reports what it is accounted at — a fixed overhead per entry

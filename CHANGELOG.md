@@ -48,6 +48,14 @@ SemVer and are `0.x` until the server persists data;
   a walk is in flight may be missed, and a key deleted while it is in flight
   may still appear. `KEYS` reports no key twice; `SCAN` may, exactly as in
   Redis.
+- `SCAN` gathers up to `COUNT` keys per call across shards rather than
+  answering from one shard per call. The cursor format is unchanged and
+  clients need no change. `COUNT` is now the client's key target rather than
+  a budget of buckets to visit, which is what it means in Redis: a call may
+  answer with more keys than `COUNT` asked for, because the target is checked
+  between shards and not inside one. As before, a call may also answer with
+  no keys at all and a cursor that is not `0`; the loop stays the one it
+  always was, calling until the cursor comes back `0`.
 
 ## [0.0.0] - 2026-08-08
 
