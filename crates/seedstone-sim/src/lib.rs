@@ -502,6 +502,48 @@ impl SimConfig {
             maxmemory: Some(24 * 1024),
         }
     }
+
+    /// A shape wide enough for one call to cross several shards, and narrow
+    /// enough for a client to reach the end of its cycle.
+    ///
+    /// Sixteen shards, not one and not a thousand, and both bounds are the
+    /// point. One shard has no crossing in it at all: a call that never leaves
+    /// the shard it started on cannot step over the next one. A thousand puts
+    /// the cycle out of reach — the walk keys of a client are eight, so a
+    /// thousand shards hold nothing between them and the run pays for the
+    /// crossing without ever completing a cycle to check it. Sixteen is enough
+    /// shards that a call's bucket budget crosses most of them and the ones it
+    /// does not are still ahead of the cursor.
+    ///
+    /// `concurrent_scan_cycle` is on, and that is what this shape buys: the
+    /// walk's at-least-once claim is made only by a walk that reached the end
+    /// of its cycle, and it is the only claim a call that skipped a shard
+    /// breaks. Everything else a skipped shard leaves intact — the keys it did
+    /// return are real, the cursor did move, and the closing `KEYS` is a
+    /// broadcast that crosses nothing. See `tests/planted_crossing.rs`.
+    ///
+    /// `eviction`'s body with the ceiling dropped: a shape whose walks must
+    /// come back with everything cannot be one where a key is allowed to
+    /// vanish underneath them.
+    #[must_use]
+    pub const fn crossing(workload_seed: u64, sim_seed: u64) -> Self {
+        Self {
+            shards: 16,
+            executors: 4,
+            clients: 16,
+            plain_keys: 64,
+            volatile_keys: 32,
+            counter_keys: 4,
+            ops_per_client: 40,
+            pipeline_depth: 8,
+            workload_seed,
+            sim_seed,
+            quiescent_walk: false,
+            concurrent_scan_cycle: true,
+            planted: None,
+            maxmemory: None,
+        }
+    }
 }
 
 /// A deliberate defect the harness can serve its own workload through.
@@ -1769,6 +1811,17 @@ const WALK_PREFIX_STEPS: u64 = 2;
 /// are on the wire in every run.
 const WALK_STEP_COUNT: usize = 1;
 
+/// How far to shift a `SCAN` cursor to read the shard it names.
+///
+/// The edge packs `(shard, internal)` into the one integer `SCAN` exchanges,
+/// with the low 48 bits belonging to the shard's own cursor. Mirrored here
+/// rather than imported: the packing is the service's own business and its
+/// halves are private to it, so what this number is is a *claim* the harness
+/// makes about the wire — the same standing the rest of the walk's checks
+/// have. A cursor whose shard half stopped matching this would fail the
+/// monotonic check rather than pass it quietly.
+const WALK_CURSOR_SHARD_SHIFT: u32 = 48;
+
 /// How many steps a cycle-completing walk is allowed before the harness calls
 /// it a walk that is not going to finish.
 ///
@@ -2581,7 +2634,7 @@ impl Model {
     /// reverse-binary cursor exists to survive and the one no quiescent
     /// assertion can produce.
     ///
-    /// Four claims, and they are the guarantee split into the parts a
+    /// Five claims, and they are the guarantee split into the parts a
     /// concurrent walk can still make:
     ///
     /// - **No phantom.** Every key any step returns is one this client wrote
@@ -2602,6 +2655,16 @@ impl Model {
     ///   stable key, plus every churn key whose write was acknowledged and
     ///   whose removal was not. `SCAN` may return a key twice and this may
     ///   not.
+    /// - **Shard-monotonic.** A call crosses shards in order and hands back
+    ///   wherever it stopped, so within one cycle the shard half of every
+    ///   cursor returned never decreases, and every non-zero cursor names a
+    ///   shard this node has. The rest of that claim — that `0` arrives only
+    ///   after the *last* shard — is not readable from a cursor, because a
+    ///   call may cross any number of shards before it stops and the client
+    ///   sees only where it stopped. What carries it is at-least-once: a `0`
+    ///   handed back before the last shard was walked is a cycle that left
+    ///   keys unreturned. See `Plant::CrossingSkipsShard`, which is exactly
+    ///   that defect.
     ///
     /// **What the prefix shape's steps can and cannot see, measured rather
     /// than assumed.** A step is a shard at most, so two steps cover two of a
@@ -2736,6 +2799,10 @@ impl Model {
 
         let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
         let mut cursor = 0u64;
+        // The shard the last cursor named. A walk starts at cursor 0, which is
+        // shard 0's start, so a walk that has taken no step yet is already at
+        // the floor the check holds every later cursor to.
+        let mut last_shard = 0u64;
         let mut steps = 0u64;
         let mut holds = true;
 
@@ -2793,6 +2860,17 @@ impl Model {
                 holds = false;
             }
             seen.extend(keys);
+            // The shard half of the cursor, read the way the edge packs it —
+            // see `WALK_CURSOR_SHARD_SHIFT`. `0` is the end of the cycle and
+            // names no shard, so it is the loop's business below and not this
+            // check's.
+            if next != 0 {
+                let shard = next >> WALK_CURSOR_SHARD_SHIFT;
+                if shard < last_shard || shard >= u64::from(cfg.shards) {
+                    holds = false;
+                }
+                last_shard = shard;
+            }
             cursor = next;
 
             if cursor == 0 {
