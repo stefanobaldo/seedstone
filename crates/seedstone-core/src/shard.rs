@@ -543,9 +543,10 @@ pub enum Reply {
     },
     /// What one shard has counted. Never a wire answer — see [`ShardStats`].
     ///
-    /// **Boxed, and that is not incidental.** [`ShardStats`] is 176 bytes,
-    /// almost all of it the per-command call counts, and every other variant
-    /// of this enum fits in forty. Stored inline it would be the size of a
+    /// **Boxed, and that is not incidental.** [`ShardStats`] is 304 bytes,
+    /// almost all of it the per-command call counts and the time those calls
+    /// spent, and every other variant of this enum fits in forty. Stored
+    /// inline it would be the size of a
     /// `Reply`, which is the type every command answers with and which an
     /// envelope holds one of per command — so a figure a scrape asks for once
     /// a minute would be paid for by every `GET` on the machine. One
@@ -562,8 +563,10 @@ pub enum Reply {
 /// Every field is a running total from the moment the shard started, except
 /// [`keys`](Self::keys) and [`expires`](Self::expires), which are the
 /// keyspace as it stands. `INFO` sums them field by field across the shards
-/// and prints the sum; nothing here is ever divided or averaged, so the sum
-/// is the whole of the arithmetic.
+/// and prints the sum; nothing is divided or averaged here, so summing is the
+/// whole of this type's arithmetic. The one quotient `INFO` prints —
+/// `usec_per_call` — is taken at render from two of these sums, so it is a
+/// ratio of node totals rather than an average of shard averages.
 ///
 /// It reaches no client under this name: the reply carrying it is refused by
 /// the service layer's renderer, because a peer that could dispatch one would
@@ -595,6 +598,21 @@ pub struct ShardStats {
     /// from this: see [`count_call`], which says why counting them here would
     /// report one request as sixteen.
     pub calls: [u64; KIND_SLOTS],
+    /// How long those commands took, in microseconds, indexed the same way.
+    ///
+    /// One clock reading per command, differenced against the reading before
+    /// it — the executor's own, taken once when the envelope arrived, for the
+    /// first command of a batch. It measures the handler and what the
+    /// executor does around it: the memory accounting either side of `apply`,
+    /// and any eviction the write triggered, all of which are that command's
+    /// cost and nobody else's.
+    ///
+    /// **Never folded into a trace.** Under the simulator a handler cannot
+    /// `await`, so no simulated instant passes and every figure here is
+    /// exactly zero; under a real runtime it is a wall-clock reading, which is
+    /// the one kind of number a replay must not depend on. It is reported and
+    /// not decided upon.
+    pub usec: [u64; KIND_SLOTS],
 }
 
 /// One unit of work for an executor: a batch of commands and where its
@@ -1434,6 +1452,9 @@ struct ShardState<L> {
     /// gathered by a [`Command::Stats`] like any other command, which is what
     /// keeps `INFO` off the hot path entirely.
     calls: [u64; KIND_SLOTS],
+    /// Microseconds those commands spent, indexed the same way — see
+    /// [`ShardStats::usec`], which is what this becomes.
+    usec: [u64; KIND_SLOTS],
 }
 
 impl<L> ShardState<L> {
@@ -1451,6 +1472,7 @@ impl<L> ShardState<L> {
             misses: 0,
             expired: 0,
             calls: [0; KIND_SLOTS],
+            usec: [0; KIND_SLOTS],
         }
     }
 }
@@ -1520,9 +1542,14 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                 // would still be synchronous — this is not the no-await rule —
                 // but the commands of one batch would then expire keys against
                 // several different instants, which is a difference nothing
-                // about the batch justifies. Reading it once also keeps the
-                // cost at one per envelope rather than one per command.
+                // about the batch justifies.
+                //
+                // It is also the first command's timing start — see
+                // `ShardStats::usec`, which spends one further reading per
+                // command and differences each against the one before it.
                 let now = Instant::now();
+                #[cfg(not(feature = "no-command-timing"))]
+                let mut last = now;
                 // By mutable reference, so a handler can move a command's value
                 // into the dict instead of copying it — see `apply`. The trace
                 // reads the command *after* the handler has had it, and reads
@@ -1571,7 +1598,30 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                         }
                         answer
                     };
-                    count_call(state, cmd, &answer);
+                    // A reading per command, differenced against the one
+                    // before it, so a batch of `n` commands costs `n`
+                    // readings rather than `2n`.
+                    //
+                    // `saturating_duration_since` rather than a subtraction:
+                    // a monotonic clock is only promised not to go backwards,
+                    // and a reading that did would panic here rather than
+                    // report a zero microsecond nobody would miss.
+                    #[cfg(not(feature = "no-command-timing"))]
+                    let spent = {
+                        let after = Instant::now();
+                        let spent = after.saturating_duration_since(last).as_micros();
+                        last = after;
+                        // A command that ran for half a million years would
+                        // saturate; the shard it ran on has other problems.
+                        u64::try_from(spent).unwrap_or(u64::MAX)
+                    };
+                    // The campaign's A/B arm and nothing else: a build with
+                    // the reading compiled out, so that what taking it costs
+                    // can be measured against a build that takes it. The
+                    // feature is removed once that measurement exists.
+                    #[cfg(feature = "no-command-timing")]
+                    let spent = 0;
+                    count_call(state, cmd, &answer, spent);
                     trace.record(*shard, at, cmd, &answer);
                     replies.push(answer);
                 }
@@ -1773,9 +1823,17 @@ fn keyspace_stats(dict: &Dict) -> ShardStats {
 /// the server answered is a call however it was answered, which is what Redis
 /// counts and what an operator comparing `commandstats` to a client's own
 /// tally is looking for.
-fn count_call<L>(state: &mut ShardState<L>, cmd: &Command, reply: &Reply) {
+///
+/// `spent` is what the command cost in microseconds, and it is added here
+/// rather than beside the reading that produced it so that the two figures
+/// cannot disagree about which commands they describe: the one guard above
+/// decides both. A command excluded from `calls` contributes no time either,
+/// which is what keeps `usec_per_call` a quotient of two figures counted over
+/// the same set. It is always `0` on a build with the timing compiled out.
+fn count_call<L>(state: &mut ShardState<L>, cmd: &Command, reply: &Reply, spent: u64) {
     if !matches!(cmd.route(), Route::Every) {
         state.calls[usize::from(cmd.kind())] += 1;
+        state.usec[usize::from(cmd.kind())] += spent;
     }
     match read_outcome(&state.dict, cmd, reply) {
         Some(true) => state.hits += 1,
@@ -1831,6 +1889,7 @@ fn stats_of<L>(state: &ShardState<L>) -> ShardStats {
         misses: state.misses,
         expired: state.expired,
         calls: state.calls,
+        usec: state.usec,
         ..keyspace_stats(&state.dict)
     }
 }
