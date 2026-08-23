@@ -322,7 +322,14 @@ const CHUNK_COMMANDS: usize = 128;
 /// call ends at whichever of the two is reached first — occupancy is the
 /// server's to bound whoever asked, and a target honoured without a ceiling
 /// would let one call walk an entire cycle and hold the node for it.
-const WALK_STEP_BUCKETS: usize = 256;
+///
+/// Public because the number is what distinguishes the two commands' steps
+/// from outside the server: a `KEYS` step always carries the whole ceiling
+/// because every shard is walked from `0` on its own budget, while every step
+/// of a `SCAN` call after its first carries less, because the shards before it
+/// spent some. That is the only signal a shard has that the call *crossed into*
+/// it, and the simulator's crossing plant is built on it.
+pub const WALK_STEP_BUCKETS: usize = 256;
 
 /// How much of a peer-supplied byte string an error message may quote.
 const QUOTE_LIMIT: usize = 32;

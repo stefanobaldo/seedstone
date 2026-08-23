@@ -265,6 +265,12 @@ mod tests {
         assert!(warning.contains("standard"), "{warning}");
         assert!(warning.contains("planted_eviction.rs"), "{warning}");
 
+        let warning = unobservable_warning(Plant::CrossingSkipsShard, "standard")
+            .expect("a shape whose walks stop short is warned about a skipped shard");
+        assert!(warning.contains("crossing-skips-shard"), "{warning}");
+        assert!(warning.contains("standard"), "{warning}");
+        assert!(warning.contains("planted_crossing.rs"), "{warning}");
+
         assert_eq!(
             unobservable_warning(Plant::LostUpdate, "standard"),
             None,

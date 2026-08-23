@@ -112,7 +112,7 @@ use seedstone_core::shard::{
     TraceSink, parse_i64,
 };
 use seedstone_resp::{Decoder, DecoderLimits, Frame, encode};
-use seedstone_service::{NodeInfo, serve_connection};
+use seedstone_service::{NodeInfo, WALK_STEP_BUCKETS, serve_connection};
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -622,6 +622,29 @@ pub enum Plant {
     /// ceiling, so on a shape with none this defect is a written key that
     /// answers `nil`, and nothing excuses that.
     EvictsBelowCeiling,
+    /// A `SCAN` call that steps *over* every odd shard instead of into it.
+    ///
+    /// The server answers a step that crossed into an odd-numbered shard as
+    /// already spent — no keys, one bucket visited, cursor `0` — so the call
+    /// moves straight on to the shard after it. Every cursor it hands back is
+    /// still well-formed and still moves forward; every key it returns is still
+    /// a real key. What it loses is half the keyspace, and the client is never
+    /// told.
+    ///
+    /// The defect the crossing made possible and the code before it could not
+    /// have had: a walk that answered from one shard per call had no shard to
+    /// step over. It is caught by **at-least-once on a completed cycle**, which
+    /// is the only claim it breaks, and that is why it needs a shape whose
+    /// clients drive their cycle to the end over more than one shard — see
+    /// [`SimConfig::crossing`] and `tests/planted_crossing.rs`.
+    ///
+    /// Confined to steps the call *crossed into*: a shard resumed at `0` with
+    /// less than the whole bucket ceiling left, which is a step no first call
+    /// and no `KEYS` ever sends. Widening it to every step at cursor `0` would
+    /// break `KEYS` too — a broadcast that walks each shard from `0` on a full
+    /// budget — and a defect that breaks a command predating the crossing is no
+    /// longer a statement about the crossing.
+    CrossingSkipsShard,
 }
 
 impl Plant {
@@ -636,18 +659,20 @@ impl Plant {
             Self::ScanMissesRehash => "scan-misses-rehash",
             Self::IgnoresCeiling => "ignores-ceiling",
             Self::EvictsBelowCeiling => "evicts-below-ceiling",
+            Self::CrossingSkipsShard => "crossing-skips-shard",
         }
     }
 
     /// Every plant, so a caller listing or sweeping them cannot miss one
     /// added later.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::LostUpdate,
         Self::ServeExpired,
         Self::SweepEatsAll,
         Self::ScanMissesRehash,
         Self::IgnoresCeiling,
         Self::EvictsBelowCeiling,
+        Self::CrossingSkipsShard,
     ];
 
     /// The plant `name` selects, if it names one.
@@ -702,6 +727,14 @@ impl Plant {
             Self::IgnoresCeiling => {
                 Some("SimConfig::eviction, swept by crates/seedstone-sim/tests/planted_eviction.rs")
             }
+            // At-least-once is the only claim a skipped shard breaks, and only
+            // a walk that reached the end of its cycle makes it. All three
+            // swept shapes leave `concurrent_scan_cycle` off — a complete cycle
+            // is a test's to ask for, not a sweep's — so no walk they run ever
+            // gets to that claim, whatever their shard count.
+            Self::CrossingSkipsShard => Some(
+                "SimConfig::crossing, walked by crates/seedstone-sim/tests/planted_crossing.rs",
+            ),
         }
     }
 }
@@ -1451,9 +1484,9 @@ async fn server(
             EvictsBelowCeiling,
             limit,
         ),
-        // The honest pool, and the lost-update plant's too: that defect lives
-        // above the shard, where a real one would.
-        None | Some(Plant::LostUpdate) => {
+        // The honest pool, and the two router plants' too: both of those
+        // defects live above the shard, where a real one would.
+        None | Some(Plant::LostUpdate | Plant::CrossingSkipsShard) => {
             ShardPool::spawn_limited(shards, executors, seed, sink, limit)
         }
     };
@@ -1472,17 +1505,95 @@ async fn server(
     node.limit = pool.limit();
     loop {
         let (stream, _peer) = listener.accept().await?;
-        // Only one plant is a router now. The other two are inside the server,
-        // which is where the defects they imitate would be.
-        if planted == Some(Plant::LostUpdate) {
-            tokio::spawn(serve_connection(
-                stream,
-                PlantedRouter::new(pool.clone()),
-                node.clone(),
-            ));
-        } else {
-            tokio::spawn(serve_connection(stream, pool.clone(), node.clone()));
+        // Two plants are routers: a lost update, which is a defect between two
+        // messages of one command, and a crossing that skips a shard, which is
+        // a defect in a loop the shards know nothing about. The rest are inside
+        // the server, which is where the defects they imitate would be.
+        match planted {
+            Some(Plant::LostUpdate) => {
+                tokio::spawn(serve_connection(
+                    stream,
+                    PlantedRouter::new(pool.clone()),
+                    node.clone(),
+                ));
+            }
+            Some(Plant::CrossingSkipsShard) => {
+                tokio::spawn(serve_connection(
+                    stream,
+                    SkippingRouter::new(pool.clone()),
+                    node.clone(),
+                ));
+            }
+            _ => {
+                tokio::spawn(serve_connection(stream, pool.clone(), node.clone()));
+            }
         }
+    }
+}
+
+/// A router that steps over every odd shard a `SCAN` call crosses into.
+///
+/// [`Plant::CrossingSkipsShard`], and a type of its own for the reason
+/// [`PlantedRouter`] gives for having no plant parameter: a router that can be
+/// asked for one defect and quietly serve another is the failure a self-test
+/// exists to prevent. This one is above the shard because the defect is, too —
+/// crossing is the edge's loop, and a shard answers one step of it knowing
+/// nothing about the shards on either side.
+#[derive(Clone)]
+pub struct SkippingRouter {
+    /// The honest pool underneath.
+    pool: ShardPool,
+}
+
+impl SkippingRouter {
+    /// Wraps `pool` so that a `SCAN` call skips the odd shards it crosses into.
+    #[must_use]
+    pub const fn new(pool: ShardPool) -> Self {
+        Self { pool }
+    }
+}
+
+impl Router for SkippingRouter {
+    // Spelled `async fn` for the reason [`PlantedRouter`]'s impl states.
+    async fn dispatch(&self, cmd: Command) -> Reply {
+        self.pool.dispatch(cmd).await
+    }
+
+    /// The pool's own count: the plant wraps a pool, it does not resize one.
+    fn shards(&self) -> u16 {
+        self.pool.shards()
+    }
+
+    /// Where the defect is. A step at cursor `0` carrying less than the whole
+    /// bucket ceiling is a shard the call *crossed into*: the shards before it
+    /// spent the difference. Answering it as already spent — nothing found, one
+    /// bucket charged, cycle over — sends the call straight on to the next
+    /// shard with this one never opened.
+    ///
+    /// Every other step is passed through, and the two exclusions are what keep
+    /// this a statement about the crossing. A step at cursor `0` with the full
+    /// ceiling is the *first* shard of a call, which the client addressed
+    /// itself; and it is every step `KEYS` sends, which walks each shard from
+    /// `0` on a budget of its own and has crossed nothing.
+    async fn dispatch_at(&self, shard: u16, cmd: Command) -> Reply {
+        if !shard.is_multiple_of(2)
+            && matches!(
+                cmd,
+                Command::ScanStep { cursor: 0, count, .. } if count < WALK_STEP_BUCKETS
+            )
+        {
+            return Reply::Scan {
+                cursor: 0,
+                keys: Vec::new(),
+                visited: 1,
+            };
+        }
+        self.pool.dispatch_at(shard, cmd).await
+    }
+
+    /// Passed straight through: a broadcast crosses nothing.
+    async fn dispatch_every(&self, cmd: Command) -> Vec<Reply> {
+        self.pool.dispatch_every(cmd).await
     }
 }
 
@@ -3533,6 +3644,14 @@ mod tests {
                         "a reader sent somewhere must be sent to a file: {place}"
                     );
                 }
+                Plant::CrossingSkipsShard => {
+                    let place = place
+                        .expect("a shape whose walks stop short cannot observe a skipped shard");
+                    assert!(
+                        place.contains("planted_crossing.rs"),
+                        "a reader sent somewhere must be sent to a file: {place}"
+                    );
+                }
             }
         }
         // The place is a string, so nothing but this stops it outliving the
@@ -3541,6 +3660,7 @@ mod tests {
         for path in [
             concat!(env!("CARGO_MANIFEST_DIR"), "/../seedstone-core/src/dict.rs"),
             concat!(env!("CARGO_MANIFEST_DIR"), "/tests/planted_eviction.rs"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/planted_crossing.rs"),
         ] {
             assert!(
                 std::path::Path::new(path).exists(),
@@ -3554,7 +3674,7 @@ mod tests {
     /// are outside what the swept shapes reach, and one appearing or leaving
     /// that set is a change in what those shapes measure.
     #[test]
-    fn the_plants_the_swept_shapes_cannot_catch_are_the_two_that_need_a_shape() {
+    fn the_plants_the_swept_shapes_cannot_catch_are_the_three_that_need_a_shape() {
         let unobservable: Vec<&str> = Plant::ALL
             .into_iter()
             .filter(|plant| plant.unobservable_on_swept_shapes().is_some())
@@ -3562,7 +3682,11 @@ mod tests {
             .collect();
         assert_eq!(
             unobservable,
-            ["scan-misses-rehash", "ignores-ceiling"],
+            [
+                "scan-misses-rehash",
+                "ignores-ceiling",
+                "crossing-skips-shard"
+            ],
             "the plants a swept violation count says nothing about have changed"
         );
     }
