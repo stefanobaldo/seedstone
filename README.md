@@ -43,8 +43,9 @@ by evicting least-recently-used keys, or by refusing writes under
 
 `INFO`, `CONFIG GET`, `SLOWLOG` and `LATENCY` are the operational surface a
 monitoring agent reads: `INFO` in sections — `server`, `clients`, `memory`,
-`stats`, `keyspace` and `commandstats`, carrying only fields this node can
-state truthfully — `CONFIG GET` over the parameters that describe how it was
+`stats`, `keyspace` and `commandstats` with a call count and a measured
+per-command time, carrying only fields this node can state truthfully —
+`CONFIG GET` over the parameters that describe how it was
 started, and `SLOWLOG` and `LATENCY` answering as the switched-off monitors
 they are, so that a scrape completes rather than logging a refusal on every
 pass.
