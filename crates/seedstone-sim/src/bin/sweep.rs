@@ -257,7 +257,7 @@ mod tests {
             .expect("a plant the swept shapes cannot catch is warned about");
         assert!(warning.contains("scan-misses-rehash"), "{warning}");
         assert!(warning.contains("mini"), "{warning}");
-        assert!(warning.contains("planted_walk.rs"), "{warning}");
+        assert!(warning.contains("dict.rs"), "{warning}");
 
         let warning = unobservable_warning(Plant::IgnoresCeiling, "standard")
             .expect("a node that ignores a ceiling no swept shape sets is warned about");

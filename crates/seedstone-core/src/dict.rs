@@ -1387,6 +1387,66 @@ mod tests {
         }
     }
 
+    /// The order's necessity, which the growth test above only assumes.
+    ///
+    /// `scan_sees_every_stable_key_across_growth` shows that the honest cursor
+    /// finishes a cycle over a table doubling underneath it. That it *has to be
+    /// this order* is a separate claim, and this is where it is proved: the
+    /// same loop, the same growth, a cursor that counts buckets upwards instead
+    /// — and it never comes back.
+    ///
+    /// The arithmetic is the whole argument. An upward cursor advances one
+    /// bucket a step while a doubling moves the finish line by the width of the
+    /// table, so a keyspace growing by more than one bucket a step outruns it
+    /// and the cycle has no end. Reverse binary inverts that: the bits a
+    /// doubling adds are the *high* ones, which the cursor has already passed,
+    /// so a doubling halves the size of every remaining step rather than
+    /// doubling how many are left.
+    ///
+    /// Here rather than in the simulator, and that is a change from where it
+    /// used to be. The harness planted this cursor and walked a shape narrow
+    /// enough to catch it, back when a client's `COUNT` of one meant one bucket
+    /// a call. A `SCAN` call now spends a bucket ceiling of the server's own,
+    /// which covers a simulated shard's whole table several times over before
+    /// it answers — so nothing the harness can afford to run leaves a cursor in
+    /// flight long enough for a table to double under it. The shape that would
+    /// is a production-sized one: a table of millions of buckets, where a
+    /// call's ceiling is a rounding error against the width of the walk. What
+    /// the simulator cannot afford, one dict and no network can.
+    #[test]
+    fn an_upward_cursor_is_outrun_by_a_table_growing_under_it() {
+        /// The defect: buckets in ascending order, masked like the honest one.
+        #[derive(Clone)]
+        struct Upward;
+        impl WalkOrder for Upward {
+            fn advance(&self, cursor: u64, mask: u64) -> u64 {
+                cursor.wrapping_add(1) & mask
+            }
+        }
+
+        // The growth rate of the test above, and the bound is that test's
+        // guard: whatever number is generous enough to call the honest cursor
+        // hung is more than generous enough to call this one outrun.
+        let mut d = Dict::with_seed(seed());
+        for i in 0..64u32 {
+            d.insert(format!("stable-{i}").into_bytes(), entry(b""));
+        }
+        let mut c = 0;
+        let mut extra = 0u32;
+        for _ in 0..10_000 {
+            c = d.scan_in_order(c, &Upward, |_, _| {});
+            assert_ne!(
+                c, 0,
+                "an upward cursor finished a cycle over a table growing under it"
+            );
+            for _ in 0..8 {
+                d.insert(format!("noise-{extra}").into_bytes(), entry(b""));
+                extra += 1;
+            }
+            d.rehash_step(1);
+        }
+    }
+
     #[test]
     fn scanning_an_empty_dict_ends_the_cycle_without_visiting_anything() {
         let d = Dict::with_seed(seed());
