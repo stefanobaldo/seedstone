@@ -535,6 +535,11 @@ pub enum Reply {
         /// the table gave them up. Possibly empty with a non-zero cursor: a
         /// step's budget is buckets, and buckets can be empty.
         keys: Vec<Vec<u8>>,
+        /// How many buckets this step visited — the edge's unit of budget
+        /// when one call walks more than one shard. At least one; at most
+        /// what the step was asked for; exactly the table's size when the
+        /// step finished the cycle.
+        visited: usize,
     },
     /// What one shard has counted. Never a wire answer — see [`ShardStats`].
     ///
@@ -2299,10 +2304,12 @@ fn scan_step<P: ShardPolicy>(
 ) -> Reply {
     let mut keys = Vec::new();
     let mut next = cursor;
+    let mut visited = 0;
     // At least one bucket, whatever the caller asked for: a step that visited
     // none would hand back the cursor it was given, and a caller looping until
     // the cursor returns to zero would never leave.
     for _ in 0..count.max(1) {
+        visited += 1;
         next = dict.scan_in_order(next, policy, |key, entry| {
             // A key whose deadline has passed is not in the keyspace, even
             // though the sweep has not reached it. Reporting it would make a
@@ -2318,7 +2325,11 @@ fn scan_step<P: ShardPolicy>(
             break;
         }
     }
-    Reply::Scan { cursor: next, keys }
+    Reply::Scan {
+        cursor: next,
+        keys,
+        visited,
+    }
 }
 
 /// Removes `key` if its deadline has passed, appending the deletion to the log
@@ -3904,6 +3915,48 @@ mod tests {
         );
     }
 
+    /// The budget the edge accounts a crossing call by: how many buckets one
+    /// step actually walked, which is not the count it was asked for whenever
+    /// the step finished the cycle first.
+    #[test]
+    fn a_scan_step_reports_how_many_buckets_it_visited() {
+        let mut dict = Dict::with_seed(DictSeed { k0: 1, k1: 1 });
+        // Four keys in a table of eight buckets: the load factor is one, so
+        // nothing has grown and the cycle is exactly eight steps long.
+        for i in 0..4u8 {
+            dict.insert(
+                vec![i],
+                Entry {
+                    value: Vec::new(),
+                    expires_at: None,
+                    touched: 0,
+                },
+            );
+        }
+        let now = Instant::now();
+
+        let Reply::Scan {
+            visited, cursor, ..
+        } = scan_step(&dict, 0, 3, None, now, &Deadlines)
+        else {
+            panic!("a scan step must answer Reply::Scan");
+        };
+        assert_eq!(visited, 3);
+        assert_ne!(cursor, 0);
+
+        let Reply::Scan {
+            visited, cursor, ..
+        } = scan_step(&dict, 0, 100, None, now, &Deadlines)
+        else {
+            panic!("a scan step must answer Reply::Scan");
+        };
+        assert_eq!(
+            visited, 8,
+            "a step that finishes the cycle visited the whole table, not its budget"
+        );
+        assert_eq!(cursor, 0);
+    }
+
     #[tokio::test]
     async fn a_scan_step_returns_at_most_a_countful_and_a_resumable_cursor() {
         let pool = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 1 }, NoTrace);
@@ -3925,7 +3978,10 @@ mod tests {
                     },
                 )
                 .await;
-            let Reply::Scan { cursor: next, keys } = reply else {
+            let Reply::Scan {
+                cursor: next, keys, ..
+            } = reply
+            else {
                 panic!("a scan step must answer Reply::Scan, got {reply:?}");
             };
             seen.extend(keys);
@@ -3957,7 +4013,9 @@ mod tests {
         let mut seen: Vec<Vec<u8>> = Vec::new();
         let mut cursor = 0u64;
         loop {
-            let Reply::Scan { cursor: next, keys } = pool
+            let Reply::Scan {
+                cursor: next, keys, ..
+            } = pool
                 .dispatch_at(
                     0,
                     Command::ScanStep {

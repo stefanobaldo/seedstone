@@ -1032,7 +1032,15 @@ fn fold_reply(h: u64, reply: &Reply) -> u64 {
         // place and returned different keys are different answers, and a walk
         // that lost a key while its cursor kept advancing is exactly the
         // regression a trace hash is here to make visible.
-        Reply::Scan { cursor, keys } => {
+        // `visited` is deliberately absent: it is how many buckets the step
+        // walked, an accounting figure the edge budgets by, not an answer a
+        // client sees. Folding it would make the recorded hashes depend on a
+        // number no observer can read.
+        Reply::Scan {
+            cursor,
+            keys,
+            visited: _,
+        } => {
             let mut acc = mix(mix(h, 7), *cursor);
             for key in keys {
                 acc = fold_bytes(acc, key);
