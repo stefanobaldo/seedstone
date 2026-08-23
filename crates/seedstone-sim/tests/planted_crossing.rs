@@ -56,3 +56,32 @@ fn the_same_seeds_walk_clean_on_the_crossing_shape() {
         );
     }
 }
+
+/// A walk that skips every odd shard answers a subset and calls it the keyspace.
+#[test]
+fn the_harness_catches_a_crossing_that_skips_a_shard() {
+    for (seed, outcome) in sweep(Some(Plant::CrossingSkipsShard))
+        .into_iter()
+        .enumerate()
+    {
+        let seed = seed + 1;
+        assert!(
+            outcome.walk_mismatches > 0,
+            "seed {seed}: a walk that skipped shards was not caught: {outcome:?}"
+        );
+        // The plant is the walk's and nothing else's. A defect that also moved
+        // the counter sum or killed a key would be caught by whichever
+        // invariant fired first, and this test would pass without the walk
+        // having seen anything.
+        assert_eq!(
+            (
+                outcome.expected_sum == outcome.actual_sum,
+                outcome.stale_reads,
+                outcome.spurious_deaths,
+                outcome.plain_mismatches
+            ),
+            (true, 0, 0, 0),
+            "seed {seed}: skipping a shard is a walk failure and nothing else: {outcome:?}"
+        );
+    }
+}
