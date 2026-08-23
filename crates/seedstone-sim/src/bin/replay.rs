@@ -7,7 +7,7 @@
 //! stdout directly, with no parsing in between.
 //!
 //! ```text
-//! replay --sim-seed S [--workload-seed W] [--mini] [--plant NAME]
+//! replay --sim-seed S [--workload-seed W] [--mini | --eviction] [--plant NAME]
 //! ```
 //!
 //! Exits 1 if the run violated any invariant, so it also works as a plain
@@ -19,7 +19,8 @@ use std::process::ExitCode;
 #[path = "shared/args.rs"]
 mod args;
 
-const USAGE: &str = "usage: replay --sim-seed S [--workload-seed W] [--mini] [--plant NAME]";
+const USAGE: &str =
+    "usage: replay --sim-seed S [--workload-seed W] [--mini | --eviction] [--plant NAME]";
 
 fn main() -> ExitCode {
     let args = match args::Args::from_env() {
