@@ -432,6 +432,20 @@ impl Command {
         }
     }
 
+    /// The largest tag [`Command::kind`] can return.
+    ///
+    /// Every per-kind array is sized from this rather than from a literal
+    /// beside itself: `service`'s `KIND_NAMES`, and the shard's own `calls`
+    /// counter. An array sized independently is one a sixteenth variant
+    /// overruns, and the overrun would happen inside a spawned executor —
+    /// where it reads as a shard that died answering `ShardUnavailable`
+    /// rather than as an index out of bounds.
+    ///
+    /// `every_kind_tag_is_contiguous_and_bounded` is what keeps it true when
+    /// a variant is added: it fails, rather than the array growing silently
+    /// or a panic waiting for the traffic that reaches the new command.
+    pub const KIND_MAX: u8 = 15;
+
     /// A stable one-byte tag for this command's variant.
     ///
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
@@ -474,6 +488,14 @@ impl Command {
         matches!(self, Self::Set { .. } | Self::IncrBy { .. })
     }
 }
+
+/// How many slots a per-kind array needs: one per tag, plus slot `0`, which
+/// is no command.
+///
+/// Derived from [`Command::KIND_MAX`] rather than written beside each array,
+/// which is the whole point — the two arrays that use it and `service`'s
+/// `KIND_NAMES` all grow together or not at all.
+pub const KIND_SLOTS: usize = Command::KIND_MAX as usize + 1;
 
 /// A shard's answer to one [`Command`].
 ///
@@ -560,12 +582,14 @@ pub struct ShardStats {
     /// expiration.
     pub expired: u64,
     /// How many commands of each [`Command::kind`] this shard has run, indexed
-    /// by the tag itself — slot `0` is no command and stays zero.
+    /// by the tag itself — slot `0` is no command and stays zero. Sized from
+    /// [`Command::KIND_MAX`], so a variant added to `Command` widens this
+    /// rather than overrunning it.
     ///
     /// The three commands a single request sends to *every* shard are absent
     /// from this: see [`count_call`], which says why counting them here would
     /// report one request as sixteen.
-    pub calls: [u64; 16],
+    pub calls: [u64; KIND_SLOTS],
 }
 
 /// One unit of work for an executor: a batch of commands and where its
@@ -667,7 +691,9 @@ impl WalkOrder for Deadlines {}
 
 impl EvictionPolicy for Deadlines {
     fn must_evict(&self, used: u64, ceiling: Option<u64>) -> bool {
-        ceiling.is_some_and(|ceiling| used > ceiling)
+        // The same comparison `MemoryLimit::exceeded` makes, and the same
+        // function, so the byte the two paths act at cannot drift apart.
+        crate::memory::past_ceiling(used, ceiling)
     }
 }
 
@@ -1402,7 +1428,7 @@ struct ShardState<L> {
     /// shard and nothing else may touch it — the counters a scrape reads are
     /// gathered by a [`Command::Stats`] like any other command, which is what
     /// keeps `INFO` off the hot path entirely.
-    calls: [u64; 16],
+    calls: [u64; KIND_SLOTS],
 }
 
 impl<L> ShardState<L> {
@@ -1419,7 +1445,7 @@ impl<L> ShardState<L> {
             hits: 0,
             misses: 0,
             expired: 0,
-            calls: [0; 16],
+            calls: [0; KIND_SLOTS],
         }
     }
 }
@@ -1760,6 +1786,15 @@ fn count_call<L>(state: &mut ShardState<L>, cmd: &Command, reply: &Reply) {
 /// `TTL`, `TYPE` and `STRLEN` — a write is not a lookup, and neither is a
 /// command that names no key.
 ///
+/// **This is not the same set as the one that refreshes the LRU stamp**, and
+/// the difference is deliberate rather than an oversight. Five commands are
+/// counted here; three stamp — `GET`, `SET` and `INCRBY` — plus `STRLEN`,
+/// which is the only lookup of the five that reads the value. Redis draws the
+/// same two lines in the same two places, measured with `OBJECT IDLETIME`
+/// against 6.2.24: `EXISTS`, `TYPE` and `TTL` are counted as lookups and
+/// leave the stamp alone. A hit is about what an operator is told about the
+/// keyspace; a stamp is about what eviction may take next.
+///
 /// Read off the reply wherever the reply says, so the classification costs
 /// nothing: four of the five answer differently for a key that was there.
 /// `STRLEN` is the exception — a stored empty value and an absent key both
@@ -1957,7 +1992,19 @@ fn apply<L: ReplicationLog, P: ShardPolicy>(
 
         Command::Type { key } => Reply::Status(type_name(dict, key)),
 
-        Command::StrLen { key } => Reply::Integer(value_len(dict, key)),
+        // Stamped, like `GET` and unlike the other three lookups: measured
+        // against `redis:6-alpine` (6.2.24) with `OBJECT IDLETIME`, which
+        // resets on `GET` and `STRLEN` and does not on `EXISTS`, `TYPE` or
+        // `TTL`. Redis draws the line at whether the command read the *value*
+        // — `STRLEN` measures it, the other three only ask about the key —
+        // and this follows that line rather than the one `read_outcome` draws
+        // beside it. The two are deliberately different questions: what
+        // counts as a keyspace lookup is about what an operator is told, and
+        // what refreshes the stamp is about what eviction may take.
+        Command::StrLen { key } => {
+            dict.touch(key);
+            Reply::Integer(value_len(dict, key))
+        }
 
         Command::FlushDb => flush_db(dict, log, seq, shard),
 
@@ -2407,6 +2454,89 @@ pub fn parse_i64(bytes: &[u8]) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every `Command` variant's tag is inside the arrays indexed by it, and
+    /// the tags are `1..=KIND_MAX` with none missing and none shared.
+    ///
+    /// Two mechanisms, because they fail for different reasons. The `match`
+    /// below has no wildcard, so **adding a variant** to `Command` stops this
+    /// file compiling — which is the moment to decide the new tag rather than
+    /// the moment traffic reaches it. The assertion on the tags themselves
+    /// catches the rest: a tag reused, a tag skipped, or `KIND_MAX` moved
+    /// without the arrays following, any of which would index past
+    /// `KIND_SLOTS` inside a spawned executor and read as a shard that died.
+    #[test]
+    fn every_kind_tag_is_contiguous_and_bounded() {
+        let every = [
+            Command::Get { key: Vec::new() },
+            Command::Set {
+                key: Vec::new(),
+                value: Vec::new(),
+                expiry: None,
+                cond: None,
+                keep_ttl: false,
+                get: false,
+            },
+            Command::Del { key: Vec::new() },
+            Command::IncrBy {
+                key: Vec::new(),
+                delta: 1,
+            },
+            Command::Expire {
+                key: Vec::new(),
+                seconds: 1,
+            },
+            Command::Ttl { key: Vec::new() },
+            Command::Exists { key: Vec::new() },
+            Command::FlushDb,
+            Command::DbSize,
+            Command::ScanStep {
+                cursor: 0,
+                count: 1,
+                pattern: None,
+            },
+            Command::PExpire {
+                key: Vec::new(),
+                millis: 1,
+            },
+            Command::Persist { key: Vec::new() },
+            Command::Type { key: Vec::new() },
+            Command::StrLen { key: Vec::new() },
+            Command::Stats,
+        ];
+        for cmd in &every {
+            // No wildcard: a new variant fails to compile here.
+            match cmd {
+                Command::Get { .. }
+                | Command::Set { .. }
+                | Command::Del { .. }
+                | Command::IncrBy { .. }
+                | Command::Expire { .. }
+                | Command::Ttl { .. }
+                | Command::Exists { .. }
+                | Command::FlushDb
+                | Command::DbSize
+                | Command::ScanStep { .. }
+                | Command::PExpire { .. }
+                | Command::Persist { .. }
+                | Command::Type { .. }
+                | Command::StrLen { .. }
+                | Command::Stats => {}
+            }
+        }
+        let mut tags: Vec<u8> = every.iter().map(Command::kind).collect();
+        tags.sort_unstable();
+        assert_eq!(
+            tags,
+            (1..=Command::KIND_MAX).collect::<Vec<u8>>(),
+            "the tags are not 1..=KIND_MAX with none missing and none shared"
+        );
+        assert_eq!(
+            KIND_SLOTS,
+            usize::from(Command::KIND_MAX) + 1,
+            "a per-kind array would not hold every tag"
+        );
+    }
     use super::*;
     use std::sync::Mutex;
     use tokio::time::Instant;

@@ -299,8 +299,17 @@ impl Dict {
         }
     }
 
-    /// The least recently touched of up to `samples` live entries met by
+    /// The least recently touched of up to `samples` *stored* entries met by
     /// walking from `cursor`, or `None` if the dict is empty.
+    ///
+    /// **Stored, not live.** This dict holds no clock and the walk is handed
+    /// none, so an entry whose deadline has passed and which nothing has
+    /// reclaimed yet is met, counted against `samples`, and may be returned as
+    /// the victim. That is harmless where this is called from — a key that was
+    /// going to be reclaimed anyway is a good one to take, and taking it frees
+    /// the bytes the caller was asking for — but it means `samples` bounds the
+    /// entries *examined* rather than the live candidates considered, and on a
+    /// keyspace thick with expired keys the two numbers are far apart.
     ///
     /// A walk rather than a random draw: the walk order is a function of the
     /// seed and the cursor, so an eviction replays, and the cursor the caller

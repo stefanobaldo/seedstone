@@ -68,7 +68,7 @@ pub use auth::{AUTH_NOT_CONFIGURED, NOAUTH, NOAUTH_HELLO, Secret, WRONGPASS};
 use seedstone_core::glob;
 use seedstone_core::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use seedstone_core::shard::{
-    Command, Cond, Expiry, Reply, ReplyError, Router, ShardStats, parse_i64,
+    Command, Cond, Expiry, KIND_SLOTS, Reply, ReplyError, Router, ShardStats, parse_i64,
 };
 use seedstone_resp::{Decoder, DecoderLimits, Frame, ParseError, encode};
 use std::future::{Future, poll_fn};
@@ -451,10 +451,21 @@ pub const RUN_ID_HEX: usize = 40;
 /// `ScanStep` is `scan` because that is the command a peer sends to produce
 /// one. A `KEYS` walk also runs steps, and is counted separately in
 /// [`EDGE_NAMES`] as the one request it was.
-const KIND_NAMES: [&str; 16] = [
+///
+/// Sized from [`KIND_SLOTS`] rather than from a literal, so a command added to
+/// the core does not leave this table one name short of the tags it is indexed
+/// by — the core's `every_kind_tag_is_contiguous_and_bounded` says which tags
+/// exist, and the assertion below says this table has a name for each.
+const KIND_NAMES: [&str; KIND_SLOTS] = [
     "", "get", "set", "del", "incrby", "expire", "ttl", "exists", "flushdb", "dbsize", "scan",
     "pexpire", "persist", "type", "strlen", "info",
 ];
+
+const _: () = assert!(
+    KIND_NAMES.len() == KIND_SLOTS,
+    "every command kind the core can tag needs a name here: commandstats \
+     indexes this table by the tag itself"
+);
 
 /// The commands this layer answers or splits itself, counted here because no
 /// shard can count them.
