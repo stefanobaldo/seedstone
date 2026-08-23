@@ -62,8 +62,10 @@
 //!   constants and the status texts.
 
 mod auth;
+mod walk;
 
 pub use auth::{AUTH_NOT_CONFIGURED, NOAUTH, NOAUTH_HELLO, Secret, WRONGPASS};
+use walk::{pack_cursor, unpack_cursor};
 
 use seedstone_core::glob;
 use seedstone_core::memory::{EvictionMode, MemoryGauge, MemoryLimit};
@@ -1591,38 +1593,6 @@ async fn keys<R: Router>(router: &R, pattern: Vec<u8>, ceiling: usize) -> Frame 
     all.sort_unstable();
     all.dedup();
     Frame::Array(all.into_iter().map(Frame::Bulk).collect())
-}
-
-/// How many low bits of a `SCAN` cursor belong to a shard's own cursor.
-///
-/// The remaining 16 carry the shard. A shard count is a `u16` everywhere it
-/// matters, and a dict's cursor is masked to its table size — 2^48 buckets is
-/// a table this implementation cannot reach — so neither half is cramped.
-const CURSOR_INTERNAL_BITS: u32 = 48;
-
-/// The low [`CURSOR_INTERNAL_BITS`] of a cursor: the part a shard issued.
-const CURSOR_INTERNAL_MASK: u64 = (1 << CURSOR_INTERNAL_BITS) - 1;
-
-/// Packs a shard and its own cursor into the one integer `SCAN` exchanges.
-///
-/// `0` is both "start the walk" and "the walk is over", which is what makes a
-/// multi-shard walk expressible in a client that knows nothing about shards:
-/// shard 0 begins at 0, and a shard that finishes hands back the next shard's
-/// start, which is non-zero for every shard but the first. Only the last
-/// shard's completion produces 0 again.
-fn pack_cursor(shard: u16, internal: u64) -> u64 {
-    (u64::from(shard) << CURSOR_INTERNAL_BITS) | (internal & CURSOR_INTERNAL_MASK)
-}
-
-/// Splits a cursor a client handed back. Total: every `u64` is some pair.
-///
-/// Nothing here rejects anything. A cursor is peer-supplied, so the shard it
-/// names may not exist — that is the dispatch path's refusal to make, and it
-/// needs the shard count, which the packing deliberately does not know.
-fn unpack_cursor(cursor: u64) -> (u16, u64) {
-    let shard = u16::try_from(cursor >> CURSOR_INTERNAL_BITS)
-        .expect("shifting 48 of 64 bits out leaves 16, which is a u16");
-    (shard, cursor & CURSOR_INTERNAL_MASK)
 }
 
 /// One `SCAN` call: one shard, one step, and the cursor the client resumes at.
@@ -3285,6 +3255,7 @@ fn wrong_arity(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::walk::CURSOR_INTERNAL_BITS;
     use seedstone_core::dict::DictSeed;
     use seedstone_core::memory::{EvictionMode, MemoryLimit};
     use seedstone_core::shard::{NoTrace, ShardPool};
@@ -4273,28 +4244,6 @@ mod tests {
             64,
             "every key must survive a ceiling nothing can reach"
         );
-    }
-
-    /// The cursor packing's three claims, at the edges where a bit-shift is
-    /// wrong if it is wrong anywhere.
-    #[test]
-    fn a_packed_cursor_round_trips_at_every_edge() {
-        let internals = [
-            0u64,
-            1,
-            (1 << CURSOR_INTERNAL_BITS) - 1,
-            1 << (CURSOR_INTERNAL_BITS - 1),
-        ];
-        for shard in [0u16, 1, 255, u16::MAX] {
-            for internal in internals {
-                let packed = pack_cursor(shard, internal);
-                assert_eq!(
-                    unpack_cursor(packed),
-                    (shard, internal),
-                    "shard {shard} internal {internal:#x}"
-                );
-            }
-        }
     }
 
     #[test]
