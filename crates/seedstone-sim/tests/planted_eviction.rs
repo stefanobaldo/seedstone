@@ -74,14 +74,24 @@ fn a_node_that_never_reclaims_is_caught_by_the_ceiling_check() {
             outcome.evicted_keys, 0,
             "seed {seed}: this plant evicts nothing: {outcome:?}"
         );
+        // Every counter this plant does *not* own, and not a subset of them:
+        // the test's claim is that the ceiling check catches it and nothing
+        // else does, so a counter left out of this tuple is a counter the
+        // claim was never made about. A node that never reclaims takes no
+        // key, so nothing vanishes for the plain model or either walk to
+        // notice — which is what makes the silence meaningful rather than
+        // tolerated.
         assert_eq!(
             (
                 outcome.stale_reads,
                 outcome.spurious_deaths,
+                outcome.plain_mismatches,
+                outcome.walk_mismatches,
                 outcome.expected_sum == outcome.actual_sum
             ),
-            (0, 0, true),
-            "seed {seed}: not an expiry failure nor a lost update: {outcome:?}"
+            (0, 0, 0, 0, true),
+            "seed {seed}: not an expiry failure, a lost update, a plain \
+             mismatch nor a walk mismatch: {outcome:?}"
         );
     }
 }
