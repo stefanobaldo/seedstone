@@ -40,6 +40,12 @@ SemVer and are `0.x` until the server persists data;
   refused with an error naming `SCAN` as what to use instead, rather than
   returning a reply that would cost the server more than the client asked
   for.
+- `INFO commandstats` reports `usec` and `usec_per_call` beside `calls`, in
+  Redis's field order. Each command is timed where it is counted: at the
+  executor for the commands a shard runs, and at the edge for the requests no
+  shard sees whole — where the reading spans the wait for the shards the
+  request reached, and so measures what the request took rather than what it
+  cost.
 
 ### Changed
 

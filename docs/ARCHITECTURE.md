@@ -247,9 +247,11 @@ the refusal. Under `allkeys-lru` the crossing is reclaimed immediately and the
 figure is back under before the reply goes out; under `noeviction` the node
 sits marginally over its ceiling until something is deleted or expires.
 
-**The slow log and the latency monitor are disabled, by construction.** Nothing
-here times a handler, so there is no threshold at which a command would be
-recorded and no sample a reading could be drawn from. `SLOWLOG GET` is empty,
+**The slow log and the latency monitor are disabled, by construction.** The
+server times commands, but it keeps totals rather than samples: there is no
+record of what any individual command cost, so there is no threshold at which
+one would be recorded and no sample a reading could be drawn from. `SLOWLOG
+GET` is empty,
 `LATENCY LATEST` is empty, and `CONFIG GET` reports
 `slowlog-log-slower-than -1` and `latency-monitor-threshold 0` — which is what
 Redis itself reports with both monitors off, so the readings and the
@@ -262,19 +264,33 @@ server has no reading for, the `HELP` texts beside them, any other spelling a
 client tries — is refused as an unknown subcommand rather than given a
 sentence nobody measured.
 
-The same absence of timing shapes `commandstats`, which carries call counts and
-no `usec` fields; a zero there would be a measurement this server does not take,
-printed as if it did. Per-command timing is a measurement campaign's to add,
-with a cost stated, not a field to fill in. **That omission costs a metric, and
-the cost is taken deliberately.** The exporter this project is gated on parses
-a `cmdstat_` line by position: it drops one carrying fewer than three
-comma-separated fields, and otherwise reads whatever sits in the second field
-as microseconds, whatever that field is named. A line of `calls=N` alone is
-therefore dropped and no per-command metric is published at all. Padding it
-would publish a duration derived from a number that is not one — the same
-fabrication moved from this server's output into the monitoring system, where
-it is harder to see. The family is given up instead, and the lane asserts the
-duration metric is absent so that a later change cannot quietly buy it back.
+`commandstats` is where those totals are published: `calls`, `usec` and
+`usec_per_call` per command name, in Redis's field order. The measurement is
+one clock reading per command at the executor, differenced against the reading
+before it — the envelope's own for the first command of a batch — so a batch of
+`n` commands is timed with `n` readings, and what each figure covers is the
+handler plus the memory accounting and any eviction the command caused. The
+requests no shard sees whole — an `MGET`, a `KEYS`, an `INFO` — are timed at
+the edge where they are counted, and that reading is a different quantity: it
+spans the wait for every shard the request reached, so it is what the request
+took rather than what it cost. The per-call figure is the quotient of the two
+totals beside it, not an average of per-shard averages.
+
+**Under a simulated runtime the figure is exactly zero, and that is why it is
+outside the deterministic fold.** A handler cannot `await`, so no simulated
+instant passes inside one; a test holds the runtime to that, and the fold
+refuses the field by construction, so a replay never depends on a wall clock. A
+change that started advancing the clock inside a handler fails that test rather
+than moving recorded hashes.
+
+**The field order is a contract rather than a presentation choice.** The
+exporter this project is gated on parses a `cmdstat_` line by position: it drops
+one carrying fewer than three comma-separated fields, and otherwise reads
+whatever sits in the second field as microseconds, whatever that field is named.
+Printing the three fields Redis prints in Redis's order is what makes the
+per-command metric family appear at all, and the exporter lane names both
+metrics it earns so that a reordering is caught here rather than in somebody's
+dashboard.
 
 **A handler's refusal is not what an unauthenticated peer is told.** Every
 command's own error — a bad protocol version, a syntax error, a wrong number of
