@@ -311,9 +311,13 @@ true.
   rejected — a rule nobody can see failing is a rule that has already stopped
   working.
 - **The simulation sweep runs on every change that touches code**, replaying a
-  range of seeds. A companion self-test plants a genuine lost-update race and
-  requires the sweep to find it and a second process to replay it byte for
-  byte; the expiration invariants are held to the same standard, each watched
+  range of seeds. Reproducibility across a process boundary is a claim of its
+  own, made where the sweep's detection power is: the swept shape, the shape
+  with a ceiling and the one carrying the race each run once here and twice in
+  fresh processes, and all three lines must match — including the hash the
+  in-process run computed, since two subprocesses agree by construction. A
+  companion self-test plants a genuine lost-update race and requires the sweep
+  to find it; the expiration invariants are held to the same standard, each watched
   failing against a deliberately broken server before being trusted. So is the
   walk's cursor — against a keyspace narrow and deep enough for a cursor to be
   caught between steps, which the swept shape deliberately is not, and the
