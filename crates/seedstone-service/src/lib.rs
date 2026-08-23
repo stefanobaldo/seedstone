@@ -2176,7 +2176,12 @@ fn action_for(frame: Frame, node: &NodeInfo) -> Result<Action, String> {
     // A command that travels is counted by the shard that runs it, so the
     // search below is reached only by the ones answered or split here —
     // which keeps it off the path `GET` and `SET` take. A refusal the handler
-    // returned is not counted at all: it never became a command.
+    // returned is not counted at all: it never became an action.
+    //
+    // A refusal the *gate* returns is counted, though, because the gate runs
+    // after this: on a node with a password, a `PING` answered `NOAUTH` lands
+    // in the count below. See [`commandstats_section`], which states what that
+    // makes the figure mean.
     if !matches!(action, Action::Dispatch(_))
         && let Some(index) = EDGE_NAMES
             .iter()
@@ -2418,8 +2423,14 @@ fn latency(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
     Err(unknown_subcommand("LATENCY", sub))
 }
 
-/// The unknown-subcommand message, byte-exact to Redis down to the full stop
-/// and the pointer at the help text clients print back to their users.
+/// The unknown-subcommand message: Redis's shape, and not Redis's bytes.
+///
+/// Redis writes `Unknown subcommand or wrong number of arguments for '<sub>'.
+/// Try <CMD> HELP.`; this says only the first of those two things, and says it
+/// in lower case. What it keeps is the part a client acts on and prints back
+/// to its user: the `ERR` prefix, the quoted subcommand, the full stop, and
+/// the pointer at the help text. The exact text is pinned by the tests of
+/// every command that reaches here.
 ///
 /// `container` is the containing command's own name, a literal from
 /// [`COMMANDS`]; the subcommand is peer-supplied, so it is quoted rather than
@@ -2603,7 +2614,18 @@ fn keyspace_section(stats: &ShardStats) -> String {
     text
 }
 
-/// How many of each command the node has run.
+/// How many of each command this node has accepted as one.
+///
+/// Accepted, not run, and the difference is worth stating because Redis's
+/// `calls` means the second: a command is counted where it is decoded, which
+/// is before the authentication gate, so on a node with a password the `PING`,
+/// `INFO`, `CONFIG` and the rest that were answered `NOAUTH` are counted here.
+/// Redis puts a rejection that never executed in `rejected_calls`, which this
+/// section does not carry. Only the commands this layer answers itself are
+/// affected: a keyed command refused at the gate never reaches a shard, and no
+/// shard counts what it never ran. A command whose own handler refused it —
+/// bad arity, an argument it could not read — is not counted either way; it
+/// never became an action.
 ///
 /// **No `usec` and no `usec_per_call`.** Nothing here times a handler, and a
 /// zero in those fields would be a measurement this server does not take,
