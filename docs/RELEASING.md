@@ -30,8 +30,20 @@ not the first day the script runs.
 
 1. `CHANGELOG.md`: move the `[Unreleased]` entries under the new version and
    date; a candidate's entries stay under `[Unreleased]` until the final.
-2. `Cargo.toml`: set `version` — the binary reports it in `INFO` and
-   `HELLO`, so a tag and the version it carries must agree.
-3. `git tag -s vX.Y.Z -m "vX.Y.Z"` on `main`, `git push origin vX.Y.Z`.
-4. Watch the release workflow; the release appears with the archive and the
+2. `crates/seedstone/Cargo.toml`: set `version` to the tag without its `v`,
+   **verbatim, candidate suffix included** — `v0.1.0-rc.1` means
+   `version = "0.1.0-rc.1"`, not the `0.1.0` it is being cut toward. That
+   manifest and no other: the five crates carry independent versions, and this
+   is the one the binary reports in `INFO` and `HELLO`, and the one
+   `cargo pkgid -p seedstone` answers with — which is what the workflow
+   compares the tag against, character for character.
+3. `cargo build -p seedstone`, and commit the refreshed `Cargo.lock` together
+   with the manifest. The lock records the crate's own version too, and the
+   release job's first step is `cargo build --release -p seedstone --locked`,
+   which refuses to update a lock file that disagrees with the manifest. A
+   lock left behind therefore fails the release at its first step, with the
+   tag already pushed and no longer movable. (`cargo update -p seedstone
+   --precise X.Y.Z` does the same job if a build is not wanted.)
+4. `git tag -s vX.Y.Z -m "vX.Y.Z"` on `main`, `git push origin vX.Y.Z`.
+5. Watch the release workflow; the release appears with the archive and the
    checksum attached.
