@@ -591,9 +591,24 @@ pub enum Plant {
     /// what it fails at is *arriving*, which is what the walk's step bound is
     /// stated to catch.
     ///
-    /// Invisible to any walk that is not stepping bucket by bucket while its
-    /// shard's table grows, which is why it has a shape of its own rather than
-    /// a place in the swept one — see `tests/planted_walk.rs`.
+    /// **Nothing this harness runs catches it any more, and that is a change
+    /// to the walk rather than to this.** Observing it needs a cursor caught
+    /// *between* steps of a table growing under it, and what used to put it
+    /// there was a client `COUNT` of one meaning one bucket a call. A `SCAN`
+    /// call now spends a bucket ceiling of the server's own, which covers a
+    /// simulated shard's whole table several times over before it answers.
+    /// Bounding each envelope by the key target instead was tried and does not
+    /// bring it back: the *call* still loops until its target is met. The shape
+    /// that would observe it is a production-sized one — a table of millions of
+    /// buckets, where a call's ceiling is a rounding error against the width of
+    /// the walk — which is not a shape a simulator can afford.
+    ///
+    /// So the plant stays selectable, stays classified, and the claim it used
+    /// to carry end to end is made where one dict and no network can make it:
+    /// `an_upward_cursor_is_outrun_by_a_table_growing_under_it`, in
+    /// `crates/seedstone-core/src/dict.rs`. See
+    /// [`Plant::unobservable_on_swept_shapes`], which says so to anyone who
+    /// serves it.
     ScanMissesRehash,
     /// A node that reads its ceiling and never acts on it: the gauge climbs
     /// past `maxmemory` and nothing is ever reclaimed. Caught by
@@ -670,11 +685,17 @@ impl Plant {
             | Self::SweepEatsAll
             | Self::EvictsBelowCeiling => None,
             // Needs a cursor observed *between* steps of a table that is
-            // growing under it, and a swept shard holds about four keys, where
-            // one step covers the whole table — see this plant's own note.
-            Self::ScanMissesRehash => {
-                Some("SimConfig::narrow, walked by crates/seedstone-sim/tests/planted_walk.rs")
-            }
+            // growing under it, and no shape this harness can afford leaves one
+            // there: a call spends the server's whole bucket ceiling, which
+            // covers a simulated shard's table several times over. Not a
+            // narrower shape but a *deeper* one — so the place named is not a
+            // shape at all, it is the unit test at the dict where the same
+            // claim costs one table and no network. See this plant's own note.
+            Self::ScanMissesRehash => Some(
+                "an_upward_cursor_is_outrun_by_a_table_growing_under_it, in \
+                 crates/seedstone-core/src/dict.rs — no shape this harness \
+                 sweeps or walks can catch it end to end",
+            ),
             // A node that ignores a ceiling it does not have is a node
             // behaving honestly. The swept shapes set no `maxmemory`, so
             // nothing they do can tell this defect from the real thing.
@@ -3500,7 +3521,7 @@ mod tests {
                     let place =
                         place.expect("the swept shapes cannot observe an upward scan cursor");
                     assert!(
-                        place.contains("planted_walk.rs"),
+                        place.contains("dict.rs"),
                         "a reader sent somewhere must be sent to a file: {place}"
                     );
                 }
@@ -3517,14 +3538,15 @@ mod tests {
         // The place is a string, so nothing but this stops it outliving the
         // file it names — and a warning pointing at a path that is not there
         // is worse than no warning.
-        assert!(
-            std::path::Path::new(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/planted_walk.rs"
-            ))
-            .exists(),
-            "the place a plant points at no longer exists"
-        );
+        for path in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../seedstone-core/src/dict.rs"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/planted_eviction.rs"),
+        ] {
+            assert!(
+                std::path::Path::new(path).exists(),
+                "the place a plant points at no longer exists: {path}"
+            );
+        }
     }
 
     /// Which plants a sweep's violation count is evidence about, pinned as a
