@@ -90,12 +90,28 @@ pub struct MemoryLimit {
 
 impl MemoryLimit {
     /// Whether `used` is past the ceiling. `false` with no ceiling.
-    ///
-    /// Strictly past, as Redis compares it: a node holding exactly
-    /// `maxmemory` bytes is at its ceiling and not over it.
     #[must_use]
-    pub fn exceeded(self, used: u64) -> bool {
-        self.ceiling.is_some_and(|ceiling| used > ceiling)
+    pub const fn exceeded(self, used: u64) -> bool {
+        past_ceiling(used, self.ceiling)
+    }
+}
+
+/// Whether `used` is past `ceiling`. `false` with no ceiling.
+///
+/// Strictly past, as Redis compares it: a node holding exactly `maxmemory`
+/// bytes is at its ceiling and not over it.
+///
+/// A free function because two callers ask the question from different
+/// vocabularies — [`MemoryLimit::exceeded`] from the whole limit, and the
+/// shard's `EvictionPolicy` from a bare `Option<u64>` it is handed — and the
+/// comparison is the one place a `>` could quietly become a `>=` in one of
+/// them. `noeviction` refuses a write and `allkeys-lru` reclaims for it at
+/// exactly the same byte either way.
+#[must_use]
+pub const fn past_ceiling(used: u64, ceiling: Option<u64>) -> bool {
+    match ceiling {
+        Some(ceiling) => used > ceiling,
+        None => false,
     }
 }
 
