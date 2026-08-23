@@ -69,7 +69,8 @@ pub const MAX_CLIENTS_REACHED: &str = "ERR max number of clients reached";
 /// takes is a binary someone has to read the source of.
 pub const USAGE: &str = "usage: seedstone [--bind ADDR:PORT] [--max-clients N] [--maxmemory SIZE] \
                      [--maxmemory-policy allkeys-lru|noeviction] [--requirepass-file PATH] \
-                     [--no-auth]\nenv: SEEDSTONE_REQUIREPASS";
+                     [--no-auth]\n       seedstone --version | --help\n\
+                     env: SEEDSTONE_REQUIREPASS";
 
 /// The environment variable the password may arrive in instead of a file.
 ///
