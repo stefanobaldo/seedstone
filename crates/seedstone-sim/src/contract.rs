@@ -176,7 +176,7 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
     (
         b"INFO",
         Coverage::Emitted {
-            forms: &[FORM_INFO_MEMORY, FORM_INFO_STATS],
+            forms: &[FORM_INFO_MEMORY, FORM_INFO_STATS_COMMANDSTATS],
         },
     ),
     (
@@ -281,11 +281,17 @@ pub(crate) const FORM_SCAN_MATCH_COUNT: &str = "SCAN cursor MATCH pattern COUNT 
 // Emitted only by the eviction shape, which is the one that has an invariant
 // over this document's body. Everywhere else `INFO` is what it always was —
 // node identity and counters no client model can predict — and the shape that
-// reads it reads exactly the two numbers it can hold the server to:
-// `used_memory` against the ceiling, and `evicted_keys` against what the
-// clients saw go missing.
+// reads it reads exactly the three numbers it can hold the server to:
+// `used_memory` against the ceiling, `evicted_keys` against what the clients
+// saw go missing, and the shards' `usec` against the zero a clock that does
+// not move inside a handler owes it.
 pub(crate) const FORM_INFO_MEMORY: &str = "INFO memory";
-pub(crate) const FORM_INFO_STATS: &str = "INFO stats";
+// Two sections in one request, which is what the verifier sends: an `INFO`
+// builds both from a single broadcast, so asking for them together costs the
+// shape's trace nothing, and a second request would cost it a command per
+// shard. The third figure it reads is `usec`, held to the zero a paused clock
+// owes it — see `SimOutcome::executor_usec`.
+pub(crate) const FORM_INFO_STATS_COMMANDSTATS: &str = "INFO stats commandstats";
 
 /// Every form the contract claims the client emits.
 ///
