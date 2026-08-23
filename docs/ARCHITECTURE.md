@@ -126,9 +126,10 @@ Authentication is per-connection state in that same layer: one flag, and a gate
 a decoded command passes before the router ever sees it — so a peer that has
 not authenticated moves no key and learns nothing about the keyspace, not even
 from how long a refusal took. Only the attempt itself, the handshake that can
-carry it, and the goodbye are let through, and which side of the gate a command
-falls on is decided exhaustively, so one added later does not compile until
-somebody has said which. The secret is not that layer's to find: it is a
+carry it — answered whether or not it does, which is a divergence from Redis
+and is stated below — and the goodbye are let through, and which side of the
+gate a command falls on is decided exhaustively, so one added later does not
+compile until somebody has said which. The secret is not that layer's to find: it is a
 dependency the composition root reads from a file or the environment and hands
 down, which is why a node configured without one starts every connection
 already through the gate, and why the simulated node is handed none at all.
@@ -265,6 +266,22 @@ would publish a duration derived from a number that is not one — the same
 fabrication moved from this server's output into the monitoring system, where
 it is harder to see. The family is given up instead, and the lane asserts the
 duration metric is absent so that a later change cannot quietly buy it back.
+
+**`HELLO` is answered before a connection has authenticated.** Redis refuses
+it on an unauthenticated connection and tells the client to use `HELLO <proto>
+AUTH <user> <pass>` instead, so that a password-protected node says nothing at
+all until the password has been given. Here the command is answered either
+way. The inline form has to be reachable before authentication whatever else
+is decided — it is how the ordinary client libraries authenticate — and a
+client that cannot ask which protocol it is speaking has nothing correct to
+say next. The cost is that a peer which has not authenticated can read the
+node's own description: the server name, its version, the protocol version,
+the deployment mode and the role. That is metadata about the process and not
+about the keyspace — no key, no count and no hint of either, since every other
+command is refused before the router is reached — but it is a divergence taken
+with its cost, not an oversight. An operator who needs a node to say nothing
+whatever before a password is given should keep the port off untrusted
+networks, which is where transport security belongs here anyway.
 
 **The surface is a named list, and anything outside it is refused.** A command
 this server does not implement is answered with an error naming it, rather than

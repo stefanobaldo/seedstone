@@ -672,15 +672,28 @@ enum Action {
     /// do by name.
     Authenticate(Result<Frame, Frame>),
     /// A `HELLO` that carried no `AUTH`: answered exactly as [`Reply`] is, and
-    /// let through unauthenticated.
+    /// let through unauthenticated. A variant of its own so [`gated`] can name
+    /// it, rather than a wildcard arm that would silently adopt the next
+    /// action added beside it.
     ///
-    /// Redis answers `HELLO` to a connection that has not authenticated — it
-    /// is how a client learns which protocol to speak before it can say
-    /// anything else — and the variant exists so [`gated`] can say that
-    /// without a wildcard arm that would silently adopt the next action added
-    /// beside it.
+    /// **A deliberate divergence.** Redis refuses `HELLO` on a connection that
+    /// has not authenticated, and points the client at the inline `HELLO
+    /// <proto> AUTH <user> <pass>` form instead. Here it is answered. `HELLO`
+    /// has to reach the unauthenticated side of the gate whatever else is
+    /// decided, because that inline form is how the mainstream client
+    /// libraries authenticate at all — it becomes [`Authenticate`], which
+    /// passes the same gate. What this variant adds is answering the
+    /// credential-less spelling too, so a client learns which protocol it is
+    /// speaking before it has to say anything in it.
+    ///
+    /// The cost, stated rather than left to be discovered: a peer that has not
+    /// authenticated can read everything [`hello_frame`] puts on the wire —
+    /// the server name, this node's version, the protocol version, the
+    /// deployment mode and the role. Metadata about the process, and nothing
+    /// about the keyspace.
     ///
     /// [`Reply`]: Action::Reply
+    /// [`Authenticate`]: Action::Authenticate
     Hello(Frame),
     /// Answer with this frame, then hang up.
     ReplyThenClose(Frame),
@@ -7103,9 +7116,10 @@ mod tests {
         assert_eq!(frames[3], Frame::Simple("PONG".into()));
     }
 
-    /// `HELLO` with no `AUTH` is let through unauthenticated, as Redis does:
-    /// it is how a client learns what it is talking to before it can say
-    /// anything else, and it authenticates nothing by itself.
+    /// `HELLO` with no `AUTH` is let through unauthenticated, where Redis
+    /// refuses it: it is how a client learns what it is talking to before it
+    /// can say anything else, and it authenticates nothing by itself. See
+    /// `Action::Hello` for the divergence and what answering it costs.
     #[tokio::test]
     async fn hello_without_auth_answers_but_does_not_authenticate() {
         let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
