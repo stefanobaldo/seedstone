@@ -99,9 +99,10 @@ make that reproducibility possible, and runs a self-test that plants six
 genuine defects inside the server itself: a lost-update race, two broken expiry
 decisions, a keyspace walk that outruns its own cursor, and two broken eviction
 decisions — a node that never reclaims, and one that reclaims what it should be
-keeping. Each has to be caught by the counter that owns it, and what the sweep
-runs has to replay byte for byte in a second process. CI then drives the
-release binary with `redis-cli`, `redis-benchmark`, redis-py and go-redis —
+keeping. Each has to be caught by the counter that owns it, and two of those
+runs — the one that catches the race, and one under a memory ceiling — have
+to replay byte for byte in a second process. CI then drives the release
+binary with `redis-cli`, `redis-benchmark`, redis-py and go-redis —
 every one of them but `redis-cli` against a server that requires a password,
 so the authenticated path is the one the gate exercises and the open one stays
 exercised too — and then points a third party's cache-backend test suite at

@@ -2621,11 +2621,15 @@ fn keyspace_section(stats: &ShardStats) -> String {
 /// is before the authentication gate, so on a node with a password the `PING`,
 /// `INFO`, `CONFIG` and the rest that were answered `NOAUTH` are counted here.
 /// Redis puts a rejection that never executed in `rejected_calls`, which this
-/// section does not carry. Only the commands this layer answers itself are
-/// affected: a keyed command refused at the gate never reaches a shard, and no
-/// shard counts what it never ran. A command whose own handler refused it —
-/// bad arity, an argument it could not read — is not counted either way; it
-/// never became an action.
+/// section does not carry. Which commands can be inflated that way is decided
+/// by [`EDGE_NAMES`], not by whether a command names a key: an `MGET` and a
+/// `KEYS` are counted here too — [`per_key`] makes the first an [`Unbatched`]
+/// rather than a dispatch, and the second is one by construction — so a
+/// `NOAUTH` inflates them as readily as it inflates a `PING`, without either
+/// reaching a shard. What cannot be inflated is what only a shard counts: a
+/// `GET` refused at the gate never reaches one, and no shard counts what it
+/// never ran. A command whose own handler refused it — bad arity, an argument
+/// it could not read — is not counted either way; it never became an action.
 ///
 /// **No `usec` and no `usec_per_call`.** Nothing here times a handler, and a
 /// zero in those fields would be a measurement this server does not take,

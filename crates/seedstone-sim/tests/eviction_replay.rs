@@ -8,7 +8,7 @@
 //! reclaims is decided against the node's used-memory figure, a word every
 //! executor keeps current, so what a run evicts depends on what that word said
 //! at the moment it was read. The second is the reply the verifier's `INFO
-//! stats` produces — the widest thing the trace hash folds, twenty-one
+//! stats` produces — the widest thing the trace hash folds, twenty-two
 //! counters including each shard's hits, misses and expirations — which no
 //! other shape asks for.
 //!
