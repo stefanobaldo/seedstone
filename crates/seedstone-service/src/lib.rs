@@ -1509,6 +1509,14 @@ enum WalkStop {
 /// What it no longer does is stop the server for its duration, which is the
 /// difference worth having and not the same thing as being cheap.
 ///
+/// **It does not use [`scan`]'s crossing, and it should not — reviewed, and
+/// left.** Crossing exists to spend fewer *round trips*, and a round trip is
+/// what a client pays over a network. Here every step is an envelope inside
+/// one process, and the shards are walked concurrently rather than one after
+/// another, so a crossing would trade the concurrency for a sequence and buy
+/// nothing back. Said here so the next reader sees a decision rather than an
+/// oversight.
+///
 /// **What is accumulated is bounded.** The key bytes every walk gathers are
 /// counted into one shared total as they arrive, and the first walk to see
 /// that total past `ceiling` — [`KEYS_REPLY_BYTES`] on the server's own path —
