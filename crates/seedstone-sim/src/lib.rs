@@ -1717,9 +1717,10 @@ const WALK_KEYS: u32 = 8;
 
 /// The `COUNT` the verifier's `SCAN` asks for on the steps that carry one.
 ///
-/// Below the ceiling the server clamps to, so the number on the wire is the
-/// number the server uses — a `COUNT` above the clamp would exercise the clamp
-/// instead of the option.
+/// A key target, which is what `COUNT` is: the server gathers up to this many
+/// keys per call, across as many shards as its own bucket ceiling allows. The
+/// number is small enough that a verifier's cycle takes several calls on the
+/// shapes swept here, which is what puts a cursor on the wire at all.
 const WALK_SCAN_COUNT: usize = 32;
 
 /// How many fresh keys a client writes into its own walk family between two
@@ -1758,12 +1759,14 @@ const WALK_PREFIX_STEPS: u64 = 2;
 
 /// The `COUNT` a client's own walk asks for, on the clients that send one.
 ///
-/// One bucket, the smallest a step can be, and that is the point: a step
-/// large enough to finish a shard's table hands back cursor `0` and there is
-/// no walk in flight for anything to happen underneath. Half the clients send
-/// no `COUNT` at all — see [`Model::walk`] — so both parse paths are on the
-/// wire in every run, and the half that names one is the half whose cursor
-/// spends time between shards.
+/// One key, the smallest target a call can carry, so a call ends at the first
+/// key it finds rather than at the end of the budget — the shortest step this
+/// client can take, and the one that leaves a cursor in flight for the most
+/// of a run. It used to be one *bucket*, back when the server read `COUNT` as
+/// an occupancy number; it is a key target now, and a call that finds nothing
+/// matching still spends the server's whole bucket ceiling looking. Half the
+/// clients send no `COUNT` at all — see [`Model::walk`] — so both parse paths
+/// are on the wire in every run.
 const WALK_STEP_COUNT: usize = 1;
 
 /// How many steps a cycle-completing walk is allowed before the harness calls
@@ -1774,16 +1777,16 @@ const WALK_STEP_COUNT: usize = 1;
 /// could never be exceeded. What the honest cursor promises under growth is
 /// not a step count but *convergence* — a doubling halves the size of every
 /// later step instead of doubling the number of steps left — so the number of
-/// steps it needs is bounded even while the table is not. Measured across six
-/// seeds of the shape that drives a cycle: 151 to 217 steps, a tight enough
-/// cluster that five times the widest of them is room a converging cursor
-/// cannot use and a cursor that has stopped converging reaches on every seed.
+/// steps it needs is bounded even while the table is not.
 ///
-/// That range is one client's cycle, and it is the half of them that names a
-/// [`WALK_STEP_COUNT`] of one — a bucket at a time, which is the only rate at
-/// which a cursor can be caught between steps. The half that names no `COUNT`
-/// takes the server's default and finishes the same cycle in a handful of
-/// steps, so it is not what the bound is sized for.
+/// **The figures this was sized against are stale and the bound is not yet
+/// re-derived.** They were measured when a `COUNT` of one meant one bucket a
+/// step: 151 to 217 steps across six seeds of the shape that drives a cycle,
+/// with five times the widest of them the room a converging cursor cannot
+/// use. A call now crosses shards and spends a bucket ceiling of the server's
+/// own, so a cycle takes far fewer steps than that and the bound is loose
+/// rather than wrong. Re-measuring it is the walk's remaining simulator
+/// work.
 const WALK_CYCLE_STEP_BOUND: u64 = 1024;
 
 /// Where the counter family's share of a hundred rolls ends and the plain
