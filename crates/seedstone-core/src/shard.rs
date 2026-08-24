@@ -1748,19 +1748,18 @@ fn evict_until_fits<T: TraceSink, L: ReplicationLog, P: EvictionPolicy>(
     spared: Option<&[u8]>,
 ) {
     while policy.must_evict(memory.gauge.used(), memory.limit.ceiling) {
-        let Some(victim) = state
-            .dict
-            .sample_oldest(&mut state.evict_cursor, EVICTION_SAMPLES)
+        // `spared` goes to the sampler rather than being checked against
+        // what comes back: a sample that met the spared key and rejected it
+        // afterwards would answer `None` — the shard saying it has nothing to
+        // give — from a shard with plenty left. Excluded there, `None` keeps
+        // meaning what the empty case above means, and stopping stays right.
+        let Some(victim) =
+            state
+                .dict
+                .sample_oldest(&mut state.evict_cursor, EVICTION_SAMPLES, spared)
         else {
             return;
         };
-        // The sample offers the key just written only when it is the only
-        // one it met, since the write stamped it as the newest there is. So
-        // this is the shard saying it has nothing else to give, and stopping
-        // is the same answer the empty case above gives.
-        if spared == Some(victim.as_slice()) {
-            return;
-        }
         let at = state.seq;
         if append(&mut state.log, &mut state.seq, shard).is_err() {
             return;
@@ -3576,6 +3575,70 @@ mod tests {
             "OOM command not allowed when used memory > 'maxmemory'."
         );
         assert_eq!(evicted(&pool).await, 0);
+    }
+
+    /// A shard past the ceiling still gives up a key when the command that
+    /// took it there addressed the oldest one in the sample.
+    ///
+    /// `TTL` is `Route::Key` and never stamps, so the key it addresses keeps
+    /// whatever stamp it already had — which may be the oldest the sample
+    /// meets. Sparing that key has to exclude it from candidacy rather than
+    /// abandon the loop: `None` from the sampler means "this shard has nothing
+    /// to give", and a shard holding two other keys is not saying that.
+    ///
+    /// Reached through `evict_until_fits` directly rather than through the
+    /// pool, because the state it needs cannot be built out of commands: a
+    /// write stamps its own key newest, so the only way the spared key is also
+    /// the oldest is a shard already over a ceiling somebody else's bytes
+    /// pushed it past.
+    #[test]
+    fn a_command_that_does_not_stamp_still_evicts_past_the_ceiling() {
+        let mut state = ShardState::new(Dict::with_seed(DictSeed { k0: 3, k1: 5 }), NoopLog);
+        // Stamped in this order, so `spared` is the oldest of the three and
+        // the sample — which meets all of them, being smaller than
+        // `EVICTION_SAMPLES` — offers it first.
+        for key in [b"spared".as_slice(), b"middle", b"newest"] {
+            state.dict.insert(
+                key.to_vec(),
+                Entry {
+                    value: vec![0u8; 64],
+                    expires_at: None,
+                    touched: 0,
+                },
+            );
+            state.dict.touch(key);
+        }
+        let used = state.dict.used_bytes();
+        let memory = Memory {
+            gauge: MemoryGauge::default(),
+            limit: MemoryLimit {
+                // One key under what the shard is holding, so one eviction is
+                // enough to get back under and the loop has an end.
+                ceiling: Some(used - 1),
+                mode: EvictionMode::AllKeysLru,
+            },
+        };
+        memory.gauge.apply(0, used);
+
+        evict_until_fits(
+            &mut state,
+            0,
+            &memory,
+            &NoTrace,
+            &Deadlines,
+            Some(b"spared"),
+        );
+
+        assert_eq!(
+            state.dict.len(),
+            2,
+            "the loop abandoned a shard that still had room to make"
+        );
+        assert_eq!(state.evicted, 1);
+        assert!(
+            state.dict.get(b"spared").is_some(),
+            "the spared key was evicted"
+        );
     }
 
     /// A write that cannot fit even on an empty shard stops at empty rather
