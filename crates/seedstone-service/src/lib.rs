@@ -2553,34 +2553,53 @@ fn unknown_subcommand(container: &str, sub: &[u8]) -> String {
     )
 }
 
-/// The `INFO` arguments that name no section but the whole document.
+/// The `INFO` arguments that name no section but every section there is.
 ///
-/// Redis takes all three where a section name goes and answers each with a
-/// whole document rather than one section, and `all` is the spelling operators
-/// and metrics exporters reach for — treating it as an ordinary section name
-/// would answer the most common form of the command with nothing at all.
+/// Redis takes both where a section name goes and answers each with a whole
+/// document rather than one section, and `all` is the spelling operators and
+/// metrics exporters reach for — treating it as an ordinary section name would
+/// answer the most common form of the command with nothing at all.
 ///
-/// The three are not interchangeable there: Redis's `default` omits
-/// `# Commandstats` and `# Latencystats`, which `all` and `everything` both
-/// carry. They collapse to one behaviour *here* only because the two sections
-/// this server prints are in Redis's default set, leaving the distinction
-/// nothing to select. A section added outside that set would have to honour it.
+/// `default` is deliberately not one of them; it names the smaller document,
+/// and what it leaves out is [`INFO_OUTSIDE_DEFAULT`].
 ///
-/// Measured against Redis 8.10.0: each of the three answers a document of the
-/// same order of size as the unargumented `INFO`, and one of them anywhere in
-/// the argument list wins over the section names beside it — `INFO all nosuch`
-/// is the whole document while `INFO nosuch server` is the server section
-/// alone.
-const INFO_WHOLE_DOCUMENT: [&[u8]; 3] = [b"all", b"default", b"everything"];
+/// Measured against Redis 8.10.0: each answers a document of the same order of
+/// size as the unargumented `INFO`, and one of them anywhere in the argument
+/// list covers the section names beside it — `INFO all nosuch` is the whole
+/// document while `INFO nosuch server` is the server section alone.
+const INFO_EVERY_SECTION: [&[u8]; 2] = [b"all", b"everything"];
+
+/// The sections this server prints that Redis's `default` document leaves out.
+///
+/// Redis serves `# Commandstats` and `# Latencystats` for `all` and
+/// `everything` and omits both from `default` — and from an argumentless
+/// `INFO`, which is `default` under another spelling. This server prints one
+/// of the two, so the list has one entry.
+///
+/// **A section added outside Redis's default set belongs here.** That
+/// obligation used to be a sentence in a comment, and the sentence was written
+/// while the two sections this server printed were both inside the set,
+/// leaving the distinction nothing to select. `# Commandstats` was then added
+/// and the sentence did not survive it. A named list is what the next such
+/// section has to be added to, rather than a claim that has to be reread.
+const INFO_OUTSIDE_DEFAULT: [&[u8]; 1] = [b"commandstats"];
 
 /// Renders the `INFO` sections a peer asked for, or all of them if it named
 /// none.
 ///
 /// A section name nobody recognises contributes nothing rather than being an
 /// error — `INFO nosuch` is an empty bulk, which is how Redis answers one and
-/// leaves the client to notice that the field it wanted is absent. The three
-/// names in [`INFO_WHOLE_DOCUMENT`] are the exception: they ask for no section
-/// in particular and get everything.
+/// leaves the client to notice that the field it wanted is absent. The names
+/// in [`INFO_EVERY_SECTION`] are the exception: they ask for no section in
+/// particular and get all of them.
+///
+/// **The argument list is a union, not a filter.** `all` and `everything` add
+/// every section, `default` — and an empty list, which Redis reads as
+/// `default` — adds the sections in [Redis's default
+/// set](INFO_OUTSIDE_DEFAULT), and a section named outright adds itself
+/// whatever else stands beside it. So `INFO default commandstats` carries both
+/// halves, and a whole-document name beats the section names beside it by
+/// covering them rather than by discarding them.
 ///
 /// **The field names are Redis's own, `redis_` prefix and all.** `INFO`'s
 /// contract is its field names: everything that reads this output looks up
@@ -2593,17 +2612,13 @@ const INFO_WHOLE_DOCUMENT: [&[u8]; 3] = [b"all", b"default", b"everything"];
 async fn info<R: Router>(router: &R, node: &NodeInfo, wanted: &[Vec<u8>]) -> String {
     use std::fmt::Write as _;
 
-    // One of the whole-document names anywhere in the list drops the filter
-    // entirely, which is how Redis resolves them against the section names
-    // beside them.
-    let unfiltered = wanted.is_empty()
-        || wanted.iter().any(|name| {
-            INFO_WHOLE_DOCUMENT
-                .iter()
-                .any(|whole| name.eq_ignore_ascii_case(whole))
-        });
-    let asked_for =
-        |section: &[u8]| unfiltered || wanted.iter().any(|name| name.eq_ignore_ascii_case(section));
+    let named = |want: &[u8]| wanted.iter().any(|name| name.eq_ignore_ascii_case(want));
+    let every_section = INFO_EVERY_SECTION.iter().any(|whole| named(whole));
+    // An empty argument list is Redis's `default`, not its `all`.
+    let default_set = wanted.is_empty() || named(b"default");
+    let asked_for = |section: &[u8]| {
+        every_section || named(section) || (default_set && !INFO_OUTSIDE_DEFAULT.contains(&section))
+    };
     // Writing into a `String` cannot fail, so discarding the results is the
     // whole of what there is to do with them.
     let mut text = String::new();
@@ -3547,6 +3562,12 @@ mod tests {
     /// families from whatever it finds, so what has to hold is that a single
     /// `INFO` carries all of it at once — a section that is right on its own
     /// and missing from the whole is a metric family that never appears.
+    ///
+    /// `INFO all` rather than a bare `INFO`, because `# Commandstats` is
+    /// outside Redis's default document and an exporter that reads it against
+    /// a stock Redis must therefore be asking for the whole one. Sending the
+    /// bare form here would hold this server to a document Redis does not
+    /// answer, and would pass for a reason the exporter does not depend on.
     #[tokio::test]
     async fn info_reports_every_section_the_exporter_reads() {
         let pool = ShardPool::spawn(16, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
@@ -3561,7 +3582,7 @@ mod tests {
         encode(&req(&["SET", "c", "3", "EX", "600"]), &mut out);
         encode(&req(&["GET", "a"]), &mut out);
         encode(&req(&["GET", "nosuch"]), &mut out);
-        encode(&req(&["INFO"]), &mut out);
+        encode(&req(&["INFO", "all"]), &mut out);
         w.write_all(&out).await.unwrap();
         w.flush().await.unwrap();
         let frames = read_frames(&mut r, 6).await;
@@ -5778,6 +5799,72 @@ mod tests {
                     "INFO {name} must answer the whole document, and printed no {field}: {text:?}"
                 );
             }
+        }
+    }
+
+    /// `INFO` and `INFO default` answer Redis's default document, which does
+    /// not carry `# Commandstats`; `all` and `everything` do.
+    ///
+    /// The distinction is Redis's and it is the one an argumentless `INFO`
+    /// depends on: a bare `INFO` is `default` under another spelling, so the
+    /// section a client did not ask for is the one it must not receive. A
+    /// section named outright is served whatever else the list says, because
+    /// Redis resolves the list as a union rather than as a filter — which is
+    /// what makes `INFO default commandstats` a document with both halves.
+    #[tokio::test]
+    async fn info_default_leaves_out_the_sections_redis_leaves_out() {
+        let (mut r, mut w, _pool) = connected(4);
+        let mut out = Vec::new();
+        // A command first, so the section has a line in it as well as a
+        // header — the header alone would pass this test against a server
+        // that had stopped counting.
+        let requests: [&[&str]; 8] = [
+            &["SET", "a", "1"],
+            &["INFO"],
+            &["INFO", "default"],
+            &["INFO", "all"],
+            &["INFO", "everything"],
+            &["INFO", "commandstats"],
+            // Union, not filter: `default` names one set and `commandstats`
+            // adds itself to it.
+            &["INFO", "default", "commandstats"],
+            // And the default document is not empty of everything else.
+            &["INFO", "DEFAULT"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        for (i, name) in [(1, "INFO"), (2, "INFO default")] {
+            let text = bulk_text(&frames[i]);
+            assert!(
+                !text.contains("# Commandstats"),
+                "{name} carried a section Redis omits from its default document: {text:?}"
+            );
+        }
+        for (i, name) in [
+            (3, "INFO all"),
+            (4, "INFO everything"),
+            (5, "INFO commandstats"),
+            (6, "INFO default commandstats"),
+        ] {
+            let text = bulk_text(&frames[i]);
+            assert!(
+                text.contains("cmdstat_set:calls="),
+                "{name} must carry the per-command section: {text:?}"
+            );
+        }
+        // The default document keeps every section that *is* in Redis's
+        // default set, so this test cannot pass by answering nothing.
+        let default = bulk_text(&frames[7]);
+        for section in ["# Server", "# Clients", "# Memory", "# Stats", "# Keyspace"] {
+            assert!(
+                default.contains(section),
+                "INFO DEFAULT dropped {section}: {default:?}"
+            );
         }
     }
 
