@@ -2385,6 +2385,14 @@ const CONFIG_PARAMETERS: [&str; 9] = [
 /// also what keeps the reply in table order rather than in the order the peer
 /// happened to ask.
 ///
+/// **A parameter name is matched without regard to case**, as Redis matches
+/// one: its `configGetCommand` calls the glob matcher in the case-folding mode
+/// its `KEYS` does not use, so `CONFIG GET MAXMEMORY` answers there. Measured
+/// against Redis 8.10.0. The folding is done to the pattern here rather than
+/// inside [`glob`], which is the matcher `KEYS` shares: parameter names are
+/// ASCII and this table's are lower case, so folding the pattern is the whole
+/// of the difference — and keys are bytes, where a fold would be a defect.
+///
 /// There is no `CONFIG SET`: every parameter below is a fact about a node that
 /// is already running, and accepting a new ceiling at runtime would mean
 /// moving a keyspace under one. Refusing it as an unknown subcommand is the
@@ -2397,8 +2405,11 @@ fn config(sub: &[u8], globs: &[Vec<u8>], node: &NodeInfo) -> Result<Action, Stri
         return Err(wrong_arity("config|get"));
     }
     let mut reply = Vec::new();
+    // Folded once, not once per row: the peer sends a handful of patterns and
+    // the table is walked whole for each of them.
+    let folded: Vec<Vec<u8>> = globs.iter().map(|glob| glob.to_ascii_lowercase()).collect();
     for name in CONFIG_PARAMETERS {
-        if globs
+        if folded
             .iter()
             .any(|pattern| glob::matches(pattern, name.as_bytes()))
         {
@@ -6088,6 +6099,68 @@ mod tests {
         assert_eq!(
             frames[7],
             Frame::Error("ERR wrong number of arguments for 'config' command".into())
+        );
+    }
+
+    /// `CONFIG GET` selects a parameter without regard to case, and `KEYS`
+    /// still selects a key with it.
+    ///
+    /// Redis matches a configuration parameter with its glob matcher's
+    /// case-folding mode and a key with the same matcher's exact one, so the
+    /// two commands share an implementation there and differ in one argument.
+    /// They differ here by where the folding is done — at this call site
+    /// rather than inside `glob` — and the second half of this test is what
+    /// says the difference did not leak: a key named in one case is not found
+    /// in the other, which is a contract no server may break.
+    #[tokio::test]
+    async fn config_get_matches_a_parameter_without_case_and_a_key_with_it() {
+        let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let mut node = NodeInfo::for_tests();
+        node.limit = MemoryLimit {
+            ceiling: Some(64 << 20),
+            mode: EvictionMode::AllKeysLru,
+        };
+        tokio::spawn(serve_connection(server, pool, node));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        let requests: [&[&str]; 6] = [
+            &["CONFIG", "GET", "MAXMEMORY"],
+            &["CONFIG", "GET", "MaxMemory-Policy"],
+            // A glob, folded the same way: the pattern's case is not part of
+            // what it selects.
+            &["CONFIG", "GET", "MAXMEMORY*"],
+            &["SET", "Alpha", "1"],
+            &["KEYS", "alpha"],
+            &["KEYS", "Alpha"],
+        ];
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        // The name in the reply is the table's own spelling, not the peer's:
+        // a client that reads the pairs back by name is reading the name
+        // Redis would have answered with.
+        assert_eq!(frames[0], pairs(&[("maxmemory", "67108864")]));
+        assert_eq!(frames[1], pairs(&[("maxmemory-policy", "allkeys-lru")]));
+        assert_eq!(
+            frames[2],
+            pairs(&[
+                ("maxmemory", "67108864"),
+                ("maxmemory-policy", "allkeys-lru")
+            ])
+        );
+        assert_eq!(
+            frames[4],
+            Frame::Array(Vec::new()),
+            "a key walk folded case, and keys are bytes"
+        );
+        assert_eq!(
+            frames[5],
+            Frame::Array(vec![Frame::Bulk(b"Alpha".to_vec())])
         );
     }
 
