@@ -2921,10 +2921,25 @@ fn human_bytes(bytes: u64) -> String {
 /// then does anything about the connection matter — `AUTH` if it was given,
 /// and otherwise the gate's [`NOAUTH_HELLO`]. It is observable at every step.
 /// `HELLO abc BOGUS x` names two mistakes and Redis reports the version, so
-/// reading the options first would answer a different one; and `HELLO 99` on a
-/// connection that has not authenticated is `NOPROTO` rather than a refusal to
-/// talk, because a version this server could never speak is settled before a
-/// password could change the answer.
+/// reading the options first would answer a different one.
+///
+/// **That order is observable only where the gate lets a handler's own refusal
+/// out** — on a node with no password, or on a connection that has
+/// authenticated. On a password-protected node that has not, a refusal built
+/// here never reaches the peer: [`gated`] decides on the [`Action`], and by
+/// then a handler's `Err` is an ordinary `Action::Reply`, so `HELLO 99`
+/// answers with the general [`NOAUTH`] rather than with [`NOPROTO`] — and
+/// rather than even with [`NOAUTH_HELLO`], which the handshake that parsed
+/// gets. So the two credential-less handshakes are told different things, and
+/// the one that also named a bad version is told the less useful of the two.
+///
+/// Redis decides a request's own mistakes first and only then asks whether the
+/// connection may be answered; this asks in the other order. It is a
+/// diagnostic loss and not an authorisation one — nothing about the node leaks
+/// either way, and a client that branches on `NOPROTO` to downgrade falls back
+/// on the error it does get. `hello_without_auth_is_refused` pins both
+/// answers, and this is recorded rather than fixed because letting a refusal
+/// through the gate is a change to the connection model's error path.
 fn hello(args: &[Vec<u8>], node: &NodeInfo) -> Result<Action, String> {
     // No version at all is `HELLO` bare, which names no version to disagree
     // with and carries no options to read.
@@ -7613,6 +7628,15 @@ mod tests {
     /// worked. Both spellings of the credential-less handshake are checked —
     /// bare, and with the version — because they take different paths through
     /// `hello` and meet the gate at the same place.
+    ///
+    /// The third row is the divergence rather than the agreement, and it is
+    /// here because it is the same mechanism seen from the other side.
+    /// `HELLO 99` names a version this server refuses on its own, so `hello`
+    /// returns an `Err` — and an `Err` is an `Action::Reply` by the time
+    /// `gated` decides, which is the arm that answers with the *general*
+    /// refusal. So the handshake that parsed is told the form that would have
+    /// worked and the one that did not is told nothing of the kind, where
+    /// Redis would have answered the version first and the gate second.
     #[tokio::test]
     async fn hello_without_auth_is_refused() {
         let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
@@ -7622,15 +7646,22 @@ mod tests {
         let mut out = Vec::new();
         encode(&req(&["HELLO"]), &mut out);
         encode(&req(&["HELLO", "2"]), &mut out);
+        encode(&req(&["HELLO", "99"]), &mut out);
         encode(&req(&["PING"]), &mut out);
         w.write_all(&out).await.unwrap();
         w.flush().await.unwrap();
-        let frames = read_frames(&mut r, 3).await;
+        let frames = read_frames(&mut r, 4).await;
         assert_eq!(frames[0], Frame::Error(NOAUTH_HELLO.to_owned()));
         assert_eq!(frames[1], Frame::Error(NOAUTH_HELLO.to_owned()));
+        assert_eq!(
+            frames[2],
+            Frame::Error(NOAUTH.to_owned()),
+            "a HELLO the handler refused is answered by the gate, and with \
+             the general refusal rather than the handshake's"
+        );
         // The general refusal, not the handshake's: the two texts are
         // different on purpose and a client tells the requests apart by them.
-        assert_eq!(frames[2], Frame::Error(NOAUTH.to_owned()));
+        assert_eq!(frames[3], Frame::Error(NOAUTH.to_owned()));
     }
 
     /// The same handshake on a node with **no** password is answered, because
