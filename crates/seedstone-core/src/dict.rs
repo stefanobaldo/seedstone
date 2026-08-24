@@ -324,8 +324,20 @@ impl Dict {
     /// misjudge a different set — the one where the sample straddles the fold
     /// in the other direction — rather than none, and neither costs anything
     /// but a cache miss.
+    ///
+    /// `spared` is a key the caller will not accept as the answer. It is
+    /// skipped where it is met rather than filtered out of the result, so
+    /// meeting it costs the caller nothing: the walk goes on, `samples` is not
+    /// charged for it, and `None` still means the dict had no other entry to
+    /// offer. Filtering afterwards would answer `None` from a sample that
+    /// merely happened to meet the spared key first.
     #[must_use]
-    pub fn sample_oldest(&self, cursor: &mut u64, samples: usize) -> Option<Vec<u8>> {
+    pub fn sample_oldest(
+        &self,
+        cursor: &mut u64,
+        samples: usize,
+        spared: Option<&[u8]>,
+    ) -> Option<Vec<u8>> {
         if self.is_empty() {
             return None;
         }
@@ -338,6 +350,14 @@ impl Dict {
         let bound = self.old.len() + self.new.as_ref().map_or(0, Vec::len);
         while seen < samples && steps < bound {
             *cursor = self.scan(*cursor, |key, entry| {
+                // The spared key is excluded from candidacy rather than
+                // ending the walk, so `None` keeps meaning "this shard has
+                // nothing to give". It is not counted against `samples`
+                // either: a sample that met only the spared key met nothing,
+                // and charging it would shrink the real sample by one.
+                if spared == Some(key) {
+                    return;
+                }
                 seen += 1;
                 // The key is cloned only when it becomes the candidate, not
                 // once per entry met: a sample of five over a chained bucket
@@ -2165,7 +2185,7 @@ mod tests {
         let mut recent_victims = 0;
         for _ in 0..100 {
             let victim = dict
-                .sample_oldest(&mut cursor, 5)
+                .sample_oldest(&mut cursor, 5, None)
                 .expect("a non-empty dict has a victim");
             let index: u32 = std::str::from_utf8(&victim[1..]).unwrap().parse().unwrap();
             if index >= 800 {
@@ -2195,6 +2215,6 @@ mod tests {
     #[test]
     fn an_empty_dict_offers_no_victim() {
         let dict = Dict::with_seed(DictSeed { k0: 1, k1: 2 });
-        assert_eq!(dict.sample_oldest(&mut 0, 5), None);
+        assert_eq!(dict.sample_oldest(&mut 0, 5, None), None);
     }
 }
