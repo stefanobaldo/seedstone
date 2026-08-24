@@ -1548,7 +1548,6 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                 // `ShardStats::usec`, which spends one further reading per
                 // command and differences each against the one before it.
                 let now = Instant::now();
-                #[cfg(not(feature = "no-command-timing"))]
                 let mut last = now;
                 // By mutable reference, so a handler can move a command's value
                 // into the dict instead of copying it — see `apply`. The trace
@@ -1606,7 +1605,6 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                     // a monotonic clock is only promised not to go backwards,
                     // and a reading that did would panic here rather than
                     // report a zero microsecond nobody would miss.
-                    #[cfg(not(feature = "no-command-timing"))]
                     let spent = {
                         let after = Instant::now();
                         let spent = after.saturating_duration_since(last).as_micros();
@@ -1615,12 +1613,6 @@ async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                         // saturate; the shard it ran on has other problems.
                         u64::try_from(spent).unwrap_or(u64::MAX)
                     };
-                    // The campaign's A/B arm and nothing else: a build with
-                    // the reading compiled out, so that what taking it costs
-                    // can be measured against a build that takes it. The
-                    // feature is removed once that measurement exists.
-                    #[cfg(feature = "no-command-timing")]
-                    let spent = 0;
                     count_call(state, cmd, &answer, spent);
                     trace.record(*shard, at, cmd, &answer);
                     replies.push(answer);

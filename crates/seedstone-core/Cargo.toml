@@ -11,14 +11,6 @@ publish = false
 tokio.workspace = true
 siphasher.workspace = true
 
-# One arm of a measurement campaign, and nothing an operator should ever
-# choose. `no-command-timing` compiles out the per-command clock reading in the
-# executor so that what the reading costs can be measured against a build that
-# takes it, on the same machine on the same day. It is not a runtime switch and
-# it is not a supported configuration: a node built with it reports `usec=0`
-# for every command. Removed once the measurement is in hand.
-[features]
-no-command-timing = []
 
 # `test-util` is what makes `tokio::time` a clock a test can hold still and
 # step by hand, which is the only way a deadline is testable without waiting
