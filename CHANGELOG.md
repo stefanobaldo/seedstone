@@ -32,10 +32,13 @@ SemVer and are `0.x` until the server persists data;
   ceiling to reach is refused rather than silently ignored.
 - The operational surface a monitoring agent reads: `INFO` in sections —
   `server`, `clients`, `memory`, `stats`, `keyspace` and `commandstats`,
-  carrying only fields this server can state truthfully — `CONFIG GET` over
-  the parameters that describe how it was started, and `SLOWLOG` and
-  `LATENCY` answering as the switched-off monitors they are, so that a
-  scrape completes without an error line per pass.
+  carrying only fields this server can state truthfully, and drawing the
+  default document as Redis draws it, so a bare `INFO` and `INFO default`
+  leave `commandstats` out where `INFO all` carries it — `CONFIG GET` over
+  the parameters that describe how it was started, selected without regard
+  to case as Redis selects a parameter name — and `SLOWLOG` and `LATENCY`
+  answering as the switched-off monitors they are, so that a scrape
+  completes without an error line per pass.
 - A ceiling on a `KEYS` reply. Past 64 MiB of gathered keys the command is
   refused with an error naming `SCAN` as what to use instead, rather than
   returning a reply that would cost the server more than the client asked
@@ -45,7 +48,9 @@ SemVer and are `0.x` until the server persists data;
   executor for the commands a shard runs, and at the edge for the requests no
   shard sees whole — where the reading spans the wait for the shards the
   request reached, and so measures what the request took rather than what it
-  cost.
+  cost. A request this server splits is counted and timed at both layers, so
+  the `cmdstat_` totals are not additive; `docs/ARCHITECTURE.md` says which
+  of the two figures answers which question.
 
 ### Changed
 
