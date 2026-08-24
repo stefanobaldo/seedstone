@@ -2020,6 +2020,14 @@ const WALK_CURSOR_SHARD_SHIFT: u32 = 48;
 /// walk forms cost the same now, so there is no longer a question of which
 /// clients were counted.
 ///
+/// **Re-measured when the server's bucket ceiling was raised, and unmoved** —
+/// the same 1, and the same 2 to 16, over the same twelve runs. That is not a
+/// coincidence and is the useful half of the measurement: on these shapes a
+/// call ends at the client's key target, not at the server's ceiling, so the
+/// ceiling is not what sets the step count and raising it changes nothing
+/// here. A shape whose calls run out of budget before they run out of target
+/// would move these figures; neither of these two does.
+///
 /// **What the bound is for has changed with them, and it is worth saying which
 /// of the two it is.** It is not a live detector any more. It was one for a
 /// cursor that advanced upwards instead of in reverse binary order — a walk
@@ -3699,8 +3707,11 @@ mod tests {
         // commands did not move. The trace folds every command's kind and
         // every reply, so an added command changes it by construction. A
         // change here with no workload or reply change beside it is a
-        // regression, not a repin.
-        const MINI_1_42: u64 = 0x35bb_a61c_d6e9_0aac;
+        // regression, not a repin. The fourth kind fired a second time when
+        // the walk's bucket ceiling was raised: one call now crosses more
+        // shards, so the same steps in the same order fold different replies,
+        // and `expected_sum` and the four counts held still again.
+        const MINI_1_42: u64 = 0x6dc4_a5e3_dc16_43c3;
 
         let outcome = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(

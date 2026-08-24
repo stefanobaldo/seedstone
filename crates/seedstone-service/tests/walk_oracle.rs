@@ -17,14 +17,15 @@
 use seedstone_core::dict::DictSeed;
 use seedstone_core::shard::{Command, NoTrace, Router as _, ShardPool};
 use seedstone_resp::{Frame, encode, parse};
-use seedstone_service::{NodeInfo, serve_connection};
+use seedstone_service::{NodeInfo, WALK_STEP_BUCKETS, serve_connection};
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf, split};
 
-/// The server's per-call occupancy ceiling, mirrored rather than imported —
-/// `WALK_STEP_BUCKETS` is not public, and the bound below is a statement
-/// about how many calls a cycle costs, which needs the number.
-const BUCKET_CEILING: usize = 256;
+/// The server's per-call occupancy ceiling, imported rather than mirrored.
+/// It was a mirror while the constant was private, and the mirror outlived
+/// that: the constant became public and then changed, leaving this file
+/// asserting a bound derived from a number the server had stopped using.
+const BUCKET_CEILING: usize = WALK_STEP_BUCKETS;
 
 /// The smallest table a shard can have, from the core's `INITIAL_BUCKETS`.
 /// Mirrored for the same reason, and used the same way: as the floor on how
