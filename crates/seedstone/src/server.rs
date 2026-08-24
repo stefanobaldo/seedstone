@@ -417,6 +417,11 @@ impl Server {
                     // descriptors. Neither is a reason to stop serving the
                     // connections that did get in.
                     let Ok((stream, _peer)) = accepted else { continue };
+                    // Before the permit is asked for, so a connection this
+                    // loop is about to refuse is configured the same way as
+                    // one it is about to serve: `refuse` writes to that
+                    // socket too.
+                    configure_accepted(&stream);
                     // Counted before the permit is asked for, so the total and
                     // the refusals describe the same population: every
                     // connection this loop took off the listener is one or the
@@ -467,6 +472,24 @@ impl Drop for Attached {
     }
 }
 
+/// Applies the socket options an accepted connection needs before it is served.
+///
+/// One option today: Nagle off. A pipelined batch larger than the service's
+/// read ceiling spans several drains, so its replies leave in more than one
+/// write — and with Nagle on, every write after the first is withheld until the
+/// peer acknowledges the one before it. The peer is a client waiting for the
+/// rest of that batch, so it has nothing to send but an acknowledgement, and
+/// the kernel delays that one. The pair costs a round trip's worth of wall
+/// clock per batch and neither end is doing any work while it passes.
+///
+/// A failure is ignored rather than propagated, deliberately: serving a
+/// connection with Nagle on is worse than serving it without, and both are
+/// better than refusing it. The accept loop already treats a per-connection
+/// failure as per-connection.
+fn configure_accepted(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+}
+
 /// Tells a peer the server is full, then drops the connection.
 ///
 /// Both results are discarded: the peer is being disconnected either way, and
@@ -509,7 +532,7 @@ fn wall_clock() -> u64 {
 mod tests {
     use super::{
         Config, DEFAULT_BIND, EvictionMode, MAX_CLIENTS_REACHED, MemoryLimit, PASSWORD_ENV, SHARDS,
-        USAGE, executors,
+        TcpListener, TcpStream, USAGE, configure_accepted, executors,
     };
 
     /// Whatever this host answers, the count has to be one the pool accepts:
@@ -703,5 +726,28 @@ mod tests {
     #[test]
     fn the_refusal_is_byte_exact_to_redis() {
         assert_eq!(MAX_CLIENTS_REACHED, "ERR max number of clients reached");
+    }
+
+    /// A pipelined batch larger than the service's read ceiling spans several
+    /// drains, so the replies leave in more than one write. With Nagle on,
+    /// every write after the first waits for the peer's acknowledgement, and a
+    /// peer that is still waiting for the rest of the batch has nothing to
+    /// send but a delayed one.
+    ///
+    /// The option is read back off a real accepted socket rather than the call
+    /// site being asserted by inspection: `set_nodelay` returning `Ok` says
+    /// the syscall was accepted, not that this end of this connection is the
+    /// one carrying the option.
+    #[tokio::test]
+    async fn accepted_connections_disable_nagle() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (accepted, _peer) = listener.accept().await.unwrap();
+
+        configure_accepted(&accepted);
+
+        assert!(accepted.nodelay().unwrap(), "Nagle is still on");
+        drop(client.await.unwrap());
     }
 }
