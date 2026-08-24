@@ -309,9 +309,24 @@ const CHUNK_COMMANDS: usize = 128;
 /// How many buckets one step of a keyspace walk visits before answering.
 ///
 /// It is the unit of occupancy: larger holds a shard for longer per step and
-/// pays less per-envelope overhead, smaller yields sooner and pays more. Sized
-/// against the core's `EXPIRE_BUCKETS_PER_TICK`, which is the other bounded
-/// walk over the same table.
+/// pays less per-envelope overhead, smaller yields sooner and pays more.
+///
+/// **The value is chosen on measurement**, not reasoned from a sibling
+/// constant. Two builds differing in this number alone were walked over a
+/// keyspace shaped like the workloads this project targets, and this is the
+/// one whose pattern-matched cycle cost fewer round trips and less wall for no
+/// measurable cost on the cycle without a pattern, on `KEYS`, or anywhere else
+/// the pair was compared. The core's `EXPIRE_BUCKETS_PER_TICK` is the other
+/// bounded walk over the same table and is what an earlier value was reasoned
+/// from; it is not what settled this one.
+///
+/// What the measurement did not price, and a reader changing this number
+/// should know: a larger budget lets one call cross more shards before it
+/// answers, so the call itself takes longer to return even where the cycle it
+/// belongs to is faster — and a shard whose table exceeds the budget is held
+/// for the whole of it in one step. Neither is visible at a keyspace where
+/// tables are small and the budget is spent crossing shards rather than
+/// walking one.
 ///
 /// It serves the two walking commands differently, and deliberately with one
 /// number. `KEYS` carries no `COUNT` on the wire, so this *is* its step.
@@ -329,7 +344,7 @@ const CHUNK_COMMANDS: usize = 128;
 /// of a `SCAN` call after its first carries less, because the shards before it
 /// spent some. That is the only signal a shard has that the call *crossed into*
 /// it, and the simulator's crossing plant is built on it.
-pub const WALK_STEP_BUCKETS: usize = 256;
+pub const WALK_STEP_BUCKETS: usize = 1024;
 
 /// How much of a peer-supplied byte string an error message may quote.
 const QUOTE_LIMIT: usize = 32;
@@ -4332,6 +4347,14 @@ mod tests {
     /// timing assertion on a shared runner is a flake.
     #[tokio::test]
     async fn a_keys_walk_takes_many_envelopes_rather_than_one() {
+        /// How many keys the fixture writes, sized off the budget rather than
+        /// written as a number: a number tracks whatever the budget happened
+        /// to be the day it was written, and this fixture was 2000 keys and
+        /// stopped exercising the property the first time
+        /// [`WALK_STEP_BUCKETS`] moved. Enough keys that the shard's table
+        /// cannot fit inside one step whatever the constant becomes.
+        const KEYS: usize = WALK_STEP_BUCKETS * 4;
+
         /// Counts the steps each shard is asked for, and otherwise is its pool.
         #[derive(Clone)]
         struct CountSteps {
@@ -4373,23 +4396,23 @@ mod tests {
         let (mut r, mut w) = tokio::io::split(client);
 
         let mut out = Vec::new();
-        for i in 0..2000u32 {
+        for i in 0..KEYS {
             encode(&req(&["SET", &format!("k-{i}"), "v"]), &mut out);
         }
         encode(&req(&["KEYS", "k-*"]), &mut out);
         w.write_all(&out).await.unwrap();
         w.flush().await.unwrap();
-        let frames = read_frames(&mut r, 2001).await;
-        assert!(matches!(&frames[2000], Frame::Array(a) if a.len() == 2000));
+        let frames = read_frames(&mut r, KEYS + 1).await;
+        assert!(matches!(&frames[KEYS], Frame::Array(a) if a.len() == KEYS));
 
         let steps = router.steps.lock().expect("steps mutex").len();
-        // 2000 keys over a table walked WALK_STEP_BUCKETS at a time cannot be
-        // one envelope. The assertion is deliberately `> 1` and not an exact
-        // count: how many buckets 2000 keys occupy is the dict's business and
+        // A table this size walked WALK_STEP_BUCKETS at a time cannot be one
+        // envelope. The assertion is deliberately `> 1` and not an exact
+        // count: how many buckets these keys occupy is the dict's business and
         // may change, while "more than one envelope" is the property.
         assert!(
             steps > 1,
-            "a 2000-key walk took {steps} envelope(s); one means it held the shard for the cycle"
+            "a {KEYS}-key walk took {steps} envelope(s); one means it held the shard for the cycle"
         );
     }
 
@@ -4472,17 +4495,20 @@ mod tests {
         // arrangement the assertions below are about.
         const SHARDS: u16 = 2;
         let (mut r, mut w, _pool) = connected(SHARDS);
-        let mut out = Vec::new();
         // Enough keys that a shard's cursor space is larger than one call's
         // whole bucket budget, which is what makes a call stop in the middle
         // of a shard below — the case the cursor's shard-plus-internal shape
-        // exists for.
-        for i in 0..2000u32 {
+        // exists for. Derived from the budget and the shard count rather than
+        // written as a number: as a number it silently stopped exercising the
+        // property the first time `WALK_STEP_BUCKETS` moved.
+        let keys = WALK_STEP_BUCKETS * usize::from(SHARDS) * 4;
+        let mut out = Vec::new();
+        for i in 0..keys {
             encode(&req(&["SET", &format!("s-{i}"), "v"]), &mut out);
         }
         w.write_all(&out).await.unwrap();
         w.flush().await.unwrap();
-        let _ = read_frames(&mut r, 2000).await;
+        let _ = read_frames(&mut r, keys).await;
 
         let mut seen: Vec<Vec<u8>> = Vec::new();
         let mut cursor = String::from("0");
@@ -4522,7 +4548,7 @@ mod tests {
         }
         seen.sort();
         seen.dedup();
-        assert_eq!(seen.len(), 2000);
+        assert_eq!(seen.len(), keys);
         // A call crosses shards now, so a cycle can cost fewer calls than the
         // node has shards and a count alone proves nothing either way. The
         // property is stated on the cursors themselves: some call stopped
