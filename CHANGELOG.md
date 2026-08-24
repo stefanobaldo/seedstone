@@ -68,6 +68,16 @@ SemVer and are `0.x` until the server persists data;
   no keys at all and a cursor that is not `0`; the loop stays the one it
   always was, calling until the cursor comes back `0`.
 
+### Fixed
+
+- Accepted connections now disable Nagle's algorithm. A pipelined batch larger
+  than the read ceiling leaves in more than one write, and with Nagle on every
+  write after the first waited for an acknowledgement the peer had no reason to
+  send promptly.
+- Eviction past the memory ceiling no longer stops early when the key the
+  triggering command addressed is the oldest one it sampled. The key is
+  excluded from candidacy instead, so a shard with room to make still makes it.
+
 ## [0.0.0] - 2026-08-08
 
 - A placeholder that reserved the name: a workspace, a pinned toolchain and
