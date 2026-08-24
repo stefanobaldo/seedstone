@@ -485,8 +485,11 @@ pub const RUN_ID_HEX: usize = 40;
 /// at the edge as `info` and the shards leave it alone.
 ///
 /// `ScanStep` is `scan` because that is the command a peer sends to produce
-/// one. A `KEYS` walk also runs steps, and is counted separately in
-/// [`EDGE_NAMES`] as the one request it was.
+/// one — and a `KEYS` walk runs steps too, so its steps are counted here under
+/// `scan` *as well as* once at the edge under `keys`. A single `KEYS` on a
+/// sixteen-shard node adds sixteen or more to `cmdstat_scan` with no peer
+/// having sent a `SCAN`. Both lines are true of different things and neither
+/// is the other's total; see [`commands_processed`].
 ///
 /// Sized from [`KIND_SLOTS`] rather than from a literal, so a command added to
 /// the core does not leave this table one name short of the tags it is indexed
@@ -2849,10 +2852,20 @@ fn command_stats(node: &NodeInfo, stats: &ShardStats) -> Vec<(&'static str, u64,
 
 /// What `total_commands_processed` reports: every command counted anywhere.
 ///
-/// The same two halves [`command_stats`] sums, added rather than listed. A
-/// request the edge split — an `MGET` over four keys — is counted once here
-/// and four times by the shards, which is what Redis's own figure does with a
-/// command that expands into others.
+/// The same two halves [`command_stats`] sums, added rather than listed.
+///
+/// **A request the edge splits is counted at both layers, and Redis does not
+/// do this.** An `MGET` over four keys is one request here and four `GET`s at
+/// the shards, so it adds five. Redis increments `stat_numcommands` once per
+/// `call()`, and an `MGET` is one `call()` however many keys it names —
+/// what expands into further calls there is a script or a transaction body,
+/// not a multi-key read (measured against `redis:6-alpine`, 6.2.24). The
+/// divergence follows from the architecture rather than from a choice: the
+/// work a shard did is a figure this node can state and an operator wants,
+/// and dropping it would leave the shards' own counters describing nothing.
+/// So it is stated instead of corrected — here, and in the observability
+/// section of `docs/ARCHITECTURE.md`, where the operator reading the document
+/// meets it.
 fn commands_processed(node: &NodeInfo, stats: &ShardStats) -> u64 {
     command_stats(node, stats)
         .into_iter()

@@ -276,6 +276,19 @@ spans the wait for every shard the request reached, so it is what the request
 took rather than what it cost. The per-call figure is the quotient of the two
 totals beside it, not an average of per-shard averages.
 
+**A request this server splits is counted at both layers, and the totals are
+not additive.** An `MGET` over four keys is one `mget` at the edge and four
+`get`s at the shards; a `KEYS` is one `keys` at the edge and at least one
+`scan` step per shard it walked, so a node that has served a single `KEYS`
+reports `cmdstat_scan` lines no peer asked for. The microseconds double the
+same way, and they double twice over: the edge reading spans the wait for the
+shards, which timed the same work themselves. So the sum of `usec` across the
+`cmdstat_` lines exceeds the time the node actually spent, and a reading that
+wants what the node spent takes the shard-run commands alone. Redis counts one
+call per request and has no second layer to disagree with — the split is this
+server's, and it is published rather than folded away because the work the
+shards did is what an operator is trying to see.
+
 **Under a simulated runtime the figure is exactly zero, and that is why it is
 outside the deterministic fold.** A handler cannot `await`, so no simulated
 instant passes inside one; a test holds the runtime to that, and the fold
