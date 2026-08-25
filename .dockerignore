@@ -1,0 +1,8 @@
+# What the build context does not need. `lab`, `docs/superpowers` and
+# `.superpowers` are symlinks in a maintainer's checkout and exist nowhere on a
+# CI runner; excluding them keeps the context the same tree on both.
+target/
+lab/
+docs/
+.git/
+.superpowers/

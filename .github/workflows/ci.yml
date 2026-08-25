@@ -138,7 +138,10 @@ jobs:
   # kind of news.
   e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 25 rather than 15 since this job also builds the container image: the
+    # builder stage compiles the workspace from scratch, with no cache the
+    # Rust action can reach inside `docker build`.
+    timeout-minutes: 25
     steps:
       # Same pinning policy as the job above, and the same three actions are
       # pinned to the same SHAs there — see that job's comment for why a tag
@@ -177,6 +180,14 @@ jobs:
       - name: build the server
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: cargo build --release -p seedstone --locked
+      # The image is exercised on every pull request for the reason the
+      # packaging script is: the day a tag is pushed must not be the first day
+      # it builds. Nothing is pushed here.
+      - name: the image builds and answers
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: |
+          docker build -t seedstone-pr .
+          docker run --rm seedstone-pr --version
       # Here rather than in `release.yml` alone, so that the day a tag is
       # pushed is not the first day this script runs. It packages the binary
       # this job already built, unpacks it again and makes the result answer

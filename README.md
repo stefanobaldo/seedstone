@@ -31,6 +31,13 @@ readable by every other process on the host. A bind outside loopback
 refuses to start without a password from either source, unless `--no-auth`
 says so deliberately.
 
+The same server ships as a container image, `ghcr.io/stefanobaldo/seedstone`,
+tagged per release. It runs as a non-root user and holds nothing but the
+binary, so the options above are the container's arguments:
+`docker run -p 6379:6379 ghcr.io/stefanobaldo/seedstone:<tag> --bind 0.0.0.0:6379 --no-auth`
+serves on the published port with no password — pass `SEEDSTONE_REQUIREPASS`
+in the environment for one.
+
 **What it answers:** `GET`, `SET` (with `EX`, `PX`, `EXAT`, `PXAT`, `NX`, `XX`,
 `KEEPTTL`, `GET`), `MGET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `PERSIST`,
 `TTL`, `TYPE`, `STRLEN`, `INCRBY`, `SCAN`, `KEYS`, `DBSIZE`, `FLUSHDB`,
