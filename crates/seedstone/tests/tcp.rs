@@ -249,6 +249,64 @@ async fn a_password_is_required_over_a_real_socket() {
     );
 }
 
+/// An error reply is counted where it is written, so the peer that caused it
+/// can read the count back on the same connection. `INFO stats` carries the
+/// total and `INFO errorstats` the per-code rows, as Redis 6.2 prints them
+/// (`redis:6-alpine`, `redis_version:6.2.24`).
+#[tokio::test(flavor = "multi_thread")]
+async fn error_replies_are_counted_by_code_and_in_total() {
+    let addr = started(4, None).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    let Frame::Error(text) = round_trip(&mut stream, &["NOSUCH"]).await else {
+        panic!("an unknown command must answer an error")
+    };
+    assert!(text.starts_with("ERR "), "{text}");
+    round_trip(&mut stream, &["SET", "k", "v"]).await;
+    let Frame::Error(_) = round_trip(&mut stream, &["INCRBY", "k", "1"]).await else {
+        panic!("INCRBY on a non-integer must answer an error")
+    };
+
+    let Frame::Bulk(errorstats) = round_trip(&mut stream, &["INFO", "errorstats"]).await else {
+        panic!("INFO answers a bulk")
+    };
+    let errorstats = String::from_utf8(errorstats).unwrap();
+    assert!(errorstats.starts_with("# Errorstats\r\n"), "{errorstats}");
+    assert!(
+        errorstats.contains("errorstat_ERR:count=2\r\n"),
+        "{errorstats}"
+    );
+    assert_eq!(info_field(&mut stream, "total_error_replies").await, 2);
+}
+
+/// The auth gate's refusal never reaches a handler, and it is counted all the
+/// same: every error the peer reads is an error the node wrote. Redis 6.2
+/// (`redis:6-alpine`, `redis_version:6.2.24`) files its `NOAUTH` the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_noauth_refusal_is_an_error_reply_too() {
+    let addr = started(4, Some("pw")).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    let Frame::Error(text) = round_trip(&mut stream, &["GET", "k"]).await else {
+        panic!("an unauthenticated GET must be refused")
+    };
+    assert!(text.starts_with("NOAUTH "), "{text}");
+    assert_eq!(
+        round_trip(&mut stream, &["AUTH", "pw"]).await,
+        Frame::Simple("OK".into())
+    );
+
+    let Frame::Bulk(errorstats) = round_trip(&mut stream, &["INFO", "errorstats"]).await else {
+        panic!("INFO answers a bulk")
+    };
+    let errorstats = String::from_utf8(errorstats).unwrap();
+    assert!(
+        errorstats.contains("errorstat_NOAUTH:count=1\r\n"),
+        "{errorstats}"
+    );
+    assert_eq!(info_field(&mut stream, "total_error_replies").await, 1);
+}
+
 // --- helpers ---
 
 /// Binds an ephemeral port, spawns the accept loop, returns the address.

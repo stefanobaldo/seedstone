@@ -640,6 +640,18 @@ pub struct NodeInfo {
     pub net_in: Arc<AtomicU64>,
     /// Bytes written to peers, counted where they are flushed.
     pub net_out: Arc<AtomicU64>,
+    /// Error replies written to peers, whatever produced them — a handler, the
+    /// auth gate, the parser. `INFO stats` reports the total as
+    /// `total_error_replies` and `INFO errorstats` one row per code, the way
+    /// Redis 6.2 (`redis:6-alpine`, `redis_version:6.2.24`) prints them.
+    /// Counted where the frame is appended to the outgoing buffer, because
+    /// that is the one place every error passes through.
+    pub error_replies: Arc<AtomicU64>,
+    /// Per-code counts behind `errorstats`. A `BTreeMap` so the section
+    /// renders in one order; a mutex because errors are rare enough that a
+    /// lock on the error path costs nothing anyone will measure, and the
+    /// critical section never awaits.
+    pub errorstats: Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
     /// How many of each [`EDGE_NAMES`] command peers have sent, in that
     /// order.
     ///
@@ -701,6 +713,8 @@ impl NodeInfo {
             rejected_connections: Arc::new(AtomicU64::new(0)),
             net_in: Arc::new(AtomicU64::new(0)),
             net_out: Arc::new(AtomicU64::new(0)),
+            error_replies: Arc::new(AtomicU64::new(0)),
+            errorstats: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             edge_calls: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             edge_usec: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
         }
@@ -1104,7 +1118,7 @@ async fn serve_connection_limited<S, R>(
         // before anything is written or read. `QUIT` takes this path too: its
         // `OK` is the last slot of the last chunk, and nothing pipelined
         // behind it was ever decoded.
-        if !emit_chunk(&mut stream, &mut out, &router, &mut chunk, &node.net_out).await {
+        if !emit_chunk(&mut stream, &mut out, &router, &mut chunk, &node).await {
             return;
         }
         if !flush_replies(&mut stream, &mut out, &node.net_out).await || hang_up {
@@ -1298,7 +1312,7 @@ where
                     // ordering this loop guarantees moves; only how many
                     // commands one message carries.
                     if chunk.batch.len() >= CHUNK_COMMANDS
-                        && !emit_chunk(stream, out, router, chunk, &node.net_out).await
+                        && !emit_chunk(stream, out, router, chunk, node).await
                     {
                         return Drained::Over;
                     }
@@ -1312,7 +1326,7 @@ where
                     // front of it, empty the keyspace in front of the writes
                     // that filled it, or answer a `KEYS` without the key a
                     // `SET` just wrote.
-                    if !emit_chunk(stream, out, router, chunk, &node.net_out).await {
+                    if !emit_chunk(stream, out, router, chunk, node).await {
                         return Drained::Over;
                     }
                     chunk
@@ -1346,7 +1360,7 @@ where
                 // replies, then the refusal. A chunk that could not be emitted
                 // means the peer is already gone, and there is nobody left to
                 // refuse.
-                if !emit_chunk(stream, out, router, chunk, &node.net_out).await {
+                if !emit_chunk(stream, out, router, chunk, node).await {
                     return Drained::Over;
                 }
                 append_frame(out, &safe_error(&protocol_error(&error)));
@@ -1382,7 +1396,7 @@ async fn emit_chunk<S, R>(
     out: &mut Vec<u8>,
     router: &R,
     chunk: &mut Chunk,
-    net_out: &AtomicU64,
+    node: &NodeInfo,
 ) -> bool
 where
     S: AsyncWrite + Unpin,
@@ -1414,6 +1428,9 @@ where
                     .unwrap_or(Reply::Error(ReplyError::ShardUnavailable)),
             ),
         };
+        if let Frame::Error(text) = &frame {
+            count_error_reply(node, text);
+        }
         append_frame(out, &frame);
         // A chunk that has already earned a write's worth of replies takes it
         // here rather than waiting for the drain to end — see
@@ -1421,7 +1438,7 @@ where
         // order, only sooner, so none of the orderings the drain guarantees
         // moves: the write happens *between* two replies, never inside one,
         // and never while a frame is half-decoded.
-        if out.len() >= REPLY_HIGH_WATER && !flush_replies(stream, out, net_out).await {
+        if out.len() >= REPLY_HIGH_WATER && !flush_replies(stream, out, &node.net_out).await {
             return false;
         }
     }
@@ -1432,6 +1449,23 @@ where
 /// replies from the same drain.
 fn append_frame(out: &mut Vec<u8>, frame: &Frame) {
     encode(frame, out);
+}
+
+/// The code an error reply is filed under: its first word, which is how Redis
+/// 6.2 (`redis:6-alpine`, `redis_version:6.2.24`) groups `errorstats` (`ERR`,
+/// `NOAUTH`, `WRONGPASS`, …).
+fn error_code(text: &str) -> &str {
+    text.split(' ').next().unwrap_or(text)
+}
+
+/// Files one error reply under its code and in the total.
+fn count_error_reply(node: &NodeInfo, text: &str) {
+    node.error_replies.fetch_add(1, Ordering::Relaxed);
+    let mut stats = node
+        .errorstats
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *stats.entry(error_code(text).to_owned()).or_insert(0) += 1;
 }
 
 /// Writes everything the drain accumulated and flushes once.
@@ -2596,6 +2630,11 @@ const INFO_EVERY_SECTION: [&[u8]; 2] = [b"all", b"everything"];
 /// leaving the distinction nothing to select. `# Commandstats` was then added
 /// and the sentence did not survive it. A named list is what the next such
 /// section has to be added to, rather than a claim that has to be reread.
+///
+/// `# Errorstats` was checked against `redis:6-alpine`
+/// (`redis_version:6.2.24`) when this server started printing it: an
+/// argumentless `INFO` there carries the section, so it is inside the default
+/// set and does not belong in this list.
 const INFO_OUTSIDE_DEFAULT: [&[u8]; 1] = [b"commandstats"];
 
 /// Renders the `INFO` sections a peer asked for, or all of them if it named
@@ -2700,17 +2739,49 @@ async fn info<R: Router>(router: &R, node: &NodeInfo, wanted: &[Vec<u8>]) -> Str
     if asked_for(b"commandstats") {
         text.push_str(&commandstats_section(node, &stats));
     }
+    if asked_for(b"errorstats") {
+        text.push_str(&errorstats_section(node));
+    }
+    text
+}
+
+/// One row per error code, or a bare header when nothing has failed yet —
+/// which is what Redis 6.2 prints for a fresh node: `INFO errorstats` on
+/// `redis:6-alpine` (`redis_version:6.2.24`) answers the bulk
+/// `# Errorstats\r\n\r\n`, header and the section's own trailing blank.
+fn errorstats_section(node: &NodeInfo) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::from("# Errorstats\r\n");
+    // The lock is released before the section is finished, rather than at the
+    // end of the function: the rows are all it is held for, and the error path
+    // that takes it next has no reason to wait on a `push_str`.
+    {
+        let stats = node
+            .errorstats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (code, count) in stats.iter() {
+            let _ = write!(text, "errorstat_{code}:count={count}\r\n");
+        }
+    }
+    text.push_str("\r\n");
     text
 }
 
 /// The running totals an operator watches: what the node has done since it
 /// started, half of it counted by the shards and half at the edge.
+///
+/// `total_error_replies` sits here beside the other edge counters. Redis 6.2
+/// (`redis:6-alpine`, `redis_version:6.2.24`) prints it much later in the
+/// section, near its end — the position is not the contract, the name is, and
+/// everything that reads this document looks the field up by name.
 fn stats_section(node: &NodeInfo, stats: &ShardStats) -> String {
     format!(
         "# Stats\r\n\
          total_connections_received:{}\r\n\
          total_commands_processed:{}\r\n\
          rejected_connections:{}\r\n\
+         total_error_replies:{}\r\n\
          expired_keys:{}\r\n\
          evicted_keys:{}\r\n\
          keyspace_hits:{}\r\n\
@@ -2720,6 +2791,7 @@ fn stats_section(node: &NodeInfo, stats: &ShardStats) -> String {
         node.total_connections.load(Ordering::Relaxed),
         commands_processed(node, stats),
         node.rejected_connections.load(Ordering::Relaxed),
+        node.error_replies.load(Ordering::Relaxed),
         stats.expired,
         stats.evicted,
         stats.hits,
@@ -3664,6 +3736,7 @@ mod tests {
         has("expired_keys:0");
         has("evicted_keys:0");
         has("rejected_connections:0");
+        has("total_error_replies:0");
         field("total_connections_received").parse::<u64>().unwrap();
         field("total_commands_processed").parse::<u64>().unwrap();
         assert!(
@@ -3686,6 +3759,35 @@ mod tests {
         };
         counted("cmdstat_set:calls=3,usec=");
         counted("cmdstat_get:calls=2,usec=");
+
+        has("# Errorstats");
+    }
+
+    /// `errorstats` renders what the edge filed, one row per code, sorted.
+    #[tokio::test]
+    async fn info_errorstats_renders_one_row_per_code() {
+        // The section reaches no shard, so any router serves.
+        let router = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let node = NodeInfo::for_tests();
+        count_error_reply(&node, "NOAUTH Authentication required.");
+        count_error_reply(&node, "ERR unknown command 'x'");
+        count_error_reply(&node, "ERR wrong number of arguments");
+        let text = info(&router, &node, &[b"errorstats".to_vec()]).await;
+        assert_eq!(
+            text,
+            "# Errorstats\r\nerrorstat_ERR:count=2\r\nerrorstat_NOAUTH:count=1\r\n\r\n"
+        );
+    }
+
+    /// A node that has failed at nothing prints the header alone, which is
+    /// what `redis:6-alpine` (`redis_version:6.2.24`) answers for a fresh
+    /// node: the bulk is `# Errorstats\r\n\r\n`, header and the section's own
+    /// trailing blank.
+    #[tokio::test]
+    async fn info_errorstats_on_a_fresh_node_is_a_bare_header() {
+        let router = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let text = info(&router, &NodeInfo::for_tests(), &[b"errorstats".to_vec()]).await;
+        assert_eq!(text, "# Errorstats\r\n\r\n");
     }
 
     /// An empty keyspace is a section with no rows, which is what Redis
