@@ -138,9 +138,12 @@ jobs:
   # kind of news.
   e2e:
     runs-on: ubuntu-latest
-    # 25 rather than 15 since this job also builds the container image: the
-    # builder stage compiles the workspace from scratch, with no cache the
-    # Rust action can reach inside `docker build`.
+    # 25 rather than 15 since this job also builds the container image. The
+    # builder stage compiles the workspace from scratch — no cache the Rust
+    # action holds reaches inside `docker build` — which measured 55 s on a
+    # cold `ubuntu-latest` runner, against a whole job of 2 m 36 s. The
+    # headroom is for the day a dependency tree makes that build much longer,
+    # not for what it costs today.
     timeout-minutes: 25
     steps:
       # Same pinning policy as the job above, and the same three actions are
