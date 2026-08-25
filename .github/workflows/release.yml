@@ -10,6 +10,8 @@ on:
 # Only `gh release create` needs this. `ci.yml` stays read-only.
 permissions:
   contents: write
+  # The image is pushed with the workflow token; no PAT exists in this repository.
+  packages: write
 
 jobs:
   release:
@@ -37,6 +39,22 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           [ "${{ github.event_name }}" = "workflow_dispatch" ] && version="dispatch-${GITHUB_SHA::8}"
           bash scripts/package-release.sh target/release/seedstone "$version" x86_64-unknown-linux-gnu dist
+      # One image per tag, named after the tag. Built from the same tree the
+      # tarball's binary came from, and smoked before anything is pushed: an
+      # image that cannot report its version is not a release.
+      - name: image
+        run: |
+          ref="${GITHUB_REF_NAME}"
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && ref="dispatch-${GITHUB_SHA::8}"
+          echo "IMAGE=ghcr.io/stefanobaldo/seedstone:${ref}" >> "$GITHUB_ENV"
+          docker build -t "ghcr.io/stefanobaldo/seedstone:${ref}" .
+          reported="$(docker run --rm "ghcr.io/stefanobaldo/seedstone:${ref}" --version)"
+          case "$reported" in 'seedstone '?*) ;; *) echo "the image does not report its version: $reported" >&2; exit 1;; esac
+      - name: push image
+        if: github.event_name == 'push'
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"
       # The notes are the changelog's section for this version, and a
       # candidate has none of its own: `docs/RELEASING.md` keeps a
       # candidate's entries under `[Unreleased]` until the final is cut, so
