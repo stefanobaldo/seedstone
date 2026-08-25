@@ -363,9 +363,9 @@ impl Server {
     /// waiting silently on a connection the server will not read is worse than
     /// a peer that knows.
     ///
-    /// Shutdown is a clean exit from the accept loop: connections already
-    /// running finish on their own tasks, and the process ends when the
-    /// runtime does.
+    /// Shutdown is a clean exit from the accept loop, on Ctrl-C or on SIGTERM
+    /// — see [`shutdown_requested`]: connections already running finish on
+    /// their own tasks, and the process ends when the runtime does.
     pub async fn run(self) {
         let clients = Arc::new(Semaphore::new(self.max_clients));
         // Assembled once, here, because this is the only place that knows any
@@ -403,6 +403,12 @@ impl Server {
             edge_calls: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             edge_usec: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
         };
+        // Created once and polled across every turn of the loop, rather than
+        // rebuilt inside the `select!`: a signal watcher registered afresh on
+        // each iteration is one that can miss a signal delivered between two
+        // registrations.
+        let shutdown = shutdown_requested();
+        tokio::pin!(shutdown);
         loop {
             tokio::select! {
                 // `biased` for the reason the shard loop states: unbiased arm
@@ -411,7 +417,9 @@ impl Server {
                 // outranks one more connection.
                 biased;
 
-                _ = tokio::signal::ctrl_c() => break,
+                // `()` rather than `_`: the future resolves to the unit, and
+                // the arm says which of the two it is binding.
+                () = &mut shutdown => break,
 
                 accepted = self.listener.accept() => {
                     // A failed accept is per-connection — the peer vanished
@@ -471,6 +479,37 @@ impl Attached {
 impl Drop for Attached {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Resolves when the process is asked to stop: Ctrl-C from a terminal, or
+/// SIGTERM from a supervisor.
+///
+/// In a container this binary is PID 1, and PID 1 *ignores* every signal it has
+/// no handler for — so without the SIGTERM half a pod deletion sits out its
+/// whole grace period and ends in SIGKILL.
+///
+/// Registration failing is not a reason to refuse to start: Ctrl-C still works,
+/// and the alternative is a server that cannot be run at all.
+async fn shutdown_requested() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(mut term) = signal(SignalKind::terminate()) else {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        };
+        tokio::select! {
+            // `biased` for the accept loop's reason: no runtime RNG on a path
+            // that has no fairness to buy.
+            biased;
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
