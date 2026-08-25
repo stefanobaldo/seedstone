@@ -40,6 +40,9 @@ if [ -z "$expected_lines" ]; then
   want redis_evicted_keys_total 0
   want redis_expired_keys_total 0
   want redis_rejected_connections_total 0
+  # The lane sends no bad command, so the count is zero — the assertion is
+  # that the exporter *built* the metric from a field the server now prints.
+  want redis_total_error_replies 0
   grep -Eq '^redis_memory_used_bytes [1-9]' "$metrics" || fail "redis_memory_used_bytes is missing or zero"
   grep -Eq '^redis_keyspace_hits_total ' "$metrics" || fail "redis_keyspace_hits_total is missing"
   grep -Eq '^redis_keyspace_misses_total ' "$metrics" || fail "redis_keyspace_misses_total is missing"

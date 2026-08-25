@@ -398,6 +398,8 @@ impl Server {
             rejected_connections: Arc::new(AtomicU64::new(0)),
             net_in: Arc::new(AtomicU64::new(0)),
             net_out: Arc::new(AtomicU64::new(0)),
+            error_replies: Arc::new(AtomicU64::new(0)),
+            errorstats: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             edge_calls: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             edge_usec: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
         };
@@ -494,6 +496,14 @@ fn configure_accepted(stream: &TcpStream) {
 ///
 /// Both results are discarded: the peer is being disconnected either way, and
 /// there is nowhere left to report a write failure to.
+///
+/// **This error is not one of `total_error_replies`.** The frame never reaches
+/// the outgoing buffer that counts them, and that matches Redis: on
+/// `redis:6-alpine` (`redis_version:6.2.24`), driving connections past
+/// `maxclients` moved `rejected_connections` from 0 to 9 while
+/// `total_error_replies` stayed where it was and `errorstats` gained no row.
+/// The refusal is counted once, as a refused connection, which is the counter
+/// an operator reads for it.
 async fn refuse(mut stream: TcpStream) {
     let mut out = Vec::new();
     encode(&Frame::Error(MAX_CLIENTS_REACHED.to_owned()), &mut out);
