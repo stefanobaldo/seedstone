@@ -244,7 +244,7 @@ checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 
 [[package]]
 name = "seedstone"
-version = "0.0.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "getrandom 0.4.3",
  "seedstone-core",

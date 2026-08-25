@@ -51,6 +51,16 @@ SemVer and are `0.x` until the server persists data;
   cost. A request this server splits is counted and timed at both layers, so
   the `cmdstat_` totals are not additive; `docs/ARCHITECTURE.md` says which
   of the two figures answers which question.
+- `INFO` reports `total_error_replies` in its stats section and an
+  `errorstats` section with one `errorstat_<code>:count=N` row per error
+  code, counted at the edge for every error reply the server writes —
+  including the authentication gate's refusals.
+- The server stops on `SIGTERM` the way it stops on Ctrl-C. In a container it
+  is PID 1, which ignores signals it has no handler for, so this is what
+  makes a pod deletion end promptly instead of at the end of its grace period.
+- A container image, `ghcr.io/stefanobaldo/seedstone:<tag>`, published for
+  every release beside the binary archive: a distroless image holding the
+  binary alone, running as a non-root user.
 
 ### Changed
 
