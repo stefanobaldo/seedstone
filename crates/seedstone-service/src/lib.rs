@@ -976,18 +976,22 @@ fn micros_since(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-/// One decoded request's place in a chunk.
+/// One decoded request's place in a chunk, with the command behind it.
 ///
 /// A request is either answered already — a connection command, or anything
 /// the peer got wrong — or waiting on the router, in which case the slot
 /// carries where in the chunk's batch its command went. Holding both kinds in
 /// one ordered vector is what puts a batch back into request order after it
 /// comes back grouped by whoever ran it.
+///
+/// The label rides here rather than being looked up at the drain because the
+/// drain has no way back to the command: a pending slot's index points into a
+/// batch that has already been moved into the router.
 enum Slot {
     /// Answered here; this frame goes out as it stands.
-    Ready(Frame),
+    Ready(Frame, CommandLabel),
     /// Answered by the router; the index is into the chunk's batch.
-    Pending(usize),
+    Pending(usize, CommandLabel),
 }
 
 /// Serves one connection until the peer disconnects or sends something that
@@ -1302,50 +1306,56 @@ where
 {
     loop {
         match decoder.try_next() {
-            Ok(Some(frame)) => match gated(frame_to_action(frame, node), *authenticated) {
-                Action::Dispatch(cmd) => {
-                    chunk.slots.push(Slot::Pending(chunk.batch.len()));
-                    chunk.batch.push(cmd);
-                    // A batch at the mark is dispatched here rather than held
-                    // until the decoder runs dry — see [`CHUNK_COMMANDS`]. The
-                    // peer sees the same frames in the same order, so no
-                    // ordering this loop guarantees moves; only how many
-                    // commands one message carries.
-                    if chunk.batch.len() >= CHUNK_COMMANDS
-                        && !emit_chunk(stream, out, router, chunk, node).await
-                    {
-                        return Drained::Over;
+            Ok(Some(frame)) => {
+                // The gate may replace the action, and the label survives it
+                // on purpose: a `GET` refused with `NOAUTH` is still a `GET`,
+                // and that is what an operator reading the refusal needs.
+                let (action, label) = frame_to_action(frame, node);
+                match gated(action, *authenticated) {
+                    Action::Dispatch(cmd) => {
+                        chunk.slots.push(Slot::Pending(chunk.batch.len(), label));
+                        chunk.batch.push(cmd);
+                        // A batch at the mark is dispatched here rather than held
+                        // until the decoder runs dry — see [`CHUNK_COMMANDS`]. The
+                        // peer sees the same frames in the same order, so no
+                        // ordering this loop guarantees moves; only how many
+                        // commands one message carries.
+                        if chunk.batch.len() >= CHUNK_COMMANDS
+                            && !emit_chunk(stream, out, router, chunk, node).await
+                        {
+                            return Drained::Over;
+                        }
+                    }
+                    Action::Unbatched(request) => {
+                        // The chunk closes *before* the request runs, and that is
+                        // an ordering requirement rather than tidiness: the
+                        // commands already batched were written by the peer ahead
+                        // of this one, and dispatching this while those wait would
+                        // run a `DEL k` before the `SET k v` the peer pipelined in
+                        // front of it, empty the keyspace in front of the writes
+                        // that filled it, or answer a `KEYS` without the key a
+                        // `SET` just wrote.
+                        if !emit_chunk(stream, out, router, chunk, node).await {
+                            return Drained::Over;
+                        }
+                        chunk
+                            .slots
+                            .push(Slot::Ready(request.answer(router, node).await, label));
+                    }
+                    Action::Reply(frame) | Action::Hello(frame) => {
+                        chunk.slots.push(Slot::Ready(frame, label));
+                    }
+                    Action::Authenticate(outcome) => {
+                        chunk
+                            .slots
+                            .push(Slot::Ready(settle_auth(outcome, authenticated), label));
+                    }
+                    Action::ReplyThenClose(frame) => {
+                        chunk.slots.push(Slot::Ready(frame, label));
+                        return Drained::HangUp;
                     }
                 }
-                Action::Unbatched(request) => {
-                    // The chunk closes *before* the request runs, and that is
-                    // an ordering requirement rather than tidiness: the
-                    // commands already batched were written by the peer ahead
-                    // of this one, and dispatching this while those wait would
-                    // run a `DEL k` before the `SET k v` the peer pipelined in
-                    // front of it, empty the keyspace in front of the writes
-                    // that filled it, or answer a `KEYS` without the key a
-                    // `SET` just wrote.
-                    if !emit_chunk(stream, out, router, chunk, node).await {
-                        return Drained::Over;
-                    }
-                    chunk
-                        .slots
-                        .push(Slot::Ready(request.answer(router, node).await));
-                }
-                Action::Reply(frame) | Action::Hello(frame) => {
-                    chunk.slots.push(Slot::Ready(frame));
-                }
-                Action::Authenticate(outcome) => {
-                    chunk
-                        .slots
-                        .push(Slot::Ready(settle_auth(outcome, authenticated)));
-                }
-                Action::ReplyThenClose(frame) => {
-                    chunk.slots.push(Slot::Ready(frame));
-                    return Drained::HangUp;
-                }
-            },
+            }
             // A proper prefix of a valid frame: read more.
             Ok(None) => return Drained::Dry,
             Err(error) => {
@@ -1419,17 +1429,24 @@ where
             .collect()
     };
     for slot in chunk.slots.drain(..) {
-        let frame = match slot {
-            Slot::Ready(frame) => frame,
-            Slot::Pending(index) => reply_to_frame(
-                replies
-                    .get_mut(index)
-                    .and_then(Option::take)
-                    .unwrap_or(Reply::Error(ReplyError::ShardUnavailable)),
+        let (frame, label) = match slot {
+            Slot::Ready(frame, label) => (frame, label),
+            Slot::Pending(index, label) => (
+                reply_to_frame(
+                    replies
+                        .get_mut(index)
+                        .and_then(Option::take)
+                        .unwrap_or(Reply::Error(ReplyError::ShardUnavailable)),
+                ),
+                label,
             ),
         };
         if let Frame::Error(text) = &frame {
             count_error_reply(node, text);
+            // Counted and named in the same breath, deliberately: a counter
+            // that moves without a line beside it is the situation this was
+            // added to end.
+            log_error_reply(node, &label, text);
         }
         append_frame(out, &frame);
         // A chunk that has already earned a write's worth of replies takes it
@@ -1456,6 +1473,115 @@ fn append_frame(out: &mut Vec<u8>, frame: &Frame) {
 /// `NOAUTH`, `WRONGPASS`, …).
 fn error_code(text: &str) -> &str {
     text.split(' ').next().unwrap_or(text)
+}
+
+/// The command behind one slot, carried so that an error reply can name it.
+///
+/// **Nothing here allocates on the path where the command succeeds.** A
+/// recognised command borrows the same `&'static str` the stats tables use,
+/// and the owned variant is built only where a command was not recognised —
+/// which is already an error path, so its allocation is paid by a request
+/// that was going to be answered with an error anyway.
+enum CommandLabel {
+    /// A command the server knows, named by the static tables.
+    Known(&'static str),
+    /// Bytes the peer sent that name no command. Lossy-converted at
+    /// construction: this is peer input and never reaches anything but a log.
+    Raw(Box<str>),
+    /// No command behind the reply — a protocol-level refusal.
+    Anonymous,
+}
+
+impl CommandLabel {
+    /// Appends the command's name, or nothing when there is no command.
+    fn render(&self, out: &mut String) {
+        match self {
+            Self::Known(name) => out.push_str(name),
+            Self::Raw(raw) => out.push_str(raw),
+            Self::Anonymous => {}
+        }
+    }
+}
+
+/// The static name a recognised command is logged under, given its
+/// ASCII-uppercased name, or `None` for a name neither table holds.
+///
+/// [`KIND_NAMES`] and [`EDGE_NAMES`] are the two vocabularies `commandstats`
+/// prints, so a log line drawn from them names a command exactly as the
+/// document an operator correlates it against does. Between them they cover
+/// every entry of [`COMMANDS`] — the keyed commands by the kind a shard tags,
+/// the rest by the slot the edge counts — and
+/// `every_command_the_surface_accepts_has_a_static_label` is what keeps that
+/// true as the surface grows.
+///
+/// [`KIND_NAMES`] is scanned first because its early slots are the traffic:
+/// `get` and `set` resolve in two comparisons of three bytes, and the scan a
+/// keyed command pays here is the shape of the one it already pays in
+/// [`edge_slot`].
+fn known_name(upper: &[u8]) -> Option<&'static str> {
+    KIND_NAMES
+        .iter()
+        .chain(EDGE_NAMES.iter())
+        .copied()
+        // Slot `0` of `KIND_NAMES` is no command, and its empty name would
+        // match nothing a peer can send — but a table entry that matches by
+        // being empty is not something to leave to the caller.
+        .find(|name| !name.is_empty() && name.as_bytes().eq_ignore_ascii_case(upper))
+}
+
+/// Appends `raw` as the body of a JSON string — no surrounding quotes.
+///
+/// RESP arguments and error texts quote bytes the peer chose, including
+/// newlines and control characters. Without this, one argument can forge a
+/// whole log line in an aggregator that splits on newlines, which is a
+/// correctness problem and not a tidiness one.
+fn json_escaped(raw: &str, out: &mut String) {
+    use std::fmt::Write as _;
+    for ch in raw.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// One JSON line describing one error reply.
+///
+/// The timestamp is [`NodeInfo::now_unix_millis`] and never `SystemTime::now`:
+/// the wall clock is the one input a replay cannot reproduce, and the
+/// simulator freezes this one at [`FIXED_UNIX_MILLIS`], so a replayed run
+/// writes the line the original run wrote.
+fn error_reply_line(node: &NodeInfo, label: &CommandLabel, text: &str) -> String {
+    let mut line = String::with_capacity(text.len() + 96);
+    line.push_str("{\"evt\":\"error_reply\",\"ts\":");
+    // A field holding `fn() -> u64`, not a method: the parentheses are load
+    // bearing. This is the injected wall clock, and the only one a replay can
+    // reproduce.
+    line.push_str(&(node.now_unix_millis)().to_string());
+    line.push_str(",\"code\":\"");
+    json_escaped(error_code(text), &mut line);
+    line.push_str("\",\"cmd\":\"");
+    let mut cmd = String::new();
+    label.render(&mut cmd);
+    json_escaped(&cmd, &mut line);
+    line.push_str("\",\"msg\":\"");
+    json_escaped(text, &mut line);
+    line.push_str("\"}");
+    line
+}
+
+/// Writes one error reply's line to stderr, beside the startup lines the
+/// binary already writes there. Both streams reach a container's log file, so
+/// the choice is consistency rather than routing.
+fn log_error_reply(node: &NodeInfo, label: &CommandLabel, text: &str) {
+    eprintln!("{}", error_reply_line(node, label, text));
 }
 
 /// Files one error reply under its code and in the total.
@@ -2055,16 +2181,27 @@ fn settle_auth(outcome: Result<Frame, Frame>, authenticated: &mut bool) -> Frame
     }
 }
 
-/// Maps a request frame to what should happen because of it.
+/// Maps a request frame to what should happen because of it, and names the
+/// command it came from.
 ///
 /// Every failure below is answered and survived: a frame that is well-formed
 /// RESP but not a command this server can run is the peer's mistake, not a
 /// reason to desynchronise the stream.
-fn frame_to_action(frame: Frame, node: &NodeInfo) -> Action {
-    match action_for(frame, node) {
+///
+/// The label comes back alongside the action because the frame is consumed
+/// here and there is no second chance at it: the drain that eventually sees
+/// the error reply has neither the frame nor the batch it went into. One
+/// parse, one label — a second parse would put peer-input handling in two
+/// places, which is what this module's opening paragraphs forbid.
+fn frame_to_action(frame: Frame, node: &NodeInfo) -> (Action, CommandLabel) {
+    // Anonymous until a name is read, which is what a frame that is not even
+    // an array of bulk strings leaves it as.
+    let mut label = CommandLabel::Anonymous;
+    let action = match action_for(frame, node, &mut label) {
         Ok(action) => action,
         Err(message) => Action::Reply(safe_error(&message)),
-    }
+    };
+    (action, label)
 }
 
 /// What a command does with the arguments that follow its name.
@@ -2286,7 +2423,7 @@ const COMMANDS: &[(&[u8], Handler)] = &[
 /// reply is *moved* out of the array the codec built. What is left behind is an
 /// empty `Vec` that dies with the array, and the alternative is a second copy
 /// of every value the peer wrote, on the path every write takes.
-fn action_for(frame: Frame, node: &NodeInfo) -> Result<Action, String> {
+fn action_for(frame: Frame, node: &NodeInfo, label: &mut CommandLabel) -> Result<Action, String> {
     let Frame::Array(parts) = frame else {
         return Err("ERR Protocol error: expected an array of bulk strings".into());
     };
@@ -2313,9 +2450,20 @@ fn action_for(frame: Frame, node: &NodeInfo) -> Result<Action, String> {
         .iter()
         .find(|(known, _)| *known == upper.as_slice())
     else {
+        // The one place a label allocates, and it is already an error path:
+        // the reply below quotes the same bytes, so the request was going to
+        // pay for them whatever happened.
+        *label = CommandLabel::Raw(String::from_utf8_lossy(name).into());
         // The name is peer-supplied. It is quoted, not echoed.
         return Err(format!("ERR unknown command '{}'", quote(name)));
     };
+    // Named *before* the handler runs, so a refusal the handler returns — a
+    // wrong arity, an unparsable expiry — is attributed rather than anonymous.
+    // `known_name` covers every entry of the table just matched, so this
+    // borrows a static name and allocates nothing.
+    if let Some(known) = known_name(&upper) {
+        *label = CommandLabel::Known(known);
+    }
     // A command that travels is counted by the shard that runs it, so this
     // search decides nothing for `GET` and `SET` beyond a miss — and a miss is
     // what keeps the clock reading below off their path entirely. A refusal
@@ -3833,6 +3981,165 @@ mod tests {
         )
         .await;
         assert_eq!(text, "# Keyspace\r\n\r\n# Errorstats\r\n");
+    }
+
+    /// The escaper is the only thing standing between an argument a peer chose
+    /// and a log line the aggregator parses, so it is tested on the bytes that
+    /// break a line rather than on ordinary text.
+    #[test]
+    fn json_escaped_neutralises_everything_that_could_forge_a_line() {
+        let mut out = String::new();
+        json_escaped("a\"b\\c\nd\re\tf", &mut out);
+        assert_eq!(out, r#"a\"b\\c\nd\re\tf"#);
+
+        let mut out = String::new();
+        json_escaped("\u{1}", &mut out);
+        assert_eq!(out, r"\u0001");
+    }
+
+    /// A recognised command names itself with no allocation; the label is the
+    /// static name the stats tables already carry.
+    #[test]
+    fn a_known_command_label_renders_its_name() {
+        let mut out = String::new();
+        CommandLabel::Known("get").render(&mut out);
+        assert_eq!(out, "get");
+    }
+
+    /// An unrecognised command still names itself: this is the case the log
+    /// was added for — a typo no table contains, where the counter could say
+    /// only that an `ERR` had happened.
+    #[test]
+    fn an_unknown_command_label_renders_the_bytes_the_peer_sent() {
+        let mut out = String::new();
+        CommandLabel::Raw("dbsizde".into()).render(&mut out);
+        assert_eq!(out, "dbsizde");
+    }
+
+    /// A refusal with no command behind it — a protocol-level one — says so
+    /// rather than inventing a name.
+    #[test]
+    fn an_anonymous_label_renders_empty() {
+        let mut out = String::new();
+        CommandLabel::Anonymous.render(&mut out);
+        assert_eq!(out, "");
+    }
+
+    /// Every name the command surface accepts resolves to a static label, so
+    /// the recognised path never falls through to [`CommandLabel::Anonymous`]
+    /// and never allocates. The tables the label is drawn from are maintained
+    /// beside the surface rather than by it, so this is the assertion that
+    /// keeps a command added to one from going unnamed by the others.
+    #[test]
+    fn every_command_the_surface_accepts_has_a_static_label() {
+        for name in command_names() {
+            assert!(
+                known_name(&name.to_ascii_uppercase()).is_some(),
+                "{} names no slot in KIND_NAMES or EDGE_NAMES",
+                String::from_utf8_lossy(name),
+            );
+        }
+    }
+
+    /// The line is JSON, it carries the code, the command and the message, and
+    /// its timestamp is the node's injected wall clock — frozen under the
+    /// simulator, which is what makes a replay reproduce it.
+    #[test]
+    fn an_error_reply_line_carries_the_code_the_command_and_the_message() {
+        let node = NodeInfo::for_tests();
+        let line = error_reply_line(
+            &node,
+            &CommandLabel::Raw("dbsizde".into()),
+            "ERR unknown command 'dbsizde'",
+        );
+        assert!(line.starts_with('{') && line.ends_with('}'), "{line}");
+        assert!(line.contains(r#""evt":"error_reply""#), "{line}");
+        assert!(line.contains(r#""code":"ERR""#), "{line}");
+        assert!(line.contains(r#""cmd":"dbsizde""#), "{line}");
+        assert!(
+            line.contains(r#""msg":"ERR unknown command 'dbsizde'""#),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!(r#""ts":{FIXED_UNIX_MILLIS}"#)),
+            "{line}"
+        );
+    }
+
+    /// The message is escaped, because it quotes bytes the peer chose.
+    #[test]
+    fn an_error_reply_line_escapes_the_message_it_quotes() {
+        let node = NodeInfo::for_tests();
+        let line = error_reply_line(&node, &CommandLabel::Anonymous, "ERR bad \"arg\"\nsecond");
+        assert!(line.contains(r#"ERR bad \"arg\"\nsecond"#), "{line}");
+        assert_eq!(line.matches('\n').count(), 0, "one line, always: {line}");
+    }
+
+    /// The label the drain carries to the log, for each of the four shapes a
+    /// frame can have: a recognised command, a recognised command its handler
+    /// refuses, a name no table holds, and a frame with no command in it.
+    ///
+    /// The wrong-arity case is the one worth having. The label is set before
+    /// the handler runs precisely so that a refusal the handler returns is
+    /// attributed, and moving that assignment below the handler would leave
+    /// `wrong number of arguments` anonymous while every other test still
+    /// passed.
+    #[test]
+    fn the_label_names_the_command_behind_each_shape_of_frame() {
+        let node = NodeInfo::for_tests();
+        let named = |frame| {
+            let (_, label) = frame_to_action(frame, &node);
+            let mut out = String::new();
+            label.render(&mut out);
+            out
+        };
+
+        assert_eq!(named(req(&["GET", "k"])), "get");
+        assert_eq!(
+            named(req(&["MGET", "a", "b"])),
+            "mget",
+            "the request the peer made, not the GETs it becomes"
+        );
+        assert_eq!(
+            named(req(&["SET", "k"])),
+            "set",
+            "a wrong arity is a refusal, and it names its command"
+        );
+        assert_eq!(named(req(&["dbsizde"])), "dbsizde");
+        assert_eq!(
+            named(Frame::Integer(1)),
+            "",
+            "no array of bulk strings, so no command to name"
+        );
+    }
+
+    /// An unrecognised command reaches the counting site, which is where the
+    /// line is written beside the count.
+    ///
+    /// This is the end-to-end half: the drain really carries a label from
+    /// `frame_to_action` to `emit_chunk`, and the counter really moves for a
+    /// name no table holds. The line itself goes to stderr, so what it
+    /// contains is `error_reply_line`'s tests to assert and this one's to
+    /// reach.
+    #[tokio::test]
+    async fn an_unknown_command_both_counts_and_names_itself() {
+        let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let node = NodeInfo::for_tests();
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server, pool, node.clone()));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        encode(&req(&["dbsizde"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 1).await;
+        assert!(
+            matches!(&frames[0], Frame::Error(e) if e.contains("unknown command 'dbsizde'")),
+            "{frames:?}"
+        );
+        assert_eq!(node.error_replies.load(Ordering::Relaxed), 1);
+        let text = errorstats_section(&node);
+        assert!(text.contains("errorstat_ERR:count=1"), "{text}");
     }
 
     /// `commandstats` counts the request the peer made, not the commands the
