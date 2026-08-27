@@ -2742,13 +2742,32 @@ async fn info<R: Router>(router: &R, node: &NodeInfo, wanted: &[Vec<u8>]) -> Str
     if asked_for(b"errorstats") {
         text.push_str(&errorstats_section(node));
     }
+    // Redis writes the blank line *between* sections, as a prefix on each
+    // section but the first — never as a suffix on all of them — so the
+    // document ends on its last field. Every section here is written with its
+    // own trailing blank, which is the same thing everywhere except at the
+    // end, so the join is already right and only the last two bytes are
+    // wrong. Trimming them is equivalent to re-shaping every section into a
+    // prefix-separator and touches one place instead of seven.
+    //
+    // Measured against `redis:6-alpine` (`redis_version:6.2.24`) and
+    // `redis:8-alpine` (`redis_version:8.10.1`), which agree: `INFO
+    // keyspace` answers 12 bytes and `INFO errorstats` 14, where this server
+    // answered 14 and 16.
+    if text.ends_with("\r\n\r\n") {
+        text.truncate(text.len() - 2);
+    }
     text
 }
 
-/// One row per error code, or a bare header when nothing has failed yet —
-/// which is what Redis 6.2 prints for a fresh node: `INFO errorstats` on
-/// `redis:6-alpine` (`redis_version:6.2.24`) answers the bulk
-/// `# Errorstats\r\n\r\n`, header and the section's own trailing blank.
+/// One row per error code, or a bare header when nothing has failed yet.
+///
+/// The section is written with its own trailing blank, which is how it joins
+/// the next one; [`info`] trims that blank when this section ends the
+/// document, because Redis's separator is a prefix and not a suffix. On a
+/// fresh node `INFO errorstats` therefore answers the bulk
+/// `# Errorstats\r\n` — 14 bytes on `redis:6-alpine`
+/// (`redis_version:6.2.24`), which this now matches.
 fn errorstats_section(node: &NodeInfo) -> String {
     use std::fmt::Write as _;
     let mut text = String::from("# Errorstats\r\n");
@@ -3775,28 +3794,45 @@ mod tests {
         let text = info(&router, &node, &[b"errorstats".to_vec()]).await;
         assert_eq!(
             text,
-            "# Errorstats\r\nerrorstat_ERR:count=2\r\nerrorstat_NOAUTH:count=1\r\n\r\n"
+            "# Errorstats\r\nerrorstat_ERR:count=2\r\nerrorstat_NOAUTH:count=1\r\n"
         );
     }
 
-    /// A node that has failed at nothing prints the header alone, which is
-    /// what `redis:6-alpine` (`redis_version:6.2.24`) answers for a fresh
-    /// node: the bulk is `# Errorstats\r\n\r\n`, header and the section's own
-    /// trailing blank.
+    /// A bare header, and nothing after it. `INFO errorstats` on a fresh
+    /// `redis:6-alpine` (`redis_version:6.2.24`) answers the bulk
+    /// `# Errorstats\r\n`: Redis separates sections with a blank line rather
+    /// than terminating each with one, so the document ends on its last field.
+    /// `redis:8-alpine` (`redis_version:8.10.1`) answers the same.
     #[tokio::test]
     async fn info_errorstats_on_a_fresh_node_is_a_bare_header() {
         let router = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let text = info(&router, &NodeInfo::for_tests(), &[b"errorstats".to_vec()]).await;
-        assert_eq!(text, "# Errorstats\r\n\r\n");
+        assert_eq!(text, "# Errorstats\r\n");
     }
 
-    /// An empty keyspace is a section with no rows, which is what Redis
-    /// answers and what tells an exporter there is no database to describe.
+    /// `# Keyspace` with no `db0` line, and no trailing blank. Measured
+    /// against `redis:6-alpine` (`redis_version:6.2.24`), which answers 12
+    /// bytes here where this server answered 14.
     #[tokio::test]
     async fn info_keyspace_on_an_empty_node_has_no_db_line() {
         let router = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
         let text = info(&router, &NodeInfo::for_tests(), &[b"keyspace".to_vec()]).await;
-        assert_eq!(text, "# Keyspace\r\n\r\n");
+        assert_eq!(text, "# Keyspace\r\n");
+    }
+
+    /// Two sections join on exactly one blank line, and the document still
+    /// ends on its last field. This is the property a trailing trim can
+    /// break, so it is asserted separately from either section's own shape.
+    #[tokio::test]
+    async fn info_separates_sections_with_one_blank_line_and_ends_without_one() {
+        let router = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let text = info(
+            &router,
+            &NodeInfo::for_tests(),
+            &[b"keyspace".to_vec(), b"errorstats".to_vec()],
+        )
+        .await;
+        assert_eq!(text, "# Keyspace\r\n\r\n# Errorstats\r\n");
     }
 
     /// `commandstats` counts the request the peer made, not the commands the
