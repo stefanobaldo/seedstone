@@ -61,6 +61,10 @@ SemVer and are `0.x` until the server persists data;
 - A container image, `ghcr.io/stefanobaldo/seedstone:<tag>`, published for
   every release beside the binary archive: a distroless image holding the
   binary alone, running as a non-root user.
+- Every error reply is now written to stderr as one JSON line naming the
+  command behind it, its error code and its message. `INFO errorstats` counts
+  errors by code; it cannot say which command produced one, which makes an
+  unexplained increment unexplainable. The line closes that.
 
 ### Changed
 
@@ -80,6 +84,11 @@ SemVer and are `0.x` until the server persists data;
 
 ### Fixed
 
+- `INFO` no longer ends its reply with a blank line. Redis separates sections
+  with a blank line rather than terminating each with one, so the document
+  ends on its last field; this server appended one to whichever section came
+  last. Clients that split on lines and drop empties were unaffected; a
+  byte-for-byte comparison and the reply's length were not.
 - Accepted connections now disable Nagle's algorithm. A pipelined batch larger
   than the read ceiling leaves in more than one write, and with Nagle on every
   write after the first waited for an acknowledgement the peer had no reason to
