@@ -39,14 +39,14 @@ serves on the published port with no password — pass `SEEDSTONE_REQUIREPASS`
 in the environment for one.
 
 **What it answers:** `GET`, `SET` (with `EX`, `PX`, `EXAT`, `PXAT`, `NX`, `XX`,
-`KEEPTTL`, `GET`), `MGET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `PERSIST`,
-`TTL`, `TYPE`, `STRLEN`, `INCRBY`, `SCAN`, `KEYS`, `DBSIZE`, `FLUSHDB`,
-`PING`, `ECHO`, `AUTH`, `HELLO`, `INFO`, `CONFIG GET`, `SLOWLOG`, `LATENCY`,
-`COMMAND`, `CLIENT`, `QUIT`. `DEL`, `EXISTS` and `MGET` take several keys. Keys
-with a deadline are removed when touched and by a background sweep that does
-not wait to be asked. With `--maxmemory`, the keyspace is held under a ceiling
-by evicting least-recently-used keys, or by refusing writes under
-`noeviction`.
+`KEEPTTL`, `GET`), `SETEX`, `MGET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`,
+`PERSIST`, `TTL`, `TYPE`, `STRLEN`, `INCRBY`, `SCAN`, `KEYS`, `DBSIZE`,
+`FLUSHDB`, `PING`, `ECHO`, `AUTH`, `HELLO`, `INFO`, `CONFIG GET`, `SLOWLOG`,
+`LATENCY`, `COMMAND`, `CLIENT`, `QUIT`. `DEL`, `EXISTS` and `MGET` take
+several keys. Keys with a deadline are removed when touched and by a
+background sweep that does not wait to be asked. With `--maxmemory`, the
+keyspace is held under a ceiling by evicting least-recently-used keys, or by
+refusing writes under `noeviction`.
 
 `INFO`, `CONFIG GET`, `SLOWLOG` and `LATENCY` are the operational surface a
 monitoring agent reads: `INFO` in sections — `server`, `clients`, `memory`,

@@ -5,6 +5,15 @@ Notable changes to SeedStone, in the form of
 SemVer and are `0.x` until the server persists data;
 [docs/RELEASING.md](docs/RELEASING.md) is how one is cut.
 
+## [Unreleased]
+
+### Added
+
+- `SETEX key seconds value` — `SET key value EX seconds` under the name Redis
+  gave it before `SET` grew options, which redis-py's `setex()` still puts on
+  the wire. Same write, same refusals, same error texts as `SET … EX`, and its
+  own `cmdstat_setex` line in `INFO commandstats`.
+
 ## [0.1.0] - 2026-09-05
 
 ### Added
