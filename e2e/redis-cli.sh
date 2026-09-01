@@ -69,6 +69,19 @@ expect "set nx on a fresh key" OK r set fresh a NX
 expect "set nx on a taken key" "" r set fresh b NX
 expect "the value the refusal left alone" a r get fresh
 
+# SETEX: the span before the value, and the error text a real client sees.
+expect "setex" OK r setex k3 100 v3
+expect "setex value" v3 r get k3
+ttl=$(r ttl k3)
+if [ "$ttl" -le 90 ] || [ "$ttl" -gt 100 ]; then
+    echo "setex ttl: expected 90 < ttl <= 100, got '$ttl'" >&2
+    exit 1
+fi
+# A refused span writes nothing — the value from the SETEX above survives.
+expect "setex refuses a zero span" \
+    "ERR invalid expire time in 'setex' command" r setex k3 0 clobbered
+expect "the value the refusal left alone" v3 r get k3
+
 r info | grep -q '^# Server'
 r info | grep -q '^connected_clients:'
 
