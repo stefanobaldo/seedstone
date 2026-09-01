@@ -2317,6 +2317,30 @@ const COMMANDS: &[(&[u8], Handler)] = &[
         [key] => Ok(Action::Dispatch(Command::StrLen { key: take(key) })),
         _ => Err(wrong_arity("strlen")),
     }),
+    // The last of the keyed commands, and the one with the least traffic
+    // behind it: the surface's one production caller reaches it on a single
+    // cache-miss path. It sits after the keyed commands that carry the load
+    // so none of them pays a comparison for it.
+    (b"SETEX", |args, _| match args {
+        [key, seconds, value] => {
+            // Parsed before the key and the value are taken, so a refused
+            // span leaves nothing half-consumed — and writes nothing: the
+            // shard never hears of a `SETEX` whose span was refused, which is
+            // Redis's behaviour too (6.2.24, 8.10.1: a refused `SETEX` over
+            // a key leaves its value and its `TTL` untouched).
+            //
+            // The ceiling is `SET … EX`'s, so the two spellings of one write
+            // agree with each other. Whether that ceiling is Redis's is a
+            // separate question, answered at `MAX_EXPIRE_SECONDS`.
+            let seconds = set_expire_value(seconds, MAX_EXPIRE_SECONDS, "setex")?;
+            Ok(Action::Dispatch(Command::SetEx {
+                key: take(key),
+                seconds,
+                value: take(value),
+            }))
+        }
+        _ => Err(wrong_arity("setex")),
+    }),
     // Keyspace-wide: no key to route on, but every shard has to hear it.
     (b"DBSIZE", |args, _| match args {
         [] => Ok(Action::Unbatched(Unbatched::Every(Command::DbSize))),
@@ -3390,7 +3414,7 @@ fn set_options(mut rest: &[Vec<u8>], node: &NodeInfo) -> Result<SetOptions, Stri
     let expiry = match expiry_arg {
         None => None,
         Some((unit, value)) => {
-            let value = set_expire_value(value, unit.ceiling)?;
+            let value = set_expire_value(value, unit.ceiling, "set")?;
             Some(match unit.form {
                 ExpiryForm::Span(build) => build(value),
                 // The multiplication cannot overflow: `set_expire_value` has
@@ -3637,7 +3661,8 @@ const fn condition(option: &[u8]) -> Option<Cond> {
 /// what the unit can carry.
 ///
 /// Called once per `SET`, on the occurrence that survived the walk rather than
-/// on each one — [`set_options`] says why that is observable.
+/// on each one — [`set_options`] says why that is observable — and once per
+/// `SETEX`, on its one positional span.
 ///
 /// Positive is a rule about the value, not about the deadline it resolves to,
 /// and the two come apart for the absolute options: `EXAT 1` names a moment
@@ -3645,13 +3670,20 @@ const fn condition(option: &[u8]) -> Option<Cond> {
 /// both `ERR invalid expire time in 'set' command`. So a `SET` whose deadline
 /// has already passed is not a write refused, but a `SET` whose *number* is
 /// zero or negative is. `ceiling` is what the option's unit may carry; see
-/// [`expiry_unit`].
-fn set_expire_value(value: &[u8], ceiling: i64) -> Result<u64, String> {
+/// [`expiry_unit`]. `name` is the refusing command's own lowercase name, for
+/// [`invalid_expire`] — `set` or `setex`, a literal from the table, never
+/// peer-supplied.
+///
+/// The wording is Redis 8.10.1's. Redis 6.2.24 says `ERR invalid expire time
+/// in setex` — bare, no quotes, no `command` — for `set`, `setex`, `expire`
+/// and `pexpire` alike; the four were reworded together between those
+/// versions, and this server follows the newer form for all four.
+fn set_expire_value(value: &[u8], ceiling: i64, name: &str) -> Result<u64, String> {
     let value = parse_i64(value).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
     if value <= 0 || value > ceiling {
-        return Err(invalid_expire("set"));
+        return Err(invalid_expire(name));
     }
-    u64::try_from(value).map_err(|_| invalid_expire("set"))
+    u64::try_from(value).map_err(|_| invalid_expire(name))
 }
 
 /// Parses `EXPIRE`'s span, which unlike `SET`'s may be zero or negative.
@@ -4644,6 +4676,120 @@ mod tests {
             frames[18],
             Frame::Error("ERR wrong number of arguments for 'persist' command".into())
         );
+    }
+
+    /// `SETEX` is `SET key value EX seconds` with the span before the value,
+    /// and refuses what that `SET` refuses. Every row is measured against
+    /// `redis:6-alpine` (`redis_version:6.2.24`) and `redis:8-alpine`
+    /// (`redis_version:8.10.1`), which agree on every reply but one wording:
+    /// 6.2 says `invalid expire time in setex`, 8.10 says `in 'setex'
+    /// command`. This server says the second, as it does for `set`, `expire`
+    /// and `pexpire`.
+    ///
+    /// Two rows are about what is *not* written. A refused span — zero, or
+    /// not a number — leaves the key exactly as it was: the shard never
+    /// hears of the command, so there is nothing to roll back.
+    #[tokio::test]
+    async fn setex_is_set_with_ex_under_its_old_name() {
+        let (mut r, mut w, _pool) = connected(16);
+        let requests: [&[&str]; 23] = [
+            &["SETEX", "good", "100", "hello"],
+            &["GET", "good"],
+            &["TTL", "good"],
+            &["TYPE", "good"],
+            &["setex", "lower", "100", "hello"],
+            // Arity is exact: nothing after the value, not even a `SET`
+            // option Redis would take on `SET` itself.
+            &["SETEX", "k"],
+            &["SETEX", "k", "1"],
+            &["SETEX", "k", "1", "v", "extra"],
+            &["SETEX", "k", "10", "v", "NX"],
+            &["SETEX", "k", "0", "v"],
+            &["SETEX", "k", "-1", "v"],
+            &["SETEX", "k", "notanum", "v"],
+            &["SETEX", "k", "1.5", "v"],
+            &["SETEX", "k", "", "v"],
+            &["SETEX", "k", "9223372036854775807", "v"],
+            &["SETEX", "k", "999999999999", "v"],
+            // Value and deadline are both overwritten: a key without a
+            // deadline acquires one.
+            &["SET", "pre", "x"],
+            &["SETEX", "pre", "50", "replaced"],
+            &["GET", "pre"],
+            &["TTL", "pre"],
+            // A refused span writes nothing.
+            &["SETEX", "good", "0", "shouldnotwrite"],
+            &["SETEX", "good", "notanum", "shouldnotwrite"],
+            &["GET", "good"],
+        ];
+        let mut out = Vec::new();
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        let arity = Frame::Error("ERR wrong number of arguments for 'setex' command".into());
+        let expire = Frame::Error("ERR invalid expire time in 'setex' command".into());
+        let not_int = Frame::Error("ERR value is not an integer or out of range".into());
+        let expected: [Frame; 23] = [
+            Frame::Simple("OK".into()),
+            Frame::Bulk(b"hello".to_vec()),
+            Frame::Integer(100),
+            Frame::Simple("string".into()),
+            Frame::Simple("OK".into()),
+            arity.clone(),
+            arity.clone(),
+            arity.clone(),
+            arity,
+            expire.clone(),
+            expire.clone(),
+            not_int.clone(),
+            not_int.clone(),
+            not_int,
+            expire.clone(),
+            Frame::Simple("OK".into()),
+            Frame::Simple("OK".into()),
+            Frame::Simple("OK".into()),
+            Frame::Bulk(b"replaced".to_vec()),
+            Frame::Integer(50),
+            expire,
+            Frame::Error("ERR value is not an integer or out of range".into()),
+            Frame::Bulk(b"hello".to_vec()),
+        ];
+        for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
+            assert_eq!(got, want, "request {i}: {:?}", requests[i]);
+        }
+    }
+
+    /// `SETEX` is counted under its own name, and does not move `set`'s
+    /// count — the reason it is a command kind rather than an alias. Redis
+    /// keeps the two apart the same way (`cmdstat_setex` beside
+    /// `cmdstat_set` on 6.2.24 and 8.10.1).
+    #[tokio::test]
+    async fn setex_is_counted_apart_from_set() {
+        let (mut r, mut w, _pool) = connected(16);
+        let mut out = Vec::new();
+        encode(&req(&["SET", "a", "1"]), &mut out);
+        encode(&req(&["SETEX", "b", "10", "2"]), &mut out);
+        encode(&req(&["SETEX", "c", "10", "3"]), &mut out);
+        encode(&req(&["INFO", "commandstats"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 4).await;
+        let Frame::Bulk(text) = &frames[3] else {
+            panic!("INFO answered {:?}", frames[3])
+        };
+        let text = String::from_utf8(text.clone()).unwrap();
+        let counted = |prefix: &str| {
+            assert!(
+                text.lines().any(|written| written.starts_with(prefix)),
+                "no line beginning {prefix:?} in {text}"
+            );
+        };
+        counted("cmdstat_set:calls=1,usec=");
+        counted("cmdstat_setex:calls=2,usec=");
     }
 
     /// `TYPE` and `STRLEN` describe an entry without handing back its value.

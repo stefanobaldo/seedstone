@@ -1831,8 +1831,8 @@ enum Check {
     /// A `STRLEN` of an owned plain key: the length of what the model holds,
     /// or zero.
     PlainStrLen { slot: u32 },
-    /// A `SET` of an owned volatile key: the model adopts `deadline` if it
-    /// took.
+    /// A `SET … EX/PX` or `SETEX` of an owned volatile key: the model adopts
+    /// `deadline` if it took.
     VolatileSet { slot: u32, deadline: Instant },
     /// An `EXPIRE` or a `PEXPIRE` of an owned volatile key: the model adopts
     /// `deadline` only if the server says there was a key there to take it.
@@ -1849,14 +1849,26 @@ enum Check {
     VolatileGet { slot: u32 },
 }
 
-/// A deadline a `SET` can ask for: the option, its argument, and what the two
-/// come to in milliseconds.
+/// How a deadline is spelled on the wire.
+#[derive(Clone, Copy)]
+enum Spelling {
+    /// `SET key value <option> <argument>`.
+    SetOption(&'static str),
+    /// `SETEX key <argument> value` — the span *before* the value, which is
+    /// what makes it a spelling and not an option: the parser reaches it by
+    /// position, through a different table entry, and a bug in that entry is
+    /// one no `SET … EX` can find.
+    SetEx,
+}
+
+/// A deadline a write can ask for: how it is spelled, its argument, and what
+/// the two come to in milliseconds.
 struct Deadline {
-    option: &'static str,
+    spelling: Spelling,
     argument: u64,
     millis: u64,
-    /// Which of the contract's `SET` forms this deadline makes the command.
-    /// The two options are two forms, and this is where they are told apart.
+    /// Which of the contract's forms this deadline makes the command. The
+    /// spellings are separate forms, and this is where they are told apart.
     form: &'static str,
 }
 
@@ -1867,48 +1879,56 @@ struct Deadline {
 /// read reachable while the server is still under load; the long ones outlive
 /// the whole workload, which is what makes a spurious death reachable at all.
 /// None exceeds a second, because the settle at the end waits out the longest
-/// of them and every millisecond of that is paid for in ticks. Both options
-/// appear because `EX` and `PX` are separate arms of the parser and separate
-/// arithmetic in the handler.
-const DEADLINES: [Deadline; 6] = [
+/// of them and every millisecond of that is paid for in ticks. Both `SET`
+/// options appear because `EX` and `PX` are separate arms of the parser and
+/// separate arithmetic in the handler; `SETEX` appears because it is a third
+/// arm — a different table entry reading the span by position — that resolves
+/// to the same handler, and the sweep has to see that it does.
+const DEADLINES: [Deadline; 7] = [
     Deadline {
-        option: "PX",
+        spelling: Spelling::SetOption("PX"),
         argument: 1,
         millis: 1,
         form: contract::FORM_SET_PX,
     },
     Deadline {
-        option: "PX",
+        spelling: Spelling::SetOption("PX"),
         argument: 20,
         millis: 20,
         form: contract::FORM_SET_PX,
     },
     Deadline {
-        option: "PX",
+        spelling: Spelling::SetOption("PX"),
         argument: 60,
         millis: 60,
         form: contract::FORM_SET_PX,
     },
     Deadline {
-        option: "PX",
+        spelling: Spelling::SetOption("PX"),
         argument: 150,
         millis: 150,
         form: contract::FORM_SET_PX,
     },
     Deadline {
-        option: "PX",
+        spelling: Spelling::SetOption("PX"),
         argument: 300,
         millis: 300,
         form: contract::FORM_SET_PX,
     },
-    // The one that outlives the settle, and the only way to reach the `EX`
-    // arm of the option parser: keys given this are never decided dead, only
-    // decided alive, which is the half of the invariant nothing else reaches.
+    // The two that outlive the settle, and the only ways to reach the
+    // seconds unit: keys given these are never decided dead, only decided
+    // alive, which is the half of the invariant nothing else reaches.
     Deadline {
-        option: "EX",
+        spelling: Spelling::SetOption("EX"),
         argument: 1,
         millis: 1000,
         form: contract::FORM_SET_EX,
+    },
+    Deadline {
+        spelling: Spelling::SetEx,
+        argument: 1,
+        millis: 1000,
+        form: contract::FORM_SETEX,
     },
 ];
 
@@ -2319,22 +2339,25 @@ impl Model {
             PLAIN_END..70 => {
                 let slot = self.volatile.pick(rng);
                 let deadline = &DEADLINES[rng.random_range(0..DEADLINES.len())];
+                let key = volatile_key(self.volatile.key(slot));
+                let value = format!("{seq}@{}", self.volatile.key(slot));
+                let argument = deadline.argument.to_string();
+                let frame = match deadline.spelling {
+                    Spelling::SetOption(option) => {
+                        command(&["SET", &key, &value, option, &argument])
+                    }
+                    Spelling::SetEx => command(&["SETEX", &key, &argument, &value]),
+                };
                 Op {
-                    frame: command(&[
-                        "SET",
-                        &volatile_key(self.volatile.key(slot)),
-                        &format!("{seq}@{}", self.volatile.key(slot)),
-                        deadline.option,
-                        &deadline.argument.to_string(),
-                    ]),
+                    frame,
                     check: Check::VolatileSet {
                         slot,
                         deadline: sent + Duration::from_millis(deadline.millis),
                     },
                     // Carried by the deadline rather than derived from its
-                    // option here: the two spellings would then be two places
-                    // to keep in step, and the one that drifted would be the
-                    // one nothing reads.
+                    // spelling here: the two would then be two places to keep
+                    // in step, and the one that drifted would be the one
+                    // nothing reads.
                     form: deadline.form,
                 }
             }
@@ -3711,7 +3734,13 @@ mod tests {
         // the walk's bucket ceiling was raised: one call now crosses more
         // shards, so the same steps in the same order fold different replies,
         // and `expected_sum` and the four counts held still again.
-        const MINI_1_42: u64 = 0x6dc4_a5e3_dc16_43c3;
+        //
+        // And then the first kind fired: `SETEX` joined the deadlines a
+        // volatile write can draw, so a roll that used to spell a deadline
+        // `SET key value EX 1` now sometimes spells it `SETEX key 1 value`.
+        // A new command kind on the wire, folded by its tag — the case the
+        // paragraph above calls a repin by construction.
+        const MINI_1_42: u64 = 0x3ae9_1409_66c1_24e5;
 
         let outcome = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(
@@ -3732,7 +3761,13 @@ mod tests {
                 outcome.plain_checks,
                 outcome.walk_checks
             ),
-            (54, 25, 149, 32),
+            // `SETEX`'s arrival moved the first two and neither of the last
+            // two: the seventh deadline is a second long, so two of the seven
+            // a volatile write can draw now outlive the settle where one of
+            // six did, and the draw decides `alive` where it used to decide
+            // `dead`. Both halves of the expiration invariant are still
+            // reached, which is what these two numbers are here to say.
+            (48, 34, 149, 32),
             "the recorded workload decides a different number of checks"
         );
     }
