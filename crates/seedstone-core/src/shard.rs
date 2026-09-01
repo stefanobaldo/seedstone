@@ -231,6 +231,30 @@ pub enum Command {
         /// there, not what the write did.
         get: bool,
     },
+    /// Store `value` under `key` with a deadline `seconds` from now — `SET key
+    /// value EX seconds` under the name Redis gave it before `SET` grew
+    /// options. Redis lists it as deprecated since 2.6.12 (`COMMAND DOCS
+    /// SETEX`, 8.10.1) and still answers it, and so do the clients: redis-py's
+    /// `setex()` puts this name on the wire.
+    ///
+    /// Its own variant rather than a [`Set`](Self::Set) built at the edge,
+    /// for one reason: a shard counts what it runs by variant, and Redis
+    /// reports `cmdstat_setex` apart from `cmdstat_set` (6.2.24, 8.10.1).
+    /// Folding it into `Set` would make `cmdstat_set` count commands no peer
+    /// spelled that way, and leave the error-reply log's `SETEX` with no
+    /// counter to correlate against. The write itself is `Set`'s, through the
+    /// same handler: an unconditional store with a deadline in seconds and no
+    /// other option.
+    SetEx {
+        /// The key to write.
+        key: Vec<u8>,
+        /// How many seconds from now the key dies. Strictly positive: the
+        /// service layer refuses zero and negatives before dispatch, as
+        /// Redis does.
+        seconds: u64,
+        /// The bytes to store, kept verbatim.
+        value: Vec<u8>,
+    },
     /// Remove `key`.
     Del {
         /// The key to remove.
@@ -406,6 +430,7 @@ impl Command {
         match self {
             Self::Get { key }
             | Self::Set { key, .. }
+            | Self::SetEx { key, .. }
             | Self::Del { key }
             | Self::IncrBy { key, .. }
             | Self::Expire { key, .. }
@@ -444,14 +469,14 @@ impl Command {
     /// `every_kind_tag_is_contiguous_and_bounded` is what keeps it true when
     /// a variant is added: it fails, rather than the array growing silently
     /// or a panic waiting for the traffic that reaches the new command.
-    pub const KIND_MAX: u8 = 15;
+    pub const KIND_MAX: u8 = 16;
 
     /// A stable one-byte tag for this command's variant.
     ///
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
     /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9, `ScanStep` = 10,
     /// `PExpire` = 11, `Persist` = 12, `Type` = 13, `StrLen` = 14,
-    /// `Stats` = 15. These
+    /// `Stats` = 15, `SetEx` = 16. These
     /// values are folded into the simulator's trace hash, so they are part of
     /// what a replay compares: changing one changes every recorded hash. A tag
     /// is therefore never reused and never renumbered.
@@ -473,19 +498,23 @@ impl Command {
             Self::Type { .. } => 13,
             Self::StrLen { .. } => 14,
             Self::Stats => 15,
+            Self::SetEx { .. } => 16,
         }
     }
 
     /// Whether this command is refused under `noeviction` once the gauge is
     /// past the ceiling: the ones that add bytes. Redis's `denyoom` flag.
     ///
-    /// `Set` and `IncrBy` and nothing else. `Expire` and `Persist` rewrite a
+    /// `Set`, `SetEx` and `IncrBy` and nothing else. `Expire` and `Persist` rewrite a
     /// field on an entry already there, and every other command either reads
     /// or reclaims — refusing those would leave a full node with no way back
     /// under its ceiling.
     #[must_use]
     pub const fn denied_when_full(&self) -> bool {
-        matches!(self, Self::Set { .. } | Self::IncrBy { .. })
+        matches!(
+            self,
+            Self::Set { .. } | Self::SetEx { .. } | Self::IncrBy { .. }
+        )
     }
 }
 
@@ -1915,8 +1944,8 @@ fn stats_of<L>(state: &ShardState<L>) -> ShardStats {
 /// that says no more than the arm already says buys a name and a signature
 /// for nothing. What earns an extraction is one of three things: logic two
 /// arms share, as `Expire` and `PExpire` share [`set_expiry`]; an argument
-/// list the dispatcher would otherwise have to assemble inline, as `Set` does
-/// through [`SetArgs`]; or an arm long enough that leaving it here costs the
+/// list the dispatcher would otherwise have to assemble inline, as `Set` and
+/// `SetEx` both do through [`SetArgs`]; or an arm long enough that leaving it here costs the
 /// reader the dispatcher, which is the judgement `clippy::too_many_lines`
 /// makes on our behalf. `IncrBy` was the nearest to that third case and is
 /// now [`incr_by`], extracted on the commit that gave the write paths their
@@ -1999,6 +2028,15 @@ fn apply<L: ReplicationLog, P: ShardPolicy>(
                 get: *get,
             },
         ),
+
+        Command::SetEx {
+            key,
+            seconds,
+            value,
+        } => {
+            let args = SetArgs::set_ex(key, value, *seconds);
+            set(dict, log, seq, shard, now, args)
+        }
 
         Command::Del { key } => {
             if dict.get(key).is_none() {
@@ -2107,6 +2145,28 @@ struct SetArgs<'a> {
     keep_ttl: bool,
     /// Whether the reply is the value the write replaced.
     get: bool,
+}
+
+impl<'a> SetArgs<'a> {
+    /// What `SETEX key seconds value` comes to: an unconditional store with a
+    /// deadline in seconds and every other option off.
+    ///
+    /// A constructor rather than a struct literal in the dispatcher, for the
+    /// second of the three reasons [`apply`] gives for moving code out of an
+    /// arm: the arm's whole content was an argument list assembled inline, and
+    /// six fields of it read as a decision at each one when only the deadline
+    /// is a decision at all. Naming the four that are off here says once, in
+    /// the place that owns the type, that `SETEX` has no options.
+    const fn set_ex(key: &'a Vec<u8>, value: &'a mut Vec<u8>, seconds: u64) -> Self {
+        Self {
+            key,
+            value,
+            expiry: Some(Expiry::Ex(seconds)),
+            cond: None,
+            keep_ttl: false,
+            get: false,
+        }
+    }
 }
 
 /// Stores a value, subject to everything `SET`'s options can say about it.
@@ -2564,6 +2624,11 @@ mod tests {
             Command::Type { key: Vec::new() },
             Command::StrLen { key: Vec::new() },
             Command::Stats,
+            Command::SetEx {
+                key: Vec::new(),
+                seconds: 1,
+                value: Vec::new(),
+            },
         ];
         for cmd in &every {
             // No wildcard: a new variant fails to compile here.
@@ -2582,7 +2647,8 @@ mod tests {
                 | Command::Persist { .. }
                 | Command::Type { .. }
                 | Command::StrLen { .. }
-                | Command::Stats => {}
+                | Command::Stats
+                | Command::SetEx { .. } => {}
             }
         }
         let mut tags: Vec<u8> = every.iter().map(Command::kind).collect();
@@ -2647,6 +2713,15 @@ mod tests {
         }
     }
 
+    /// `SETEX key seconds value`.
+    fn setex(key: &[u8], seconds: u64, value: &[u8]) -> Command {
+        Command::SetEx {
+            key: key.to_vec(),
+            seconds,
+            value: value.to_vec(),
+        }
+    }
+
     fn get(key: &[u8]) -> Command {
         Command::Get { key: key.to_vec() }
     }
@@ -2668,7 +2743,7 @@ mod tests {
     /// to catch and did not.
     #[test]
     fn every_command_declares_how_it_is_routed() {
-        let keyed: [Command; 11] = [
+        let keyed: [Command; 12] = [
             Command::Get { key: b"k".to_vec() },
             set(b"k", b"v"),
             Command::Del { key: b"k".to_vec() },
@@ -2689,6 +2764,7 @@ mod tests {
             Command::Exists { key: b"k".to_vec() },
             Command::Type { key: b"k".to_vec() },
             Command::StrLen { key: b"k".to_vec() },
+            setex(b"k", 1, b"v"),
         ];
         for cmd in keyed {
             assert_eq!(
@@ -2737,6 +2813,70 @@ mod tests {
             0,
             "the expired entry survived the read that reported it gone"
         );
+    }
+
+    /// `SETEX` is `SET … EX` under its old name: the value is stored, the
+    /// deadline is `seconds` out, and the key dies on the read that finds it
+    /// due — the same lazy expiry `set_with_ex_expires_lazily` pins for `SET`.
+    #[tokio::test(start_paused = true)]
+    async fn setex_writes_the_value_and_the_deadline() {
+        let mut shard = Shard::for_tests();
+        assert_eq!(shard.run(setex(b"k", 30, b"v"), Instant::now()), Reply::Ok);
+
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert_eq!(
+            shard.run(get(b"k"), Instant::now()),
+            Reply::Bulk(Some(b"v".to_vec())),
+            "a key one second short of its deadline is still a key"
+        );
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(shard.run(get(b"k"), Instant::now()), Reply::Bulk(None));
+        assert_eq!(shard.dict.len(), 0, "the expired entry survived the read");
+    }
+
+    /// An existing key is overwritten whole, value and deadline: a key that
+    /// had no deadline acquires one. Measured against `redis:6-alpine`
+    /// (6.2.24) and `redis:8-alpine` (8.10.1): `SET pre x` then
+    /// `SETEX pre 50 replaced` gives `GET pre` → `replaced`, `TTL pre` → `50`.
+    #[tokio::test(start_paused = true)]
+    async fn setex_overwrites_value_and_deadline_alike() {
+        let mut shard = Shard::for_tests();
+        assert_eq!(shard.run(set(b"pre", b"x"), Instant::now()), Reply::Ok);
+        assert_eq!(
+            shard.run(setex(b"pre", 50, b"replaced"), Instant::now()),
+            Reply::Ok
+        );
+        assert_eq!(
+            shard.run(get(b"pre"), Instant::now()),
+            Reply::Bulk(Some(b"replaced".to_vec()))
+        );
+        assert_eq!(
+            shard.run(
+                Command::Ttl {
+                    key: b"pre".to_vec()
+                },
+                Instant::now()
+            ),
+            Reply::Integer(50)
+        );
+    }
+
+    /// `SETEX` carries Redis's `denyoom` flag (`COMMAND INFO SETEX` on
+    /// 6.2.24 and 8.10.1), so under `noeviction` a full shard refuses it as
+    /// it refuses `SET`.
+    #[tokio::test]
+    async fn setex_is_refused_when_full_under_noeviction() {
+        let pool = limited(
+            2 * 8 * crate::dict::BUCKET_OVERHEAD,
+            EvictionMode::NoEviction,
+        );
+        assert_eq!(pool.dispatch(set(b"k0", &[0u8; 64])).await, Reply::Ok);
+        assert_eq!(
+            pool.dispatch(setex(b"k1", 10, &[0u8; 64])).await,
+            Reply::Error(ReplyError::OutOfMemory)
+        );
+        assert_eq!(pool.dispatch(get(b"k1")).await, Reply::Bulk(None));
     }
 
     #[tokio::test(start_paused = true)]
