@@ -497,7 +497,7 @@ pub const RUN_ID_HEX: usize = 40;
 /// exist, and the assertion below says this table has a name for each.
 const KIND_NAMES: [&str; KIND_SLOTS] = [
     "", "get", "set", "del", "incrby", "expire", "ttl", "exists", "flushdb", "dbsize", "scan",
-    "pexpire", "persist", "type", "strlen", "info",
+    "pexpire", "persist", "type", "strlen", "info", "setex",
 ];
 
 const _: () = assert!(
