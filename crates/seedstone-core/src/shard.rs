@@ -250,7 +250,7 @@ pub enum Command {
         key: Vec<u8>,
         /// How many seconds from now the key dies. Strictly positive: the
         /// service layer refuses zero and negatives before dispatch, as
-        /// Redis does.
+        /// Redis 6.2.24 and 8.10.1 do.
         seconds: u64,
         /// The bytes to store, kept verbatim.
         value: Vec<u8>,
