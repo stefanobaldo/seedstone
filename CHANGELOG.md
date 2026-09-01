@@ -65,6 +65,10 @@ SemVer and are `0.x` until the server persists data;
   command behind it, its error code and its message. `INFO errorstats` counts
   errors by code; it cannot say which command produced one, which makes an
   unexplained increment unexplainable. The line closes that.
+- `SETEX key seconds value` — `SET key value EX seconds` under the name Redis
+  gave it before `SET` grew options, which redis-py's `setex()` still puts on
+  the wire. Same write, same refusals, same error texts as `SET … EX`, and its
+  own `cmdstat_setex` line in `INFO commandstats`.
 
 ### Changed
 
