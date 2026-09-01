@@ -112,6 +112,12 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
         },
     ),
     (
+        b"SETEX",
+        Coverage::Emitted {
+            forms: &[FORM_SETEX],
+        },
+    ),
+    (
         b"DBSIZE",
         Coverage::Emitted {
             forms: &[FORM_DBSIZE],
@@ -274,6 +280,7 @@ pub(crate) const FORM_PERSIST: &str = "PERSIST key";
 pub(crate) const FORM_INCRBY: &str = "INCRBY key delta";
 pub(crate) const FORM_TYPE: &str = "TYPE key";
 pub(crate) const FORM_STRLEN: &str = "STRLEN key";
+pub(crate) const FORM_SETEX: &str = "SETEX key seconds value";
 pub(crate) const FORM_DBSIZE: &str = "DBSIZE";
 pub(crate) const FORM_KEYS: &str = "KEYS pattern";
 pub(crate) const FORM_SCAN_MATCH: &str = "SCAN cursor MATCH pattern";
