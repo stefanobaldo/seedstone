@@ -49,7 +49,9 @@ SEEDSTONE_BIN=${SEEDSTONE_BIN:-$HOME/src/seedstone-v0.1.0/target/release/seedsto
 REDIS_SERVER=${REDIS_SERVER:-$HOME/redis-8.10.0/src/redis-server}
 VALKEY_SERVER=${VALKEY_SERVER:-$HOME/valkey-9.1.1/src/valkey-server}
 DRAGONFLY=${DRAGONFLY:-$HOME/dragonfly/dragonfly-aarch64}
-GARNET=${GARNET:-$HOME/garnet/GarnetServer}
+# The Garnet release archive unpacks one directory per target framework, so the
+# executable is never at the archive's root; net8.0 is the one this harness names.
+GARNET=${GARNET:-$HOME/garnet/net8.0/GarnetServer}
 CEILING=${CEILING:-384mb}
 ARMS=${ARMS:-seedstone,redis-iot1,redis-iot4,valkey-iot1,valkey-iot4,dragonfly,garnet}
 CAL_RUNS=${CAL_RUNS:-12}
