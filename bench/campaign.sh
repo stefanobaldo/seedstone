@@ -247,11 +247,15 @@ multikey() {
   each_arm populate plain multikey_arm
 }
 
+# A stage that fails must fail the script. The canary and the calibration are
+# gates: a caller that reads only the exit status has to be told, and the
+# trailing "stage done" echo below would otherwise make every stage exit 0.
+STATUS=0
 case "$STAGE" in
-  canary|calibrate|field|expiry|eviction|multikey) "$STAGE";;
+  canary|calibrate|field|expiry|eviction|multikey) "$STAGE" || STATUS=$?;;
   all)
     canary || { echo "### campaign stopped: the canary did not pass"; exit 1; }
-    calibrate
+    calibrate || STATUS=$?
     echo "### calibrate done. Derive W:  python3 bench/report.py --calibrate <this log>"
     echo "### then run, in this order:"
     echo "###   WARMUP=<W> bash bench/campaign.sh field     > 03-field.log"
@@ -263,3 +267,4 @@ case "$STAGE" in
 esac
 
 echo "### stage $STAGE done $(date -u +%FT%TZ)  load:$(cut -d' ' -f1-3 /proc/loadavg)"
+exit "$STATUS"
