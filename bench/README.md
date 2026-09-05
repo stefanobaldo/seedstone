@@ -14,6 +14,11 @@ this directory is what produced them.
 - `results/<tag>/` — the raw logs of each published run, one per stage,
   unedited.
 
+Both refuse rather than round: `campaign.sh` exits non-zero when a stage fails,
+including a canary outside its tolerance, and `report.py --calibrate` exits
+non-zero when an arm never settles inside the cap instead of printing a `W`
+derived from the arms that did.
+
 Requirements: Linux, `redis-benchmark` and `redis-cli`, `taskset`, Python 3.
 Every path and cpuset in `campaign.sh` is an environment variable with the
 reference machine's value as its default.
