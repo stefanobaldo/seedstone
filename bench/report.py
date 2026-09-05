@@ -175,6 +175,7 @@ def calibrate(path):
         if d["kind"] == "cal":
             runs[d["arm"]].append(d["ops"])
     W = 0
+    unsettled = []
     for arm in ORDER:
         xs = runs.get(arm)
         if not xs:
@@ -187,10 +188,19 @@ def calibrate(path):
                 break
         if settle is None:
             print(f"{arm}: never settled within {len(xs)} runs — a finding, not a number to round")
+            unsettled.append(arm)
             continue
         need = settle - 1
         W = max(W, need)
         print(f"{arm}: settles at run {settle}, needs {need} discarded")
+    # W is the largest need across arms; an arm with no need contributes zero.
+    # An arm that never settled contributes nothing at all, so printing W here
+    # would answer the question with the unsettled arm left out of it — the
+    # finding reported as a number, which is what the rule forbids.
+    if unsettled:
+        print(f"W is not derivable: {', '.join(unsettled)} never settled. "
+              "Record the finding; do not run the cells on a W taken from the rest.")
+        return None
     print(f"W={W}")
     return W
 
@@ -218,7 +228,7 @@ if __name__ == "__main__":
     if args[0] == "--selftest":
         selftest()
     elif args[0] == "--calibrate":
-        calibrate(args[1])
+        sys.exit(0 if calibrate(args[1]) is not None else 1)
     else:
         for p in args:
             report(p)
