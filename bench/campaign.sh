@@ -190,10 +190,10 @@ canary() {
   }'
 }
 
-each_arm() {  # each_arm <populate|clean> <plain|ceiling> <fn> [skip-arm]
-  local mode=$1 bound=$2 fn=$3 skip=${4:-} arm
+each_arm() {  # each_arm <populate|clean> <plain|ceiling> <fn> [skip-arms, comma-separated]
+  local mode=$1 bound=$2 fn=$3 skip=",${4:-}," arm
   for arm in ${ARMS//,/ }; do
-    [[ $arm == "$skip" ]] && { echo "### $arm skipped in this stage, by design"; echo; continue; }
+    [[ $skip == *",$arm,"* ]] && { echo "### $arm skipped in this stage, by design"; echo; continue; }
     arm_start "$arm" "$mode" "$bound" || exit 1
     "$fn" "$arm"
     stop
@@ -243,14 +243,20 @@ eviction() {
   echo "### eviction: SET 10 240 B at depth 64 under a $CEILING ceiling, LRU where the engine has it;"
   echo "### the keyspace is filled past the ceiling first (discarded), then W discarded runs, then"
   echo "### three kept, so every kept run is in steady-state eviction. evicted_keys per operation"
-  echo "### is on every row. Garnet does not take part: its memory bound is not a ceiling with LRU."
+  echo "### is on every row. Two engines do not take part, for reasons that are theirs and not"
+  echo "### this cell's. Garnet: its memory bound is a log size with tail reclamation, not a"
+  echo "### ceiling with LRU, so a comparable cell does not exist. Dragonfly (v1.40.2): it"
+  echo "### requires 256 MiB of maxmemory per proactor thread and refuses to start below that,"
+  echo "### so at the ten threads this hardware gives it the smallest ceiling it accepts is"
+  echo "### 2.50 GiB - above the ~0.95 GiB this cell's keyspace can hold, which would mean no"
+  echo "### eviction at all in any arm. The ceiling was declared before the run and stands."
   eviction_arm() {
     local value; value=$(head -c 10240 /dev/zero | tr '\0' x)
     taskset -c "$CLIENT_CPUS" "$BENCH" -p "$PORT" -n 60000 -c 50 -P 64 -r 100000 -q SET "key:__rand_int__" "$value" >/dev/null 2>&1
     echo "    filled past the ceiling: $("$CLI" -p "$PORT" info stats 2>/dev/null | tr -d '\r' | grep '^evicted_keys' || echo 'evicted_keys not reported')"
     runs "$PORT" "$1" set-large 64 10240
   }
-  each_arm clean ceiling eviction_arm garnet
+  each_arm clean ceiling eviction_arm garnet,dragonfly
 }
 
 multikey() {
