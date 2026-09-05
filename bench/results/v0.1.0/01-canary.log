@@ -1,0 +1,22 @@
+### stage canary start 2026-09-05T19:11:15Z
+### load at start: 0.27 0.14 0.05
+### kernel 6.17.0-1022-gcp aarch64  cpus server=0-9 client=10-15
+### os Ubuntu 24.04.4 LTS  memtotal 62.7 GiB
+### seedstone seedstone 0.1.0  benchmark redis-benchmark 8.10.0
+
+### canary: redis io-threads 1, GET 64 B, depth 64, 50 clients, 100 000 spread keys, populated
+### reference 2551021 ops/s, tolerance +-5 %
+--- redis-iot1 [populate] pid=3179 threads=6 load:0.27
+    cmd: /home/stefanobaldo/redis-8.10.0/src/redis-server --port 6391 --save  --appendonly no --io-threads 1
+    redis_version:8.10.0
+    os:Linux 6.17.0-1022-gcp aarch64
+    gcc_version:13.3.0
+    probe: 47/50 hits on key:%012d  dbsize=95061
+    io-threads=1
+cell arm=redis-iot1 kind=kept shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2551020.50 user_us=0.300 sys_us=0.090 total_us=0.390 cores=0.99 client_cores=0.54 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2570694.00 user_us=0.320 sys_us=0.070 total_us=0.390 cores=1.00 client_cores=0.53 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2570694.00 user_us=0.310 sys_us=0.080 total_us=0.390 cores=1.00 client_cores=0.54 evicted=0 evicted_per_op=0.000
+
+### CANARY median=2570694.00 reference=2551021 delta=+0.77% tolerance=+-5%
+### CANARY PASSED
+### stage canary done 2026-09-05T19:11:18Z  load:0.41 0.18 0.06

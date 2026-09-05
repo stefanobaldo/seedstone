@@ -1,0 +1,86 @@
+### stage eviction start 2026-09-05T19:45:34Z
+### load at start: 0.00 0.08 0.67
+### kernel 6.17.0-1022-gcp aarch64  cpus server=0-9 client=10-15
+### os Ubuntu 24.04.4 LTS  memtotal 62.7 GiB
+### seedstone seedstone 0.1.0  benchmark redis-benchmark 8.10.0
+
+### eviction: SET 10 240 B at depth 64 under a 384mb ceiling, LRU where the engine has it;
+### the keyspace is filled past the ceiling first (discarded), then W discarded runs, then
+### three kept, so every kept run is in steady-state eviction. evicted_keys per operation
+### is on every row. Two engines do not take part, for reasons that are theirs and not
+### this cell's. Garnet: its memory bound is a log size with tail reclamation, not a
+### ceiling with LRU, so a comparable cell does not exist. Dragonfly (v1.40.2): it
+### requires 256 MiB of maxmemory per proactor thread and refuses to start below that,
+### so at the ten threads this hardware gives it the smallest ceiling it accepts is
+### 2.50 GiB - above the ~0.95 GiB this cell's keyspace can hold, which would mean no
+### eviction at all in any arm. The ceiling was declared before the run and stands.
+--- seedstone [clean] pid=21076 threads=11 load:0.00
+    cmd: /home/stefanobaldo/src/seedstone-v0.1.0/target/release/seedstone --bind 127.0.0.1:6390 --max-clients 2000 --no-auth --maxmemory 384mb --maxmemory-policy allkeys-lru
+    redis_version:0.1.0
+    filled past the ceiling: evicted_keys:6702
+cell arm=seedstone kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=599161.19 user_us=5.410 sys_us=3.190 total_us=8.600 cores=5.15 client_cores=1.01 evicted=611126 evicted_per_op=0.611
+cell arm=seedstone kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=609384.50 user_us=5.360 sys_us=3.200 total_us=8.560 cores=5.22 client_cores=1.01 evicted=612445 evicted_per_op=0.612
+cell arm=seedstone kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=590667.44 user_us=5.460 sys_us=3.150 total_us=8.610 cores=5.09 client_cores=1.01 evicted=611783 evicted_per_op=0.612
+cell arm=seedstone kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=596302.88 user_us=5.350 sys_us=3.210 total_us=8.560 cores=5.10 client_cores=1.01 evicted=611743 evicted_per_op=0.612
+cell arm=seedstone kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=585823.06 user_us=5.400 sys_us=3.170 total_us=8.570 cores=5.02 client_cores=1.01 evicted=612931 evicted_per_op=0.613
+cell arm=seedstone kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=576036.88 user_us=5.390 sys_us=3.190 total_us=8.580 cores=4.94 client_cores=1.01 evicted=611874 evicted_per_op=0.612
+
+--- redis-iot1 [clean] pid=21246 threads=6 load:0.99
+    cmd: /home/stefanobaldo/redis-8.10.0/src/redis-server --port 6391 --save  --appendonly no --io-threads 1 --maxmemory 384mb --maxmemory-policy allkeys-lru
+    redis_version:8.10.0
+    os:Linux 6.17.0-1022-gcp aarch64
+    gcc_version:13.3.0
+    filled past the ceiling: evicted_keys:14348
+cell arm=redis-iot1 kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=233426.70 user_us=1.960 sys_us=2.330 total_us=4.290 cores=1.00 client_cores=0.48 evicted=678255 evicted_per_op=0.678
+cell arm=redis-iot1 kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=232234.08 user_us=1.920 sys_us=2.390 total_us=4.310 cores=1.00 client_cores=0.51 evicted=677966 evicted_per_op=0.678
+cell arm=redis-iot1 kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=232288.05 user_us=1.950 sys_us=2.360 total_us=4.310 cores=1.00 client_cores=0.48 evicted=676401 evicted_per_op=0.676
+cell arm=redis-iot1 kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=233208.95 user_us=1.870 sys_us=2.420 total_us=4.290 cores=1.00 client_cores=0.48 evicted=677752 evicted_per_op=0.678
+cell arm=redis-iot1 kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=232720.50 user_us=1.910 sys_us=2.380 total_us=4.290 cores=1.00 client_cores=0.50 evicted=676758 evicted_per_op=0.677
+cell arm=redis-iot1 kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=234027.62 user_us=1.910 sys_us=2.360 total_us=4.270 cores=1.00 client_cores=0.48 evicted=676903 evicted_per_op=0.677
+
+--- redis-iot4 [clean] pid=21415 threads=9 load:1.20
+    cmd: /home/stefanobaldo/redis-8.10.0/src/redis-server --port 6391 --save  --appendonly no --io-threads 4 --maxmemory 384mb --maxmemory-policy allkeys-lru
+    redis_version:8.10.0
+    os:Linux 6.17.0-1022-gcp aarch64
+    gcc_version:13.3.0
+    filled past the ceiling: evicted_keys:14324
+cell arm=redis-iot4 kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=612745.12 user_us=2.980 sys_us=3.140 total_us=6.120 cores=3.75 client_cores=1.01 evicted=677361 evicted_per_op=0.677
+cell arm=redis-iot4 kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=598444.06 user_us=2.940 sys_us=3.000 total_us=5.940 cores=3.55 client_cores=1.01 evicted=677400 evicted_per_op=0.677
+cell arm=redis-iot4 kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=638162.06 user_us=2.860 sys_us=3.080 total_us=5.940 cores=3.79 client_cores=1.01 evicted=678206 evicted_per_op=0.678
+cell arm=redis-iot4 kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=630119.69 user_us=2.880 sys_us=3.100 total_us=5.980 cores=3.77 client_cores=1.01 evicted=677904 evicted_per_op=0.678
+cell arm=redis-iot4 kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=609756.12 user_us=3.020 sys_us=3.180 total_us=6.200 cores=3.78 client_cores=1.01 evicted=677414 evicted_per_op=0.677
+cell arm=redis-iot4 kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=610128.12 user_us=2.950 sys_us=3.110 total_us=6.060 cores=3.70 client_cores=1.01 evicted=677864 evicted_per_op=0.678
+
+--- valkey-iot1 [clean] pid=21589 threads=7 load:1.64
+    cmd: /home/stefanobaldo/valkey-9.1.1/src/valkey-server --port 6393 --save  --appendonly no --io-threads 1 --maxmemory 384mb --maxmemory-policy allkeys-lru
+    redis_version:7.2.4
+    valkey_version:9.1.1
+    os:Linux 6.17.0-1022-gcp aarch64
+    gcc_version:13.3.0
+    filled past the ceiling: evicted_keys:14261
+cell arm=valkey-iot1 kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=233808.75 user_us=1.930 sys_us=2.350 total_us=4.280 cores=1.00 client_cores=0.49 evicted=677465 evicted_per_op=0.677
+cell arm=valkey-iot1 kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=233100.23 user_us=1.860 sys_us=2.430 total_us=4.290 cores=1.00 client_cores=0.48 evicted=677806 evicted_per_op=0.678
+cell arm=valkey-iot1 kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=235515.80 user_us=1.830 sys_us=2.420 total_us=4.250 cores=1.00 client_cores=0.48 evicted=677386 evicted_per_op=0.677
+cell arm=valkey-iot1 kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=229463.06 user_us=1.890 sys_us=2.470 total_us=4.360 cores=1.00 client_cores=0.48 evicted=676541 evicted_per_op=0.677
+cell arm=valkey-iot1 kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=230680.50 user_us=1.920 sys_us=2.400 total_us=4.320 cores=1.00 client_cores=0.48 evicted=677673 evicted_per_op=0.678
+cell arm=valkey-iot1 kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=230840.27 user_us=1.920 sys_us=2.420 total_us=4.340 cores=1.00 client_cores=0.48 evicted=677747 evicted_per_op=0.678
+
+--- valkey-iot4 [clean] pid=21759 threads=13 load:1.31
+    cmd: /home/stefanobaldo/valkey-9.1.1/src/valkey-server --port 6393 --save  --appendonly no --io-threads 4 --maxmemory 384mb --maxmemory-policy allkeys-lru
+    redis_version:7.2.4
+    valkey_version:9.1.1
+    os:Linux 6.17.0-1022-gcp aarch64
+    gcc_version:13.3.0
+    filled past the ceiling: evicted_keys:14366
+cell arm=valkey-iot4 kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=524109.03 user_us=5.190 sys_us=1.940 total_us=7.130 cores=3.74 client_cores=0.98 evicted=678539 evicted_per_op=0.679
+cell arm=valkey-iot4 kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=554631.19 user_us=5.110 sys_us=1.810 total_us=6.920 cores=3.84 client_cores=1.01 evicted=678713 evicted_per_op=0.679
+cell arm=valkey-iot4 kind=warmup shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=585823.06 user_us=4.880 sys_us=1.810 total_us=6.690 cores=3.92 client_cores=1.00 evicted=678657 evicted_per_op=0.679
+cell arm=valkey-iot4 kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=586854.44 user_us=4.930 sys_us=1.790 total_us=6.720 cores=3.94 client_cores=1.01 evicted=677720 evicted_per_op=0.678
+cell arm=valkey-iot4 kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=509424.34 user_us=5.460 sys_us=1.950 total_us=7.410 cores=3.77 client_cores=1.00 evicted=679011 evicted_per_op=0.679
+cell arm=valkey-iot4 kind=kept shape=set-large arg=10240 depth=64 clients=50 keyspace=100000 payload=10240 n=1000000 ops=616522.81 user_us=4.520 sys_us=1.880 total_us=6.400 cores=3.95 client_cores=1.01 evicted=679008 evicted_per_op=0.679
+
+### dragonfly skipped in this stage, by design
+
+### garnet skipped in this stage, by design
+
+### stage eviction done 2026-09-05T19:47:10Z  load:1.80 0.71 0.84
