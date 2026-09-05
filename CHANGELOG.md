@@ -5,21 +5,29 @@ Notable changes to SeedStone, in the form of
 SemVer and are `0.x` until the server persists data;
 [docs/RELEASING.md](docs/RELEASING.md) is how one is cut.
 
-## [Unreleased]
+## [0.1.0] - 2026-09-05
 
 ### Added
 
 - A server. It speaks RESP2 over TCP, so `redis-cli` and the ordinary client
-  libraries reach it unmodified: `GET`, `SET`, `DEL`, `EXISTS`, `EXPIRE`,
-  `TTL`, `INCRBY`, `PING`, `ECHO`, `HELLO`, `COMMAND`, `CLIENT` and `QUIT`.
-- Keyspace inspection: `SCAN`, with `MATCH` and `COUNT`; `KEYS`; `DBSIZE`;
-  and `FLUSHDB`. `MGET` reads several keys in one request, as `DEL` and
-  `EXISTS` do.
-- The rest of `SET`'s algebra: `EX`, `PX`, `EXAT` and `PXAT` set a deadline,
-  `NX` and `XX` make the write conditional, `KEEPTTL` leaves an existing
-  deadline alone, and `GET` returns the value that was replaced.
-- `PEXPIRE` and `PERSIST` beside `EXPIRE` and `TTL`, and `TYPE` and `STRLEN`
-  to ask what a key holds without reading it.
+  libraries reach it unmodified. `GET` and `SET`, with the whole of `SET`'s
+  algebra: `EX`, `PX`, `EXAT` and `PXAT` set a deadline, `NX` and `XX` make
+  the write conditional, `KEEPTTL` leaves an existing deadline alone, and
+  `GET` returns the value that was replaced. `DEL`, `EXISTS` and `MGET` take
+  several keys in one request. `EXPIRE`, `PEXPIRE`, `TTL` and `PERSIST` for
+  deadlines, `TYPE` and `STRLEN` to ask what a key holds without reading it,
+  and `INCRBY`. Keyspace inspection through `SCAN`, with `MATCH` and `COUNT`,
+  `KEYS`, `DBSIZE` and `FLUSHDB`. And the connection commands a client library
+  expects: `PING`, `ECHO`, `HELLO`, `COMMAND`, `CLIENT` and `QUIT`.
+- A keyspace walk is at-least-once, not a snapshot. `KEYS` and `SCAN` answer
+  with a set that was the keyspace at no single instant: a key created while a
+  walk is in flight may be missed, and a key deleted while it is in flight may
+  still appear. `KEYS` reports no key twice; `SCAN` may, exactly as in Redis.
+  `SCAN` gathers up to `COUNT` keys per call across shards, so `COUNT` is the
+  client's key target rather than a budget of buckets to visit — which is what
+  it means in Redis — and a call may answer with more keys than were asked
+  for, or with none at all and a cursor that is not `0`. The loop is the
+  ordinary one: call until the cursor comes back `0`.
 - Authentication. `AUTH`, and `HELLO` with an `AUTH` clause, against one
   password for the `default` user. The password arrives in
   `--requirepass-file <path>` or in `SEEDSTONE_REQUIREPASS`, never in an
@@ -38,7 +46,11 @@ SemVer and are `0.x` until the server persists data;
   the parameters that describe how it was started, selected without regard
   to case as Redis selects a parameter name — and `SLOWLOG` and `LATENCY`
   answering as the switched-off monitors they are, so that a scrape
-  completes without an error line per pass.
+  completes without an error line per pass. The `INFO` document ends on its
+  last field, as Redis's does: sections are separated by a blank line rather
+  than terminated by one, byte-for-byte against `redis:6-alpine`
+  (`redis_version:6.2.24`) and `redis:8-alpine` (`redis_version:8.10.1`),
+  which agree.
 - A ceiling on a `KEYS` reply. Past 64 MiB of gathered keys the command is
   refused with an error naming `SCAN` as what to use instead, rather than
   returning a reply that would cost the server more than the client asked
@@ -61,41 +73,10 @@ SemVer and are `0.x` until the server persists data;
 - A container image, `ghcr.io/stefanobaldo/seedstone:<tag>`, published for
   every release beside the binary archive: a distroless image holding the
   binary alone, running as a non-root user.
-- Every error reply is now written to stderr as one JSON line naming the
+- Every error reply is written to stderr as one JSON line naming the
   command behind it, its error code and its message. `INFO errorstats` counts
   errors by code; it cannot say which command produced one, which makes an
   unexplained increment unexplainable. The line closes that.
-
-### Changed
-
-- A keyspace walk is at-least-once, not a snapshot. `KEYS` and `SCAN` answer
-  with a set that was the keyspace at no single instant: a key created while
-  a walk is in flight may be missed, and a key deleted while it is in flight
-  may still appear. `KEYS` reports no key twice; `SCAN` may, exactly as in
-  Redis.
-- `SCAN` gathers up to `COUNT` keys per call across shards rather than
-  answering from one shard per call. The cursor format is unchanged and
-  clients need no change. `COUNT` is now the client's key target rather than
-  a budget of buckets to visit, which is what it means in Redis: a call may
-  answer with more keys than `COUNT` asked for, because the target is checked
-  between shards and not inside one. As before, a call may also answer with
-  no keys at all and a cursor that is not `0`; the loop stays the one it
-  always was, calling until the cursor comes back `0`.
-
-### Fixed
-
-- `INFO` no longer ends its reply with a blank line. Redis separates sections
-  with a blank line rather than terminating each with one, so the document
-  ends on its last field; this server appended one to whichever section came
-  last. Clients that split on lines and drop empties were unaffected; a
-  byte-for-byte comparison and the reply's length were not.
-- Accepted connections now disable Nagle's algorithm. A pipelined batch larger
-  than the read ceiling leaves in more than one write, and with Nagle on every
-  write after the first waited for an acknowledgement the peer had no reason to
-  send promptly.
-- Eviction past the memory ceiling no longer stops early when the key the
-  triggering command addressed is the oldest one it sampled. The key is
-  excluded from candidacy instead, so a shard with room to make still makes it.
 
 ## [0.0.0] - 2026-08-08
 

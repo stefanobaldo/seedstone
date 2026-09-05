@@ -30,6 +30,17 @@ not the first day the script runs.
 
 1. `CHANGELOG.md`: move the `[Unreleased]` entries under the new version and
    date; a candidate's entries stay under `[Unreleased]` until the final.
+
+   **A first release has no `Changed` and no `Fixed`.** Both are relative to
+   something published, and before the first tag there is nothing to be
+   relative to: a correction to code that never shipped is invisible to every
+   reader of that release, and belongs to the commit that made it. Whatever
+   such an entry says that a new reader still needs — a contract, a
+   compatibility claim — is stated positively under `Added`, as a property of
+   the thing rather than a history of it. This is worth checking at the move
+   and nowhere earlier: each entry is written by the plan that earns it, when
+   the destination is `[Unreleased]` and the question cannot yet be asked, so
+   the assembled document is first read as a whole here.
 2. `crates/seedstone/Cargo.toml`: set `version` to the tag without its `v`,
    **verbatim, candidate suffix included** — `v0.1.0-rc.1` means
    `version = "0.1.0-rc.1"`, not the `0.1.0` it is being cut toward. That
