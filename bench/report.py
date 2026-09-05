@@ -53,14 +53,22 @@ def rowkey(d):
 
 def describe(key):
     shape, arg, depth, clients, keyspace, payload = key
+    size = fmt(int(payload))
     what = {
-        "get": f"GET {payload} B",
-        "set": f"SET {payload} B",
-        "set-ex": f"SET {payload} B EX {arg}",
-        "set-large": f"SET {payload} B",
+        "get": f"GET {size} B",
+        "set": f"SET {size} B",
+        "set-ex": f"SET {size} B EX {arg}",
+        "set-large": f"SET {size} B",
         "mget": f"MGET {arg} keys",
     }[shape]
-    return f"{what}, depth {depth}, {clients} clients, {keyspace} spread keys"
+    return f"{what}, depth {depth}, {clients} clients, {fmt(int(keyspace))} spread keys"
+
+
+def sortkey(key):
+    """Shape, then depth, then the shape argument — all three as numbers where
+    they are numbers. Sorted as text, MGET's 1, 4 and 16 keys come out 1, 16, 4."""
+    shape, arg, depth = key[0], key[1], key[2]
+    return (shape, int(depth), int(arg) if arg.isdigit() else 0, arg)
 
 
 def median(xs):
@@ -156,7 +164,7 @@ def pairs(present, base):
 def report(path):
     summary = summarise(parse(path))
     print(f"## {path}\n")
-    for key in sorted(summary, key=lambda k: (k[0], int(k[2]), k[1])):
+    for key in sorted(summary, key=sortkey):
         present = summary[key]
         base = present.get("seedstone")
         print(f"### {describe(key)}\n")
@@ -213,6 +221,11 @@ def selftest():
     assert word(4.234, 0.01, "cpu") == "more expensive per operation 4.23x"
     assert word(0.6185, 0.01, "cpu") == "cheaper per operation 0.62x"
     assert abs(spread([100, 102, 98]) - 0.04) < 1e-9
+    assert fmt(10240) == "10\u202f240" and fmt(64) == "64"
+    mget = [("mget", a, "64", "50", "100000", "64") for a in ("16", "1", "4")]
+    assert [k[1] for k in sorted(mget, key=sortkey)] == ["1", "4", "16"]
+    assert describe(("set-large", "10240", "64", "50", "100000", "10240")) == (
+        "SET 10\u202f240 B, depth 64, 50 clients, 100\u202f000 spread keys")
     line = ("cell arm=redis-iot1 kind=kept shape=get arg=- depth=64 clients=50 keyspace=100000 "
             "payload=64 n=1000000 ops=2583979.25 user_us=0.310 sys_us=0.080 total_us=0.380 "
             "cores=0.98 client_cores=0.40 evicted=- evicted_per_op=-")
