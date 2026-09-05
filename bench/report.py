@@ -74,7 +74,7 @@ def spread(xs):
 
 def fmt(n, digits=0):
     s = f"{n:,.{digits}f}"
-    return s.replace(",", " ")
+    return s.replace(",", " ")
 
 
 def word(r, s, kind):
