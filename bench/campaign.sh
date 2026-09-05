@@ -219,7 +219,15 @@ expiry() {
   expiry_arm() {
     runs "$PORT" "$1" set 64 -
     runs "$PORT" "$1" set-ex 64 60
-    echo "    ttl probe: $("$CLI" -p "$PORT" ttl key:000000012345 2>/dev/null | tr -d '\r') (a deadline reached the server)"
+    # The probe says what it read. Asserting a deadline unconditionally would
+    # print "a deadline reached the server" beside a -1, which is the sentence
+    # this cell exists to check, printed over the answer that refutes it.
+    local ttl; ttl=$("$CLI" -p "$PORT" ttl key:000000012345 2>/dev/null | tr -d '\r')
+    if [[ $ttl =~ ^[0-9]+$ ]] && (( ttl > 0 )); then
+      echo "    ttl probe: $ttl (a deadline reached the server)"
+    else
+      echo "    ttl probe: $ttl (NO deadline on key:000000012345 — -1 the key has none, -2 no key)"
+    fi
   }
   each_arm populate plain expiry_arm
 }
