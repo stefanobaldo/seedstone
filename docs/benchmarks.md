@@ -144,7 +144,13 @@ _(Added after the run, from `python3 bench/report.py bench/results/v0.1.0/*.log`
   the whole of the tuning.
 - Two payloads (64 B, 10 240 B), one key distribution (100 000 spread keys),
   pipeline depth at most 64, 50 connections throughout.
-- Garnet is absent from the eviction table for the reason stated there.
+- Garnet and Dragonfly are both absent from the eviction table, each for the
+  reason stated there: Garnet bounds memory by a log size with tail
+  reclamation rather than a ceiling with LRU, and Dragonfly refuses to start
+  below 256 MiB of `maxmemory` per proactor thread, which at ten threads puts
+  the smallest ceiling it accepts above everything this cell's keyspace can
+  hold. The ceiling was declared before the run and was not moved to
+  accommodate an engine.
 - A throughput figure that does not state its key distribution is a figure
   about the harness. Every figure here states it.
 
