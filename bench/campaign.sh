@@ -91,9 +91,13 @@ probe_hits() {
 }
 
 banner() {
+  local os mem
+  os=$(grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"')
+  mem=$(awk '/^MemTotal/{printf "%.1f GiB", $2/1048576}' /proc/meminfo 2>/dev/null)
   echo "### stage $1 start $(date -u +%FT%TZ)"
   echo "### load at start:$(cut -d' ' -f1-3 /proc/loadavg | sed 's/^/ /')"
   echo "### kernel $(uname -r) $(uname -m)  cpus server=$SERVER_CPUS client=$CLIENT_CPUS"
+  echo "### os ${os:-unknown}  memtotal ${mem:-unknown}"
   echo "### seedstone $("$SEEDSTONE_BIN" --version 2>/dev/null)  benchmark $("$BENCH" --version 2>/dev/null | head -1)"
   echo
 }

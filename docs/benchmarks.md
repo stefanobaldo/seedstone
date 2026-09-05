@@ -14,10 +14,12 @@ would be a marketing number, so the method comes first.
 ## What was measured, and on what
 
 **The machine.** One GCP `c4a-standard-16`: Google Axion (ARM Neoverse-V2),
-16 physical cores with one thread each, a single NUMA node, 62 GiB. Ubuntu
-24.04, the kernel version echoed at the head of every log. The server under
-test is pinned to ten cores (`0-9`) and the load generator to the other six
-(`10-15`), and the two talk over loopback. Nothing else runs on the machine.
+16 physical cores with one thread each, a single NUMA node, 62.7 GiB of
+memory. Ubuntu 24.04. The distribution, the memory and the kernel version are
+echoed at the head of every log, so the three facts in this paragraph can be
+read off the logs rather than taken on trust. The server under test is pinned
+to ten cores (`0-9`) and the load generator to the other six (`10-15`), and the
+two talk over loopback. Nothing else runs on the machine.
 
 **The load generator.** `redis-benchmark`, from the Redis release measured
 (8.10.0), is the only client. Its own CPU is on every row of every table, so a
