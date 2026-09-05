@@ -123,8 +123,9 @@ def table(arms, present, base):
                 f"{c['total_us']:.3f} | {c['cores']:.2f} | {c['client_cores']:.2f} |")
         if evict:
             line += f" {c['evicted_per_op']:.3f} |" if c["evicted_per_op"] is not None else " - |"
-        ratio = base["ops"] / c["ops"] if base and c["ops"] else 0.0
-        line += f" {ratio:.3f} |"
+        # No seedstone row, or a median of zero, is a missing ratio and says so.
+        # Printed as 0.000 it would read as a measured hundredfold gap.
+        line += f" {base['ops'] / c['ops']:.3f} |" if base and c["ops"] else " - |"
         lines.append(line)
     return "\n".join(lines)
 
@@ -135,10 +136,18 @@ def pairs(present, base):
         if a == "seedstone" or a not in present:
             continue
         c = present[a]
-        r_ops = base["ops"] / c["ops"]
-        r_cpu = base["total_us"] / c["total_us"]
         s_ops = max(base["spread_ops"], c["spread_ops"])
         s_cpu = max(base["spread_cpu"], c["spread_cpu"])
+        # A median of zero has no ratio. CPU per operation reads zero whenever a
+        # run is short enough that the clock tick swallows it, and dividing by it
+        # ends the report; the pair is unreadable, which is what is printed.
+        if not (base["ops"] and c["ops"] and base["total_us"] and c["total_us"]):
+            out.append(f"- seedstone vs {a}: no reading — a median is zero "
+                       f"(seedstone {base['ops']:.2f} ops/s at {base['total_us']:.3f} µs/op; "
+                       f"{a} {c['ops']:.2f} ops/s at {c['total_us']:.3f} µs/op)")
+            continue
+        r_ops = base["ops"] / c["ops"]
+        r_cpu = base["total_us"] / c["total_us"]
         out.append(f"- seedstone vs {a}: {word(r_ops, s_ops, 'ops')} on throughput; "
                    f"{word(r_cpu, s_cpu, 'cpu')} (spreads {100*s_ops:.2f} % / {100*s_cpu:.2f} %)")
     return "\n".join(out)
