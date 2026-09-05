@@ -105,9 +105,10 @@ arms; the one-minute load average is printed before every start instead.
 
 **The canary.** Before anything else, Redis at one I/O thread runs the
 reference shape, and its median is compared with the figure the same
-configuration produced on the reference machine when this harness was first
-run — 2 551 021 operations per second — with a tolerance of ±5 %. A run whose
-canary lands outside that interval was not made on a comparable machine, and
+configuration produced on the reference machine when this baseline was first
+measured — 2 551 021 operations per second — with a tolerance of ±5 %. A run
+whose canary lands outside that interval was not made on a comparable machine,
+and
 its figures are not comparable to the tables below. The harness checks this
 itself and stops.
 
