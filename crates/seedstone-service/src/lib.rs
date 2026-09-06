@@ -3674,10 +3674,11 @@ const fn condition(option: &[u8]) -> Option<Cond> {
 /// [`invalid_expire`] — `set` or `setex`, a literal from the table, never
 /// peer-supplied.
 ///
-/// The wording is Redis 8.10.1's. Redis 6.2.24 says `ERR invalid expire time
-/// in setex` — bare, no quotes, no `command` — for `set`, `setex`, `expire`
-/// and `pexpire` alike; the four were reworded together between those
-/// versions, and this server follows the newer form for all four.
+/// The wording is Redis 8.10.1's. Redis 6.2.24 names the command bare — no
+/// quotes, no trailing `command` — so its `SETEX` refusal reads `ERR invalid
+/// expire time in setex`, and `set`, `expire` and `pexpire` read the same way
+/// with their own names in that slot; the four were reworded together between
+/// those versions, and this server follows the newer form for all four.
 fn set_expire_value(value: &[u8], ceiling: i64, name: &str) -> Result<u64, String> {
     let value = parse_i64(value).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
     if value <= 0 || value > ceiling {
