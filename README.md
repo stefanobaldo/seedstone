@@ -59,7 +59,22 @@ pass.
 
 **What it does not have yet:** persistence — a restart is an empty keyspace —
 along with RESP3, replication, clustering, and every data type except strings.
-There are no benchmarks published.
+
+**Performance:** measured on a 16-core ARM instance against Redis and Valkey at
+one and four I/O threads, and against Dragonfly and Garnet. On pipelined reads
+of small values at depth 64 this server is ahead of Redis and ahead of Valkey,
+at both of their I/O-thread settings; the word changes with the depth — at
+depth 4 it is behind each of them at one of their two settings and
+indistinguishable at the other — and the tables carry all four depths. On
+unpipelined reads, the shape a cache client actually runs, it is ahead of Redis
+and ahead of Valkey. On 10 KB writes under a memory ceiling with eviction it is
+ahead of Redis and of Valkey at one I/O thread, behind Redis at four and
+indistinguishable from Valkey at four. On multi-key reads of four and sixteen
+keys it is behind Redis, and behind every other engine measured; and it is more
+expensive per operation than Redis at pipeline depths above one. Every figure,
+the method that produced it, the raw logs and what the numbers do not say are in
+[docs/benchmarks.md](docs/benchmarks.md). No figure appears here, because a
+figure without its method beside it is a marketing number.
 
 **What it deliberately does not answer:** the inline command protocol, server-
 side scripting, transactions, and `CONFIG SET` — every parameter `CONFIG GET`
