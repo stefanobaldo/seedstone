@@ -225,6 +225,8 @@ Other engines:
 - seedstone vs dragonfly: indistinguishable on throughput; cheaper per operation 0.57x (spreads 13.73 % / 8.69 %)
 - seedstone vs garnet: ahead 1.07x on throughput; cheaper per operation 0.50x (spreads 3.22 % / 3.06 %)
 
+Tracked as #32.
+
 #### Depth 16
 
 | arm | ops/s | user µs/op | sys µs/op | total µs/op | server cores | client cores | evicted/op | ×seedstone |
@@ -278,6 +280,8 @@ Other engines:
 - seedstone vs valkey-iot4: ahead 1.18x on throughput; more expensive per operation 1.92x (spreads 0.42 % / 1.74 %)
 - seedstone vs dragonfly: behind 0.91x on throughput; more expensive per operation 1.41x (spreads 1.83 % / 1.27 %)
 - seedstone vs garnet: behind 0.97x on throughput; more expensive per operation 1.49x (spreads 1.29 % / 8.11 %)
+
+Tracked as #33.
 
 The two quantities point opposite ways against `redis-iot1`, `redis-iot4`,
 `valkey-iot1` and `valkey-iot4`: this server is ahead on throughput and more
@@ -352,6 +356,8 @@ Other engines:
 - seedstone vs dragonfly: behind 0.63x on throughput; more expensive per operation 1.85x (spreads 11.34 % / 9.94 %)
 - seedstone vs garnet: behind 0.66x on throughput; more expensive per operation 1.93x (spreads 11.34 % / 12.57 %)
 
+Tracked as #34.
+
 The two quantities point opposite ways against `redis-iot1`, `redis-iot4`,
 `valkey-iot1` and `valkey-iot4`: this server is ahead on throughput and more
 expensive per operation against each of them, and both readings are of the
@@ -416,6 +422,8 @@ ceiling is not the same across arms, and neither is what one eviction costs.
 - seedstone vs valkey-iot1: ahead 2.54x on throughput; more expensive per operation 1.97x (spreads 3.46 % / 0.92 %)
 - seedstone vs valkey-iot4: indistinguishable on throughput; more expensive per operation 1.28x (spreads 18.25 % / 15.03 %)
 
+Tracked as #35.
+
 The two quantities point opposite ways against `redis-iot1` and
 `valkey-iot1`: this server is ahead on throughput and more expensive per
 operation against each of them, and both readings are of the same runs.
@@ -456,6 +464,8 @@ Other engines:
 - seedstone vs dragonfly: behind 0.73x on throughput; more expensive per operation 1.72x (spreads 1.14 % / 0.28 %)
 - seedstone vs garnet: behind 0.76x on throughput; more expensive per operation 2.11x (spreads 1.08 % / 3.51 %)
 
+Tracked as #36.
+
 The two quantities point opposite ways against `redis-iot1` and
 `valkey-iot1`: this server is ahead on throughput and more expensive per
 operation against each of them, and both readings are of the same runs.
@@ -492,6 +502,8 @@ Other engines:
 - seedstone vs dragonfly: behind 0.69x on throughput; more expensive per operation 1.63x (spreads 0.35 % / 0.16 %)
 - seedstone vs garnet: behind 0.44x on throughput; more expensive per operation 4.32x (spreads 1.26 % / 4.61 %)
 
+Tracked as #37.
+
 #### 16 keys
 
 | arm | ops/s | user µs/op | sys µs/op | total µs/op | server cores | client cores | evicted/op | ×seedstone |
@@ -516,6 +528,8 @@ Other engines:
 - seedstone vs valkey-iot4: behind 0.59x on throughput; more expensive per operation 4.03x (spreads 3.54 % / 2.68 %)
 - seedstone vs dragonfly: behind 0.58x on throughput; more expensive per operation 2.03x (spreads 3.54 % / 2.68 %)
 - seedstone vs garnet: behind 0.40x on throughput; more expensive per operation 5.45x (spreads 3.54 % / 3.12 %)
+
+Tracked as #38.
 
 ## What these numbers do not say
 
