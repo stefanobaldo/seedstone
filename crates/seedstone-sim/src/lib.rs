@@ -1787,17 +1787,22 @@ enum Check {
     /// there would mean giving the key up, which is coverage bought by losing
     /// an invariant.
     PlainSet { slot: u32, value: Vec<u8> },
-    /// A `SET … NX` or `SET … XX` of an owned plain key.
+    /// A `SET … NX`, a `SET … XX` or a `SETNX` of an owned plain key.
     ///
     /// The strongest thing the plain model can be asked, because the answer is
-    /// the model itself: `OK` where the condition held and a null where it did
-    /// not. The model knows presence exactly — nothing else writes these keys
-    /// — so both replies are predictions rather than observations.
+    /// the model itself: the condition held, or it did not. The model knows
+    /// presence exactly — nothing else writes these keys — so both replies are
+    /// predictions rather than observations.
+    ///
+    /// Three commands in one check rather than two, because the decision is
+    /// one decision; what `reply` carries is the only thing that differs.
     PlainSetCond {
         slot: u32,
         value: Vec<u8>,
         /// `true` for `XX`, which sets only where a value already is.
         only_if_present: bool,
+        /// How the two answers are spelled on the wire.
+        reply: CondReply,
     },
     /// A `SET … GET` of an owned plain key: the reply is what the key held
     /// *before* this command, and the key holds `value` after it.
@@ -1847,6 +1852,23 @@ enum Check {
     VolatilePersist { slot: u32 },
     /// A `GET` of an owned volatile key — the two expiration invariants.
     VolatileGet { slot: u32 },
+}
+
+/// How a conditional write's two answers are spelled on the wire.
+///
+/// The same decision in two types. `SETNX` is the reason this exists: it is
+/// `SET key value NX` under an older name, and a client library that read its
+/// reply as a boolean would read a truthy `OK` for a write that was refused if
+/// the server answered the `SET` spelling's frames. So the model predicts the
+/// decision once and the frame separately, and a server that got the decision
+/// right in the wrong type fails here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CondReply {
+    /// `SET … NX` and `SET … XX`: `+OK` where the condition held, a null
+    /// where it did not.
+    OkOrNull,
+    /// `SETNX`: `:1` where it held, `:0` where it did not (6.2.24, 8.10.1).
+    OneOrZero,
 }
 
 /// How a deadline is spelled on the wire.
@@ -2284,21 +2306,44 @@ impl Model {
                 // would be two arms that had to agree about what presence
                 // means.
                 let only_if_present = roll >= 26;
+                // One of the two `NX` rolls spells it `SETNX` instead, for
+                // `SETEX`'s reason and one more. `SETNX` reaches the parser
+                // through a different table entry, so a bug in that entry is
+                // one no `SET … NX` can find; and it answers the decision as
+                // an integer, so a server that took the right decision and
+                // put it in the `SET` spelling's frame is caught here and
+                // nowhere else. It takes a roll off `SET … NX` rather than
+                // adding one, so the arm's share of the hundred is unchanged
+                // and only what one roll puts on the wire moves.
+                let old_name = roll == 25;
                 let slot = self.plain.pick(rng);
                 let value = format!("{seq}@{}", self.plain.key(slot));
-                Op {
-                    frame: command(&[
+                let key = plain_key(self.plain.key(slot));
+                let frame = if old_name {
+                    command(&["SETNX", &key, &value])
+                } else {
+                    command(&[
                         "SET",
-                        &plain_key(self.plain.key(slot)),
+                        &key,
                         &value,
                         if only_if_present { "XX" } else { "NX" },
-                    ]),
+                    ])
+                };
+                Op {
+                    frame,
                     check: Check::PlainSetCond {
                         slot,
                         value: value.into_bytes(),
                         only_if_present,
+                        reply: if old_name {
+                            CondReply::OneOrZero
+                        } else {
+                            CondReply::OkOrNull
+                        },
                     },
-                    form: if only_if_present {
+                    form: if old_name {
+                        contract::FORM_SETNX
+                    } else if only_if_present {
                         contract::FORM_SET_XX
                     } else {
                         contract::FORM_SET_NX
@@ -2449,14 +2494,26 @@ impl Model {
                     slot,
                     value,
                     only_if_present,
+                    reply: spelling,
                 } => {
                     let held = self.plain_state[*slot as usize].clone();
-                    let took = matches!(reply, Frame::Simple(text) if text == "OK");
-                    // The two answers a condition can give. Anything else is
-                    // the server declining to run the command at all, which is
-                    // no statement about the key and leaves the model with
-                    // nothing to hold.
-                    let refused = matches!(reply, Frame::Null);
+                    // The two answers a condition can give, in whichever type
+                    // this spelling gives them. Anything else is the server
+                    // declining to run the command at all, which is no
+                    // statement about the key and leaves the model with
+                    // nothing to hold — and a `SETNX` answering `+OK` lands
+                    // there too, which is the point of reading the frame the
+                    // spelling names rather than either frame that means yes.
+                    let (took, refused) = match spelling {
+                        CondReply::OkOrNull => (
+                            matches!(reply, Frame::Simple(text) if text == "OK"),
+                            matches!(reply, Frame::Null),
+                        ),
+                        CondReply::OneOrZero => (
+                            matches!(reply, Frame::Integer(1)),
+                            matches!(reply, Frame::Integer(0)),
+                        ),
+                    };
                     let present = match held {
                         Known::Nothing => None,
                         Known::Absent => Some(false),
@@ -3740,7 +3797,15 @@ mod tests {
         // `SET key value EX 1` now sometimes spells it `SETEX key 1 value`.
         // A new command kind on the wire, folded by its tag — the case the
         // paragraph above calls a repin by construction.
-        const MINI_1_42: u64 = 0x3ae9_1409_66c1_24e5;
+        //
+        // And the first kind again, for `SETNX`: one of the two rolls that
+        // spelled a conditional write `SET key value NX` now spells it
+        // `SETNX key value`. The arm's four rolls in a hundred are unchanged
+        // and so is the number of conditional writes issued, so this moves
+        // by the new tag and the new reply frame alone — `expected_sum` and
+        // all four check counts hold still, which is what says the workload
+        // did not move underneath it.
+        const MINI_1_42: u64 = 0x711a_6c89_f836_a863;
 
         let outcome = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(

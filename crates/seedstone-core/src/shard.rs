@@ -255,6 +255,26 @@ pub enum Command {
         /// The bytes to store, kept verbatim.
         value: Vec<u8>,
     },
+    /// `SETNX key value` — `SET key value NX` under the name Redis gave it
+    /// before `SET` grew options, which redis-py's `setnx()` still puts on
+    /// the wire.
+    ///
+    /// Its own variant for [`SetEx`](Self::SetEx)'s reason and one more. A
+    /// shard counts what it runs by variant and Redis reports
+    /// `cmdstat_setnx` apart from `cmdstat_set` (6.2.24), so folding it into
+    /// [`Set`](Self::Set) would make `cmdstat_set` count commands no peer
+    /// spelled that way. The one more is the reply: `SET … NX` answers `+OK`
+    /// or a nil bulk, and `SETNX` answers `:1` or `:0` (6.2.24, 8.10.1) —
+    /// the same decision reported in a different type, which an alias built
+    /// at the edge could not express. A client library reading that reply as
+    /// a boolean, which is what redis-py's `setnx()` does, would read a
+    /// truthy `OK` for a write that was refused.
+    SetNx {
+        /// The key to write, only if it is not already there.
+        key: Vec<u8>,
+        /// The bytes to store, kept verbatim.
+        value: Vec<u8>,
+    },
     /// Remove `key`.
     Del {
         /// The key to remove.
@@ -431,6 +451,7 @@ impl Command {
             Self::Get { key }
             | Self::Set { key, .. }
             | Self::SetEx { key, .. }
+            | Self::SetNx { key, .. }
             | Self::Del { key }
             | Self::IncrBy { key, .. }
             | Self::Expire { key, .. }
@@ -469,14 +490,14 @@ impl Command {
     /// `every_kind_tag_is_contiguous_and_bounded` is what keeps it true when
     /// a variant is added: it fails, rather than the array growing silently
     /// or a panic waiting for the traffic that reaches the new command.
-    pub const KIND_MAX: u8 = 16;
+    pub const KIND_MAX: u8 = 17;
 
     /// A stable one-byte tag for this command's variant.
     ///
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
     /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9, `ScanStep` = 10,
     /// `PExpire` = 11, `Persist` = 12, `Type` = 13, `StrLen` = 14,
-    /// `Stats` = 15, `SetEx` = 16. These
+    /// `Stats` = 15, `SetEx` = 16, `SetNx` = 17. These
     /// values are folded into the simulator's trace hash, so they are part of
     /// what a replay compares: changing one changes every recorded hash. A tag
     /// is therefore never reused and never renumbered.
@@ -499,13 +520,14 @@ impl Command {
             Self::StrLen { .. } => 14,
             Self::Stats => 15,
             Self::SetEx { .. } => 16,
+            Self::SetNx { .. } => 17,
         }
     }
 
     /// Whether this command is refused under `noeviction` once the gauge is
     /// past the ceiling: the ones that add bytes. Redis's `denyoom` flag.
     ///
-    /// `Set`, `SetEx` and `IncrBy` and nothing else. `Expire` and `Persist` rewrite a
+    /// `Set`, `SetEx`, `SetNx` and `IncrBy` and nothing else. `Expire` and `Persist` rewrite a
     /// field on an entry already there, and every other command either reads
     /// or reclaims — refusing those would leave a full node with no way back
     /// under its ceiling.
@@ -513,7 +535,7 @@ impl Command {
     pub const fn denied_when_full(&self) -> bool {
         matches!(
             self,
-            Self::Set { .. } | Self::SetEx { .. } | Self::IncrBy { .. }
+            Self::Set { .. } | Self::SetEx { .. } | Self::SetNx { .. } | Self::IncrBy { .. }
         )
     }
 }
@@ -2038,6 +2060,23 @@ fn apply<L: ReplicationLog, P: ShardPolicy>(
             set(dict, log, seq, shard, now, args)
         }
 
+        Command::SetNx { key, value } => {
+            let args = SetArgs::set_nx(key, value);
+            // `set` answers `Ok` or `Bulk(None)` for the `NX` condition; this
+            // spelling reports the same decision as an integer (6.2.24,
+            // 8.10.1).
+            //
+            // The `other` arm is not a catch-all for convenience: `set` can
+            // answer a log-write failure and the ceiling refusal, and those
+            // must travel unchanged rather than become a `0` that would tell
+            // a client its key already existed.
+            match set(dict, log, seq, shard, now, args) {
+                Reply::Ok => Reply::Integer(1),
+                Reply::Bulk(None) => Reply::Integer(0),
+                other => other,
+            }
+        }
+
         Command::Del { key } => {
             if dict.get(key).is_none() {
                 return Reply::Removed(false);
@@ -2163,6 +2202,20 @@ impl<'a> SetArgs<'a> {
             value,
             expiry: Some(Expiry::Ex(seconds)),
             cond: None,
+            keep_ttl: false,
+            get: false,
+        }
+    }
+
+    /// The four fields `SETNX` does not have. Named here for
+    /// [`set_ex`](Self::set_ex)'s reason: the type carries six fields and
+    /// only the condition is a decision this command makes.
+    const fn set_nx(key: &'a Vec<u8>, value: &'a mut Vec<u8>) -> Self {
+        Self {
+            key,
+            value,
+            expiry: None,
+            cond: Some(Cond::Nx),
             keep_ttl: false,
             get: false,
         }
@@ -2629,6 +2682,10 @@ mod tests {
                 seconds: 1,
                 value: Vec::new(),
             },
+            Command::SetNx {
+                key: Vec::new(),
+                value: Vec::new(),
+            },
         ];
         for cmd in &every {
             // No wildcard: a new variant fails to compile here.
@@ -2648,7 +2705,8 @@ mod tests {
                 | Command::Type { .. }
                 | Command::StrLen { .. }
                 | Command::Stats
-                | Command::SetEx { .. } => {}
+                | Command::SetEx { .. }
+                | Command::SetNx { .. } => {}
             }
         }
         let mut tags: Vec<u8> = every.iter().map(Command::kind).collect();

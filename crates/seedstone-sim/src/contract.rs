@@ -118,6 +118,12 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
         },
     ),
     (
+        b"SETNX",
+        Coverage::Emitted {
+            forms: &[FORM_SETNX],
+        },
+    ),
+    (
         b"DBSIZE",
         Coverage::Emitted {
             forms: &[FORM_DBSIZE],
@@ -281,6 +287,12 @@ pub(crate) const FORM_INCRBY: &str = "INCRBY key delta";
 pub(crate) const FORM_TYPE: &str = "TYPE key";
 pub(crate) const FORM_STRLEN: &str = "STRLEN key";
 pub(crate) const FORM_SETEX: &str = "SETEX key seconds value";
+// A form of its own rather than a second label on `SET key value NX`, because
+// the two are not the same reply: `SET … NX` answers `+OK` or a null and
+// `SETNX` answers `:1` or `:0` (6.2.24, 8.10.1). The client model predicts the
+// decision either way, so the only thing separating them is the frame it comes
+// in — which is exactly what a form is for.
+pub(crate) const FORM_SETNX: &str = "SETNX key value";
 pub(crate) const FORM_DBSIZE: &str = "DBSIZE";
 pub(crate) const FORM_KEYS: &str = "KEYS pattern";
 pub(crate) const FORM_SCAN_MATCH: &str = "SCAN cursor MATCH pattern";
