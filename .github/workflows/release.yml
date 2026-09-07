@@ -22,23 +22,31 @@ jobs:
       # owner may move, and a release is the last place to accept that.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # `--locked` so what is published is built from the lockfile that was
-      # tested, not from whatever resolved on the day.
-      - run: cargo build --release -p seedstone --locked
       # The binary reports its version in `INFO` and `HELLO`, so a tag that
       # disagrees with `Cargo.toml` would publish an archive that lies about
       # itself. Only a tag can disagree; a dispatch names no version.
+      #
+      # Before the build, not after: the check is two shell commands and the
+      # build is minutes, and a tag is not movable once pushed — so the cheap
+      # refusal has to come first or it arrives after the expensive one.
       - name: the tag and the crate agree
         if: github.event_name == 'push'
         run: |
           tag="${GITHUB_REF_NAME#v}"
           crate="$(cargo pkgid -p seedstone | sed 's/.*#//')"
           [ "$tag" = "$crate" ] || { echo "tag v$tag but Cargo.toml says $crate" >&2; exit 1; }
+      # `--locked` so what is published is built from the lockfile that was
+      # tested, not from whatever resolved on the day.
+      - run: cargo build --release -p seedstone --locked
       - name: package
         run: |
           version="${GITHUB_REF_NAME#v}"
           [ "${{ github.event_name }}" = "workflow_dispatch" ] && version="dispatch-${GITHUB_SHA::8}"
-          bash scripts/package-release.sh target/release/seedstone "$version" x86_64-unknown-linux-gnu dist
+          # Read from the compiler rather than written down: `ubuntu-latest`
+          # is a label its owner may move, and the day it moves a literal
+          # triple mislabels the archive instead of failing.
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          bash scripts/package-release.sh target/release/seedstone "$version" "$triple" dist
       # One image per tag, named after the tag. Built from the same tree the
       # tarball's binary came from, and smoked before anything is pushed: an
       # image that cannot report its version is not a release.
