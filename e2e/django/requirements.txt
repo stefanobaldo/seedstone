@@ -1,11 +1,11 @@
 # The client pair this gate exercises, frozen deliberately. See README.md.
 django-redis==4.12.1
 redis==4.1.4
-Django==3.0.14
-pytest==7.4.4
+Django==5.2.16
+pytest==9.0.3
 # Not a client, and not optional. The suite's test module imports the msgpack
 # serializer at import time, so without this nothing collects at all.
-msgpack==1.0.5
+msgpack==1.2.1
 # Also not optional. The client's lock retries acquisition forever, so a lock
 # this server cannot grant is an infinite wait rather than a failure — and a
 # lane that hangs cannot be red, green, or read. A per-test bound turns every
