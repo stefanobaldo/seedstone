@@ -88,9 +88,10 @@ control this server does not model. Nor does it terminate TLS: transport
 security belongs to the deployment, in front of the node.
 
 **Releases:** a tag publishes a GitHub Release carrying an x86_64 Linux binary
-and its `sha256`. [CHANGELOG.md](CHANGELOG.md) is what changed;
-[docs/RELEASING.md](docs/RELEASING.md) is how a version is cut. There is no tag
-yet — for now the server is built from source, as above.
+and its `sha256`, and a container image,
+`ghcr.io/stefanobaldo/seedstone:<tag>`. [CHANGELOG.md](CHANGELOG.md) is what
+changed; [docs/RELEASING.md](docs/RELEASING.md) is how a version is cut. The
+current release is `v0.1.0`.
 
 ## How it is built
 
