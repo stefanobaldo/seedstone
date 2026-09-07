@@ -82,6 +82,28 @@ expect "setex refuses a zero span" \
     "ERR invalid expire time in 'setex' command" r setex k3 0 clobbered
 expect "the value the refusal left alone" v3 r get k3
 
+# SETNX answers an integer where SET ... NX answers OK or a nil (redis 6.2.24),
+# which is the whole reason it is a command here and not a rewrite at the edge:
+# a client reading the reply as a boolean sees the difference.
+expect "setnx on a fresh key" 1 r setnx k4 v4
+expect "setnx value" v4 r get k4
+expect "setnx on a taken key" 0 r setnx k4 clobbered
+expect "the value the refusal left alone" v4 r get k4
+
+# PSETEX: SETEX's millisecond spelling. Read back through TTL, which is what
+# this server answers, and in seconds — so a span read in the wrong unit would
+# answer 100000 here rather than a hundred.
+expect "psetex" OK r psetex k5 100000 v5
+expect "psetex value" v5 r get k5
+ttl=$(r ttl k5)
+if [ "$ttl" -le 90 ] || [ "$ttl" -gt 100 ]; then
+    echo "psetex ttl: expected 90 < ttl <= 100, got '$ttl'" >&2
+    exit 1
+fi
+expect "psetex refuses a zero span" \
+    "ERR invalid expire time in 'psetex' command" r psetex k5 0 clobbered
+expect "the value the refusal left alone" v5 r get k5
+
 r info | grep -q '^# Server'
 r info | grep -q '^connected_clients:'
 
