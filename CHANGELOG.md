@@ -17,7 +17,7 @@ SemVer and are `0.x` until the server persists data;
   and `SET key value PX milliseconds` under the names Redis gave them before
   `SET` grew options, which redis-py's `setnx()` and `psetex()` still put on
   the wire. `SETNX` answers `1` or `0` rather than `SET … NX`'s `OK` or nil,
-  which is how Redis has always spelled that reply. Each gets its own
+  which is how Redis 6.2.24 and 8.10.1 spell that reply. Each gets its own
   `cmdstat_` line in `INFO commandstats`.
 
 ## [0.1.0] - 2026-09-05
