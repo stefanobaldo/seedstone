@@ -17,7 +17,13 @@ mkdir -p "$stage/$name" "$out"
 cp "$binary" "$stage/$name/seedstone"
 cp LICENSE-APACHE LICENSE-MIT README.md CHANGELOG.md "$stage/$name/"
 tar -C "$stage" -czf "$out/$name.tar.gz" "$name"
-( cd "$out" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" )
+# `sha256sum` is GNU; a stock macOS has `shasum` and not it. Both write the
+# same two-field line, so the artifact does not depend on which ran.
+if command -v sha256sum > /dev/null; then
+  ( cd "$out" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" )
+else
+  ( cd "$out" && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
+fi
 # The archive must contain a binary that runs, and one that can say what it
 # is: a release nobody can identify once it is unpacked is not a release.
 # Unpacked from the archive rather than checked in place, so what is asserted
