@@ -1881,6 +1881,9 @@ enum Spelling {
     /// position, through a different table entry, and a bug in that entry is
     /// one no `SET … EX` can find.
     SetEx,
+    /// `PSETEX key <argument> value` — [`SetEx`](Self::SetEx) one unit down,
+    /// and a fourth table entry for the same reason.
+    PSetEx,
 }
 
 /// A deadline a write can ask for: how it is spelled, its argument, and what
@@ -1903,10 +1906,11 @@ struct Deadline {
 /// None exceeds a second, because the settle at the end waits out the longest
 /// of them and every millisecond of that is paid for in ticks. Both `SET`
 /// options appear because `EX` and `PX` are separate arms of the parser and
-/// separate arithmetic in the handler; `SETEX` appears because it is a third
-/// arm — a different table entry reading the span by position — that resolves
-/// to the same handler, and the sweep has to see that it does.
-const DEADLINES: [Deadline; 7] = [
+/// separate arithmetic in the handler; `SETEX` and `PSETEX` appear because
+/// they are a third and a fourth arm — different table entries reading the
+/// span by position — that resolve to the same handler, and the sweep has to
+/// see that they do.
+const DEADLINES: [Deadline; 8] = [
     Deadline {
         spelling: Spelling::SetOption("PX"),
         argument: 1,
@@ -1951,6 +1955,17 @@ const DEADLINES: [Deadline; 7] = [
         argument: 1,
         millis: 1000,
         form: contract::FORM_SETEX,
+    },
+    // `PSETEX` is drawn short rather than long, which is the half `SETEX`
+    // cannot reach: its unit is milliseconds, so a key given this one dies
+    // inside the run and the draw decides it *dead*. The two positional
+    // spellings then cover both halves of the expiration invariant between
+    // them instead of both landing on the same one.
+    Deadline {
+        spelling: Spelling::PSetEx,
+        argument: 300,
+        millis: 300,
+        form: contract::FORM_PSETEX,
     },
 ];
 
@@ -2392,6 +2407,7 @@ impl Model {
                         command(&["SET", &key, &value, option, &argument])
                     }
                     Spelling::SetEx => command(&["SETEX", &key, &argument, &value]),
+                    Spelling::PSetEx => command(&["PSETEX", &key, &argument, &value]),
                 };
                 Op {
                     frame,
@@ -3805,7 +3821,14 @@ mod tests {
         // by the new tag and the new reply frame alone — `expected_sum` and
         // all four check counts hold still, which is what says the workload
         // did not move underneath it.
-        const MINI_1_42: u64 = 0x711a_6c89_f836_a863;
+        //
+        // And once more for `PSETEX`, which is a repin of the first kind and
+        // the second at once: an eighth deadline joins the seven a volatile
+        // write can draw, so both the tags on the wire and the draw itself
+        // move. It is drawn short, so `dead_checks` rises where `SETEX` had
+        // raised `alive_checks` — the two positional spellings now reach one
+        // half of the expiration invariant each.
+        const MINI_1_42: u64 = 0x959f_0105_262d_501d;
 
         let outcome = run_sim(&SimConfig::mini(1, 42));
         assert_eq!(
@@ -3832,7 +3855,14 @@ mod tests {
             // six did, and the draw decides `alive` where it used to decide
             // `dead`. Both halves of the expiration invariant are still
             // reached, which is what these two numbers are here to say.
-            (48, 34, 149, 32),
+            //
+            // `PSETEX`'s arrival moved the same two back the other way, for
+            // the mirror of that reason: the eighth deadline is 300ms, so it
+            // dies inside the run and two of the eight outlive the settle
+            // where two of seven did. `plain_checks` and `walk_checks` held
+            // still through both, which is what says a deadline was added and
+            // nothing else moved.
+            (51, 32, 149, 32),
             "the recorded workload decides a different number of checks"
         );
     }

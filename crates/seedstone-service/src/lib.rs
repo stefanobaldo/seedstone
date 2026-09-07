@@ -497,7 +497,7 @@ pub const RUN_ID_HEX: usize = 40;
 /// exist, and the assertion below says this table has a name for each.
 const KIND_NAMES: [&str; KIND_SLOTS] = [
     "", "get", "set", "del", "incrby", "expire", "ttl", "exists", "flushdb", "dbsize", "scan",
-    "pexpire", "persist", "type", "strlen", "info", "setex", "setnx",
+    "pexpire", "persist", "type", "strlen", "info", "setex", "setnx", "psetex",
 ];
 
 const _: () = assert!(
@@ -2350,6 +2350,31 @@ const COMMANDS: &[(&[u8], Handler)] = &[
             value: take(value),
         })),
         _ => Err(wrong_arity("setnx")),
+    }),
+    (b"PSETEX", |args, _| match args {
+        [key, millis, value] => {
+            // Parsed before the key and the value are taken, so a refused
+            // span leaves nothing half-consumed — and writes nothing: the
+            // shard never hears of a `PSETEX` whose span was refused, which
+            // is Redis's behaviour too (6.2.24: a refused `PSETEX` over a key
+            // leaves its value and its `TTL` untouched).
+            //
+            // The ceiling is `PEXPIRE`'s rather than `SET … PX`'s, which is
+            // the one place the two spellings of this write are held to
+            // different numbers. `SET … PX` takes anything an `i64` holds
+            // because Redis takes it there too — a divergence recorded at
+            // `expiry_unit` — while `MAX_EXPIRE_MILLIS` is what Redis itself
+            // refuses, and `PSETEX k 9223372036854775807 v` is refused on
+            // 6.2.24 and 8.10.1 alike. Following `SET … PX` here would accept
+            // a span Redis turns away at this door.
+            let millis = set_expire_value(millis, MAX_EXPIRE_MILLIS, "psetex")?;
+            Ok(Action::Dispatch(Command::PSetEx {
+                key: take(key),
+                millis,
+                value: take(value),
+            }))
+        }
+        _ => Err(wrong_arity("psetex")),
     }),
     // Keyspace-wide: no key to route on, but every shard has to hear it.
     (b"DBSIZE", |args, _| match args {
@@ -4858,6 +4883,131 @@ mod tests {
         ];
         for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
             assert_eq!(got, want, "request {i}: {:?}", requests[i]);
+        }
+    }
+
+    /// `PSETEX` is `SET key value PX milliseconds` with the span before the
+    /// value — `SETEX`'s millisecond spelling. Measured against
+    /// `redis:6-alpine` (`redis_version:6.2.24`).
+    #[tokio::test]
+    async fn psetex_writes_a_value_and_a_millisecond_deadline() {
+        let (mut r, mut w, _pool) = connected(16);
+        let requests: [&[&str]; 8] = [
+            &["PSETEX", "good", "100000", "hello"],
+            &["GET", "good"],
+            &["TYPE", "good"],
+            &["psetex", "lower", "100000", "hello"],
+            // Value and deadline are both overwritten: a key without a
+            // deadline acquires one.
+            &["SET", "pre", "x"],
+            &["PSETEX", "pre", "50000", "replaced"],
+            &["GET", "pre"],
+            // `TTL` and not `PTTL`: this server answers the first and not the
+            // second. It still tells the two units apart — a span read as
+            // seconds rather than milliseconds would answer `100000` here,
+            // not `100`.
+            &["TTL", "good"],
+        ];
+        let mut out = Vec::new();
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        let expected: [Frame; 7] = [
+            Frame::Simple("OK".into()),
+            Frame::Bulk(b"hello".to_vec()),
+            Frame::Simple("string".into()),
+            Frame::Simple("OK".into()),
+            Frame::Simple("OK".into()),
+            Frame::Simple("OK".into()),
+            Frame::Bulk(b"replaced".to_vec()),
+        ];
+        for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
+            assert_eq!(got, want, "request {i}: {:?}", requests[i]);
+        }
+        // The deadline is a span from now, so the assertion is a range, not a
+        // point: the clock advances between the write and the read, and the
+        // second the reply is rounded to may be either side of it. Redis
+        // decays the same way — `PTTL` after `PSETEX good 100000` read
+        // `99900` on 6.2.24.
+        match &frames[7] {
+            Frame::Integer(secs) => assert!((99..=100).contains(secs), "TTL was {secs}"),
+            other => panic!("TTL answered {other:?}"),
+        }
+    }
+
+    /// A refused span leaves the standing key exactly as it was, value and
+    /// deadline both: the shard never hears of the command, so there is
+    /// nothing to roll back (6.2.24).
+    ///
+    /// The wording of the refusal is 8.10.1's, as it is for `set`, `setex`,
+    /// `expire` and `pexpire` — 6.2.24 names the command bare, without quotes
+    /// and without the trailing `command`, and this server follows the newer
+    /// form for all of them.
+    #[tokio::test]
+    async fn psetex_refuses_a_span_and_writes_nothing() {
+        let (mut r, mut w, _pool) = connected(16);
+        let requests: [&[&str]; 8] = [
+            &["SET", "guard", "original"],
+            &["PSETEX", "guard", "0", "refused"],
+            &["PSETEX", "guard", "-1", "refused"],
+            &["PSETEX", "guard", "9223372036854775807", "refused"],
+            &["PSETEX", "guard", "notanum", "refused"],
+            &["PSETEX", "guard", "1.5", "refused"],
+            &["GET", "guard"],
+            &["TTL", "guard"],
+        ];
+        let mut out = Vec::new();
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        let expire = Frame::Error("ERR invalid expire time in 'psetex' command".into());
+        let not_int = Frame::Error("ERR value is not an integer or out of range".into());
+        let expected: [Frame; 8] = [
+            Frame::Simple("OK".into()),
+            expire.clone(),
+            expire.clone(),
+            expire,
+            not_int.clone(),
+            not_int,
+            Frame::Bulk(b"original".to_vec()),
+            Frame::Integer(-1),
+        ];
+        for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
+            assert_eq!(got, want, "request {i}: {:?}", requests[i]);
+        }
+    }
+
+    /// Arity is exact: nothing after the value, not even a `SET` option Redis
+    /// would take on `SET` itself.
+    #[tokio::test]
+    async fn psetex_refuses_every_arity_but_three() {
+        let (mut r, mut w, _pool) = connected(16);
+        let requests: [&[&str]; 5] = [
+            &["PSETEX"],
+            &["PSETEX", "k"],
+            &["PSETEX", "k", "1"],
+            &["PSETEX", "k", "1", "v", "extra"],
+            &["PSETEX", "k", "10", "v", "NX"],
+        ];
+        let mut out = Vec::new();
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        let arity = Frame::Error("ERR wrong number of arguments for 'psetex' command".into());
+        for (i, got) in frames.iter().enumerate() {
+            assert_eq!(got, &arity, "request {i}: {:?}", requests[i]);
         }
     }
 
