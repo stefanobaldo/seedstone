@@ -497,7 +497,7 @@ pub const RUN_ID_HEX: usize = 40;
 /// exist, and the assertion below says this table has a name for each.
 const KIND_NAMES: [&str; KIND_SLOTS] = [
     "", "get", "set", "del", "incrby", "expire", "ttl", "exists", "flushdb", "dbsize", "scan",
-    "pexpire", "persist", "type", "strlen", "info", "setex",
+    "pexpire", "persist", "type", "strlen", "info", "setex", "setnx",
 ];
 
 const _: () = assert!(
@@ -2340,6 +2340,16 @@ const COMMANDS: &[(&[u8], Handler)] = &[
             }))
         }
         _ => Err(wrong_arity("setex")),
+    }),
+    // Beside `SETEX` for the same reason it sits here: a name a client
+    // library still puts on the wire, behind no traffic worth a comparison
+    // ahead of the keyed commands that carry the load.
+    (b"SETNX", |args, _| match args {
+        [key, value] => Ok(Action::Dispatch(Command::SetNx {
+            key: take(key),
+            value: take(value),
+        })),
+        _ => Err(wrong_arity("setnx")),
     }),
     // Keyspace-wide: no key to route on, but every shard has to hear it.
     (b"DBSIZE", |args, _| match args {
@@ -4791,6 +4801,64 @@ mod tests {
         };
         counted("cmdstat_set:calls=1,usec=");
         counted("cmdstat_setex:calls=2,usec=");
+    }
+
+    /// `SETNX` is `SET key value NX` under the name Redis gave it before
+    /// `SET` grew options, with one difference that is not cosmetic: it
+    /// answers an integer where `SET … NX` answers `+OK` or a nil bulk. Every
+    /// row is measured against `redis:6-alpine` (`redis_version:6.2.24`), and
+    /// the rows that could differ were read again on `redis:8-alpine`
+    /// (`redis_version:8.10.1`), which answers the same.
+    ///
+    /// The last three rows are the ones that decide the handler. A key that
+    /// is already there is refused *whatever its state*, and the deadline it
+    /// carries is neither refreshed nor cleared — so this cannot be written
+    /// as a write followed by a check.
+    #[tokio::test]
+    async fn setnx_writes_only_a_key_that_is_not_there() {
+        let (mut r, mut w, _pool) = connected(16);
+        let requests: [&[&str]; 12] = [
+            &["SETNX", "fresh", "hello"],
+            &["GET", "fresh"],
+            &["TTL", "fresh"],
+            &["SETNX", "fresh", "other"],
+            &["GET", "fresh"],
+            &["setnx", "lower", "hello"],
+            // Arity is exact: two arguments, no options.
+            &["SETNX"],
+            &["SETNX", "k"],
+            &["SETNX", "k", "v", "extra"],
+            // A key already there is refused with its deadline intact.
+            &["SET", "withttl", "v", "EX", "100"],
+            &["SETNX", "withttl", "other"],
+            &["TTL", "withttl"],
+        ];
+        let mut out = Vec::new();
+        for parts in requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+
+        let frames = read_frames(&mut r, requests.len()).await;
+        let arity = Frame::Error("ERR wrong number of arguments for 'setnx' command".into());
+        let expected: [Frame; 12] = [
+            Frame::Integer(1),
+            Frame::Bulk(b"hello".to_vec()),
+            Frame::Integer(-1),
+            Frame::Integer(0),
+            Frame::Bulk(b"hello".to_vec()),
+            Frame::Integer(1),
+            arity.clone(),
+            arity.clone(),
+            arity,
+            Frame::Simple("OK".into()),
+            Frame::Integer(0),
+            Frame::Integer(100),
+        ];
+        for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
+            assert_eq!(got, want, "request {i}: {:?}", requests[i]);
+        }
     }
 
     /// `TYPE` and `STRLEN` describe an entry without handing back its value.
