@@ -275,6 +275,25 @@ pub enum Command {
         /// The bytes to store, kept verbatim.
         value: Vec<u8>,
     },
+    /// `PSETEX key milliseconds value` — `SET key value PX milliseconds`
+    /// under the name Redis gave it before `SET` grew options.
+    ///
+    /// Its own variant for [`SetEx`](Self::SetEx)'s reason: Redis reports
+    /// `cmdstat_psetex` apart from `cmdstat_set` (6.2.24), and the
+    /// error-reply log needs a counter to correlate its `PSETEX` against. The
+    /// write itself is [`Set`](Self::Set)'s, through the same handler, and so
+    /// is the reply — unlike [`SetNx`](Self::SetNx), this spelling answers
+    /// exactly what the option spelling answers.
+    PSetEx {
+        /// The key to write.
+        key: Vec<u8>,
+        /// How many milliseconds from now the key dies. Strictly positive:
+        /// the service layer refuses zero and negatives before dispatch, as
+        /// Redis 6.2.24 and 8.10.1 do.
+        millis: u64,
+        /// The bytes to store, kept verbatim.
+        value: Vec<u8>,
+    },
     /// Remove `key`.
     Del {
         /// The key to remove.
@@ -452,6 +471,7 @@ impl Command {
             | Self::Set { key, .. }
             | Self::SetEx { key, .. }
             | Self::SetNx { key, .. }
+            | Self::PSetEx { key, .. }
             | Self::Del { key }
             | Self::IncrBy { key, .. }
             | Self::Expire { key, .. }
@@ -490,14 +510,14 @@ impl Command {
     /// `every_kind_tag_is_contiguous_and_bounded` is what keeps it true when
     /// a variant is added: it fails, rather than the array growing silently
     /// or a panic waiting for the traffic that reaches the new command.
-    pub const KIND_MAX: u8 = 17;
+    pub const KIND_MAX: u8 = 18;
 
     /// A stable one-byte tag for this command's variant.
     ///
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
     /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9, `ScanStep` = 10,
     /// `PExpire` = 11, `Persist` = 12, `Type` = 13, `StrLen` = 14,
-    /// `Stats` = 15, `SetEx` = 16, `SetNx` = 17. These
+    /// `Stats` = 15, `SetEx` = 16, `SetNx` = 17, `PSetEx` = 18. These
     /// values are folded into the simulator's trace hash, so they are part of
     /// what a replay compares: changing one changes every recorded hash. A tag
     /// is therefore never reused and never renumbered.
@@ -521,13 +541,15 @@ impl Command {
             Self::Stats => 15,
             Self::SetEx { .. } => 16,
             Self::SetNx { .. } => 17,
+            Self::PSetEx { .. } => 18,
         }
     }
 
     /// Whether this command is refused under `noeviction` once the gauge is
     /// past the ceiling: the ones that add bytes. Redis's `denyoom` flag.
     ///
-    /// `Set`, `SetEx`, `SetNx` and `IncrBy` and nothing else. `Expire` and `Persist` rewrite a
+    /// `Set`, `SetEx`, `SetNx`, `PSetEx` and `IncrBy` and nothing else. `Expire` and
+    /// `Persist` rewrite a
     /// field on an entry already there, and every other command either reads
     /// or reclaims — refusing those would leave a full node with no way back
     /// under its ceiling.
@@ -535,7 +557,11 @@ impl Command {
     pub const fn denied_when_full(&self) -> bool {
         matches!(
             self,
-            Self::Set { .. } | Self::SetEx { .. } | Self::SetNx { .. } | Self::IncrBy { .. }
+            Self::Set { .. }
+                | Self::SetEx { .. }
+                | Self::SetNx { .. }
+                | Self::PSetEx { .. }
+                | Self::IncrBy { .. }
         )
     }
 }
@@ -1971,8 +1997,11 @@ fn stats_of<L>(state: &ShardState<L>) -> ShardStats {
 /// reader the dispatcher, which is the judgement `clippy::too_many_lines`
 /// makes on our behalf. `IncrBy` was the nearest to that third case and is
 /// now [`incr_by`], extracted on the commit that gave the write paths their
-/// LRU stamp and took the dispatcher one line over the limit. `Del` is now
-/// the nearest.
+/// LRU stamp and took the dispatcher one line over the limit. `SetNx` was the
+/// second to hit it, on the commit that added it, and is now [`set_nx`]. The
+/// same commit took the dispatcher over a second time, and `Del` — named
+/// here as the nearest for as long as this comment has existed — is now
+/// [`del`]. `Expire` is the nearest of what is left.
 ///
 /// The ordering is the half with no judgement in it, and it is what the next
 /// extraction has to respect: every extracted handler sits below in the order
@@ -2060,33 +2089,14 @@ fn apply<L: ReplicationLog, P: ShardPolicy>(
             set(dict, log, seq, shard, now, args)
         }
 
-        Command::SetNx { key, value } => {
-            let args = SetArgs::set_nx(key, value);
-            // `set` answers `Ok` or `Bulk(None)` for the `NX` condition; this
-            // spelling reports the same decision as an integer (6.2.24,
-            // 8.10.1).
-            //
-            // The `other` arm is not a catch-all for convenience: `set` can
-            // answer a log-write failure and the ceiling refusal, and those
-            // must travel unchanged rather than become a `0` that would tell
-            // a client its key already existed.
-            match set(dict, log, seq, shard, now, args) {
-                Reply::Ok => Reply::Integer(1),
-                Reply::Bulk(None) => Reply::Integer(0),
-                other => other,
-            }
+        Command::SetNx { key, value } => set_nx(dict, log, seq, shard, now, key, value),
+
+        Command::PSetEx { key, millis, value } => {
+            let args = SetArgs::pset_ex(key, value, *millis);
+            set(dict, log, seq, shard, now, args)
         }
 
-        Command::Del { key } => {
-            if dict.get(key).is_none() {
-                return Reply::Removed(false);
-            }
-            if let Err(failed) = append(log, seq, shard) {
-                return failed;
-            }
-            dict.remove(key);
-            Reply::Removed(true)
-        }
+        Command::Del { key } => del(dict, log, seq, shard, key),
 
         Command::IncrBy { key, delta } => incr_by(dict, log, seq, shard, key, *delta),
 
@@ -2220,6 +2230,20 @@ impl<'a> SetArgs<'a> {
             get: false,
         }
     }
+
+    /// [`set_ex`](Self::set_ex)'s shape with the span in milliseconds. The
+    /// four fields named off here say once that `PSETEX` has no options
+    /// either.
+    const fn pset_ex(key: &'a Vec<u8>, value: &'a mut Vec<u8>, millis: u64) -> Self {
+        Self {
+            key,
+            value,
+            expiry: Some(Expiry::Px(millis)),
+            cond: None,
+            keep_ttl: false,
+            get: false,
+        }
+    }
 }
 
 /// Stores a value, subject to everything `SET`'s options can say about it.
@@ -2303,6 +2327,60 @@ fn set<L: ReplicationLog>(
 /// integer and a result that would leave `i64` both refuse before anything
 /// reaches the log, which is what keeps the log free of records that replay
 /// to a no-op.
+/// `SETNX key value`: [`set`]'s `NX` decision, reported as an integer.
+///
+/// Extracted for the third of the three reasons [`apply`] gives — the arm was
+/// what took the dispatcher over `clippy::too_many_lines` — and it sits here
+/// rather than beside its sibling handlers because the ordering rule is the
+/// match's: `SetNx` dispatches after `Set` and `SetEx`, whose handler is
+/// [`set`] directly above.
+fn set_nx<L: ReplicationLog>(
+    dict: &mut Dict,
+    log: &mut L,
+    seq: &mut u64,
+    shard: u16,
+    now: Instant,
+    key: &Vec<u8>,
+    value: &mut Vec<u8>,
+) -> Reply {
+    // `set` answers `Ok` or `Bulk(None)` for the `NX` condition; this spelling
+    // reports the same decision as an integer (6.2.24, 8.10.1).
+    //
+    // The `other` arm is not a catch-all for convenience: `set` can answer a
+    // log-write failure and the ceiling refusal, and those must travel
+    // unchanged rather than become a `0` that would tell a client its key
+    // already existed.
+    match set(dict, log, seq, shard, now, SetArgs::set_nx(key, value)) {
+        Reply::Ok => Reply::Integer(1),
+        Reply::Bulk(None) => Reply::Integer(0),
+        other => other,
+    }
+}
+
+/// `DEL key`: remove the entry, and say whether there was one.
+///
+/// Extracted for [`apply`]'s third reason, on the commit its doc comment
+/// predicted would come for it. The arm carries a real decision — a key that
+/// is not there is not a write, so the log is never appended to for it — and
+/// that decision is unchanged by the move; what changed is that the
+/// dispatcher is a page again.
+fn del<L: ReplicationLog>(
+    dict: &mut Dict,
+    log: &mut L,
+    seq: &mut u64,
+    shard: u16,
+    key: &[u8],
+) -> Reply {
+    if dict.get(key).is_none() {
+        return Reply::Removed(false);
+    }
+    if let Err(failed) = append(log, seq, shard) {
+        return failed;
+    }
+    dict.remove(key);
+    Reply::Removed(true)
+}
+
 fn incr_by<L: ReplicationLog>(
     dict: &mut Dict,
     log: &mut L,
@@ -2686,6 +2764,11 @@ mod tests {
                 key: Vec::new(),
                 value: Vec::new(),
             },
+            Command::PSetEx {
+                key: Vec::new(),
+                millis: 1,
+                value: Vec::new(),
+            },
         ];
         for cmd in &every {
             // No wildcard: a new variant fails to compile here.
@@ -2706,7 +2789,8 @@ mod tests {
                 | Command::StrLen { .. }
                 | Command::Stats
                 | Command::SetEx { .. }
-                | Command::SetNx { .. } => {}
+                | Command::SetNx { .. }
+                | Command::PSetEx { .. } => {}
             }
         }
         let mut tags: Vec<u8> = every.iter().map(Command::kind).collect();

@@ -124,6 +124,12 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
         },
     ),
     (
+        b"PSETEX",
+        Coverage::Emitted {
+            forms: &[FORM_PSETEX],
+        },
+    ),
+    (
         b"DBSIZE",
         Coverage::Emitted {
             forms: &[FORM_DBSIZE],
@@ -293,6 +299,10 @@ pub(crate) const FORM_SETEX: &str = "SETEX key seconds value";
 // decision either way, so the only thing separating them is the frame it comes
 // in — which is exactly what a form is for.
 pub(crate) const FORM_SETNX: &str = "SETNX key value";
+// `SETEX`'s reason, one unit down: a fourth table entry reading a span by
+// position, resolving to the same handler, which the sweep has to see that it
+// does.
+pub(crate) const FORM_PSETEX: &str = "PSETEX key millis value";
 pub(crate) const FORM_DBSIZE: &str = "DBSIZE";
 pub(crate) const FORM_KEYS: &str = "KEYS pattern";
 pub(crate) const FORM_SCAN_MATCH: &str = "SCAN cursor MATCH pattern";
