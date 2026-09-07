@@ -37,7 +37,7 @@ artifacts and not one:
 
 The workflow also refuses to publish a tag whose name disagrees with
 `cargo pkgid -p seedstone`, character for character. That check is the reason
-step 2 below insists on the candidate suffix.
+step 3 below insists on the candidate suffix.
 
 ## Cutting one
 
@@ -55,21 +55,38 @@ step 2 below insists on the candidate suffix.
    the destination is `[Unreleased]` and the question cannot yet be asked, so
    the assembled document is first read as a whole here.
 
-2. `crates/seedstone/Cargo.toml`: set `version` to the tag without its `v`,
+2. `CHANGELOG.md`'s link footer: point `[Unreleased]` at the new version and
+   give the new version its own definition. A final gets a compare against the
+   version before it; the first release of all has nothing to compare against
+   and gets its release URL instead. A candidate gets **no** definition — it
+   has no section of its own to link, for the same reason step 1 keeps its
+   entries under `[Unreleased]`.
+
+   ```markdown
+   [Unreleased]: https://github.com/stefanobaldo/seedstone/compare/vX.Y.Z...HEAD
+   [X.Y.Z]: https://github.com/stefanobaldo/seedstone/compare/vA.B.C...vX.Y.Z
+   ```
+
+   It is a step here rather than a convention because nothing checks it: the
+   headings render either way, the release workflow reads sections and not
+   links, and a missing definition is invisible to every gate this repository
+   has.
+
+3. `crates/seedstone/Cargo.toml`: set `version` to the tag without its `v`,
    **verbatim, candidate suffix included** — `v0.1.0-rc.1` means
    `version = "0.1.0-rc.1"`, not the `0.1.0` it is being cut toward. That
    manifest and no other: the five crates carry independent versions, and this
    is the one the binary reports in `INFO` and `HELLO`, and the one
    `cargo pkgid -p seedstone` answers with — which is what the workflow
    compares the tag against, character for character.
-3. `cargo build -p seedstone`, and commit the refreshed `Cargo.lock` together
+4. `cargo build -p seedstone`, and commit the refreshed `Cargo.lock` together
    with the manifest. The lock records the crate's own version too, and the
    release job's first step is `cargo build --release -p seedstone --locked`,
    which refuses to update a lock file that disagrees with the manifest. A
    lock left behind therefore fails the release at its first step, with the
    tag already pushed and no longer movable. (`cargo update -p seedstone
    --precise X.Y.Z` does the same job if a build is not wanted.)
-4. Tag `main`, signed, **carrying the changelog section as its message** — cut
+5. Tag `main`, signed, **carrying the changelog section as its message** — cut
    by the same `awk` the release workflow uses for the notes, so that the tag
    and the release cannot drift apart:
 
@@ -115,6 +132,6 @@ step 2 below insists on the candidate suffix.
    rewriting a published tag creates a new object under the same name, and
    `git fetch` does not update a tag a clone already has, so every existing
    clone would silently disagree with the repository about what that tag is.)*
-5. Watch the release workflow. It ends with the archive and its checksum
+6. Watch the release workflow. It ends with the archive and its checksum
    attached to the release, and the image pushed — all three artifacts of
    "What a tag does", not just the one the release page shows.

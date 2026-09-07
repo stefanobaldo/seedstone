@@ -91,3 +91,8 @@ SemVer and are `0.x` until the server persists data;
 
 - A placeholder that reserved the name: a workspace, a pinned toolchain and
   the determinism gate, with no server behind them.
+
+<!-- [0.0.0] has no definition: it was a crates.io placeholder and was never
+     tagged in git, so every URL for it would 404. -->
+[Unreleased]: https://github.com/stefanobaldo/seedstone/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/stefanobaldo/seedstone/releases/tag/v0.1.0
