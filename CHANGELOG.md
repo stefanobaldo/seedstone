@@ -7,6 +7,8 @@ SemVer and are `0.x` until the server persists data;
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-08
+
 ### Added
 
 - `SETEX key seconds value` — `SET key value EX seconds` under the name Redis
@@ -100,5 +102,6 @@ SemVer and are `0.x` until the server persists data;
 
 <!-- [0.0.0] has no definition: it was a crates.io placeholder and was never
      tagged in git, so every URL for it would 404. -->
-[Unreleased]: https://github.com/stefanobaldo/seedstone/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/stefanobaldo/seedstone/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/stefanobaldo/seedstone/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/stefanobaldo/seedstone/releases/tag/v0.1.0
