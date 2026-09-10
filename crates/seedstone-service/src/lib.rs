@@ -382,12 +382,13 @@ pub const INVALID_CURSOR: &str = "ERR invalid cursor";
 /// Redis's ceiling is the clock's: it adds the span to `now` in milliseconds
 /// and refuses when the sum leaves an `i64`, so its boundary is
 /// `(i64::MAX - now_ms) / 1000` seconds and moves by one every second.
-/// Measured on 6.2.24 and 8.10.1 on 2026-09-10: with `now_ms` at
-/// `1789079945526`, `9223370247774828` seconds is accepted and
-/// `9223370247774832` is refused by `SET … EX`, `SETEX` and `EXPIRE` alike —
-/// and by `SET … PX`, `PSETEX` and `PEXPIRE` at the same boundary in
-/// milliseconds — while `i64::MAX / 1000` — this constant — is refused by
-/// both versions. That boundary is applied by
+/// Measured on 6.2.24 and 8.10.1 on 2026-09-10, each against its own clock —
+/// `now_ms` of `1789079945526` on the first and `1789079945747` on the second,
+/// which put the boundary at the same second: `9223370247774828` seconds is
+/// accepted and `9223370247774832` is refused by `SET … EX`, `SETEX` and
+/// `EXPIRE` alike — and by `SET … PX`, `PSETEX` and `PEXPIRE` at the same
+/// boundary in milliseconds — while `i64::MAX / 1000` — this constant — is
+/// refused by both versions. That boundary is applied by
 /// [`refuse_past_the_clock`]; this constant is the cheap first check in front
 /// of it, and the reason it exists is arithmetic on this side: a span in
 /// seconds is multiplied by a thousand before anything is done with it, and a
@@ -3754,8 +3755,9 @@ const fn condition(option: &[u8]) -> Option<Cond> {
 /// clock-relative ceiling [`refuse_past_the_clock`] applies after the
 /// constant one: `Some(1000)` for `EX` and `SETEX`, `Some(1)` for `PX` and
 /// `PSETEX`. `None` is for the absolute options, whose value is a deadline
-/// rather than a span and whose ceiling Redis judges by its own rules — see
-/// [`expiry_unit`].
+/// rather than a span: no span ceiling is applied to them here, and where
+/// Redis puts their boundary is outside the readings this check stands on,
+/// which cover the six span commands. See [`expiry_unit`].
 fn set_expire_value(
     value: &[u8],
     ceiling: i64,
@@ -4743,7 +4745,7 @@ mod tests {
             // then refuses, because `now` plus it leaves the `i64` a deadline
             // is held in. The accepted side of that boundary is pinned to the
             // millisecond in `expiry_spans_are_bounded_by_the_clock_like_redis`,
-            // against the measurements these rows would otherwise only bracket.
+            // which these two rows only bracket from above.
             &["PEXPIRE", "k", "9223372036854775807"],
             &["PEXPIRE", "k", "9223372036854775000"],
             // The arity, for each of the two.
@@ -6052,11 +6054,10 @@ mod tests {
 
     /// Redis bounds a span by the clock — `now + span` must fit an `i64` of
     /// milliseconds — so its ceiling is `(i64::MAX - now_ms) / 1000` seconds
-    /// and moves by one every second. Read on 6.2.24 and 8.10.1 (issue #27
-    /// and the compatibility measurements): one below the boundary is
-    /// accepted, one above is `ERR invalid expire time in '<cmd>' command`,
-    /// and `i64::MAX / 1000` — this server's old constant — is refused by
-    /// both.
+    /// and moves by one every second. Read on 6.2.24 and 8.10.1 (issue #27):
+    /// one below the boundary is accepted, one above is `ERR invalid expire
+    /// time in '<cmd>' command`, and `i64::MAX / 1000` — this server's old
+    /// constant — is refused by both.
     #[tokio::test]
     async fn expiry_spans_are_bounded_by_the_clock_like_redis() {
         let (mut r, mut w, _pool) = connected(16);
