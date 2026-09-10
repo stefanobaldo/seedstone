@@ -2921,8 +2921,7 @@ async fn info<R: Router>(router: &R, node: &NodeInfo, wanted: &[Vec<u8>]) -> Str
              used_memory_human:{}\r\n\
              maxmemory:{ceiling}\r\n\
              maxmemory_human:{}\r\n\
-             maxmemory_policy:{}\r\n\
-             mem_fragmentation_ratio:1.00\r\n\r\n",
+             maxmemory_policy:{}\r\n\r\n",
             human_bytes(used),
             human_bytes(ceiling),
             policy.name(),
@@ -3820,10 +3819,9 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(used, gauge.used());
-        assert!(
-            text.contains("\r\nmem_fragmentation_ratio:1.00\r\n"),
-            "{text}"
-        );
+        // No RSS is measured here, so there is no ratio to report: a field
+        // that is always `1.00` reads as a healthy measurement and is not one.
+        assert!(!text.contains("mem_fragmentation_ratio"), "{text}");
         assert!(text.contains("used_memory_human:"), "{text}");
     }
 
@@ -3963,7 +3961,10 @@ mod tests {
 
         has("# Clients");
         has("# Memory");
-        has("mem_fragmentation_ratio:1.00");
+        assert!(
+            !text.contains("mem_fragmentation_ratio"),
+            "a ratio nothing measures must not be reported"
+        );
 
         has("# Stats");
         has("keyspace_hits:1");
