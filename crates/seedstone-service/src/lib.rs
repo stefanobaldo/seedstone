@@ -376,13 +376,22 @@ const SCAN_DEFAULT_COUNT: usize = 10;
 /// `ERR invalid cursor`; a client that can act on either can act on both.
 pub const INVALID_CURSOR: &str = "ERR invalid cursor";
 
-/// The largest span, in seconds, an expiry option may name.
+/// The largest span, in seconds, an expiry option may name **before the clock
+/// is consulted** — the arithmetic ceiling, not Redis's.
 ///
-/// Redis's own ceiling, and the reason it has one is arithmetic: it holds a
-/// deadline in milliseconds, so a span in seconds is multiplied by a thousand
-/// before anything is done with it, and a value past `i64::MAX / 1000` cannot
-/// survive that. Matching the ceiling is what makes the refusal byte-exact
-/// rather than merely sensible.
+/// Redis's ceiling is the clock's: it adds the span to `now` in milliseconds
+/// and refuses when the sum leaves an `i64`, so its boundary is
+/// `(i64::MAX - now_ms) / 1000` seconds and moves by one every second.
+/// Measured on 6.2.24 and 8.10.1 on 2026-09-10: with `now_ms` at
+/// `1789079945526`, `9223370247774828` seconds is accepted and
+/// `9223370247774832` is refused by `SET … EX`, `SETEX` and `EXPIRE` alike —
+/// and by `SET … PX`, `PSETEX` and `PEXPIRE` at the same boundary in
+/// milliseconds — while `i64::MAX / 1000` — this constant — is refused by
+/// both versions. That boundary is applied by
+/// [`refuse_past_the_clock`]; this constant is the cheap first check in front
+/// of it, and the reason it exists is arithmetic on this side: a span in
+/// seconds is multiplied by a thousand before anything is done with it, and a
+/// value past `i64::MAX / 1000` cannot survive that.
 ///
 /// It also closes a hole on this side. The shard turns a span into an
 /// [`Instant`](std::time::Instant) and stores *no deadline* when that
@@ -393,7 +402,9 @@ pub const INVALID_CURSOR: &str = "ERR invalid cursor";
 /// number is refused here, where it is still a number.
 const MAX_EXPIRE_SECONDS: i64 = i64::MAX / 1000;
 
-/// The largest span, in milliseconds, `PEXPIRE` may name.
+/// The largest span, in milliseconds, `PEXPIRE` may name before the clock is
+/// consulted — the arithmetic ceiling, as [`MAX_EXPIRE_SECONDS`] is in its own
+/// unit.
 ///
 /// Not [`MAX_EXPIRE_SECONDS`] restated. That ceiling stands on the two reasons
 /// its own documentation gives, and neither of them reaches a span already
@@ -442,24 +453,46 @@ const MAX_EXPIRE_SECONDS: i64 = i64::MAX / 1000;
 /// spelled in a smaller unit.
 ///
 /// Redis's ceiling here is `i64::MAX` minus its own wall-clock reading in
-/// milliseconds, so it moves as the clock does: measured on 8.10, a span of
-/// `9223370000000000000` was accepted and `i64::MAX` was refused, with the
-/// boundary between them different every day. This server keeps deadlines as
-/// monotonic instants and has no wall clock to subtract, so it cannot
-/// reproduce a moving boundary. The two therefore disagree over a band at the
-/// very top of the `i64` range — spans from `i64::MAX` minus the current Unix
-/// time in milliseconds up to this ceiling, every one of them some 290 million
-/// years out.
-///
-/// **`SET … PX` does not share this ceiling, and Redis is why.** The same
-/// server answers `OK` to `SET k v PX 9223372036854775807` and refuses
-/// `PEXPIRE k 9223372036854775807`: it validates a `PEXPIRE` against the wall
-/// clock and holds a `PX` to no ceiling at all, refusing only a non-positive
-/// one. So the two ceilings in this file disagreeing about the same unit is
-/// Redis's own asymmetry rather than an oversight in either — see
-/// [`expiry_unit`] for the `PX` side of it, and for the divergence it leaves
-/// open here.
+/// milliseconds, so it moves as the clock does, and it is the same boundary
+/// in every door that takes a span: measured on 6.2.24 and 8.10.1 on
+/// 2026-09-10, `PEXPIRE`, `PSETEX` and `SET … PX` each accept a span two
+/// seconds below `i64::MAX - now_ms` and refuse one two seconds above, and
+/// each refuses `i64::MAX`. This server reproduces that boundary rather than
+/// approximating it — [`refuse_past_the_clock`] is where the comparison lives
+/// — and this constant is the arithmetic filter in front of it, so a span it
+/// refuses never reaches the clock at all.
 const MAX_EXPIRE_MILLIS: i64 = MAX_EXPIRE_SECONDS * 1000;
+
+/// A span at or below this, in milliseconds, cannot overflow the clock before
+/// the year 3000, so the fast path never reads the clock for it.
+///
+/// `i64::MAX` minus the Unix time of 3000-01-01T00:00:00Z in milliseconds.
+/// Every span a client has ever sent is some twenty orders of magnitude below
+/// it; the ones above are the probes that exist to find the boundary, and
+/// those pay one clock read.
+const CLOCK_SAFE_SPAN_MILLIS: u64 = i64::MAX as u64 - 32_503_680_000_000;
+
+/// Redis's ceiling on a span, which is the clock's: `now + span` must fit an
+/// `i64` of milliseconds, so the boundary is `i64::MAX - now_ms` and moves by
+/// one every millisecond. Measured on 6.2.24 and 8.10.1 (issue #27): one
+/// below is accepted, one above is `invalid expire time`, and a constant
+/// `i64::MAX / 1000` seconds — this server's former ceiling — is refused by
+/// both, about fifty-six years of spans above where Redis stops.
+///
+/// The constant ceilings stay as the first check, so a span they refuse never
+/// gets here, and [`CLOCK_SAFE_SPAN_MILLIS`] is the second, so a span they
+/// accept reads the clock only when it is within a millennium of the boundary.
+/// The hot path pays a comparison and nothing else.
+fn refuse_past_the_clock(span_millis: u64, name: &str, node: &NodeInfo) -> Result<(), String> {
+    if span_millis <= CLOCK_SAFE_SPAN_MILLIS {
+        return Ok(());
+    }
+    let now = (node.now_unix_millis)();
+    if span_millis > (i64::MAX as u64).saturating_sub(now) {
+        return Err(invalid_expire(name));
+    }
+    Ok(())
+}
 
 /// What this server answers `HELLO` with, and what it calls itself.
 const SERVER_NAME: &str = "seedstone";
@@ -2270,9 +2303,9 @@ const COMMANDS: &[(&[u8], Handler)] = &[
     (b"EXISTS", |args, _| {
         per_key(args, "exists", Fold::Sum, |key| Command::Exists { key })
     }),
-    (b"EXPIRE", |args, _| match args {
+    (b"EXPIRE", |args, node| match args {
         [key, seconds] => {
-            let seconds = expire_seconds(seconds)?;
+            let seconds = expire_seconds(seconds, node)?;
             Ok(Action::Dispatch(Command::Expire {
                 key: take(key),
                 seconds,
@@ -2284,9 +2317,9 @@ const COMMANDS: &[(&[u8], Handler)] = &[
         [key] => Ok(Action::Dispatch(Command::Ttl { key: take(key) })),
         _ => Err(wrong_arity("ttl")),
     }),
-    (b"PEXPIRE", |args, _| match args {
+    (b"PEXPIRE", |args, node| match args {
         [key, millis] => {
-            let millis = expire_millis(millis)?;
+            let millis = expire_millis(millis, node)?;
             Ok(Action::Dispatch(Command::PExpire {
                 key: take(key),
                 millis,
@@ -2321,7 +2354,7 @@ const COMMANDS: &[(&[u8], Handler)] = &[
     // behind it: the surface's one production caller reaches it on a single
     // cache-miss path. It sits after the keyed commands that carry the load
     // so none of them pays a comparison for it.
-    (b"SETEX", |args, _| match args {
+    (b"SETEX", |args, node| match args {
         [key, seconds, value] => {
             // Parsed before the key and the value are taken, so a refused
             // span leaves nothing half-consumed — and writes nothing: the
@@ -2332,7 +2365,8 @@ const COMMANDS: &[(&[u8], Handler)] = &[
             // The ceiling is `SET … EX`'s, so the two spellings of one write
             // agree with each other. Whether that ceiling is Redis's is a
             // separate question, answered at `MAX_EXPIRE_SECONDS`.
-            let seconds = set_expire_value(seconds, MAX_EXPIRE_SECONDS, "setex")?;
+            let seconds =
+                set_expire_value(seconds, MAX_EXPIRE_SECONDS, "setex", node, Some(1_000))?;
             Ok(Action::Dispatch(Command::SetEx {
                 key: take(key),
                 seconds,
@@ -2351,7 +2385,7 @@ const COMMANDS: &[(&[u8], Handler)] = &[
         })),
         _ => Err(wrong_arity("setnx")),
     }),
-    (b"PSETEX", |args, _| match args {
+    (b"PSETEX", |args, node| match args {
         [key, millis, value] => {
             // Parsed before the key and the value are taken, so a refused
             // span leaves nothing half-consumed — and writes nothing: the
@@ -2359,15 +2393,14 @@ const COMMANDS: &[(&[u8], Handler)] = &[
             // is Redis's behaviour too (6.2.24: a refused `PSETEX` over a key
             // leaves its value and its `TTL` untouched).
             //
-            // The ceiling is `PEXPIRE`'s rather than `SET … PX`'s, which is
-            // the one place the two spellings of this write are held to
-            // different numbers. `SET … PX` takes anything an `i64` holds
-            // because Redis takes it there too — a divergence recorded at
-            // `expiry_unit` — while `MAX_EXPIRE_MILLIS` is what Redis itself
-            // refuses, and `PSETEX k 9223372036854775807 v` is refused on
-            // 6.2.24 and 8.10.1 alike. Following `SET … PX` here would accept
-            // a span Redis turns away at this door.
-            let millis = set_expire_value(millis, MAX_EXPIRE_MILLIS, "psetex")?;
+            // The constant ceiling is `PEXPIRE`'s rather than `SET … PX`'s,
+            // and the two spellings of this write still agree about what they
+            // refuse, because the number that decides a long span is neither
+            // of those constants: it is the clock's boundary, which every
+            // span command shares — see [`refuse_past_the_clock`]. Measured
+            // on 6.2.24 and 8.10.1, `PSETEX k 9223372036854775807 v` is
+            // refused, and so is `SET k v PX 9223372036854775807`.
+            let millis = set_expire_value(millis, MAX_EXPIRE_MILLIS, "psetex", node, Some(1))?;
             Ok(Action::Dispatch(Command::PSetEx {
                 key: take(key),
                 millis,
@@ -3448,9 +3481,16 @@ fn set_options(mut rest: &[Vec<u8>], node: &NodeInfo) -> Result<SetOptions, Stri
     let expiry = match expiry_arg {
         None => None,
         Some((unit, value)) => {
-            let value = set_expire_value(value, unit.ceiling, "set")?;
+            // A span is held to the clock as well as to its unit's ceiling; a
+            // deadline is not, its value being an absolute time rather than
+            // something added to `now`.
+            let per_unit_millis = match unit.form {
+                ExpiryForm::Span(per_unit_millis, _) => Some(per_unit_millis),
+                ExpiryForm::Deadline(_) => None,
+            };
+            let value = set_expire_value(value, unit.ceiling, "set", node, per_unit_millis)?;
             Some(match unit.form {
-                ExpiryForm::Span(build) => build(value),
+                ExpiryForm::Span(_, build) => build(value),
                 // The multiplication cannot overflow: `set_expire_value` has
                 // just held the value to a ceiling of `i64::MAX` milliseconds
                 // expressed in this unit. Saturating anyway, so that a ceiling
@@ -3588,8 +3628,11 @@ struct ExpiryUnit {
 /// Whether an option's value is a span or a deadline.
 enum ExpiryForm {
     /// A span, which stays in the unit the client chose all the way to the
-    /// shard — see [`Expiry`] — and so only has to be wrapped.
-    Span(fn(u64) -> Expiry),
+    /// shard — see [`Expiry`] — and so only has to be wrapped. It carries
+    /// this many milliseconds per unit, as `Deadline` does, for the one thing
+    /// on this side that has to read the span in a common unit:
+    /// [`refuse_past_the_clock`].
+    Span(u64, fn(u64) -> Expiry),
     /// A deadline on the wall clock, in this many milliseconds per unit. It is
     /// turned into a span here; see [`remaining_from`].
     Deadline(u64),
@@ -3601,28 +3644,21 @@ fn expiry_unit(option: &[u8]) -> Option<ExpiryUnit> {
         Some(ExpiryUnit {
             option: ExpiryOption::Ex,
             ceiling: MAX_EXPIRE_SECONDS,
-            form: ExpiryForm::Span(Expiry::Ex),
+            form: ExpiryForm::Span(1_000, Expiry::Ex),
         })
     } else if option.eq_ignore_ascii_case(b"PX") {
-        // Already in the unit that ceiling exists to protect, so anything
-        // positive an `i64` can hold is a span Redis accepts — measured on
-        // 8.10, where `SET k v PX 9223372036854775807` answers `OK` while
-        // `PEXPIRE k 9223372036854775807` is refused. Redis really does take
-        // through this door what it turns away at the other, which is why this
-        // ceiling and [`MAX_EXPIRE_MILLIS`] disagree about the same unit.
-        //
-        // **A known divergence, recorded rather than closed.** Redis lets the
-        // addition overflow and stores the key already expired, so its `TTL`
-        // answers `-2` for a `SET` it just accepted. Here the span fits a
-        // monotonic instant, so the key keeps a deadline some 290 million
-        // years out and stays alive — measured through this server, where the
-        // same `SET` is followed by `TTL k` answering `9223372036854776`.
-        // Narrowing the accepted range to match would refuse a `SET` Redis
-        // performs, which is the larger incompatibility of the two.
+        // The value is already in the unit a deadline is held in, so nothing
+        // multiplies it and the arithmetic ceiling here is the whole `i64`.
+        // The boundary that actually refuses a long span is the clock's, and
+        // this door shares it with the `EX` one: measured on 2026-09-10
+        // against 6.2.24 and 8.10.1, `SET k v PX 9223372036854775807` is
+        // refused by both, as is a millisecond span two seconds past
+        // `i64::MAX - now_ms`, while two seconds below it is accepted — see
+        // [`refuse_past_the_clock`], which is where that comparison lives.
         Some(ExpiryUnit {
             option: ExpiryOption::Px,
             ceiling: i64::MAX,
-            form: ExpiryForm::Span(Expiry::Px),
+            form: ExpiryForm::Span(1, Expiry::Px),
         })
     } else if option.eq_ignore_ascii_case(b"EXAT") {
         Some(ExpiryUnit {
@@ -3713,12 +3749,29 @@ const fn condition(option: &[u8]) -> Option<Cond> {
 /// expire time in setex`, and `set`, `expire` and `pexpire` read the same way
 /// with their own names in that slot; the four were reworded together between
 /// those versions, and this server follows the newer form for all four.
-fn set_expire_value(value: &[u8], ceiling: i64, name: &str) -> Result<u64, String> {
+///
+/// `per_unit_millis` says how to read the value as a span, for the
+/// clock-relative ceiling [`refuse_past_the_clock`] applies after the
+/// constant one: `Some(1000)` for `EX` and `SETEX`, `Some(1)` for `PX` and
+/// `PSETEX`. `None` is for the absolute options, whose value is a deadline
+/// rather than a span and whose ceiling Redis judges by its own rules — see
+/// [`expiry_unit`].
+fn set_expire_value(
+    value: &[u8],
+    ceiling: i64,
+    name: &str,
+    node: &NodeInfo,
+    per_unit_millis: Option<u64>,
+) -> Result<u64, String> {
     let value = parse_i64(value).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
     if value <= 0 || value > ceiling {
         return Err(invalid_expire(name));
     }
-    u64::try_from(value).map_err(|_| invalid_expire(name))
+    let value = u64::try_from(value).map_err(|_| invalid_expire(name))?;
+    if let Some(per_unit_millis) = per_unit_millis {
+        refuse_past_the_clock(value.saturating_mul(per_unit_millis), name, node)?;
+    }
+    Ok(value)
 }
 
 /// Parses `EXPIRE`'s span, which unlike `SET`'s may be zero or negative.
@@ -3726,11 +3779,19 @@ fn set_expire_value(value: &[u8], ceiling: i64, name: &str) -> Result<u64, Strin
 /// A deadline in the past is a deletion the client asked for in the past tense,
 /// and Redis performs it. What it refuses is a span it cannot do arithmetic on
 /// — see [`MAX_EXPIRE_SECONDS`], in both directions.
-fn expire_seconds(seconds: &[u8]) -> Result<i64, String> {
+fn expire_seconds(seconds: &[u8], node: &NodeInfo) -> Result<i64, String> {
     let seconds =
         parse_i64(seconds).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
     if !(-MAX_EXPIRE_SECONDS..=MAX_EXPIRE_SECONDS).contains(&seconds) {
         return Err(invalid_expire("expire"));
+    }
+    // Only a span in the future reaches the clock, and the conversion is what
+    // holds the others back: a negative span is a deletion in the past tense
+    // and names no deadline the clock could overflow. The multiplication
+    // cannot overflow either, the range check above having just held the
+    // value to `MAX_EXPIRE_SECONDS`, which is `i64::MAX / 1000`.
+    if let Ok(span) = u64::try_from(seconds) {
+        refuse_past_the_clock(span * 1000, "expire", node)?;
     }
     Ok(seconds)
 }
@@ -3743,11 +3804,17 @@ fn expire_seconds(seconds: &[u8]) -> Result<i64, String> {
 /// `PEXPIRE k -9223372036854775808` deletes the key and answers `1`. Every
 /// non-positive span means the same thing whatever its size, so a floor here
 /// would refuse a number the command already knows what to do with.
-fn expire_millis(millis: &[u8]) -> Result<i64, String> {
+fn expire_millis(millis: &[u8], node: &NodeInfo) -> Result<i64, String> {
     let millis =
         parse_i64(millis).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
     if millis > MAX_EXPIRE_MILLIS {
         return Err(invalid_expire("pexpire"));
+    }
+    // As in [`expire_seconds`]: the conversion is what excludes the negatives,
+    // which name a deadline already past rather than one the clock could
+    // overflow.
+    if let Ok(span) = u64::try_from(millis) {
+        refuse_past_the_clock(span, "pexpire", node)?;
     }
     Ok(millis)
 }
@@ -4645,7 +4712,10 @@ mod tests {
     /// `PEXPIRE` whose span is not in the future answers `1` and deletes the
     /// key, which is `EXPIRE`'s applied-expiry answer in the smaller unit. And
     /// a span of `i64::MAX` is refused as an invalid expire time rather than
-    /// accepted as a key that outlives the universe.
+    /// accepted as a key that outlives the universe — as is every span past
+    /// the clock-relative boundary read on 6.2.24 and 8.10.1, whose accepted
+    /// side is pinned in
+    /// [`expiry_spans_are_bounded_by_the_clock_like_redis`].
     #[tokio::test]
     async fn pexpire_and_persist_move_a_deadline_and_take_it_away() {
         let (mut r, mut w, _pool) = connected(16);
@@ -4667,9 +4737,13 @@ mod tests {
             &["SET", "n", "v"],
             &["PEXPIRE", "n", "-1"],
             &["EXISTS", "n"],
-            // The ceiling, from both sides: the largest span this server
-            // accepts, and a number past it. A refusal alone would pin only
-            // that the ceiling is somewhere below `i64::MAX`.
+            // Two spans past the ceiling, which is the clock's rather than
+            // either constant in this file: the second is `MAX_EXPIRE_MILLIS`
+            // itself, which the constant filter lets through and the clock
+            // then refuses, because `now` plus it leaves the `i64` a deadline
+            // is held in. The accepted side of that boundary is pinned to the
+            // millisecond in `expiry_spans_are_bounded_by_the_clock_like_redis`,
+            // against the measurements these rows would otherwise only bracket.
             &["PEXPIRE", "k", "9223372036854775807"],
             &["PEXPIRE", "k", "9223372036854775000"],
             // The arity, for each of the two.
@@ -4702,8 +4776,8 @@ mod tests {
         );
         assert_eq!(
             frames[16],
-            Frame::Integer(1),
-            "the ceiling itself is a span that is accepted"
+            Frame::Error("ERR invalid expire time in 'pexpire' command".into()),
+            "the old constant ceiling is itself past the clock's boundary"
         );
         assert_eq!(
             frames[17],
@@ -5974,6 +6048,102 @@ mod tests {
             "the refused EXPIRE must not have touched the deadline"
         );
         assert_eq!(frames[4], Frame::Integer(1));
+    }
+
+    /// Redis bounds a span by the clock — `now + span` must fit an `i64` of
+    /// milliseconds — so its ceiling is `(i64::MAX - now_ms) / 1000` seconds
+    /// and moves by one every second. Read on 6.2.24 and 8.10.1 (issue #27
+    /// and the compatibility measurements): one below the boundary is
+    /// accepted, one above is `ERR invalid expire time in '<cmd>' command`,
+    /// and `i64::MAX / 1000` — this server's old constant — is refused by
+    /// both.
+    #[tokio::test]
+    async fn expiry_spans_are_bounded_by_the_clock_like_redis() {
+        let (mut r, mut w, _pool) = connected(16);
+        let now = (NodeInfo::for_tests().now_unix_millis)();
+        let boundary_secs = (i64::MAX as u64 - now) / 1000;
+        let boundary_millis = i64::MAX as u64 - now;
+        let under_in_secs = (boundary_secs - 1).to_string();
+        let over_in_secs = (boundary_secs + 1).to_string();
+        let under_in_millis = (boundary_millis - 1).to_string();
+        let over_in_millis = (boundary_millis + 1).to_string();
+        let old = (i64::MAX / 1000).to_string();
+        let requests: Vec<Vec<&str>> = vec![
+            vec!["SET", "a", "v", "EX", &under_in_secs],
+            vec!["SET", "a", "v", "EX", &over_in_secs],
+            vec!["SET", "a", "v", "EX", &old],
+            vec!["SETEX", "b", &under_in_secs, "v"],
+            vec!["SETEX", "b", &over_in_secs, "v"],
+            vec!["EXPIRE", "a", &under_in_secs],
+            vec!["EXPIRE", "a", &over_in_secs],
+            vec!["PSETEX", "c", &under_in_millis, "v"],
+            vec!["PSETEX", "c", &over_in_millis, "v"],
+            vec!["PEXPIRE", "a", &under_in_millis],
+            vec!["PEXPIRE", "a", &over_in_millis],
+            vec!["SET", "d", "v", "PX", &under_in_millis],
+            vec!["SET", "d", "v", "PX", &over_in_millis],
+        ];
+        let mut out = Vec::new();
+        for parts in &requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, requests.len()).await;
+        let refused =
+            |name: &str| Frame::Error(format!("ERR invalid expire time in '{name}' command"));
+        assert_eq!(frames[0], Frame::Simple("OK".into()));
+        assert_eq!(frames[1], refused("set"));
+        assert_eq!(
+            frames[2],
+            refused("set"),
+            "the old constant is past Redis's boundary"
+        );
+        assert_eq!(frames[3], Frame::Simple("OK".into()));
+        assert_eq!(frames[4], refused("setex"));
+        assert_eq!(frames[5], Frame::Integer(1));
+        assert_eq!(frames[6], refused("expire"));
+        assert_eq!(frames[7], Frame::Simple("OK".into()));
+        assert_eq!(frames[8], refused("psetex"));
+        assert_eq!(frames[9], Frame::Integer(1));
+        assert_eq!(frames[10], refused("pexpire"));
+        assert_eq!(frames[11], Frame::Simple("OK".into()));
+        assert_eq!(frames[12], refused("set"));
+    }
+
+    /// An ordinary span never reads the wall clock: the constant filters run
+    /// first and [`CLOCK_SAFE_SPAN_MILLIS`] second, so only a probe within a
+    /// millennium of the boundary pays for the read.
+    #[tokio::test]
+    async fn ordinary_spans_do_not_read_the_clock() {
+        static READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn counting_clock() -> u64 {
+            READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            1_788_298_743_000
+        }
+        let pool = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(4096);
+        let mut node = NodeInfo::for_tests();
+        node.now_unix_millis = counting_clock;
+        tokio::spawn(serve_connection(server, pool, node));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        for parts in [
+            &["SET", "k", "v", "PX", "60000"][..],
+            &["SETEX", "k", "60", "v"],
+            &["EXPIRE", "k", "60"],
+            &["PEXPIRE", "k", "60000"],
+        ] {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let _ = read_frames(&mut r, 4).await;
+        assert_eq!(
+            READS.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an ordinary span read the clock"
+        );
     }
 
     /// A router that cannot be dispatched to.

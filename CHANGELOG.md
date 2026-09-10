@@ -14,6 +14,12 @@ SemVer and are `0.x` until the server persists data;
   set size, so it has no `used_memory_rss` to divide by, and a field that is
   always `1.00` reads as a healthy measurement when it is not one. A consumer
   that finds the field absent is correctly informed.
+- The largest expiry span a command accepts is now Redis's: `now` plus the span
+  must fit a signed 64-bit millisecond clock, so the ceiling is clock-relative
+  and moves by one every second. `SET … EX`, `SETEX`, `EXPIRE` and their
+  millisecond spellings refuse exactly the spans Redis 6.2.24 and 8.10.1
+  refuse, where they previously accepted a band of about fifty-six years above
+  Redis's boundary. Ordinary spans never read the clock for this check.
 
 ## [0.1.1] - 2026-09-08
 
