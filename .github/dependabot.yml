@@ -35,3 +35,43 @@ updates:
         patterns:
           - "rand*"
           - "getrandom"
+  # The client lanes. Each is a manifest of test-only dependencies that run
+  # against the server; a bump arrives as a pull request the e2e job judges.
+  - package-ecosystem: pip
+    directory: /e2e/python
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
+    groups:
+      redis-py-lane:
+        patterns: ["*"]
+  - package-ecosystem: gomod
+    directory: /e2e/go
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
+    groups:
+      go-redis-lane:
+        patterns: ["*"]
+  - package-ecosystem: pip
+    directory: /e2e/django/current
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
+    groups:
+      django-current-lane:
+        patterns: ["*"]
+  # The pinned pair is pinned on purpose — e2e/django/README.md says why —
+  # and a bump to it is not a change this lane can take. Listing it with an
+  # ignore covering everything is what stops Dependabot opening pull requests
+  # against it, security updates included; the alerts on it are dismissed
+  # with their reason where they are raised.
+  - package-ecosystem: pip
+    directory: /e2e/django/pinned
+    schedule:
+      interval: monthly
+    ignore:
+      - dependency-name: "*"
