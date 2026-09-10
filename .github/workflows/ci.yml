@@ -251,14 +251,18 @@ jobs:
           trap 'kill "$server" 2>/dev/null || true' EXIT
           for _ in $(seq 50); do redis-cli -p 6390 -a "$SEEDSTONE_PASSWORD" --no-auth-warning ping >/dev/null 2>&1 && break; sleep 0.1; done
           cd e2e/go && go test ./...
-      # The compatibility lane. It runs in a container rather than on the
-      # runner's Python because the client pair it exercises is pinned and the
-      # interpreter that pair wants is older than any runner image will keep
-      # offering. `--network host` is what lets the container reach the server
-      # this job started on localhost.
+      # The compatibility lanes, one per client pair. They run in containers
+      # rather than on the runner's Python because each pair pins its own
+      # interpreter — the pinned pair's is older than any runner image will
+      # keep offering, and the current pair's moves with its releases.
+      # `--network host` is what lets a container reach the server this job
+      # started on localhost.
       - name: django-redis, pinned pair
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: bash e2e/django/run.sh target/release/seedstone pinned
+      - name: django-redis, current pair
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: bash e2e/django/run.sh target/release/seedstone current
       # The exporter lane: a stock Prometheus exporter, pinned by manifest-list
       # digest, scrapes the server and must log no refused command. Its
       # expectations file plays the role the django lane's does — tolerated
