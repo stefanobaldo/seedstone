@@ -7,6 +7,14 @@ SemVer and are `0.x` until the server persists data;
 
 ## [Unreleased]
 
+### Fixed
+
+- `INFO memory` no longer reports `mem_fragmentation_ratio`. The value was a
+  constant `1.00`, not a measurement: this server does not read its resident
+  set size, so it has no `used_memory_rss` to divide by, and a field that is
+  always `1.00` reads as a healthy measurement when it is not one. A consumer
+  that finds the field absent is correctly informed.
+
 ## [0.1.1] - 2026-09-08
 
 ### Added
