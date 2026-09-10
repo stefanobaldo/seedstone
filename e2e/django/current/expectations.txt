@@ -1,0 +1,90 @@
+# Tests this lane expects to fail, and why. Format:
+#
+#     <pytest node id pattern> | <category> | <reason>
+#
+# The node id may carry `*` as a wildcard, and `*` is the only metacharacter:
+# `[` and `]` are literal, so `test_pexpire[*]` names that test under all
+# three settings and does not name `test_pexpire_at`. One row per command
+# family rather than one per test, because the backend of this pair drives
+# whole families this server does not answer and a row per test would say the
+# same sentence twenty times. Two rows may not claim the same test, and a row
+# that matches nothing collected is an error — that is what keeps the file
+# from going stale.
+#
+# Categories:
+#   out-of-rule       the test needs a command this server deliberately does
+#                     not answer. Permanent until the command arrives in a
+#                     later milestone. The reason MUST name the command.
+#   not-yet           the surface is planned and not built yet. Temporary.
+#   not-this-server   the test fails against Redis too, with the same client
+#                     pair — so it is not a fact about this server. The reason
+#                     MUST carry the Redis version it was read against.
+#
+# Every row is a strict xfail: a listed test that starts passing turns this
+# lane red until its row is removed. Moving a row to out-of-rule to make CI
+# green is a defect, not a fix — out-of-rule requires a named command this
+# server refuses on purpose.
+
+# --- out-of-rule: sets ---------------------------------------------------
+# The whole set family. Every one of these seeds its fixture by adding
+# members, so each ends at the first SADD rather than at the command its name
+# carries; the reason names what the run actually refused.
+test_backend.py::TestDjangoRedisCache::test_sadd[*] | out-of-rule | SADD: this server answers no set commands
+test_backend.py::TestDjangoRedisCache::test_scard[*] | out-of-rule | SADD: the test adds members before counting them
+test_backend.py::TestDjangoRedisCache::test_sdiff*[*] | out-of-rule | SADD: the test adds members before differencing them
+test_backend.py::TestDjangoRedisCache::test_sinter[*] | out-of-rule | SADD: the test adds members before intersecting them
+test_backend.py::TestDjangoRedisCache::test_interstore[*] | out-of-rule | SADD: the test adds members before intersecting them into a key
+test_backend.py::TestDjangoRedisCache::test_sismember[*] | out-of-rule | SADD: the test adds a member before asking for it
+test_backend.py::TestDjangoRedisCache::test_smismember[*] | out-of-rule | SADD: the test adds members before asking for them
+test_backend.py::TestDjangoRedisCache::test_smove[*] | out-of-rule | SADD: the test adds a member before moving it
+test_backend.py::TestDjangoRedisCache::test_spop*[*] | out-of-rule | SADD: the test adds members before popping one
+test_backend.py::TestDjangoRedisCache::test_srandmember*[*] | out-of-rule | SADD: the test adds members before sampling one
+test_backend.py::TestDjangoRedisCache::test_srem[*] | out-of-rule | SADD: the test adds a member before removing it
+test_backend.py::TestDjangoRedisCache::test_sscan*[*] | out-of-rule | SADD: the test adds members before walking them
+test_backend.py::TestDjangoRedisCache::test_sunion*[*] | out-of-rule | SADD: the test adds members before unioning them
+
+# --- out-of-rule: hashes -------------------------------------------------
+# The hash family, which the 7.0.0 backend drives and the pinned pair's
+# backend did not have at all.
+test_backend.py::TestDjangoRedisCache::test_hset[*] | out-of-rule | HSET: this server answers no hash commands
+test_backend.py::TestDjangoRedisCache::test_hdel[*] | out-of-rule | HSET: the test writes a field before deleting it
+test_backend.py::TestDjangoRedisCache::test_hexists[*] | out-of-rule | HSET: the test writes a field before asking for it
+test_backend.py::TestDjangoRedisCache::test_hkeys[*] | out-of-rule | HSET: the test writes fields before listing them
+test_backend.py::TestDjangoRedisCache::test_hash_*[*] | out-of-rule | HSET: the test writes fields before reading their shape
+test_backend.py::TestDjangoRedisCache::test_hlen[*] | out-of-rule | HLEN: this server answers no hash commands
+
+# --- out-of-rule: transactions -------------------------------------------
+# The backend writes and deletes several keys through a transactional
+# pipeline, so every one of these ends at EXEC. `test_delete_pattern` is the
+# one that moved: the pinned pair's backend deleted matched keys one by one
+# and passed this test, and 7.0.0 routes the same call through the pipeline.
+test_backend.py::TestDjangoRedisCache::test_delete[*] | out-of-rule | EXEC: the backend deletes through a transactional pipeline
+test_backend.py::TestDjangoRedisCache::test_delete_many[*] | out-of-rule | EXEC: the backend deletes through a transactional pipeline
+test_backend.py::TestDjangoRedisCache::test_delete_many_generator[*] | out-of-rule | EXEC: the backend deletes through a transactional pipeline
+test_backend.py::TestDjangoRedisCache::test_delete_pattern[*] | out-of-rule | EXEC: the backend deletes the keys a pattern matched through a transactional pipeline
+test_backend.py::TestDjangoRedisCache::test_set_many[*] | out-of-rule | EXEC: the backend writes many keys through a transactional pipeline
+
+# --- out-of-rule: scripting ----------------------------------------------
+# The lock is granted by this server and released by a registered script, so
+# a lock it grants is a lock nothing can hand back.
+test_backend.py::TestDjangoRedisCache::test_lock*[*] | out-of-rule | EVALSHA: the client acquires and releases its lock through a registered script
+# `incr` is a script in 7.0.0, where the pinned pair's backend used INCRBY and
+# passed `test_incr_error`; the client's recovery path for a server that
+# refuses a script asks the key for its TTL and cannot create one that is
+# missing.
+test_backend.py::TestDjangoRedisCache::test_incr_error[*] | out-of-rule | EVAL: the client increments through a script
+test_backend.py::TestDjangoRedisCache::test_incr_ignore_check[*] | out-of-rule | EVAL: the client increments through a script, and its recovery path cannot create a key that is missing
+
+# --- not-yet: millisecond and absolute deadlines -------------------------
+# Inside the compatibility rule and not built yet.
+test_backend.py::TestDjangoRedisCache::test_pttl[*] | not-yet | PTTL: the server writes millisecond deadlines and reads none back
+test_backend.py::TestDjangoRedisCache::test_pexpire[*] | not-yet | PTTL: the test reads back the deadline it set
+test_backend.py::TestDjangoRedisCache::test_pexpire_at[*] | not-yet | PEXPIREAT: an absolute millisecond deadline
+test_backend.py::TestDjangoRedisCache::test_expire_at[*] | not-yet | EXPIREAT: an absolute second deadline
+
+# --- not-this-server -----------------------------------------------------
+# The msgpack serializer round-trips an IntEnum as a plain int, so the test's
+# `is` comparison fails whatever it is talking to. Read against Redis 8.10.1
+# on 2026-09-10 with this same pair and harness: it fails there too, and it is
+# the only test of this suite that does.
+test_backend.py::TestDjangoRedisCache::test_intenum[lane_msgpack] | not-this-server | msgpack 1.2.2 returns int, not the IntEnum member; fails identically against Redis 8.10.1
