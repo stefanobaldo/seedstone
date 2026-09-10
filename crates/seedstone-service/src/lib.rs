@@ -6979,9 +6979,15 @@ mod tests {
         w.flush().await.unwrap();
 
         let frames = read_frames(&mut r, requests.len()).await;
-        // The name in the reply is the table's own spelling, not the peer's:
-        // a client that reads the pairs back by name is reading the name
-        // Redis would have answered with.
+        // The name in the reply is the table's own spelling, not the peer's.
+        // Redis is not one answer here and the two versions this project is
+        // read against disagree: 6.2.24 echoes its own lower-case spelling
+        // for every form, while 8.10.1 echoes the peer's spelling back when
+        // the request named a parameter exactly — `CONFIG GET MAXMEMORY`
+        // answers `MAXMEMORY` there — and its own only when the request was
+        // a glob. Measured on both, 2026-09-10. This server follows 6.2.24:
+        // one spelling for every form, which is the one a client reading the
+        // pairs back by name can rely on.
         assert_eq!(frames[0], pairs(&[("maxmemory", "67108864")]));
         assert_eq!(frames[1], pairs(&[("maxmemory-policy", "allkeys-lru")]));
         assert_eq!(
