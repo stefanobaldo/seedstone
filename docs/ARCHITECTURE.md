@@ -216,14 +216,15 @@ replayed run would not reproduce it, and a memory ceiling derived from it
 would be a different ceiling on every machine. What the formula costs is
 exactness: it counts the bytes a value has, not the bytes the allocator
 rounded them up to, and it does not count what the process spends outside the
-keyspace. `INFO memory` therefore reports no fragmentation ratio: the ratio is
-a resident set size divided by the accounted figure, and nothing here reads a
-resident set size to divide by. A constant `1.00` in the field would read as a
-measured healthy figure when nothing measured it, so the field is absent
-instead. It also means the process's resident size is larger than
-`used_memory` — by the allocator's rounding and by everything the process
-holds outside the keyspace — so an operator sizing a ceiling against the
-machine should leave room for the difference.
+keyspace. `INFO memory` therefore reports no fragmentation ratio. Redis
+computes that field as `used_memory_rss / used_memory` — on idle containers it
+was read at 14.57 on 6.2.24 and 14.89 on 8.10.1, nowhere near 1 — and nothing
+here reads a resident set size to divide by. A constant `1.00` in the field
+would read as a measured healthy figure when nothing measured it, so the field
+is absent instead. The formula also means the process's resident size is
+larger than `used_memory` — by the allocator's rounding and by everything the
+process holds outside the keyspace — so an operator sizing a ceiling against
+the machine should leave room for the difference.
 
 **Eviction samples from the shard that is writing, against a ceiling the whole
 node shares.** `maxmemory` is compared with one figure — the sum of what every
