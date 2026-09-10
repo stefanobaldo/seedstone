@@ -256,9 +256,9 @@ jobs:
       # interpreter that pair wants is older than any runner image will keep
       # offering. `--network host` is what lets the container reach the server
       # this job started on localhost.
-      - name: django-redis
+      - name: django-redis, pinned pair
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
-        run: bash e2e/django/run.sh target/release/seedstone
+        run: bash e2e/django/run.sh target/release/seedstone pinned
       # The exporter lane: a stock Prometheus exporter, pinned by manifest-list
       # digest, scrapes the server and must log no refused command. Its
       # expectations file plays the role the django lane's does — tolerated

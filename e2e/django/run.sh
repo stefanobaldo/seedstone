@@ -1,26 +1,23 @@
 #!/usr/bin/env bash
 # Drives seedstone with the django-redis suite inside a container pinned by
-# digest to the interpreter that client pair needs.
+# digest to the interpreter one client pair needs. Which pair is the second
+# argument: a directory beside this script holding the pins (`pair.env`),
+# the requirements, the expectations file and the settings.
 #
 # The suite is not vendored: it is fetched from its published sdist, verified
 # against a pinned digest, and extracted for the run. That keeps a third
-# party's 1,200 lines of tests out of this repository while keeping the run
-# reproducible.
+# party's tests out of this repository while keeping the run reproducible.
 set -euo pipefail
 
-server_binary="${1:?usage: run.sh <path-to-seedstone-binary>}"
+server_binary="${1:?usage: run.sh <path-to-seedstone-binary> <pair>}"
+pair="${2:?usage: run.sh <path-to-seedstone-binary> <pair>   (pair: a directory beside this script, e.g. pinned or current)}"
 port="${SEEDSTONE_PORT:-6390}"
 here="$(cd "$(dirname "$0")" && pwd)"
-# python:3.7-slim, by the digest of its multi-architecture manifest list: the
-# same selection on arm64 and amd64. The tag is kept in this comment for a
-# human reader; the digest is what runs.
-image="python@sha256:b53f496ca43e5af6994f8e316cf03af31050bf7944e0e4a308ad86c001cf028b"
-
-# The digest the release publishes, not the digest some download happened to
-# produce. It is checked inside the container: an archive that does not match
-# is a different suite, and a gate running a suite other than the one it names
-# is not a gate.
-export DJANGO_REDIS_SHA256=306589c7021e6468b2656edc89f62b8ba67e8d5a1c8877e2688042263daa7a63
+pair_dir="${here}/${pair}"
+[ -f "${pair_dir}/pair.env" ] || { echo "run.sh: no pair.env in ${pair_dir}" >&2; exit 2; }
+# shellcheck source=/dev/null
+. "${pair_dir}/pair.env"
+export DJANGO_REDIS_VERSION DJANGO_REDIS_SHA256 TEST_FILES
 
 # How the container reaches the server. On Linux — which is where this runs in
 # CI — the container shares this machine's network namespace, so the server
@@ -60,17 +57,23 @@ for _ in $(seq 100); do
 done
 
 docker run --rm "${network[@]}" \
-  -v "${here}:/lane" -w /lane \
+  -v "${pair_dir}:/lane" -w /lane \
   -e SEEDSTONE_HOST="$server_host" \
   -e SEEDSTONE_PORT="$port" \
   -e SEEDSTONE_PASSWORD="$password" \
-  -e DJANGO_REDIS_SHA256 \
-  "$image" sh -euc '
+  -e DJANGO_REDIS_VERSION -e DJANGO_REDIS_SHA256 -e TEST_FILES \
+  "$IMAGE" sh -euc '
     pip install --quiet --no-cache-dir --disable-pip-version-check --root-user-action=ignore -r requirements.txt
-    pip download --quiet --no-deps --no-binary :all: --disable-pip-version-check --dest /tmp/sdist django-redis==4.12.1
-    echo "${DJANGO_REDIS_SHA256}  /tmp/sdist/django-redis-4.12.1.tar.gz" | sha256sum -c -
-    tar -xzf /tmp/sdist/django-redis-4.12.1.tar.gz -C /tmp
-    cp -r /tmp/django-redis-4.12.1/tests /tmp/tests
-    cp conftest.py settings.py expectations.txt /tmp/tests/
-    cd /tmp/tests && python -m pytest test_backend.py -q --timeout 30
+    pip download --quiet --no-deps --no-binary :all: --disable-pip-version-check --dest /tmp/sdist "django-redis==${DJANGO_REDIS_VERSION}"
+    archive="$(ls /tmp/sdist/django*redis-${DJANGO_REDIS_VERSION}.tar.gz)"
+    echo "${DJANGO_REDIS_SHA256}  ${archive}" | sha256sum -c -
+    tar -xzf "${archive}" -C /tmp
+    src="$(ls -d /tmp/django*redis-${DJANGO_REDIS_VERSION})"
+    cp -r "${src}/tests" /tmp/tests
+    # The lane supplies the harness: its conftest, its expectations, and its
+    # settings (a module or a package) replace the suite'"'"'s own.
+    rm -rf /tmp/tests/conftest.py /tmp/tests/settings /tmp/tests/settings.py
+    cp conftest.py expectations.txt /tmp/tests/
+    if [ -d settings ]; then cp -r settings /tmp/tests/settings; else cp settings.py /tmp/tests/; fi
+    cd /tmp/tests && python -m pytest ${TEST_FILES} -q --timeout 30
   '
