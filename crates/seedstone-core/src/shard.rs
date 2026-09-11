@@ -294,6 +294,40 @@ pub enum Command {
         /// The bytes to store, kept verbatim.
         value: Vec<u8>,
     },
+    /// Report how long `key` has left, in milliseconds.
+    ///
+    /// [`Ttl`](Self::Ttl) in the unit the deadline is actually kept in. Its
+    /// own variant for `SETEX`'s reason: a shard counts what it runs by
+    /// variant, and Redis reports `cmdstat_pttl` apart from `cmdstat_ttl`
+    /// (6.2.24, 8.10.1). The read is `Ttl`'s arm without the rounding.
+    PTtl {
+        /// The key to ask about.
+        key: Vec<u8>,
+    },
+    /// Give `key` the deadline `EXPIREAT` named, or delete it if that deadline
+    /// has passed.
+    ///
+    /// The shard has no wall clock, so the absolute Unix time the client sent
+    /// is resolved at the edge — exactly as `SET … EXAT` is — into the span
+    /// carried here, and from there this is [`PExpire`](Self::PExpire) through
+    /// the same handler: a positive span is a deadline, any other span is a
+    /// deletion answered `1`. Its own variant for `cmdstat_expireat` (6.2.24,
+    /// 8.10.1).
+    ExpireAt {
+        /// The key to put a deadline on.
+        key: Vec<u8>,
+        /// Milliseconds left until the deadline the client named, as the edge
+        /// computed them; zero or negative means the deadline has passed.
+        millis: i64,
+    },
+    /// [`ExpireAt`](Self::ExpireAt) for `PEXPIREAT`: the same resolved span,
+    /// counted under its own name (`cmdstat_pexpireat`, 6.2.24 and 8.10.1).
+    PExpireAt {
+        /// The key to put a deadline on.
+        key: Vec<u8>,
+        /// Milliseconds left until the deadline the client named.
+        millis: i64,
+    },
     /// Remove `key`.
     Del {
         /// The key to remove.
@@ -480,7 +514,10 @@ impl Command {
             | Self::Persist { key }
             | Self::Exists { key }
             | Self::Type { key }
-            | Self::StrLen { key } => Route::Key(key),
+            | Self::StrLen { key }
+            | Self::PTtl { key }
+            | Self::ExpireAt { key, .. }
+            | Self::PExpireAt { key, .. } => Route::Key(key),
             Self::FlushDb | Self::DbSize | Self::Stats => Route::Every,
             // The one route that is not self-sufficient. A step knows where it
             // is in *a* shard's table and not which shard's, so it names no
@@ -510,14 +547,15 @@ impl Command {
     /// `every_kind_tag_is_contiguous_and_bounded` is what keeps it true when
     /// a variant is added: it fails, rather than the array growing silently
     /// or a panic waiting for the traffic that reaches the new command.
-    pub const KIND_MAX: u8 = 18;
+    pub const KIND_MAX: u8 = 21;
 
     /// A stable one-byte tag for this command's variant.
     ///
     /// `Get` = 1, `Set` = 2, `Del` = 3, `IncrBy` = 4, `Expire` = 5, `Ttl` = 6,
     /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9, `ScanStep` = 10,
     /// `PExpire` = 11, `Persist` = 12, `Type` = 13, `StrLen` = 14,
-    /// `Stats` = 15, `SetEx` = 16, `SetNx` = 17, `PSetEx` = 18. These
+    /// `Stats` = 15, `SetEx` = 16, `SetNx` = 17, `PSetEx` = 18,
+    /// `PTtl` = 19, `ExpireAt` = 20, `PExpireAt` = 21. These
     /// values are folded into the simulator's trace hash, so they are part of
     /// what a replay compares: changing one changes every recorded hash. A tag
     /// is therefore never reused and never renumbered.
@@ -542,6 +580,9 @@ impl Command {
             Self::SetEx { .. } => 16,
             Self::SetNx { .. } => 17,
             Self::PSetEx { .. } => 18,
+            Self::PTtl { .. } => 19,
+            Self::ExpireAt { .. } => 20,
+            Self::PExpireAt { .. } => 21,
         }
     }
 
@@ -1937,8 +1978,11 @@ fn read_outcome(dict: &Dict, cmd: &Command, reply: &Reply) -> Option<bool> {
         (Command::Get { .. }, Reply::Bulk(value)) => Some(value.is_some()),
         (Command::Exists { .. }, Reply::Integer(found)) => Some(*found == 1),
         // `-2` is `TTL`'s answer for a key that is not there; `-1` and every
-        // span above it are answers about a key that is.
-        (Command::Ttl { .. }, Reply::Integer(remaining)) => Some(*remaining != -2),
+        // span above it are answers about a key that is. `PTTL` draws the same
+        // line at the same number, in the other unit.
+        (Command::Ttl { .. } | Command::PTtl { .. }, Reply::Integer(remaining)) => {
+            Some(*remaining != -2)
+        }
         (Command::Type { .. }, Reply::Status(name)) => Some(*name != "none"),
         (Command::StrLen { key }, Reply::Integer(len)) => Some(*len > 0 || dict.get(key).is_some()),
         _ => None,
@@ -2105,16 +2149,20 @@ fn apply<L: ReplicationLog, P: ShardPolicy>(
             set_expiry(dict, log, seq, shard, key, at)
         }
 
-        Command::PExpire { key, millis } => {
+        // `EXPIREAT` and `PEXPIREAT` reach the shard as the span the edge
+        // resolved out of the absolute deadline they named, which is exactly
+        // `PEXPIRE`'s argument — so the three share one arm rather than three
+        // copies kept identical by hand.
+        Command::PExpire { key, millis }
+        | Command::ExpireAt { key, millis }
+        | Command::PExpireAt { key, millis } => {
             let at = span_deadline(now, *millis, Expiry::Px);
             set_expiry(dict, log, seq, shard, key, at)
         }
 
-        Command::Ttl { key } => match dict.get(key).map(|entry| entry.expires_at) {
-            None => Reply::Integer(-2),
-            Some(None) => Reply::Integer(-1),
-            Some(Some(at)) => Reply::Integer(remaining_seconds(at, now)),
-        },
+        Command::Ttl { key } => ttl_reply(dict, key, now, remaining_seconds),
+
+        Command::PTtl { key } => ttl_reply(dict, key, now, remaining_millis),
 
         Command::Persist { key } => {
             // Two keys answer `0` here for two different reasons: one is not
@@ -2657,6 +2705,31 @@ fn remaining_seconds(expires_at: Instant, now: Instant) -> i64 {
     i64::try_from(millis.saturating_add(500) / 1000).unwrap_or(i64::MAX)
 }
 
+/// What `PTTL` answers for a key with a deadline: the milliseconds left, not
+/// rounded — the unit the deadline is kept in, reported as it is.
+fn remaining_millis(expires_at: Instant, now: Instant) -> i64 {
+    i64::try_from(expires_at.saturating_duration_since(now).as_millis()).unwrap_or(i64::MAX)
+}
+
+/// What `TTL` and `PTTL` answer, which differ only in what `remaining` makes
+/// of the deadline: `-2` for a key that is not there, `-1` for one carrying no
+/// deadline, otherwise the span left in that function's unit.
+///
+/// The two sentinels are the same numbers in both units — they are not spans —
+/// so they are written once here rather than in each arm.
+fn ttl_reply(
+    dict: &Dict,
+    key: &[u8],
+    now: Instant,
+    remaining: fn(Instant, Instant) -> i64,
+) -> Reply {
+    match dict.get(key).map(|entry| entry.expires_at) {
+        None => Reply::Integer(-2),
+        Some(None) => Reply::Integer(-1),
+        Some(Some(at)) => Reply::Integer(remaining(at, now)),
+    }
+}
+
 /// Appends one record for a mutation about to happen, advancing `seq`.
 ///
 /// The payload is empty: today the log records that a mutation occurred and
@@ -2769,6 +2842,15 @@ mod tests {
                 millis: 1,
                 value: Vec::new(),
             },
+            Command::PTtl { key: Vec::new() },
+            Command::ExpireAt {
+                key: Vec::new(),
+                millis: 1,
+            },
+            Command::PExpireAt {
+                key: Vec::new(),
+                millis: 1,
+            },
         ];
         for cmd in &every {
             // No wildcard: a new variant fails to compile here.
@@ -2790,7 +2872,10 @@ mod tests {
                 | Command::Stats
                 | Command::SetEx { .. }
                 | Command::SetNx { .. }
-                | Command::PSetEx { .. } => {}
+                | Command::PSetEx { .. }
+                | Command::PTtl { .. }
+                | Command::ExpireAt { .. }
+                | Command::PExpireAt { .. } => {}
             }
         }
         let mut tags: Vec<u8> = every.iter().map(Command::kind).collect();
@@ -2885,7 +2970,7 @@ mod tests {
     /// to catch and did not.
     #[test]
     fn every_command_declares_how_it_is_routed() {
-        let keyed: [Command; 12] = [
+        let keyed: [Command; 15] = [
             Command::Get { key: b"k".to_vec() },
             set(b"k", b"v"),
             Command::Del { key: b"k".to_vec() },
@@ -2907,6 +2992,15 @@ mod tests {
             Command::Type { key: b"k".to_vec() },
             Command::StrLen { key: b"k".to_vec() },
             setex(b"k", 1, b"v"),
+            Command::PTtl { key: b"k".to_vec() },
+            Command::ExpireAt {
+                key: b"k".to_vec(),
+                millis: 1,
+            },
+            Command::PExpireAt {
+                key: b"k".to_vec(),
+                millis: 1,
+            },
         ];
         for cmd in keyed {
             assert_eq!(
@@ -2975,6 +3069,89 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         assert_eq!(shard.run(get(b"k"), Instant::now()), Reply::Bulk(None));
         assert_eq!(shard.dict.len(), 0, "the expired entry survived the read");
+    }
+
+    fn pttl(key: &[u8]) -> Command {
+        Command::PTtl { key: key.to_vec() }
+    }
+
+    /// `PTTL` is `TTL` in milliseconds: `-2` for a key that is not there,
+    /// `-1` for one with no deadline, otherwise the span left — not rounded
+    /// to a second, which is what separates it from `TTL`. Read on 6.2.24 and
+    /// 8.10.1: `SET k v PX 100000` then `PTTL k` answers a value in
+    /// `(0, 100000]` where `TTL k` answers `100`.
+    #[tokio::test(start_paused = true)]
+    async fn pttl_answers_in_milliseconds() {
+        let mut shard = Shard::for_tests();
+        assert_eq!(shard.run(pttl(b"k"), Instant::now()), Reply::Integer(-2));
+        assert_eq!(shard.run(set(b"k", b"v"), Instant::now()), Reply::Ok);
+        assert_eq!(shard.run(pttl(b"k"), Instant::now()), Reply::Integer(-1));
+        assert_eq!(
+            shard.run(
+                Command::PExpire {
+                    key: b"k".to_vec(),
+                    millis: 1500
+                },
+                Instant::now()
+            ),
+            Reply::Integer(1)
+        );
+        tokio::time::advance(Duration::from_millis(400)).await;
+        assert_eq!(shard.run(pttl(b"k"), Instant::now()), Reply::Integer(1100));
+        assert_eq!(
+            shard.run(Command::Ttl { key: b"k".to_vec() }, Instant::now()),
+            Reply::Integer(1),
+            "TTL rounds the same deadline to the nearest second"
+        );
+    }
+
+    /// `EXPIREAT`/`PEXPIREAT` reach the shard as the span left until the
+    /// deadline the edge resolved, so the shard's part is `PEXPIRE`'s: a
+    /// positive span is a deadline, a span that is not positive deletes the
+    /// key and is reported as an applied expiry — `1` — which is what Redis
+    /// answers `EXPIREAT k 1` with (6.2.24, 8.10.1), the key gone at once.
+    #[tokio::test(start_paused = true)]
+    async fn expireat_is_pexpire_on_a_span_the_edge_resolved() {
+        let mut shard = Shard::for_tests();
+        assert_eq!(shard.run(set(b"k", b"v"), Instant::now()), Reply::Ok);
+        assert_eq!(
+            shard.run(
+                Command::ExpireAt {
+                    key: b"k".to_vec(),
+                    millis: 30_000
+                },
+                Instant::now()
+            ),
+            Reply::Integer(1)
+        );
+        assert_eq!(
+            shard.run(pttl(b"k"), Instant::now()),
+            Reply::Integer(30_000)
+        );
+        assert_eq!(
+            shard.run(
+                Command::PExpireAt {
+                    key: b"k".to_vec(),
+                    millis: 0
+                },
+                Instant::now()
+            ),
+            Reply::Integer(1),
+            "a deadline already passed is a deletion, reported as applied"
+        );
+        assert_eq!(shard.run(get(b"k"), Instant::now()), Reply::Bulk(None));
+        assert_eq!(shard.dict.len(), 0);
+        assert_eq!(
+            shard.run(
+                Command::ExpireAt {
+                    key: b"missing".to_vec(),
+                    millis: 30_000
+                },
+                Instant::now()
+            ),
+            Reply::Integer(0),
+            "nothing to expire"
+        );
     }
 
     /// An existing key is overwritten whole, value and deadline: a key that
