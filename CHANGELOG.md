@@ -26,7 +26,9 @@ SemVer and are `0.x` until the server persists data;
   is the order Redis 6.2.24 and 8.10.1 decide it in. Previously an
   unauthenticated client was told `NOAUTH` for every such request, so a client
   probing for RESP3 support could not tell a refused version from a missing
-  password.
+  password. One consequence for an operator: such a handshake is now counted
+  in `INFO commandstats` as a `cmdstat_hello` call, where before it was
+  counted nowhere.
 
 ## [0.1.1] - 2026-09-08
 

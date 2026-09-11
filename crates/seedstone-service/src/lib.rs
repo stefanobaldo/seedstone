@@ -2576,7 +2576,13 @@ fn action_for(frame: Frame, node: &NodeInfo, label: &mut CommandLabel) -> Result
     // A command that travels is counted by the shard that runs it, so this
     // search decides nothing for `GET` and `SET` beyond a miss — and a miss is
     // what keeps the clock reading below off their path entirely. A refusal
-    // the handler returns is not counted at all: it never became an action.
+    // the handler returns as an `Err` is not counted at all: it never became
+    // an action. One it returns as an [`Action::Refuse`] is counted, because
+    // it did become one — `INFO commandstats` printed
+    // `cmdstat_hello:calls=1,usec=1` for a single refused `HELLO 99`
+    // (`a_refused_hello_is_counted_in_commandstats` is that reading, taken
+    // 2026-09-10), where the same refusal spelt as an `Err` printed no
+    // `cmdstat_hello` line at all.
     //
     // A refusal the *gate* returns is counted, though, because the gate runs
     // after this: on a node with a password, a `PING` answered `NOAUTH` lands
@@ -3117,6 +3123,11 @@ fn keyspace_section(stats: &ShardStats) -> String {
 /// `GET` refused at the gate never reaches one, and no shard counts what it
 /// never ran. A command whose own handler refused it — bad arity, an argument
 /// it could not read — is not counted either way; it never became an action.
+/// The exception is a refusal the handler decides *about the request*, which
+/// is an [`Action::Refuse`] and so an action by construction: a `HELLO` naming
+/// a protocol version this server does not speak is counted here, read off
+/// this section on 2026-09-10 as
+/// `cmdstat_hello:calls=1,usec=1,usec_per_call=1.00` for one such handshake.
 ///
 /// **`usec` is measured, not estimated.** Each command is timed where it is
 /// counted: at the executor, by one clock reading differenced against the
@@ -3275,11 +3286,13 @@ fn human_bytes(bytes: u64) -> String {
 /// exactly one accepted value. The refusal for every other one is
 /// [`NOPROTO`] — see that constant for why the exact text is a contract.
 ///
-/// **The order the four refusals are decided in is Redis's**, measured
-/// against `redis:6-alpine` (6.2.24) rather than reasoned about: the protocol
-/// version is parsed, then range-checked, then the options are read, and only
-/// then does anything about the connection matter — `AUTH` if it was given,
-/// and otherwise the gate's [`NOAUTH_HELLO`]. It is observable at every step.
+/// **The order the refusals are decided in is Redis's**, measured against
+/// `redis:6-alpine` (6.2.24) rather than reasoned about: the protocol version
+/// is parsed, then range-checked, then the options are read — the three this
+/// handler decides about the request itself — and only then does anything
+/// about the connection matter: `AUTH` if it was given, the configuration
+/// mistake below if it was given to a node with no password, and otherwise
+/// the gate's [`NOAUTH_HELLO`]. It is observable at every step.
 /// `HELLO abc BOGUS x` names two mistakes and Redis reports the version, so
 /// reading the options first would answer a different one.
 ///
@@ -8675,17 +8688,23 @@ mod tests {
         assert_eq!(frames[3], Frame::Error(NOAUTH.to_owned()));
     }
 
-    /// Every refusal `hello` decides on its own passes the gate unauthenticated
-    /// — and only those: the same connection's `GET` is still `NOAUTH`. Rows
-    /// read against `redis:6-alpine` (6.2.24) and `redis:8-alpine` (8.10.1)
-    /// with `--requirepass`, no `AUTH` sent, on 2026-09-10.
+    /// The three refusals `hello` decides about the request itself pass the
+    /// gate unauthenticated — and only those: the same connection's `GET` is
+    /// still `NOAUTH`, and `AUTH_NOT_CONFIGURED`, which `hello` also decides,
+    /// is not one of them. Rows read against `redis:6-alpine` (6.2.24) and
+    /// `redis:8-alpine` (8.10.1) with `--requirepass`, no `AUTH` sent, on
+    /// 2026-09-10.
     ///
     /// Two rows are this server's answer rather than Redis's, and say so
     /// where they sit. `SETNAME` is **accepted** by both versions once the
     /// connection has authenticated (`CLIENT GETNAME` reads the name back);
-    /// this server refuses it because it has no client name to set. And
-    /// `NOAUTH_HELLO`'s sentence is 6.2.24's — 8.10.1 spells the same
-    /// refusal with `the HELLO <proto> AUTH <user> <pass> option`.
+    /// unauthenticated, where the rows above were read, both answer the
+    /// `NOAUTH HELLO` sentence instead, because the option parses and the
+    /// connection is then the objection. This server refuses it in either
+    /// state: it has no client name to set, and taking the option silently
+    /// would be worse than either answer. And `NOAUTH_HELLO`'s sentence is
+    /// 6.2.24's — 8.10.1 spells the same refusal with
+    /// `the HELLO <proto> AUTH <user> <pass> option`.
     #[tokio::test]
     async fn hello_refusals_pass_the_gate_unauthenticated() {
         let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
@@ -8706,10 +8725,14 @@ mod tests {
                 &["HELLO", "2", "SETNAME", "x"],
                 "ERR Syntax error in HELLO option 'SETNAME'",
             ),
-            // The handshake redis-py 8 opens with when it is credentialed and
-            // nobody named `protocol=2`. Redis authenticates it and answers a
-            // RESP3 map; here the version is decided first, so the client is
-            // told which half of its request was refused.
+            // `HELLO 3` is what redis-py 8.1.0 opens every connection with
+            // unless the caller names `protocol=2` — the reading behind the
+            // client lane's settings, which records that and the separate
+            // one-argument `AUTH` that lane's URL produces. The embedded
+            // `AUTH` option is Redis's own spelling of a handshake that
+            // authenticates, and both versions answer this one with a RESP3
+            // map (6.2.24, 8.10.1); here the version is decided first, so the
+            // client is told which half of its request was refused.
             (&["HELLO", "3", "AUTH", "default", "pw"], NOPROTO),
             (&["HELLO", "2"], NOAUTH_HELLO),
             (&["GET", "k"], NOAUTH),
@@ -8724,6 +8747,50 @@ mod tests {
         for (frame, (args, expected)) in frames.iter().zip(cases) {
             assert_eq!(*frame, Frame::Error(expected.to_owned()), "{args:?}");
         }
+    }
+
+    /// What `INFO commandstats` reports for a `HELLO` the handler refused —
+    /// read off the section, not inferred from the path the refusal took.
+    ///
+    /// A refusal that travels as `Action::Refuse` *is* an action, and the
+    /// edge counts every action that is not a `Dispatch`, so a refused
+    /// handshake lands in `cmdstat_hello` — `calls=1,usec=1` for the one
+    /// below, read off the section on 2026-09-10 rather than derived from the
+    /// path. The same refusal spelt as the handler's `Err` never became an
+    /// action and printed no `cmdstat_hello` line at all, read the same way
+    /// the same day with the handler returning one. Which figure the section
+    /// therefore reports is what this test is here to keep honest; see
+    /// [`commandstats_section`] for what it means.
+    ///
+    /// The reading is taken on the same connection *after* it authenticates,
+    /// because `INFO` is gated too: an unauthenticated peer cannot read the
+    /// section its handshake just moved. The refusal being counted happened
+    /// before the `AUTH`, which is the case that matters, and the
+    /// `cmdstat_auth` line beside it is what says the reading came from the
+    /// connection that sent all three.
+    #[tokio::test]
+    async fn a_refused_hello_is_counted_in_commandstats() {
+        let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server, pool, node_with_password(b"pw")));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        encode(&req(&["HELLO", "99"]), &mut out);
+        encode(&req(&["AUTH", "default", "pw"]), &mut out);
+        encode(&req(&["INFO", "commandstats"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 3).await;
+        assert_eq!(frames[0], Frame::Error(NOPROTO.to_owned()));
+        let Frame::Bulk(text) = &frames[2] else {
+            panic!("INFO answered {:?}", frames[2])
+        };
+        let text = String::from_utf8(text.clone()).unwrap();
+        assert!(
+            text.contains("cmdstat_hello:calls=1,"),
+            "one refused handshake, one call: {text}"
+        );
+        assert!(text.contains("cmdstat_auth:calls=1,"), "{text}");
     }
 
     /// The same handshake on a node with **no** password is answered, because
@@ -8757,10 +8824,9 @@ mod tests {
     /// The rows that matter are the ones where two mistakes compete. `HELLO
     /// abc BOGUS x` is a bad version *and* a bad option, and the version is
     /// what Redis reports, so reading the options first — which this server
-    /// did — answers the wrong one. `SETNAME` stays this server's own
-    /// divergence: Redis parses the option and accepts it, where this refuses
-    /// it, because there is no client name here to set and taking it silently
-    /// would be worse than either answer.
+    /// did — answers the wrong one. `SETNAME` has no row here; the divergence
+    /// it carries is argued where the row is, in
+    /// `hello_refusals_pass_the_gate_unauthenticated`.
     #[tokio::test]
     async fn hello_refusals_are_decided_in_redis_order() {
         let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
