@@ -40,11 +40,12 @@ in the environment for one.
 
 **What it answers:** `GET`, `SET` (with `EX`, `PX`, `EXAT`, `PXAT`, `NX`, `XX`,
 `KEEPTTL`, `GET`), `SETEX`, `SETNX`, `PSETEX`, `MGET`, `DEL`, `EXISTS`,
-`EXPIRE`, `PEXPIRE`, `PERSIST`, `TTL`, `TYPE`, `STRLEN`, `INCRBY`, `SCAN`,
-`KEYS`, `DBSIZE`, `FLUSHDB`, `PING`, `ECHO`, `AUTH`, `HELLO`, `INFO`,
-`CONFIG GET`, `SLOWLOG`, `LATENCY`, `COMMAND`, `CLIENT`, `QUIT`. `DEL`,
-`EXISTS` and `MGET` take several keys. Keys with a deadline are removed when
-touched and by a background sweep that does not wait to be asked. With
+`EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `PERSIST`, `TTL`, `PTTL`,
+`TYPE`, `STRLEN`, `INCRBY`, `SCAN`, `KEYS`, `DBSIZE`, `FLUSHDB`, `PING`,
+`ECHO`, `AUTH`, `HELLO`, `INFO`, `CONFIG GET`, `SLOWLOG`, `LATENCY`,
+`COMMAND`, `CLIENT`, `QUIT`. `DEL`, `EXISTS` and `MGET` take several keys.
+Keys with a deadline are removed when touched and by a background sweep that
+does not wait to be asked. With
 `--maxmemory`, the keyspace is held under a ceiling by evicting
 least-recently-used keys, or by refusing writes under `noeviction`.
 
@@ -85,7 +86,9 @@ is refused with an error naming the command, rather than answered
 approximately. The same line is drawn outside the command set: authentication
 is one password for the `default` user, with no ACL users beside it — access
 control this server does not model. Nor does it terminate TLS: transport
-security belongs to the deployment, in front of the node.
+security belongs to the deployment, in front of the node. The full list —
+what is answered, what is refused, and where this server differs from Redis on
+purpose — is [docs/compatibility.md](docs/compatibility.md).
 
 **Releases:** a tag publishes a GitHub Release carrying an x86_64 Linux binary
 and its `sha256`, and a container image,
