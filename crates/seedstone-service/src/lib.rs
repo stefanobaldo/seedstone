@@ -886,7 +886,12 @@ enum Unbatched {
     },
     /// A request naming no key at all: it reaches every shard and the answers
     /// are folded into one reply — see [`broadcast`].
-    Every(Command),
+    Every {
+        /// The command every shard runs.
+        cmd: Command,
+        /// What the shards' replies are folded into.
+        gather: Gather,
+    },
     /// A request naming a pattern rather than a key. The edge walks every
     /// shard itself, a bounded step at a time, and gathers what matches — see
     /// [`keys`]. It is not an [`Every`](Unbatched::Every) because one command
@@ -955,6 +960,22 @@ impl Fold {
     }
 }
 
+/// How [`broadcast`] folds one reply per shard into the frame the peer sees.
+///
+/// Decided at the command table, where the command is named, rather than by
+/// matching the command inside `broadcast` — so a keyspace-wide command
+/// answering neither a count nor `+OK` is a compile error at the table, not
+/// a reply folded the wrong way. The same reason [`Fold`] exists for the
+/// fan-out.
+#[derive(Clone, Copy)]
+enum Gather {
+    /// Every shard answers a count and the peer gets their sum — `DBSIZE`,
+    /// which is how the reply is the size of the keyspace and not of a shard.
+    Sum,
+    /// Every shard answers `+OK` and so does the peer, once — `FLUSHDB`.
+    AllOk,
+}
+
 impl Unbatched {
     /// What the peer called this request, lower-cased.
     ///
@@ -970,7 +991,7 @@ impl Unbatched {
             // command's own name is the request's: the table that names a
             // kind for `commandstats` is the same table, so there is no
             // second spelling to keep in step.
-            Self::Every(cmd) => KIND_NAMES[usize::from(cmd.kind())],
+            Self::Every { cmd, .. } => KIND_NAMES[usize::from(cmd.kind())],
             Self::Keys(_) => "keys",
             Self::Scan { .. } => "scan",
             Self::Info(_) => "info",
@@ -990,7 +1011,7 @@ impl Unbatched {
         let started = slot.map(|_| Instant::now());
         let frame = match self {
             Self::FanOut { cmds, fold, .. } => fan_out(router, cmds, fold).await,
-            Self::Every(cmd) => broadcast(router, cmd).await,
+            Self::Every { cmd, gather } => broadcast(router, cmd, gather).await,
             Self::Keys(pattern) => keys(router, pattern, KEYS_REPLY_BYTES).await,
             Self::Scan {
                 cursor,
@@ -1738,13 +1759,10 @@ fn reply_to_frame(reply: Reply) -> Frame {
 /// applied. So the error means "not everywhere", not "nowhere" — which is the
 /// same thing a fan-out's error means, and for the same reason.
 ///
-/// Short of an error, the fold is decided by the command, and it is read off
-/// the command *before* it travels — the command itself is moved into the
-/// router. `DBSIZE` sums, which is what makes it the size of the keyspace
-/// rather than of a shard; every other keyspace-wide command asks each shard
-/// to do something and is answered `+OK` once they all have.
-async fn broadcast<R: Router>(router: &R, cmd: Command) -> Frame {
-    let sum = matches!(cmd, Command::DbSize);
+/// Short of an error, the fold is the [`Gather`] the command table chose:
+/// `DBSIZE` sums, which is what makes it the size of the keyspace rather than
+/// of a shard; `FLUSHDB` is answered `+OK` once every shard has.
+async fn broadcast<R: Router>(router: &R, cmd: Command, gather: Gather) -> Frame {
     let mut total: i64 = 0;
     for reply in router.dispatch_every(cmd).await {
         match reply {
@@ -1756,10 +1774,9 @@ async fn broadcast<R: Router>(router: &R, cmd: Command) -> Frame {
             other => return reply_to_frame(other),
         }
     }
-    if sum {
-        Frame::Integer(total)
-    } else {
-        Frame::Simple("OK".into())
+    match gather {
+        Gather::Sum => Frame::Integer(total),
+        Gather::AllOk => Frame::Simple("OK".into()),
     }
 }
 
@@ -2428,7 +2445,10 @@ const COMMANDS: &[(&[u8], Handler)] = &[
     }),
     // Keyspace-wide: no key to route on, but every shard has to hear it.
     (b"DBSIZE", |args, _| match args {
-        [] => Ok(Action::Unbatched(Unbatched::Every(Command::DbSize))),
+        [] => Ok(Action::Unbatched(Unbatched::Every {
+            cmd: Command::DbSize,
+            gather: Gather::Sum,
+        })),
         _ => Err(wrong_arity("dbsize")),
     }),
     (b"KEYS", |args, _| match args {
@@ -2450,7 +2470,10 @@ const COMMANDS: &[(&[u8], Handler)] = &[
     (b"FLUSHDB", |args, _| match args {
         // Redis takes ASYNC and SYNC here. This server has one behaviour and
         // saying so plainly beats accepting a word it would then ignore.
-        [] => Ok(Action::Unbatched(Unbatched::Every(Command::FlushDb))),
+        [] => Ok(Action::Unbatched(Unbatched::Every {
+            cmd: Command::FlushDb,
+            gather: Gather::AllOk,
+        })),
         _ => Err(wrong_arity("flushdb")),
     }),
     // From here down: the connection's own business, answered without a shard
