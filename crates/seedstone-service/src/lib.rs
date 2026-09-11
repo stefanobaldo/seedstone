@@ -962,11 +962,18 @@ impl Fold {
 
 /// How [`broadcast`] folds one reply per shard into the frame the peer sees.
 ///
-/// Decided at the command table, where the command is named, rather than by
-/// matching the command inside `broadcast` — so a keyspace-wide command
-/// answering neither a count nor `+OK` is a compile error at the table, not
-/// a reply folded the wrong way. The same reason [`Fold`] exists for the
-/// fan-out.
+/// Named at the command table, where the command is named, rather than
+/// matched off the command inside `broadcast`. What that buys is that the
+/// fold can no longer be *omitted*: a keyspace-wide command added to the
+/// table has to say which of these it answers, where before it inherited
+/// `+OK` from the arm every command but `DBSIZE` fell into, without anyone
+/// having chosen it. Which of the two is right remains the table's to get
+/// right — both compile.
+///
+/// The one place that reads this matches the whole enum, so a third gather
+/// added later is a compile error in [`broadcast`] rather than a reply
+/// quietly folded as one of these two. The same reason [`Fold`] exists for
+/// the fan-out.
 #[derive(Clone, Copy)]
 enum Gather {
     /// Every shard answers a count and the peer gets their sum — `DBSIZE`,
