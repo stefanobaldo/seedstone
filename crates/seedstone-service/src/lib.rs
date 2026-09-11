@@ -530,8 +530,28 @@ pub const RUN_ID_HEX: usize = 40;
 /// by — the core's `every_kind_tag_is_contiguous_and_bounded` says which tags
 /// exist, and the assertion below says this table has a name for each.
 const KIND_NAMES: [&str; KIND_SLOTS] = [
-    "", "get", "set", "del", "incrby", "expire", "ttl", "exists", "flushdb", "dbsize", "scan",
-    "pexpire", "persist", "type", "strlen", "info", "setex", "setnx", "psetex",
+    "",
+    "get",
+    "set",
+    "del",
+    "incrby",
+    "expire",
+    "ttl",
+    "exists",
+    "flushdb",
+    "dbsize",
+    "scan",
+    "pexpire",
+    "persist",
+    "type",
+    "strlen",
+    "info",
+    "setex",
+    "setnx",
+    "psetex",
+    "pttl",
+    "expireat",
+    "pexpireat",
 ];
 
 const _: () = assert!(
@@ -2372,6 +2392,30 @@ const COMMANDS: &[(&[u8], Handler)] = &[
         [key] => Ok(Action::Dispatch(Command::Persist { key: take(key) })),
         _ => Err(wrong_arity("persist")),
     }),
+    (b"PTTL", |args, _| match args {
+        [key] => Ok(Action::Dispatch(Command::PTtl { key: take(key) })),
+        _ => Err(wrong_arity("pttl")),
+    }),
+    (b"EXPIREAT", |args, node| match args {
+        [key, at] => {
+            let millis = absolute_deadline_span(at, 1000, "expireat", node)?;
+            Ok(Action::Dispatch(Command::ExpireAt {
+                key: take(key),
+                millis,
+            }))
+        }
+        _ => Err(wrong_arity("expireat")),
+    }),
+    (b"PEXPIREAT", |args, node| match args {
+        [key, at] => {
+            let millis = absolute_deadline_span(at, 1, "pexpireat", node)?;
+            Ok(Action::Dispatch(Command::PExpireAt {
+                key: take(key),
+                millis,
+            }))
+        }
+        _ => Err(wrong_arity("pexpireat")),
+    }),
     (b"INCRBY", |args, _| match args {
         [key, delta] => {
             let delta =
@@ -3853,10 +3897,13 @@ fn expire_seconds(seconds: &[u8], node: &NodeInfo) -> Result<i64, String> {
 ///
 /// Checked in one direction only, where `EXPIRE`'s span is checked in both.
 /// Redis bounds a span in seconds at each end because each end is multiplied,
-/// and bounds a span in milliseconds only from above — measured on 8.10, where
-/// `PEXPIRE k -9223372036854775808` deletes the key and answers `1`. Every
-/// non-positive span means the same thing whatever its size, so a floor here
-/// would refuse a number the command already knows what to do with.
+/// and bounds a span in milliseconds only from above — read on 6.2.24 and
+/// 8.10.1, where `PEXPIRE k -9223372036854775808` deletes the key and answers
+/// `1`, and where the first number below it fails the *parse* rather than the
+/// range check. Every non-positive span means the same thing whatever its
+/// size, so a floor here would refuse a number the command already knows what
+/// to do with. [`absolute_deadline_span`] meets the same asymmetry one unit
+/// out, between `EXPIREAT` and `PEXPIREAT`.
 fn expire_millis(millis: &[u8], node: &NodeInfo) -> Result<i64, String> {
     let millis =
         parse_i64(millis).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
@@ -3870,6 +3917,47 @@ fn expire_millis(millis: &[u8], node: &NodeInfo) -> Result<i64, String> {
         refuse_past_the_clock(span, "pexpire", node)?;
     }
     Ok(millis)
+}
+
+/// Turns the absolute Unix deadline `EXPIREAT`/`PEXPIREAT` name into the span
+/// the shard understands, in milliseconds — the same reconciliation of the
+/// wall clock with the shard's monotonic one that [`remaining_from`] does for
+/// `SET … EXAT/PXAT`, and for the same reason.
+///
+/// What Redis refuses is a number it cannot do arithmetic on: a non-integer,
+/// or a time whose milliseconds leave an `i64`. A time already passed — zero,
+/// negative, or last year — is a deletion the client asked for in the past
+/// tense, and Redis performs it (6.2.24, 8.10.1).
+///
+/// The range check is the multiplication overflowing rather than a pair of
+/// bounds, because the two commands' boundaries are **not** each other's
+/// mirror. Read on 6.2.24 and 8.10.1: `EXPIREAT` is held at both ends to
+/// `±(i64::MAX / 1000)` — `-9223372036854776` is refused — while `PEXPIREAT`
+/// takes every `i64` there is, `i64::MIN` included, which deletes the key and
+/// answers `1`. A floor spelled `-(i64::MAX / per_unit_millis)` would refuse
+/// that one millisecond value; `checked_mul` answers both commands at both
+/// ends, because a millisecond count is never multiplied at all.
+///
+/// `per_unit_millis` is `1000` for `EXPIREAT` and `1` for `PEXPIREAT`; `name`
+/// is the refusing command's own lowercase name, a literal from the table.
+fn absolute_deadline_span(
+    value: &[u8],
+    per_unit_millis: i64,
+    name: &str,
+    node: &NodeInfo,
+) -> Result<i64, String> {
+    let when = parse_i64(value).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
+    let deadline_millis = when
+        .checked_mul(per_unit_millis)
+        .ok_or_else(|| invalid_expire(name))?;
+    if deadline_millis <= 0 {
+        return Ok(0);
+    }
+    let deadline_millis = u64::try_from(deadline_millis).expect("checked positive above");
+    let Expiry::Px(remaining) = remaining_from(deadline_millis, node) else {
+        unreachable!("remaining_from answers in milliseconds")
+    };
+    Ok(i64::try_from(remaining).unwrap_or(i64::MAX))
 }
 
 /// The invalid-expiry message, with the command's own lowercase name — a
@@ -6101,6 +6189,182 @@ mod tests {
             "the refused EXPIRE must not have touched the deadline"
         );
         assert_eq!(frames[4], Frame::Integer(1));
+    }
+
+    /// The millisecond read and the two absolute deadlines, answered as Redis
+    /// answers them (6.2.24 and 8.10.1, the readings this branch stands on).
+    /// `EXPIREAT` with a time already passed deletes the key and reports `1`;
+    /// a non-integer is `not an integer` rather than an invalid expire time,
+    /// the parse failing before any range check.
+    ///
+    /// Where the boundaries are is a separate claim, in
+    /// `the_absolute_deadlines_bound_the_unit_they_multiply`.
+    #[tokio::test]
+    async fn pttl_expireat_and_pexpireat_answer_like_redis() {
+        let (mut r, mut w, _pool) = connected(16);
+        let now_ms = (NodeInfo::for_tests().now_unix_millis)();
+        let in_100_s = ((now_ms / 1000) + 100).to_string();
+        let in_100_000_ms = (now_ms + 100_000).to_string();
+        let requests: Vec<Vec<&str>> = vec![
+            vec!["SET", "k", "v"],
+            vec!["PTTL", "k"],
+            vec!["PTTL", "missing"],
+            vec!["EXPIREAT", "k", &in_100_s],
+            vec!["TTL", "k"],
+            vec!["PEXPIREAT", "k", &in_100_000_ms],
+            vec!["PTTL", "k"],
+            vec!["EXPIREAT", "k", "1"],
+            vec!["EXISTS", "k"],
+            vec!["EXPIREAT", "missing", &in_100_s],
+            vec!["SET", "k", "v"],
+            vec!["EXPIREAT", "k", "notanum"],
+            vec!["PEXPIREAT", "k", "notanum"],
+            vec!["EXPIREAT", "k"],
+            vec!["PTTL"],
+            vec!["PTTL", "k", "extra"],
+        ];
+        let mut out = Vec::new();
+        for parts in &requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, requests.len()).await;
+        let not_int = Frame::Error("ERR value is not an integer or out of range".into());
+        assert_eq!(frames[0], Frame::Simple("OK".into()));
+        assert_eq!(frames[1], Frame::Integer(-1), "no deadline");
+        assert_eq!(frames[2], Frame::Integer(-2), "no key");
+        assert_eq!(frames[3], Frame::Integer(1));
+        assert!(
+            matches!(frames[4], Frame::Integer(99..=100)),
+            "{:?}",
+            frames[4]
+        );
+        assert_eq!(frames[5], Frame::Integer(1));
+        assert!(
+            matches!(frames[6], Frame::Integer(99_000..=100_000)),
+            "PTTL reads back the millisecond deadline: {:?}",
+            frames[6]
+        );
+        assert_eq!(
+            frames[7],
+            Frame::Integer(1),
+            "a deadline in the past is applied by deleting"
+        );
+        assert_eq!(frames[8], Frame::Integer(0), "and the key is gone at once");
+        assert_eq!(frames[9], Frame::Integer(0), "nothing to expire");
+        assert_eq!(frames[10], Frame::Simple("OK".into()));
+        assert_eq!(frames[11], not_int);
+        assert_eq!(frames[12], not_int);
+        assert_eq!(
+            frames[13],
+            Frame::Error("ERR wrong number of arguments for 'expireat' command".into())
+        );
+        let pttl_arity = Frame::Error("ERR wrong number of arguments for 'pttl' command".into());
+        assert_eq!(frames[14], pttl_arity);
+        assert_eq!(frames[15], pttl_arity);
+    }
+
+    /// The two absolute spellings refuse a moment whose multiplication by the
+    /// unit leaves an `i64`, and their boundaries are **not** each other's
+    /// mirror — which is why both ends of both are here rather than one
+    /// example of each.
+    ///
+    /// Read on 6.2.24 and 8.10.1: `EXPIREAT` takes `±(i64::MAX / 1000)` and
+    /// refuses one step past either, while `PEXPIREAT` takes every `i64`
+    /// there is — `i64::MAX` is a live deadline and `i64::MIN` is a deletion
+    /// answered `1`, neither of them a refusal. A deadline at or below zero
+    /// is that same deletion at any magnitude: Redis performs it rather than
+    /// refusing the sign.
+    #[tokio::test]
+    async fn the_absolute_deadlines_bound_the_unit_they_multiply() {
+        let (mut r, mut w, _pool) = connected(16);
+        let requests: Vec<Vec<&str>> = vec![
+            vec!["SET", "k", "v"],
+            vec!["EXPIREAT", "k", "9223372036854776"],
+            vec!["EXPIREAT", "k", "9223372036854775"],
+            vec!["PEXPIREAT", "k", "9223372036854775807"],
+            vec!["SET", "k", "v"],
+            vec!["EXPIREAT", "k", "-5"],
+            vec!["EXISTS", "k"],
+            vec!["SET", "k", "v"],
+            vec!["EXPIREAT", "k", "-9223372036854776"],
+            vec!["PEXPIREAT", "k", "-9223372036854775808"],
+            vec!["EXISTS", "k"],
+        ];
+        let mut out = Vec::new();
+        for parts in &requests {
+            encode(&req(parts), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, requests.len()).await;
+        let refused = Frame::Error("ERR invalid expire time in 'expireat' command".into());
+        assert_eq!(frames[0], Frame::Simple("OK".into()));
+        assert_eq!(frames[1], refused, "one second past i64::MAX / 1000");
+        assert_eq!(
+            frames[2],
+            Frame::Integer(1),
+            "i64::MAX / 1000 is the last second EXPIREAT takes"
+        );
+        assert_eq!(
+            frames[3],
+            Frame::Integer(1),
+            "PEXPIREAT is not multiplied, so i64::MAX fits"
+        );
+        assert_eq!(frames[4], Frame::Simple("OK".into()));
+        assert_eq!(
+            frames[5],
+            Frame::Integer(1),
+            "a negative deadline is applied by deleting"
+        );
+        assert_eq!(frames[6], Frame::Integer(0));
+        assert_eq!(frames[7], Frame::Simple("OK".into()));
+        assert_eq!(frames[8], refused, "and one second past the floor");
+        assert_eq!(
+            frames[9],
+            Frame::Integer(1),
+            "while i64::MIN milliseconds is a deletion, not a refusal"
+        );
+        assert_eq!(frames[10], Frame::Integer(0), "so the key is gone");
+    }
+
+    /// The three are counted under their own names, and neither `TTL`'s
+    /// counter nor `PEXPIRE`'s moves — the reason each is a command kind
+    /// rather than an alias resolved at the edge. Redis keeps all five apart
+    /// the same way (`cmdstat_pttl`, `cmdstat_expireat`, `cmdstat_pexpireat`
+    /// beside `cmdstat_ttl` and `cmdstat_pexpire` on 6.2.24 and 8.10.1).
+    #[tokio::test]
+    async fn the_absolute_deadlines_are_counted_apart_from_the_spans() {
+        let (mut r, mut w, _pool) = connected(16);
+        let mut out = Vec::new();
+        encode(&req(&["SET", "k", "v"]), &mut out);
+        encode(&req(&["PTTL", "k"]), &mut out);
+        encode(&req(&["EXPIREAT", "k", "4102444800"]), &mut out);
+        encode(&req(&["PEXPIREAT", "k", "4102444800000"]), &mut out);
+        encode(&req(&["INFO", "commandstats"]), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 5).await;
+        let Frame::Bulk(text) = &frames[4] else {
+            panic!("INFO answered {:?}", frames[4])
+        };
+        let text = String::from_utf8(text.clone()).unwrap();
+        let counted = |prefix: &str| {
+            assert!(
+                text.lines().any(|written| written.starts_with(prefix)),
+                "no line beginning {prefix:?} in {text}"
+            );
+        };
+        counted("cmdstat_pttl:calls=1,usec=");
+        counted("cmdstat_expireat:calls=1,usec=");
+        counted("cmdstat_pexpireat:calls=1,usec=");
+        for absent in ["cmdstat_ttl:", "cmdstat_pexpire:"] {
+            assert!(
+                !text.lines().any(|written| written.starts_with(absent)),
+                "{absent:?} moved, so the span spellings are sharing a counter: {text}"
+            );
+        }
     }
 
     /// Redis bounds a span by the clock — `now + span` must fit an `i64` of

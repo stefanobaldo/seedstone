@@ -104,6 +104,30 @@ expect "psetex refuses a zero span" \
     "ERR invalid expire time in 'psetex' command" r psetex k5 0 clobbered
 expect "the value the refusal left alone" v5 r get k5
 
+# PTTL reads the deadline back in the unit it is kept in. A range for the
+# same reason TTL's is, three orders wider.
+expect "pttl of a missing key" -2 r pttl missing
+pttl=$(r pttl k5)
+if [ "$pttl" -le 90000 ] || [ "$pttl" -gt 100000 ]; then
+    echo "pttl: expected 90000 < pttl <= 100000, got '$pttl'" >&2
+    exit 1
+fi
+
+# EXPIREAT / PEXPIREAT name a moment rather than a span; one in the past is
+# a deletion reported as an applied expiry, which is what Redis answers.
+now_s=$(date +%s)
+expect "expireat" 1 r expireat k5 $((now_s + 100))
+ttl=$(r ttl k5)
+if [ "$ttl" -le 90 ] || [ "$ttl" -gt 100 ]; then
+    echo "expireat ttl: expected 90 < ttl <= 100, got '$ttl'" >&2
+    exit 1
+fi
+expect "pexpireat" 1 r pexpireat k5 $(( (now_s + 200) * 1000 ))
+expect "expireat in the past deletes" 1 r expireat k5 1
+expect "the key is gone" 0 r exists k5
+expect "expireat refuses a non-integer" \
+    "ERR value is not an integer or out of range" r expireat k4 notanum
+
 r info | grep -q '^# Server'
 r info | grep -q '^connected_clients:'
 
