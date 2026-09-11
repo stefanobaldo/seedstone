@@ -387,7 +387,7 @@ pub const INVALID_CURSOR: &str = "ERR invalid cursor";
 /// which put the boundary at the same second: `9223370247774828` seconds is
 /// accepted and `9223370247774832` is refused by `SET … EX`, `SETEX` and
 /// `EXPIRE` alike — and by `SET … PX`, `PSETEX` and `PEXPIRE` at the same
-/// boundary in milliseconds — while `i64::MAX / 1000` — this constant — is
+/// clock boundary, in milliseconds — while `i64::MAX / 1000` — this constant — is
 /// refused by both versions. That boundary is applied by
 /// [`refuse_past_the_clock`]; this constant is the cheap first check in front
 /// of it, and the reason it exists is arithmetic on this side: a span in
@@ -982,12 +982,12 @@ impl Fold {
 
 /// How [`broadcast`] folds one reply per shard into the frame the peer sees.
 ///
-/// Named at the command table, where the command is named, rather than
+/// Chosen at the command table, where the command is named, rather than
 /// matched off the command inside `broadcast`. What that buys is that the
 /// fold can no longer be *omitted*: a keyspace-wide command added to the
 /// table has to say which of these it answers, where before it inherited
-/// `+OK` from the arm every command but `DBSIZE` fell into, without anyone
-/// having chosen it. Which of the two is right remains the table's to get
+/// `+OK` from the `else` branch every command but `DbSize` fell into, without
+/// anyone having chosen it. Which of the two is right remains the table's to get
 /// right — both compile.
 ///
 /// The one place that reads this matches the whole enum, so a third gather
@@ -4169,6 +4169,11 @@ mod tests {
 
         has("# Clients");
         has("# Memory");
+        // `info_memory_reports_what_the_pool_accounts` makes the same claim
+        // of `INFO memory`; this one makes it of the whole document, which is
+        // what the exporter asks for. `contains` rather than the line-exact
+        // `has` above because the claim is an absence: the name must not
+        // appear anywhere, under any spelling of the line.
         assert!(
             !text.contains("mem_fragmentation_ratio"),
             "a ratio nothing measures must not be reported"
@@ -9059,9 +9064,10 @@ mod tests {
     /// The reading is taken on the same connection *after* it authenticates,
     /// because `INFO` is gated too: an unauthenticated peer cannot read the
     /// section its handshake just moved. The refusal being counted happened
-    /// before the `AUTH`, which is the case that matters, and the
-    /// `cmdstat_auth` line beside it is what says the reading came from the
-    /// connection that sent all three.
+    /// before the `AUTH`, which is the case that matters. The section is
+    /// node-wide rather than per connection, so the `cmdstat_auth` line beside
+    /// it says only that the node saw the `AUTH` — here that is the same thing
+    /// as this connection, because this node has exactly one.
     #[tokio::test]
     async fn a_refused_hello_is_counted_in_commandstats() {
         let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);

@@ -44,9 +44,18 @@ fn the_compatibility_page_matches_the_command_table() {
         .collect();
 
     let unlisted: Vec<_> = served.difference(&answers).collect();
-    assert!(unlisted.is_empty(), "served but not in the Answers table: {unlisted:?}");
+    assert!(
+        unlisted.is_empty(),
+        "served but not in the Answers table: {unlisted:?}"
+    );
     let contradicted: Vec<_> = served.intersection(&refuses).collect();
-    assert!(contradicted.is_empty(), "served and listed as refused: {contradicted:?}");
+    assert!(
+        contradicted.is_empty(),
+        "served and listed as refused: {contradicted:?}"
+    );
     let phantom: Vec<_> = answers.difference(&served).collect();
-    assert!(phantom.is_empty(), "in the Answers table but not served: {phantom:?}");
+    assert!(
+        phantom.is_empty(),
+        "in the Answers table but not served: {phantom:?}"
+    );
 }
