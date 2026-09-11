@@ -75,12 +75,10 @@ test_backend.py::TestDjangoRedisCache::test_lock*[*] | out-of-rule | EVALSHA: th
 test_backend.py::TestDjangoRedisCache::test_incr_error[*] | out-of-rule | EVAL: the client increments through a script
 test_backend.py::TestDjangoRedisCache::test_incr_ignore_check[*] | out-of-rule | EVAL: the client increments through a script, and its recovery path cannot create a key that is missing
 
-# --- not-yet: millisecond and absolute deadlines -------------------------
-# Inside the compatibility rule and not built yet.
-test_backend.py::TestDjangoRedisCache::test_pttl[*] | not-yet | PTTL: the server writes millisecond deadlines and reads none back
-test_backend.py::TestDjangoRedisCache::test_pexpire[*] | not-yet | PTTL: the test reads back the deadline it set
-test_backend.py::TestDjangoRedisCache::test_pexpire_at[*] | not-yet | PEXPIREAT: an absolute millisecond deadline
-test_backend.py::TestDjangoRedisCache::test_expire_at[*] | not-yet | EXPIREAT: an absolute second deadline
+# --- not-yet -------------------------------------------------------------
+# Empty. The rows that stood here named PTTL, EXPIREAT and PEXPIREAT, and
+# each came out the moment the command it waited for landed. A row belongs
+# here only while a planned command is unbuilt.
 
 # --- not-this-server -----------------------------------------------------
 # The msgpack serializer round-trips an IntEnum as a plain int, so the test's
