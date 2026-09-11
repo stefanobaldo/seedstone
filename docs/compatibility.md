@@ -83,20 +83,20 @@ page was written. One shape covers all of them — `ERR unknown command
 - **A keyspace walk is at-least-once, not a snapshot.** `KEYS` and `SCAN`
   answer with a set that was the keyspace at no single instant: a key created
   while a walk is in flight may be missed, and a key deleted while it is in
-  flight may still appear. Redis's `KEYS` is atomic because Redis is
-  single-threaded, not because the guarantee was designed; here the keyspace is
-  spread across shards that no lock spans. `KEYS` removes the duplicates that
-  follow, so it never reports a key twice; `SCAN` may, exactly as in Redis.
-  `KEYS` does not block the server and is still `O(keyspace)` — the reasoning,
-  and what a `SCAN` cursor means here, are in
+  flight may still appear. The keyspace here is spread across shards that no
+  lock spans, and a global instant would cost a barrier that every single-key
+  command would pay for. `KEYS` removes the duplicates that follow, so it never
+  reports a key twice; `SCAN` may, which is what a `SCAN` loop tolerates on any
+  server. `KEYS` does not block the server and is still `O(keyspace)` — the
+  reasoning, and what a `SCAN` cursor means here, are in
   [ARCHITECTURE.md](ARCHITECTURE.md).
 
 - **`INFO memory` has no `used_memory_rss`, `used_memory_peak` or
   `mem_fragmentation_ratio`.** `used_memory` is an accounting formula over the
   keyspace, not an allocator reading, and this server does not read its
-  resident set size — so there is nothing to divide by. Redis computes the
-  ratio as `used_memory_rss / used_memory`, and on idle containers it read
-  14.57 on 6.2.24 and 14.89 on 8.10.1, nowhere near 1: a field this server
+  resident set size — so there is nothing to divide by. 6.2.24 and 8.10.1
+  compute the ratio as `used_memory_rss / used_memory`, and on idle containers
+  it read 14.57 and 14.89 respectively, nowhere near 1: a field this server
   could only fill with a constant is absent rather than approximated.
 
 - **`CONFIG` has `GET` and no `SET`.** Every parameter it reports is a fact
