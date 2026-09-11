@@ -130,6 +130,32 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
         },
     ),
     (
+        b"PTTL",
+        Coverage::NotEmitted {
+            reason: "it is TTL in the unit the deadline is kept in, and the \
+                     client checks neither reply (Check::Ignored on TTL): a \
+                     second read-only spelling folds nothing new into the \
+                     trace, and the connection layer's tests hold the \
+                     arithmetic. Drawing it would also reshuffle every \
+                     workload's sequence for no invariant gained.",
+        },
+    ),
+    (
+        b"EXPIREAT",
+        Coverage::NotEmitted {
+            reason: "it names a wall-clock moment, which the edge resolves \
+                     into the same PExpire the client already emits before \
+                     the shard sees it; the shard-side path is covered, and \
+                     the edge's arithmetic is the connection layer's to test.",
+        },
+    ),
+    (
+        b"PEXPIREAT",
+        Coverage::NotEmitted {
+            reason: "EXPIREAT's reason, one unit down.",
+        },
+    ),
+    (
         b"DBSIZE",
         Coverage::Emitted {
             forms: &[FORM_DBSIZE],

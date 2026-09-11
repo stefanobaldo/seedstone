@@ -20,9 +20,18 @@
 //! is decided against the node's used-memory figure, a word every executor
 //! keeps current, so what a run evicts depends on what that word said at the
 //! moment it was read. The second is the reply the verifier's `INFO stats`
-//! produces — the widest thing the trace hash folds, twenty-three counters
-//! including each shard's hits, misses and expirations — which no other shape
-//! asks for. Either is a way for two runs of one seed to disagree.
+//! produces — the widest thing the trace hash folds, twenty-eight counters
+//! per shard including its hits, misses and expirations — which no other
+//! shape asks for. Either is a way for two runs of one seed to disagree.
+//!
+//! Twenty-eight is `6 + KIND_SLOTS`: the six figures a `ShardStats` carries
+//! outside its arrays (`keys`, `expires`, `evicted`, `hits`, `misses`,
+//! `expired`), plus one `calls` counter per command kind, which is
+//! `KIND_MAX + 1` = 22 with slot `0` — no command, always zero — folded with
+//! the rest. `usec` is not folded, for the reason its own doc gives. The
+//! arithmetic is written out because the number moves with every command kind
+//! added, and the sentence before this one had been counting sixteen kinds
+//! for two kinds longer than that was true.
 
 use seedstone_sim::{SimConfig, run_sim};
 
