@@ -7,6 +7,21 @@ SemVer and are `0.x` until the server persists data;
 
 ## [Unreleased]
 
+### Added
+
+- `PTTL key` — the deadline a key carries, in milliseconds, which is the unit
+  this server keeps it in. `TTL` rounds the same deadline to a second; a
+  client that set a span with `PX` or `PSETEX` can now read it back without
+  the rounding. Its own `cmdstat_pttl` line in `INFO commandstats`.
+- `EXPIREAT key unix-seconds` and `PEXPIREAT key unix-milliseconds` — a
+  deadline named as a moment rather than as a span, the command spellings of
+  `SET … EXAT` and `SET … PXAT`. A moment already passed deletes the key and
+  answers `1`, as Redis 6.2.24 and 8.10.1 do; a moment whose multiplication by
+  its unit leaves a signed 64-bit millisecond clock is refused as an invalid
+  expire time, which bounds `EXPIREAT` at both ends and leaves `PEXPIREAT` the
+  whole range — the same asymmetry those two versions have. Each gets its own
+  `cmdstat_` line.
+
 ### Fixed
 
 - `INFO memory` no longer reports `mem_fragmentation_ratio`. The value was a

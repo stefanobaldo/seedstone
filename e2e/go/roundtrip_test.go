@@ -68,8 +68,9 @@ func TestRoundtrip(t *testing.T) {
 		t.Fatalf("incrby: %d, %v", got, err)
 	}
 	// SetArgs, not the library's SetNX helper: that one sends the standalone
-	// SETNX command, which this server does not have. SetArgs is how go-redis
-	// spells `SET key value NX`, and the refusal comes back as redis.Nil.
+	// SETNX command, which answers an integer rather than the OK-or-nil this
+	// asserts. SetArgs is how go-redis spells `SET key value NX`, and the
+	// refusal comes back as redis.Nil.
 	nx := redis.SetArgs{Mode: "NX"}
 	if got, err := c.SetArgs(ctx, "gfresh", "a", nx).Result(); err != nil || got != "OK" {
 		t.Fatalf("set nx on a fresh key: %q, %v", got, err)
