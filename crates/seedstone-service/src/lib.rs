@@ -807,6 +807,21 @@ enum Action {
     /// [`Reply`]: Action::Reply
     /// [`Authenticate`]: Action::Authenticate
     Hello(Frame),
+    /// A request's own mistake, decided before the connection's state is.
+    ///
+    /// Redis answers what is wrong with the request — a protocol version it
+    /// does not speak, an option it does not know — before it asks whether
+    /// the connection may be answered at all, so an unauthenticated
+    /// `HELLO 99` is told `NOPROTO` there. A handler's `Err` is an ordinary
+    /// [`Reply`] by the time [`gated`] decides, and the gate answers every
+    /// `Reply` with `NOAUTH`; this variant is how a handler says its refusal
+    /// is about the request and not about the keyspace, and the gate lets it
+    /// through by name. Only `hello` produces it: the three refusals it
+    /// carries name nothing about the node, and no other handler has earned
+    /// the right to speak before the gate. Measured on 6.2.24 and 8.10.1.
+    ///
+    /// [`Reply`]: Action::Reply
+    Refuse(Frame),
     /// Answer with this frame, then hang up.
     ReplyThenClose(Frame),
 }
@@ -836,6 +851,7 @@ fn gated(action: Action, authenticated: bool) -> Action {
         // return above answers the handshake.
         Action::Hello(_) => Action::Reply(safe_error(NOAUTH_HELLO)),
         Action::ReplyThenClose(frame) => Action::ReplyThenClose(frame),
+        Action::Refuse(frame) => Action::Refuse(frame),
         Action::Dispatch(_) | Action::Unbatched(_) | Action::Reply(_) => {
             Action::Reply(safe_error(NOAUTH))
         }
@@ -1376,7 +1392,7 @@ where
                             .slots
                             .push(Slot::Ready(request.answer(router, node).await, label));
                     }
-                    Action::Reply(frame) | Action::Hello(frame) => {
+                    Action::Reply(frame) | Action::Hello(frame) | Action::Refuse(frame) => {
                         chunk.slots.push(Slot::Ready(frame, label));
                     }
                     Action::Authenticate(outcome) => {
@@ -3267,36 +3283,28 @@ fn human_bytes(bytes: u64) -> String {
 /// `HELLO abc BOGUS x` names two mistakes and Redis reports the version, so
 /// reading the options first would answer a different one.
 ///
-/// **That order is observable only where the gate lets a handler's own refusal
-/// out** — on a node with no password, or on a connection that has
-/// authenticated. On a password-protected node that has not, a refusal built
-/// here never reaches the peer: [`gated`] decides on the [`Action`], and by
-/// then a handler's `Err` is an ordinary `Action::Reply`, so `HELLO 99`
-/// answers with the general [`NOAUTH`] rather than with [`NOPROTO`] — and
-/// rather than even with [`NOAUTH_HELLO`], which the handshake that parsed
-/// gets. So the two credential-less handshakes are told different things, and
-/// the one that also named a bad version is told the less useful of the two.
-///
-/// Redis decides a request's own mistakes first and only then asks whether the
-/// connection may be answered; this asks in the other order. It is a
-/// diagnostic loss and not an authorisation one — nothing about the node leaks
-/// either way, and a client that branches on `NOPROTO` to downgrade falls back
-/// on the error it does get. `hello_without_auth_is_refused` pins both
-/// answers, and this is recorded rather than fixed because letting a refusal
-/// through the gate is a change to the connection model's error path.
+/// The refusals decided here travel as [`Action::Refuse`], which the gate lets
+/// through in every connection state — so an unauthenticated `HELLO 99` is
+/// told `NOPROTO`, as Redis tells it (6.2.24, 8.10.1), and the credential-less
+/// `HELLO 2` that parsed is told [`NOAUTH_HELLO`] by the gate as before.
 fn hello(args: &[Vec<u8>], node: &NodeInfo) -> Result<Action, String> {
     // No version at all is `HELLO` bare, which names no version to disagree
     // with and carries no options to read.
     let credentials = match args {
         [] => None,
         [version, rest @ ..] => {
-            let version = parse_i64(version).ok_or_else(|| {
-                "ERR Protocol version is not an integer or out of range".to_owned()
-            })?;
+            let Some(version) = parse_i64(version) else {
+                return Ok(Action::Refuse(safe_error(
+                    "ERR Protocol version is not an integer or out of range",
+                )));
+            };
             if version != 2 {
-                return Err(NOPROTO.to_owned());
+                return Ok(Action::Refuse(safe_error(NOPROTO)));
             }
-            hello_auth(rest)?
+            match hello_auth(rest) {
+                Ok(credentials) => credentials,
+                Err(text) => return Ok(Action::Refuse(safe_error(&text))),
+            }
         }
     };
     let Some(Credentials { user, pass }) = credentials else {
@@ -8630,14 +8638,15 @@ mod tests {
     /// bare, and with the version — because they take different paths through
     /// `hello` and meet the gate at the same place.
     ///
-    /// The third row is the divergence rather than the agreement, and it is
-    /// here because it is the same mechanism seen from the other side.
-    /// `HELLO 99` names a version this server refuses on its own, so `hello`
-    /// returns an `Err` — and an `Err` is an `Action::Reply` by the time
-    /// `gated` decides, which is the arm that answers with the *general*
-    /// refusal. So the handshake that parsed is told the form that would have
-    /// worked and the one that did not is told nothing of the kind, where
-    /// Redis would have answered the version first and the gate second.
+    /// The third row is the agreement, and it is here because it is the same
+    /// mechanism seen from the other side. `HELLO 99` names a version this
+    /// server refuses on its own, and that refusal travels as
+    /// [`Action::Refuse`], which the gate lets through by name — so the answer
+    /// is [`NOPROTO`] here as it is on Redis (6.2.24, 8.10.1), because a
+    /// request's own mistake is decided before the connection's state is. The
+    /// handshake that parsed is still told the form that would have worked,
+    /// and the one that named a version this server does not speak is told
+    /// which half of its request was refused.
     #[tokio::test]
     async fn hello_without_auth_is_refused() {
         let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
@@ -8656,13 +8665,65 @@ mod tests {
         assert_eq!(frames[1], Frame::Error(NOAUTH_HELLO.to_owned()));
         assert_eq!(
             frames[2],
-            Frame::Error(NOAUTH.to_owned()),
-            "a HELLO the handler refused is answered by the gate, and with \
-             the general refusal rather than the handshake's"
+            Frame::Error(NOPROTO.to_owned()),
+            "a HELLO the handler refused is answered with the handler's own \
+             refusal, before the gate is consulted — Redis's order (6.2.24, \
+             8.10.1)"
         );
         // The general refusal, not the handshake's: the two texts are
         // different on purpose and a client tells the requests apart by them.
         assert_eq!(frames[3], Frame::Error(NOAUTH.to_owned()));
+    }
+
+    /// Every refusal `hello` decides on its own passes the gate unauthenticated
+    /// — and only those: the same connection's `GET` is still `NOAUTH`. Rows
+    /// read against `redis:6-alpine` (6.2.24) and `redis:8-alpine` (8.10.1)
+    /// with `--requirepass`, no `AUTH` sent, on 2026-09-10.
+    ///
+    /// Two rows are this server's answer rather than Redis's, and say so
+    /// where they sit. `SETNAME` is **accepted** by both versions once the
+    /// connection has authenticated (`CLIENT GETNAME` reads the name back);
+    /// this server refuses it because it has no client name to set. And
+    /// `NOAUTH_HELLO`'s sentence is 6.2.24's — 8.10.1 spells the same
+    /// refusal with `the HELLO <proto> AUTH <user> <pass> option`.
+    #[tokio::test]
+    async fn hello_refusals_pass_the_gate_unauthenticated() {
+        let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server, pool, node_with_password(b"pw")));
+        let (mut r, mut w) = tokio::io::split(client);
+        let version_error = "ERR Protocol version is not an integer or out of range";
+        let cases: [(&[&str], &str); 8] = [
+            (&["HELLO", "99"], NOPROTO),
+            (&["HELLO", "abc"], version_error),
+            (&["HELLO", "abc", "BOGUS", "x"], version_error),
+            (
+                &["HELLO", "2", "BOGUS", "x"],
+                "ERR Syntax error in HELLO option 'BOGUS'",
+            ),
+            // This server's own refusal, not Redis's: see the doc comment.
+            (
+                &["HELLO", "2", "SETNAME", "x"],
+                "ERR Syntax error in HELLO option 'SETNAME'",
+            ),
+            // The handshake redis-py 8 opens with when it is credentialed and
+            // nobody named `protocol=2`. Redis authenticates it and answers a
+            // RESP3 map; here the version is decided first, so the client is
+            // told which half of its request was refused.
+            (&["HELLO", "3", "AUTH", "default", "pw"], NOPROTO),
+            (&["HELLO", "2"], NOAUTH_HELLO),
+            (&["GET", "k"], NOAUTH),
+        ];
+        let mut out = Vec::new();
+        for (args, _) in &cases {
+            encode(&req(args), &mut out);
+        }
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, cases.len()).await;
+        for (frame, (args, expected)) in frames.iter().zip(cases) {
+            assert_eq!(*frame, Frame::Error(expected.to_owned()), "{args:?}");
+        }
     }
 
     /// The same handshake on a node with **no** password is answered, because
@@ -8687,11 +8748,11 @@ mod tests {
     /// against `redis:6-alpine` (6.2.24) and asserted here so the order
     /// cannot drift back.
     ///
-    /// On a node with no password, which is where these are observable: a
-    /// handler's refusal is an `Action::Reply`, and on a connection that has
-    /// not authenticated the gate answers every one of those with the general
-    /// `NOAUTH` instead. That divergence is older than this test and is
-    /// recorded rather than fixed here.
+    /// A node with no password is only the simplest place to read them: every
+    /// row here is a refusal `hello` decides on its own, and those travel as
+    /// `Action::Refuse`, so the same answers reach a connection that has not
+    /// authenticated — which `hello_refusals_pass_the_gate_unauthenticated`
+    /// pins.
     ///
     /// The rows that matter are the ones where two mistakes compete. `HELLO
     /// abc BOGUS x` is a bad version *and* a bad option, and the version is

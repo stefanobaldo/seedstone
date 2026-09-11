@@ -20,6 +20,13 @@ SemVer and are `0.x` until the server persists data;
   millisecond spellings refuse exactly the spans Redis 6.2.24 and 8.10.1
   refuse, where they previously accepted a band of about fifty-six years above
   Redis's boundary. Ordinary spans never read the clock for this check.
+- A `HELLO` that names a protocol version this server does not speak, or an
+  option it does not take, is refused with its own error — `NOPROTO`, or the
+  syntax error — before the connection's authentication is considered, which
+  is the order Redis 6.2.24 and 8.10.1 decide it in. Previously an
+  unauthenticated client was told `NOAUTH` for every such request, so a client
+  probing for RESP3 support could not tell a refused version from a missing
+  password.
 
 ## [0.1.1] - 2026-09-08
 
