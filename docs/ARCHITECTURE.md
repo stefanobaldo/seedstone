@@ -120,7 +120,10 @@ shard. Two other routing shapes share that path: a command that names a *shard*
 instead of a key, which is how one step of a keyspace walk reaches the shard
 whose cursor it carries, and a command every shard must see, such as emptying
 the keyspace or counting it. Multi-key commands fan out from this layer, and so
-does the whole-keyspace walk — one cursor loop per shard, run concurrently.
+does the whole-keyspace walk — one cursor loop per shard, run concurrently. The
+command surface itself — every name the layer's table answers and every one it
+refuses — is documented in [compatibility.md](compatibility.md), and a test
+holds the two together.
 
 Authentication is per-connection state in that same layer: one flag, and a gate
 a decoded command passes before the router ever sees it — so a peer that has
