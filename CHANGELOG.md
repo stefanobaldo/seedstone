@@ -21,14 +21,22 @@ SemVer and are `0.x` until the server persists data;
   expire time, which bounds `EXPIREAT` at both ends and leaves `PEXPIREAT` the
   whole range — the same asymmetry those two versions have. Each gets its own
   `cmdstat_` line.
+- [docs/compatibility.md](docs/compatibility.md) — every command this server
+  answers with the forms it takes and how it differs from Redis 6.2.24 and
+  8.10.1, every command its clients emit that it refuses with the exact reply,
+  and the deliberate differences that are not commands. A test holds the page
+  and `COMMAND` together, so a command cannot be added or removed without it.
 
-### Fixed
+### Removed
 
 - `INFO memory` no longer reports `mem_fragmentation_ratio`. The value was a
   constant `1.00`, not a measurement: this server does not read its resident
   set size, so it has no `used_memory_rss` to divide by, and a field that is
   always `1.00` reads as a healthy measurement when it is not one. A consumer
   that finds the field absent is correctly informed.
+
+### Fixed
+
 - The largest expiry span a command accepts is now Redis's: `now` plus the span
   must fit a signed 64-bit millisecond clock, so the ceiling is clock-relative
   and moves by one every second. `SET … EX`, `SETEX`, `EXPIRE` and their
