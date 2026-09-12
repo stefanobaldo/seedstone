@@ -88,7 +88,7 @@ const _: () = assert!(
 ///
 /// The order is this array's own — it is what `# Commandstats` prints after
 /// the keyed commands, and nothing else reads it. It deliberately does not
-/// track [`COMMANDS`]: a name is appended here when a command is added there,
+/// track [`crate::dispatch::COMMANDS`]: a name is appended here when a command is added there,
 /// and reordering the existing ones to match would move fields in a document
 /// operators already read for no reader's benefit.
 pub const EDGE_NAMES: [&str; 15] = [

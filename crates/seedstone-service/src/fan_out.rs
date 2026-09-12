@@ -21,7 +21,7 @@ use std::task::Poll;
 /// is the bound on it. A walk whose gathered key bytes pass this is abandoned
 /// and answered with [`KEYS_TOO_LARGE`].
 ///
-/// It is [`MAX_REQUEST_BYTES`] again, for the reason stated there: one request
+/// It is [`crate::MAX_REQUEST_BYTES`] again, for the reason stated there: one request
 /// may make one connection hold this much, on the request side or on the reply
 /// side, and the two halves are held to the same figure so the pair is one
 /// number rather than two to keep in step.
@@ -29,7 +29,7 @@ use std::task::Poll;
 /// **It prices the key bytes and nothing else.** Not the `Vec` per key, not the
 /// `$<len>\r\n` each one costs on the wire, not the capacity the gathering
 /// vectors grew to hold them. So this is a bound on accumulation rather than a
-/// measurement of the frame — the same undercounting [`MAX_REQUEST_BYTES`]
+/// measurement of the frame — the same undercounting [`crate::MAX_REQUEST_BYTES`]
 /// admits to on the parsed side, and acceptable for the same reason: the
 /// figure is a ceiling on the worst case one peer can impose, not a memory
 /// budget.
