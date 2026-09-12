@@ -5,10 +5,8 @@
 use crate::dict::{Dict, Entry};
 use crate::glob;
 use crate::log::{Record, ReplicationLog};
-use crate::shard::{
-    Command, Cond, Expiry, ExpiryPolicy, Reply, ReplyError, Route, ShardPolicy, ShardState,
-    keyspace_stats,
-};
+use crate::shard::executor::{ShardState, keyspace_stats};
+use crate::shard::{Command, Cond, Expiry, ExpiryPolicy, Reply, ReplyError, Route, ShardPolicy};
 use std::time::Duration;
 use tokio::time::Instant;
 
