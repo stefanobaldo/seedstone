@@ -64,7 +64,7 @@ pub struct SimOutcome {
     /// **Always zero, and that is the claim.** A handler cannot `await`, so
     /// no simulated instant passes between the reading an envelope takes on
     /// arrival and the reading taken after each of its commands. It is what
-    /// keeps `usec` out of [`crate::fold_reply`] and a replay byte-stable, and it is
+    /// keeps `usec` out of [`crate::trace::fold_reply`] and a replay byte-stable, and it is
     /// a property of the runtime rather than of the code that reads it — so
     /// `tests/command_timing.rs` asserts it, where a runtime that started
     /// advancing the clock inside a handler fails loudly.
