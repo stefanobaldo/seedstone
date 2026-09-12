@@ -2,8 +2,8 @@
 //! refusals are decided in Redis's order and reach the peer past the
 //! authentication gate — see [`crate::gated`].
 
-use crate::Action;
 use crate::auth::{AUTH_NOT_CONFIGURED, WRONGPASS};
+use crate::dispatch::Action;
 use crate::node::{NodeInfo, SERVER_MODE, SERVER_NAME};
 use crate::reply::{quote, safe_error};
 use seedstone_core::shard::parse_i64;
