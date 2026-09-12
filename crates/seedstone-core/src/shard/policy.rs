@@ -42,7 +42,7 @@ impl TraceSink for NoTrace {
 /// Whether a deadline has come due.
 ///
 /// Expiry is decided in two places — in front of every command
-/// ([`crate::shard::evict_if_expired`]) and on the housekeeping tick ([`crate::shard::sweep_expired`]) —
+/// ([`crate::shard::apply::evict_if_expired`]) and on the housekeeping tick ([`crate::shard::sweep_expired`]) —
 /// and both ask this. Production has exactly one implementation, [`Deadlines`],
 /// and the parameter exists so that the simulator can supply others: a plant
 /// that answers wrongly *is* the defect an invariant claims to catch, where a

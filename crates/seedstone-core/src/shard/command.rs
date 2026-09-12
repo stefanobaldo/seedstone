@@ -271,7 +271,7 @@ pub enum Command {
     /// counter, incremented by every executor — is a contended word on the
     /// hot path to save a broadcast on a command nothing hot issues.
     ///
-    /// It is answered by the executor rather than by [`crate::shard::apply`], because what
+    /// It is answered by the executor rather than by [`crate::shard::apply::apply`], because what
     /// it reports lives beside the dict rather than in it.
     Stats,
 }
