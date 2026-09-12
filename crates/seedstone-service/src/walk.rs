@@ -359,4 +359,25 @@ mod tests {
             "the widest shard a cursor can name is still refused by count, not by width"
         );
     }
+
+    #[test]
+    fn only_the_very_start_of_the_walk_is_zero() {
+        // The whole scheme rests on this: 0 means "begin", and the server
+        // answers 0 only when the last shard is spent. Shard 1 at internal 0
+        // must therefore not be 0.
+        assert_eq!(pack_cursor(0, 0), 0);
+        assert_ne!(pack_cursor(1, 0), 0);
+        assert_ne!(pack_cursor(u16::MAX, 0), 0);
+    }
+
+    #[test]
+    fn a_client_supplied_cursor_is_untrusted_input() {
+        // Anything a client sends unpacks to something; nothing panics. The
+        // shard may be out of range, which the dispatch path answers rather
+        // than the packing.
+        for raw in [u64::MAX, 1 << 63, 0x0001_0000_0000_0000] {
+            let (_shard, internal) = unpack_cursor(raw);
+            assert!(internal < (1 << CURSOR_INTERNAL_BITS));
+        }
+    }
 }
