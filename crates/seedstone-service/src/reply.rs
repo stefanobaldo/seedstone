@@ -53,7 +53,7 @@ pub enum CommandLabel {
 
 impl CommandLabel {
     /// Appends the command's name, or nothing when there is no command.
-    pub fn render(&self, out: &mut String) {
+    fn render(&self, out: &mut String) {
         match self {
             Self::Known(name) => out.push_str(name),
             Self::Raw(raw) => out.push_str(raw),
@@ -264,7 +264,9 @@ pub fn quote(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::command_names;
+    use crate::dispatch::frame_to_action;
     use crate::node::FIXED_UNIX_MILLIS;
+    use crate::tests::support::req;
     use seedstone_core::shard::ReplyError;
 
     /// The escaper is the only thing standing between an argument a peer chose
@@ -468,5 +470,43 @@ mod tests {
                 "byte {byte:#04x} rendered as {rendered:?}"
             );
         }
+    }
+
+    /// The label the drain carries to the log, for each of the four shapes a
+    /// frame can have: a recognised command, a recognised command its handler
+    /// refuses, a name no table holds, and a frame with no command in it.
+    ///
+    /// The wrong-arity case is the one worth having. The label is set before
+    /// the handler runs precisely so that a refusal the handler returns is
+    /// attributed, and moving that assignment below the handler would leave
+    /// `wrong number of arguments` anonymous while every other test still
+    /// passed.
+    #[test]
+    fn the_label_names_the_command_behind_each_shape_of_frame() {
+        let node = NodeInfo::for_tests();
+        let named = |frame| {
+            let (_, label) = frame_to_action(frame, &node);
+            let mut out = String::new();
+            label.render(&mut out);
+            out
+        };
+
+        assert_eq!(named(req(&["GET", "k"])), "get");
+        assert_eq!(
+            named(req(&["MGET", "a", "b"])),
+            "mget",
+            "the request the peer made, not the GETs it becomes"
+        );
+        assert_eq!(
+            named(req(&["SET", "k"])),
+            "set",
+            "a wrong arity is a refusal, and it names its command"
+        );
+        assert_eq!(named(req(&["dbsizde"])), "dbsizde");
+        assert_eq!(
+            named(Frame::Integer(1)),
+            "",
+            "no array of bulk strings, so no command to name"
+        );
     }
 }
