@@ -3,7 +3,7 @@
 //! replies in shard order rather than completion order, and folds them into one
 //! frame.
 
-use crate::CHUNK_COMMANDS;
+use crate::connection::CHUNK_COMMANDS;
 use crate::dispatch::{Fold, Gather};
 use crate::reply::{UNRENDERABLE_REPLY, reply_to_frame};
 use crate::walk;
