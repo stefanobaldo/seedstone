@@ -250,7 +250,7 @@ pub enum Slot {
 /// owns its keys in one message per owner instead of one per command — and
 /// request order is restored by the slots rather than by the awaiting. A chunk
 /// closes when the decoder runs dry, when the batch reaches
-/// [`CHUNK_COMMANDS`], before a multi-key request fans out — see [`fan_out`],
+/// [`CHUNK_COMMANDS`], before a multi-key request fans out — see [`crate::fan_out::fan_out`],
 /// which has to run *after* what the peer wrote in front of it — and at `QUIT`
 /// or a protocol error.
 ///
