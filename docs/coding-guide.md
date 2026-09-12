@@ -33,7 +33,7 @@ reason the linked code documents in place.
 - Workspace-level allows exist only for lints that are noise as a class;
   each would carry a comment in `Cargo.toml` and an entry here. **There are
   none.** Every deviation in the tree is site-local, and there are seven:
-  `slot.rs` narrowing a quotient it has just bounded, `shard.rs` taking its
+  `slot.rs` narrowing a quotient it has just bounded, `shard/pool.rs` taking its
   trace sink, log factory and shard policy — the policy decides expiry, the
   walk's order and when memory must be reclaimed, all three — by value so a
   caller can move them in, `main.rs` drawing the hash seed and the run id from
