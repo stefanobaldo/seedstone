@@ -13,16 +13,14 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::outcome::{Shared, lock};
+use crate::verify::{WalkOutcome, check_ceiling, listed_keys, scan_reply};
 use crate::workload::{
     COUNTER_OPS, Check, CondReply, Conn, DEADLINES, EXPIRE_SECONDS, KeyRange, Known, Op,
     PEXPIRE_MILLIS, PLAIN_END, Spelling, WALK_CHURN_DELETES, WALK_CHURN_WRITES,
     WALK_CURSOR_SHARD_SHIFT, WALK_CYCLE_STEP_BOUND, WALK_KEYS, WALK_PREFIX_STEPS, WALK_STEP_COUNT,
     command, counter_key, plain_key, volatile_key, walk_key, walk_pattern,
 };
-use crate::{
-    LIVE_SLACK, SETTLE_CAP, STALE_SLACK, SimConfig, WalkOutcome, check_ceiling, contract,
-    listed_keys, scan_reply,
-};
+use crate::{LIVE_SLACK, SETTLE_CAP, STALE_SLACK, SimConfig, contract};
 
 /// One client's picture of the keys it owns, and the invariants it holds the
 /// server to over them.
