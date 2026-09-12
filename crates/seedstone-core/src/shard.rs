@@ -1,8 +1,8 @@
 //! The shard runtime: N keyspaces, hosted by a smaller number of executor
 //! tasks, each behind an unbounded inbox.
 //!
-//! A virtual shard is a [`crate::dict::Dict`] nothing else can reach, its replication
-//! position, and its log. It is the unit of *keyspace ownership*, not of
+//! A virtual shard is a [`crate::dict::Dict`] nothing else can reach, its
+//! replication position, and its log. It is the unit of *keyspace ownership*, not of
 //! scheduling: an executor task owns a contiguous range of shards and is the
 //! only thing that touches their state. Work arrives as an [`Envelope`] — a
 //! batch of `(shard, command)` pairs plus the one-shot channel its replies go
@@ -17,18 +17,35 @@
 //!
 //! # Why a handler is a plain `fn`
 //!
-//! [`crate::shard::apply::apply`] takes `&mut Dict` and returns a `Reply`. It is not `async`, and
-//! that is the point: a handler that cannot `await` cannot yield the executor
+//! [`crate::shard::apply::apply`] takes `&mut Dict` and returns a `Reply`. It is
+//! not `async`, and that is the point: a handler that cannot `await` cannot yield the executor
 //! mid-command, so a command either has not started or has finished, and two
 //! commands on one key can never interleave. The rule is enforced by the
 //! signature rather than by review — the only `await`s in an executor task are
-//! the `select!` arms of [`crate::shard::executor::run_executor`]. A batch inherits the property: no
-//! `await` separates its commands either, so nothing from another connection
-//! can land inside one.
+//! the `select!` arms of [`crate::shard::executor::run_executor`]. A batch
+//! inherits the property: no `await` separates its commands either, so nothing
+//! from another connection can land inside one.
 //!
 //! That is also why the interesting concurrency bugs of this system live
 //! *above* the shard, in code that sends two messages with an `await` between
 //! them. The simulator plants exactly that race.
+//!
+//! # Where each thing lives
+//!
+//! The vocabulary first, then the machinery that runs it, then the tests that
+//! drive the whole through a pool:
+//!
+//! - `command` — what a shard is asked to do, how each command is routed, and
+//!   the kind tags the edge counts by.
+//! - `reply` — what a shard answers, and every way it can refuse.
+//! - `policy` — the decisions production answers one way and the simulator
+//!   several: expiry, walk order, eviction, and the trace sink.
+//! - `apply` — the interpreter: one command against one dictionary, its reply,
+//!   and the replication record it appends.
+//! - `executor` — one executor's state and the housekeeping it runs between
+//!   batches: the sweep, the eviction, the counters `INFO` reads.
+//! - `pool` — the executors, the shards each owns, and `Router`, the one way a
+//!   command reaches a shard.
 
 mod apply;
 mod command;
