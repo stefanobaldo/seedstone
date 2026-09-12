@@ -2,10 +2,10 @@
 //! `LATENCY` — each a subcommand dispatcher answered at the edge. What each
 //! answers, and how it differs from Redis, is on `docs/compatibility.md`.
 
+use crate::dispatch::{Action, COMMANDS};
 use crate::node::NodeInfo;
 use crate::options::wrong_arity;
 use crate::reply::quote;
-use crate::{Action, COMMANDS};
 use seedstone_core::glob;
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
 use seedstone_core::shard::{ReplyError, parse_i64};

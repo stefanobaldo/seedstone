@@ -3,9 +3,10 @@
 //! replies in shard order rather than completion order, and folds them into one
 //! frame.
 
+use crate::CHUNK_COMMANDS;
+use crate::dispatch::{Fold, Gather};
 use crate::reply::{UNRENDERABLE_REPLY, reply_to_frame};
 use crate::walk;
-use crate::{CHUNK_COMMANDS, Fold, Gather};
 use seedstone_core::shard::{Command, Reply, ReplyError, Router};
 use seedstone_resp::Frame;
 use std::future::{Future, poll_fn};
