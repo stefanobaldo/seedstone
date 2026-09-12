@@ -447,7 +447,7 @@ pub const KIND_SLOTS: usize = Command::KIND_MAX as usize + 1;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shard::tests::{set, setex};
+    use crate::shard::tests::support::{set, setex};
 
     /// Every `Command` variant's tag is inside the arrays indexed by it, and
     /// the tags are `1..=KIND_MAX` with none missing and none shared.
