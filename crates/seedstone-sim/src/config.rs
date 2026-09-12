@@ -154,7 +154,7 @@ impl SimConfig {
     /// the cycle to cross, and none of them shows a property the first one
     /// does not — the cursor under test belongs to one dict. What the cycle
     /// costs in this shape is stated once, beside the bound that governs it:
-    /// see [`crate::WALK_CYCLE_STEP_BOUND`].
+    /// see [`crate::workload::WALK_CYCLE_STEP_BOUND`].
     ///
     /// What a shape this narrow gives up is placement, and it gives it up
     /// knowingly: nothing here is about which shard a key lands in. What it
