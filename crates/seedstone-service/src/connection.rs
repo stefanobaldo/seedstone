@@ -128,7 +128,7 @@ pub const READ_QUIET_READS: u32 = 4;
 /// The granularity at which a connection holding more than the floor is asked
 /// whether anything is still arriving.
 ///
-/// The quiet-read hysteresis in [`resize_connection_buffers`] reads its
+/// The quiet-read hysteresis in `resize_connection_buffers` reads its
 /// verdict from the shape of the reads, so it cannot reach a peer that has
 /// stopped producing them: nothing wakes a task parked on `read`. This is the
 /// only signal that can, and the interval is a compromise between holding a
@@ -242,7 +242,7 @@ pub enum Slot {
 /// ends when the decoder has no complete frame left.
 ///
 /// A drain is made of **chunks**. Within a chunk, a connection command is
-/// answered on the spot and a keyed one joins a batch, both taking a [`Slot`]
+/// answered on the spot and a keyed one joins a batch, both taking a `Slot`
 /// in the order the peer wrote them; closing the chunk dispatches the batch
 /// with [`Router::dispatch_many`], splices each reply into its slot, and
 /// appends the lot in request order. So a keyed command is no longer awaited
@@ -250,13 +250,13 @@ pub enum Slot {
 /// owns its keys in one message per owner instead of one per command — and
 /// request order is restored by the slots rather than by the awaiting. A chunk
 /// closes when the decoder runs dry, when the batch reaches
-/// [`CHUNK_COMMANDS`], before a multi-key request fans out — see [`crate::fan_out::fan_out`],
+/// `CHUNK_COMMANDS`, before a multi-key request fans out — see `fan_out::fan_out`,
 /// which has to run *after* what the peer wrote in front of it — and at `QUIT`
 /// or a protocol error.
 ///
 /// Accumulation is bounded rather than open-ended, on both axes: a drain that
-/// reaches [`REPLY_HIGH_WATER`] writes there and carries on into the same
-/// buffer, and a chunk that reaches [`CHUNK_COMMANDS`] dispatches there and
+/// reaches `REPLY_HIGH_WATER` writes there and carries on into the same
+/// buffer, and a chunk that reaches `CHUNK_COMMANDS` dispatches there and
 /// carries on in the same drain. What one connection can hold therefore does
 /// not scale with how much its peer chose to pipeline. Writing earlier can
 /// never violate the invariant above — it only shortens the time a reply
