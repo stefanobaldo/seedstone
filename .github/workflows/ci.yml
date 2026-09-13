@@ -52,6 +52,14 @@ jobs:
       # hide what they would actually fail to compile on their own.
       - name: production crates compile without simulator features
         run: cargo clippy -p seedstone -p seedstone-core -p seedstone-resp -p seedstone-service --all-targets -- -D warnings
+      # Every intra-doc link resolves to something the public documentation
+      # shows. Without this, a link that stops resolving — an item moved, a
+      # module split, a name changed — is invisible to every other gate, and
+      # the documentation is the one artifact whose reader cannot run a test.
+      - name: the documentation builds with no warnings
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
       - run: cargo test --workspace
       # Linkage, a different axis from the feature unification the step above
       # covers: neither subsumes the other, and both are load-bearing.
