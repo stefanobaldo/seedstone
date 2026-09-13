@@ -9,7 +9,7 @@
 use seedstone::server::{Config, MAX_CLIENTS_REACHED, Server};
 use seedstone_core::dict::DictSeed;
 use seedstone_resp::{Frame, encode, parse};
-use seedstone_service::{RUN_ID_HEX, Secret};
+use seedstone_service::{Passwords, RUN_ID_HEX, Secret};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -317,7 +317,7 @@ async fn started(max_clients: usize, password: Option<&str>) -> std::net::Socket
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         max_clients,
-        password: password.map(|pw| Secret::new(pw.as_bytes().to_vec())),
+        passwords: password.map(|pw| Passwords::one(Secret::new(pw.as_bytes().to_vec()))),
         ..Config::default()
     };
     let server = Server::bind(cfg, DictSeed { k0: 1, k1: 2 }, "t".repeat(RUN_ID_HEX))
