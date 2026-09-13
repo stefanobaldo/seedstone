@@ -37,6 +37,9 @@ as the server writes them:
 | `bind_failed` | `error` | `bind`, `port`, `error` | the address could not be bound; the process exits 1 after this line |
 | `error_reply` | `warn` | `code`, `cmd`, `msg` | one error reply was sent to a client; `code` is the reply's first word, `cmd` the command it answered |
 | `stopping` | `info` | `signal` | the server is leaving on `SIGTERM` or `SIGINT` |
+| `password_reloaded` | `info` | `passwords` | `SIGHUP` re-read the password file; `passwords` is how many lines it holds now, 1 or 2 |
+| `password_reload_failed` | `error` | `error` | `SIGHUP` re-read the password file and refused it; the previous passwords stay in force |
+| `password_reload_skipped` | `warn` | — | `SIGHUP` arrived, but the password came from the environment or there is none, so there was nothing to re-read |
 
 `error_reply` is `warn` and not `error` on purpose: an `ERR unknown command`
 is the client's mistake or the deployment's, and the server that reported it
