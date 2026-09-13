@@ -39,6 +39,7 @@ mod expiry;
 mod fan_out;
 mod hello;
 mod info;
+pub mod log;
 mod node;
 mod options;
 mod reply;
