@@ -62,11 +62,11 @@ pub fn hello(args: &[Vec<u8>], node: &NodeInfo) -> Result<Action, String> {
     // A handshake that names a password against a node that has none is the
     // same configuration mistake as an `AUTH` against one, and is told so in
     // the same words.
-    let Some(secret) = &node.password else {
+    let Some(passwords) = node.passwords.load() else {
         return Err(AUTH_NOT_CONFIGURED.to_owned());
     };
     let user_ok = user.eq_ignore_ascii_case(b"default");
-    let pass_ok = secret.matches(pass);
+    let pass_ok = passwords.matches(pass);
     if user_ok && pass_ok {
         Ok(Action::Authenticate(Ok(hello_frame(node))))
     } else {

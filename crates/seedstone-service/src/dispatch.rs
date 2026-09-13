@@ -583,13 +583,13 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
             [user, pass] => (Some(user), pass),
             _ => return Err(wrong_arity("auth")),
         };
-        let Some(secret) = &node.password else {
+        let Some(passwords) = node.passwords.load() else {
             return Err(AUTH_NOT_CONFIGURED.to_owned());
         };
         let user_ok = user.is_none_or(|u| u.eq_ignore_ascii_case(b"default"));
         // Both checked whatever the username said, so a wrong user and a
         // wrong password cost the same time.
-        let pass_ok = secret.matches(pass);
+        let pass_ok = passwords.matches(pass);
         if user_ok && pass_ok {
             Ok(Action::Authenticate(Ok(Frame::Simple("OK".into()))))
         } else {

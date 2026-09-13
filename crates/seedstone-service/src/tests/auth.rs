@@ -405,3 +405,82 @@ fn passwords_do_not_print_themselves() {
         );
     }
 }
+
+/// A node with two passwords answers `AUTH` with either, and `HELLO … AUTH`
+/// with either, on fresh connections.
+#[tokio::test]
+async fn a_node_with_two_passwords_accepts_either() {
+    let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+    let mut node = NodeInfo::for_tests();
+    node.passwords = PasswordStore::new(Some(Passwords::two(
+        Secret::new(b"old".to_vec()),
+        Secret::new(b"new".to_vec()),
+    )));
+    for (parts, want) in [
+        (vec!["AUTH", "old"], Frame::Simple("OK".into())),
+        (vec!["AUTH", "new"], Frame::Simple("OK".into())),
+        (vec!["AUTH", "other"], Frame::Error(WRONGPASS.to_owned())),
+        (
+            vec!["HELLO", "2", "AUTH", "default", "new"],
+            Frame::Simple("OK".into()),
+        ),
+    ] {
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(serve_connection(server, pool.clone(), node.clone()));
+        let (mut r, mut w) = tokio::io::split(client);
+        let mut out = Vec::new();
+        encode(&req(&parts), &mut out);
+        w.write_all(&out).await.unwrap();
+        w.flush().await.unwrap();
+        let frames = read_frames(&mut r, 1).await;
+        match (&frames[0], &want) {
+            // A `HELLO` answers a map, not `OK`; what is asserted is that it
+            // is not an error.
+            (Frame::Array(_), Frame::Simple(_)) if parts[0] == "HELLO" => {}
+            (got, want) => assert_eq!(got, want, "{parts:?}"),
+        }
+    }
+}
+
+/// Swapping the set under a running node: the connection that authenticated
+/// with the old password keeps working, and a new connection is gated by
+/// the new set only.
+#[tokio::test]
+async fn a_swap_keeps_the_authenticated_connection_and_gates_the_next() {
+    let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
+    let node = node_with_password(b"old");
+    let store = node.passwords.clone();
+
+    let (client, server) = tokio::io::duplex(4096);
+    tokio::spawn(serve_connection(server, pool.clone(), node.clone()));
+    let (mut r1, mut w1) = tokio::io::split(client);
+    let mut out = Vec::new();
+    encode(&req(&["AUTH", "old"]), &mut out);
+    w1.write_all(&out).await.unwrap();
+    w1.flush().await.unwrap();
+    assert_eq!(read_frames(&mut r1, 1).await[0], Frame::Simple("OK".into()));
+
+    store.store(Some(Passwords::one(Secret::new(b"new".to_vec()))));
+
+    // The first connection is still authenticated.
+    out.clear();
+    encode(&req(&["SET", "k", "v"]), &mut out);
+    w1.write_all(&out).await.unwrap();
+    w1.flush().await.unwrap();
+    assert_eq!(read_frames(&mut r1, 1).await[0], Frame::Simple("OK".into()));
+
+    // A second connection is gated by the new set.
+    let (client, server) = tokio::io::duplex(4096);
+    tokio::spawn(serve_connection(server, pool, node));
+    let (mut r2, mut w2) = tokio::io::split(client);
+    out.clear();
+    encode(&req(&["AUTH", "old"]), &mut out);
+    encode(&req(&["AUTH", "new"]), &mut out);
+    encode(&req(&["GET", "k"]), &mut out);
+    w2.write_all(&out).await.unwrap();
+    w2.flush().await.unwrap();
+    let frames = read_frames(&mut r2, 3).await;
+    assert_eq!(frames[0], Frame::Error(WRONGPASS.to_owned()));
+    assert_eq!(frames[1], Frame::Simple("OK".into()));
+    assert_eq!(frames[2], Frame::Bulk(b"v".to_vec()));
+}
