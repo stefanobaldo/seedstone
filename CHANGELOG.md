@@ -26,6 +26,22 @@ SemVer and are `0.x` until the server persists data;
   8.10.1, every command its clients emit that it refuses with the exact reply,
   and the deliberate differences that are not commands. A test holds the page
   and `COMMAND` together, so a command cannot be added or removed without it.
+- One format for everything the server writes about itself: a JSON object per
+  line on stderr with `ts`, `level` (`info`, `warn` or `error`) and `evt`,
+  then the event's fields. Four events — `listening`, `bind_failed`,
+  `error_reply`, `stopping` — documented with their fields in
+  [docs/operations.md](docs/operations.md), which a test holds to the code;
+  the field set is promised additively there. A collector no longer has to be
+  told that this server's stderr is not all errors.
+
+### Changed
+
+- The startup line `seedstone <version> listening on <addr>` and the
+  bind-failure line `bind failed: <error>` are now JSON lines with a level
+  (`listening` at `info`, `bind_failed` at `error`). Anything matching the
+  old text should select on `"evt":"listening"` instead.
+- The error-reply line carries `"level":"warn"` after `ts`; its other fields
+  (`evt`, `code`, `cmd`, `msg`) are unchanged.
 
 ### Removed
 
