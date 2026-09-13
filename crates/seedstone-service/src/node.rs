@@ -88,7 +88,7 @@ const _: () = assert!(
 ///
 /// The order is this array's own — it is what `# Commandstats` prints after
 /// the keyed commands, and nothing else reads it. It deliberately does not
-/// track [`crate::dispatch::COMMANDS`]: a name is appended here when a command is added there,
+/// track `dispatch::COMMANDS`: a name is appended here when a command is added there,
 /// and reordering the existing ones to match would move fields in a document
 /// operators already read for no reader's benefit.
 pub const EDGE_NAMES: [&str; 15] = [
@@ -253,7 +253,7 @@ impl NodeInfo {
     /// starts at zero and stays there: maintaining it belongs to whoever
     /// accepts connections, and neither caller has a workload that asks.
     ///
-    /// The wall clock stands still, at [`FIXED_UNIX_MILLIS`]. Neither caller
+    /// The wall clock stands still, at `FIXED_UNIX_MILLIS`. Neither caller
     /// has a real one to offer — there is no simulated `SystemTime`, and the
     /// only clock the simulator advances is the monotonic one — so a frozen
     /// reading is the honest answer rather than a limitation: it makes an

@@ -16,7 +16,7 @@ use std::task::Poll;
 
 /// How many bytes of key names one `KEYS` reply may accumulate at the edge.
 ///
-/// [`keys`] gathers the whole answer here before any of it reaches the wire —
+/// `keys` gathers the whole answer here before any of it reaches the wire —
 /// documented as the cost of the shape and the reason `SCAN` exists — and this
 /// is the bound on it. A walk whose gathered key bytes pass this is abandoned
 /// and answered with [`KEYS_TOO_LARGE`].
