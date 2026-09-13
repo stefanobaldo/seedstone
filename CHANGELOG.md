@@ -33,6 +33,15 @@ SemVer and are `0.x` until the server persists data;
   [docs/operations.md](docs/operations.md), which a test holds to the code;
   the field set is promised additively there. A collector no longer has to be
   told that this server's stderr is not all errors.
+- `--requirepass-file` may hold two passwords, one per line, and either
+  authenticates. With `SIGHUP` re-reading the file, a rotation is three
+  steps and no server restart: add the new password as a second line and
+  send `SIGHUP`; restart the clients with the new password; remove the old
+  line and send `SIGHUP`. The result of every reload is one line —
+  `password_reloaded`, `password_reload_failed` or
+  `password_reload_skipped` — and the procedure is in
+  [docs/operations.md](docs/operations.md). `SEEDSTONE_REQUIREPASS` still
+  holds one password and is read once: an environment is not re-read.
 
 ### Changed
 
@@ -42,6 +51,9 @@ SemVer and are `0.x` until the server persists data;
   old text should select on `"evt":"listening"` instead.
 - The error-reply line carries `"level":"warn"` after `ts`; its other fields
   (`evt`, `code`, `cmd`, `msg`) are unchanged.
+- A password file with an empty line, a whitespace-only line or more than
+  two lines is refused at startup, naming the rule. Before, a file ending in
+  two newlines was accepted with the second newline as part of the password.
 
 ### Removed
 
