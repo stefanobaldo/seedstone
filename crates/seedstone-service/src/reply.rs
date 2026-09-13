@@ -19,7 +19,7 @@
 //! the [`ReplyError`] set, and `every_error_constant_is_frame_safe` for the
 //! constants and the status texts.
 
-use crate::log::json_escaped;
+use crate::log::{ERROR_REPLY, Field, line};
 use crate::node::{EDGE_NAMES, KIND_NAMES, NodeInfo};
 use seedstone_core::shard::Reply;
 use seedstone_resp::{Frame, ParseError};
@@ -89,34 +89,33 @@ pub fn known_name(upper: &[u8]) -> Option<&'static str> {
         .find(|name| !name.is_empty() && name.as_bytes().eq_ignore_ascii_case(upper))
 }
 
-/// One JSON line describing one error reply.
+/// One JSON line describing one error reply: [`ERROR_REPLY`] rendered by
+/// [`crate::log::line`].
 ///
 /// The timestamp is [`NodeInfo::now_unix_millis`] and never `SystemTime::now`:
 /// the wall clock is the one input a replay cannot reproduce, and the
 /// simulator freezes this one at [`FIXED_UNIX_MILLIS`], so a replayed run
 /// writes the line the original run wrote.
 pub fn error_reply_line(node: &NodeInfo, label: &CommandLabel, text: &str) -> String {
-    let mut line = String::with_capacity(text.len() + 96);
-    line.push_str("{\"evt\":\"error_reply\",\"ts\":");
+    let mut cmd = String::new();
+    label.render(&mut cmd);
     // A field holding `fn() -> u64`, not a method: the parentheses are load
     // bearing. This is the injected wall clock, and the only one a replay can
     // reproduce.
-    line.push_str(&(node.now_unix_millis)().to_string());
-    line.push_str(",\"code\":\"");
-    json_escaped(error_code(text), &mut line);
-    line.push_str("\",\"cmd\":\"");
-    let mut cmd = String::new();
-    label.render(&mut cmd);
-    json_escaped(&cmd, &mut line);
-    line.push_str("\",\"msg\":\"");
-    json_escaped(text, &mut line);
-    line.push_str("\"}");
-    line
+    line(
+        (node.now_unix_millis)(),
+        &ERROR_REPLY,
+        &[
+            Field::Str(error_code(text)),
+            Field::Str(&cmd),
+            Field::Str(text),
+        ],
+    )
 }
 
-/// Writes one error reply's line to stderr, beside the startup lines the
-/// binary already writes there. Both streams reach a container's log file, so
-/// the choice is consistency rather than routing.
+/// Writes one error reply's line to stderr. Both streams reach a container's
+/// log file, so the choice is consistency rather than routing. The binary's
+/// own lines take the same shape through the same function.
 pub fn log_error_reply(node: &NodeInfo, label: &CommandLabel, text: &str) {
     eprintln!("{}", error_reply_line(node, label, text));
 }
@@ -291,9 +290,8 @@ mod tests {
         }
     }
 
-    /// The line is JSON, it carries the code, the command and the message, and
-    /// its timestamp is the node's injected wall clock — frozen under the
-    /// simulator, which is what makes a replay reproduce it.
+    /// The line is `ERROR_REPLY` rendered by `log::line`: envelope first,
+    /// then code, command and message, byte for byte.
     #[test]
     fn an_error_reply_line_carries_the_code_the_command_and_the_message() {
         let node = NodeInfo::for_tests();
@@ -302,17 +300,11 @@ mod tests {
             &CommandLabel::Raw("dbsizde".into()),
             "ERR unknown command 'dbsizde'",
         );
-        assert!(line.starts_with('{') && line.ends_with('}'), "{line}");
-        assert!(line.contains(r#""evt":"error_reply""#), "{line}");
-        assert!(line.contains(r#""code":"ERR""#), "{line}");
-        assert!(line.contains(r#""cmd":"dbsizde""#), "{line}");
-        assert!(
-            line.contains(r#""msg":"ERR unknown command 'dbsizde'""#),
-            "{line}"
-        );
-        assert!(
-            line.contains(&format!(r#""ts":{FIXED_UNIX_MILLIS}"#)),
-            "{line}"
+        assert_eq!(
+            line,
+            format!(
+                r#"{{"ts":{FIXED_UNIX_MILLIS},"level":"warn","evt":"error_reply","code":"ERR","cmd":"dbsizde","msg":"ERR unknown command 'dbsizde'"}}"#
+            )
         );
     }
 
