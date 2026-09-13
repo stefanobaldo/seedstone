@@ -45,7 +45,9 @@ mod options;
 mod reply;
 mod walk;
 
-pub use auth::{AUTH_NOT_CONFIGURED, NOAUTH, NOAUTH_HELLO, Secret, WRONGPASS};
+pub use auth::{
+    AUTH_NOT_CONFIGURED, NOAUTH, NOAUTH_HELLO, PasswordStore, Passwords, Secret, WRONGPASS,
+};
 pub use connection::{IDLE_SHED_AFTER, MAX_REQUEST_BYTES, serve_connection};
 pub use dispatch::command_names;
 pub use fan_out::{INVALID_CURSOR, KEYS_REPLY_BYTES, KEYS_TOO_LARGE, WALK_STEP_BUCKETS};
