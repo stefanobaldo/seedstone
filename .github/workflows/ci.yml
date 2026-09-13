@@ -281,6 +281,13 @@ jobs:
       - name: redis_exporter
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: bash e2e/exporter/run.sh target/release/seedstone
+      # The rotation lane: the password changes under a running server, read
+      # back through redis-cli and the server's own lines. It is the one place
+      # the signal itself is delivered; what the signal calls is exercised by
+      # the edge tests.
+      - name: password rotation
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: bash e2e/rotation.sh target/release/seedstone
 
   # A performance gate that cannot say what "fast" is, and does not need to.
   # It builds this pull request and the commit it forks from, runs both on the
