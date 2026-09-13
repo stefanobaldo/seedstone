@@ -1,7 +1,7 @@
 //! What more than one subject file needs: a served connection over a
 //! `duplex` pipe, and the small readers and writers around it.
 
-use crate::auth::Secret;
+use crate::auth::{PasswordStore, Passwords, Secret};
 use crate::connection::serve_connection;
 use crate::node::NodeInfo;
 use seedstone_core::dict::DictSeed;
@@ -60,7 +60,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FlushCounting<S> {
 
 pub fn node_with_password(pw: &[u8]) -> NodeInfo {
     let mut node = NodeInfo::for_tests();
-    node.password = Some(Secret::new(pw.to_vec()));
+    node.passwords = PasswordStore::new(Some(Passwords::one(Secret::new(pw.to_vec()))));
     node
 }
 

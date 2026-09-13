@@ -16,7 +16,7 @@ use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{NoTrace, ShardPool};
 use seedstone_resp::{Frame, encode};
 use seedstone_service::log::{Event, Field, STOPPING, line};
-use seedstone_service::{NodeInfo, Secret, serve_connection};
+use seedstone_service::{NodeInfo, PasswordStore, Passwords, Secret, serve_connection};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -386,7 +386,7 @@ impl Server {
             now_unix_millis: wall_clock,
             memory: self.pool.memory(),
             limit: self.pool.limit(),
-            password: self.password.clone(),
+            passwords: PasswordStore::new(self.password.clone().map(Passwords::one)),
             run_id: self.run_id.clone(),
             process_id: std::process::id(),
             // A path this process cannot name is reported as unknown rather

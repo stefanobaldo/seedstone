@@ -3,7 +3,7 @@
 //! a connection command answers about the process arrives as [`NodeInfo`],
 //! assembled once at the composition root and cloned per connection.
 
-use crate::auth::Secret;
+use crate::auth::PasswordStore;
 use seedstone_core::memory::{MemoryGauge, MemoryLimit};
 use seedstone_core::shard::KIND_SLOTS;
 use std::sync::Arc;
@@ -177,15 +177,20 @@ pub struct NodeInfo {
     /// executors evict by must be the same value, not two configurations that
     /// happen to agree.
     pub limit: MemoryLimit,
-    /// The password every connection must present, or `None` on a node that
-    /// asks for none.
+    /// The passwords a connection may present — one, or two during a
+    /// rotation — or an empty store on a node that asks for none.
     ///
-    /// A fact about the process like everything else here, and read from the
-    /// composition root for the reason the others are — but with one more
-    /// consequence: this is the only field whose *absence* changes what the
-    /// connection loop will run. `None` is an open node, which is why the
-    /// edge refuses to configure one on an address a network can reach.
-    pub password: Option<Secret>,
+    /// Shared, not owned: the edge may replace the set while the node runs
+    /// (`SIGHUP` re-reads the password file), and every connection's clone
+    /// of this description must see the replacement. It is the one field of
+    /// this struct that changes in a running node, and the one no command
+    /// reports — `CONFIG GET requirepass` answers empty, as Redis does — so
+    /// "every parameter is a fact fixed at startup" stays true of every
+    /// parameter a client can read. Its emptiness is still the fact that
+    /// changes what the connection loop will run: an empty store is an open
+    /// node, which is why the edge refuses to configure one on an address a
+    /// network can reach.
+    pub passwords: PasswordStore,
     /// Forty hexadecimal characters identifying this run of the process,
     /// drawn once at the composition root beside the keyspace seed.
     ///
@@ -271,7 +276,7 @@ impl NodeInfo {
             now_unix_millis: || FIXED_UNIX_MILLIS,
             memory: MemoryGauge::default(),
             limit: MemoryLimit::default(),
-            password: None,
+            passwords: PasswordStore::default(),
             // A node with no process to describe says so: forty zeros is not
             // a run identifier any process would draw, so a document carrying
             // it is recognisably a test's rather than a node's.
@@ -292,8 +297,8 @@ impl NodeInfo {
     /// Whether a connection to this node must authenticate before it can run
     /// anything.
     #[must_use]
-    pub const fn requires_auth(&self) -> bool {
-        self.password.is_some()
+    pub fn requires_auth(&self) -> bool {
+        self.passwords.requires_auth()
     }
 }
 
