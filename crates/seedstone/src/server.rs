@@ -15,6 +15,7 @@ use seedstone_core::dict::DictSeed;
 use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{NoTrace, ShardPool};
 use seedstone_resp::{Frame, encode};
+use seedstone_service::log::{Event, Field, STOPPING, line};
 use seedstone_service::{NodeInfo, Secret, serve_connection};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -417,9 +418,10 @@ impl Server {
                 // outranks one more connection.
                 biased;
 
-                // `()` rather than `_`: the future resolves to the unit, and
-                // the arm says which of the two it is binding.
-                () = &mut shutdown => break,
+                signal = &mut shutdown => {
+                    emit(&STOPPING, &[Field::Str(signal)]);
+                    break;
+                }
 
                 accepted = self.listener.accept() => {
                     // A failed accept is per-connection — the peer vanished
@@ -482,8 +484,8 @@ impl Drop for Attached {
     }
 }
 
-/// Resolves when the process is asked to stop: Ctrl-C from a terminal, or
-/// SIGTERM from a supervisor.
+/// Resolves when the process is asked to stop — Ctrl-C from a terminal, or
+/// SIGTERM from a supervisor — with the name of the signal that asked.
 ///
 /// In a container this binary is PID 1, and PID 1 *ignores* every signal it has
 /// no handler for — so without the SIGTERM half a pod deletion sits out its
@@ -491,25 +493,26 @@ impl Drop for Attached {
 ///
 /// Registration failing is not a reason to refuse to start: Ctrl-C still works,
 /// and the alternative is a server that cannot be run at all.
-async fn shutdown_requested() {
+async fn shutdown_requested() -> &'static str {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let Ok(mut term) = signal(SignalKind::terminate()) else {
             let _ = tokio::signal::ctrl_c().await;
-            return;
+            return "SIGINT";
         };
         tokio::select! {
             // `biased` for the accept loop's reason: no runtime RNG on a path
             // that has no fairness to buy.
             biased;
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = term.recv() => "SIGTERM",
         }
     }
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
     }
 }
 
@@ -577,12 +580,49 @@ fn wall_clock() -> u64 {
         })
 }
 
+/// One runtime line as the binary writes it: the service's format, with the
+/// wall clock in `ts`.
+///
+/// The composition root is the one place the wall clock may be read
+/// directly — see `wall_clock` — and these lines are the process talking
+/// about itself, not a connection talking about a peer.
+#[must_use]
+pub fn line_for(event: &Event, values: &[Field<'_>]) -> String {
+    line(wall_clock(), event, values)
+}
+
+/// Writes one runtime line to stderr.
+///
+/// Stderr for every line, whatever its level: stdout is the answer to
+/// `--version` and `--help`, and the level is in the record, not in the
+/// stream.
+pub fn emit(event: &Event, values: &[Field<'_>]) {
+    eprintln!("{}", line_for(event, values));
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Config, DEFAULT_BIND, EvictionMode, MAX_CLIENTS_REACHED, MemoryLimit, PASSWORD_ENV, SHARDS,
-        TcpListener, TcpStream, USAGE, configure_accepted, executors,
+        TcpListener, TcpStream, USAGE, configure_accepted, executors, line_for,
     };
+    use seedstone_service::log::{Field, STOPPING};
+
+    /// The binary's lines are the service's format with the wall clock in
+    /// `ts`: a real reading, and the event's fields after the envelope.
+    #[test]
+    fn a_binary_line_is_the_service_format_with_a_wall_clock() {
+        let line = line_for(&STOPPING, &[Field::Str("SIGTERM")]);
+        assert!(line.starts_with(r#"{"ts":"#), "{line}");
+        assert!(
+            line.ends_with(r#","level":"info","evt":"stopping","signal":"SIGTERM"}"#),
+            "{line}"
+        );
+        let ts: u64 = line["{\"ts\":".len()..line.find(',').unwrap()]
+            .parse()
+            .unwrap();
+        assert!(ts > 1_700_000_000_000, "not a wall-clock reading: {ts}");
+    }
 
     /// Whatever this host answers, the count has to be one the pool accepts:
     /// at least one executor, never more than there are shards to host.
