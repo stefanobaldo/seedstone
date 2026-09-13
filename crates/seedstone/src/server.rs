@@ -82,13 +82,26 @@ pub const USAGE: &str = "usage: seedstone [--bind ADDR:PORT] [--max-clients N] [
 /// form it injects one as.
 pub const PASSWORD_ENV: &str = "SEEDSTONE_REQUIREPASS";
 
+/// Where the password came from — which decides whether `SIGHUP` has
+/// anything to re-read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasswordSource {
+    /// `--requirepass-file PATH`: re-read on `SIGHUP`.
+    File(String),
+    /// [`PASSWORD_ENV`]: read once. A process does not re-read its
+    /// environment, and no orchestrator updates a running one's.
+    Env,
+    /// No password: the node is open.
+    None,
+}
+
 /// What the binary was asked to do.
 ///
-/// Not `Copy` and not comparable, because [`password`](Self::password) is
+/// Not `Copy` and not comparable, because [`passwords`](Self::passwords) is
 /// neither: a secret that can be copied implicitly is a secret with more
 /// copies than anyone counted, and one with an `==` is one that can be
-/// compared in variable time by any caller. `Debug` is safe — the secret
-/// redacts itself.
+/// compared in variable time by any caller. `Debug` is safe — the secrets
+/// redact themselves.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// The address to listen on.
@@ -97,9 +110,11 @@ pub struct Config {
     pub max_clients: usize,
     /// The ceiling the keyspace is held under, and what happens at it.
     pub limit: MemoryLimit,
-    /// The password every connection must present, or `None` on a node that
-    /// asks for none.
-    pub password: Option<Secret>,
+    /// The password every connection must present — one, or two during a
+    /// rotation — or `None` on a node that asks for none.
+    pub passwords: Option<Passwords>,
+    /// Where [`passwords`](Self::passwords) came from.
+    pub source: PasswordSource,
     /// Whether running with no password was asked for in so many words.
     ///
     /// Kept beside the absent password rather than folded into it, because
@@ -115,7 +130,8 @@ impl Default for Config {
             bind: DEFAULT_BIND,
             max_clients: DEFAULT_MAX_CLIENTS,
             limit: MemoryLimit::default(),
-            password: None,
+            passwords: None,
+            source: PasswordSource::None,
             no_auth: false,
         }
     }
@@ -164,7 +180,9 @@ impl Config {
     /// empty password is refused wherever it comes from, because a file that
     /// failed to be written and a variable that expanded to nothing both look
     /// exactly like this, and neither should start a server that answers
-    /// `AUTH ""`.
+    /// `AUTH ""`. A file holds one password per line, one or two of them —
+    /// the second is how a rotation runs, see `docs/operations.md` — and any
+    /// other shape is refused.
     ///
     /// # The bind that must be defended
     ///
@@ -229,13 +247,13 @@ impl Config {
                 other => return Err(refused(&format!("unknown argument: {other}"))),
             }
         }
-        cfg.password = password_from(password_file.as_deref(), &env)?;
-        if cfg.no_auth && cfg.password.is_some() {
+        (cfg.passwords, cfg.source) = password_from(password_file.as_deref(), &env)?;
+        if cfg.no_auth && cfg.passwords.is_some() {
             return Err(refused(
                 "--no-auth: a password was configured as well; choose one",
             ));
         }
-        if !cfg.bind.ip().is_loopback() && cfg.password.is_none() && !cfg.no_auth {
+        if !cfg.bind.ip().is_loopback() && cfg.passwords.is_none() && !cfg.no_auth {
             return Err(refused(
                 "a bind outside loopback needs a password: give --requirepass-file PATH or set \
                  SEEDSTONE_REQUIREPASS, or pass --no-auth to run open on purpose",
@@ -255,7 +273,8 @@ impl Config {
     }
 }
 
-/// The configured password, from the file or the environment.
+/// The configured password set and where it came from, from the file or the
+/// environment.
 ///
 /// Reading the file here rather than in the flag loop is what lets "both at
 /// once" be one refusal instead of two half-rules: the loop records what was
@@ -263,12 +282,21 @@ impl Config {
 fn password_from(
     file: Option<&str>,
     env: &impl Fn(&str) -> Option<String>,
-) -> Result<Option<Secret>, String> {
+) -> Result<(Option<Passwords>, PasswordSource), String> {
     let from_env = env(PASSWORD_ENV);
     let Some(path) = file else {
         return match from_env {
-            Some(value) => Ok(Some(non_empty(value.into_bytes(), PASSWORD_ENV)?)),
-            None => Ok(None),
+            Some(value) => {
+                let set = parse_password_file(value.into_bytes())
+                    .map_err(|why| refused(&format!("{PASSWORD_ENV}: {why}")))?;
+                if set.count() != 1 {
+                    return Err(refused(&format!(
+                        "{PASSWORD_ENV}: one password; a second one needs the file"
+                    )));
+                }
+                Ok((Some(set), PasswordSource::Env))
+            }
+            None => Ok((None, PasswordSource::None)),
         };
     };
     if from_env.is_some() {
@@ -276,28 +304,67 @@ fn password_from(
             "--requirepass-file and SEEDSTONE_REQUIREPASS are both set: choose one",
         ));
     }
-    let mut bytes = std::fs::read(path)
-        .map_err(|error| refused(&format!("--requirepass-file: {path}: {error}")))?;
-    // One trailing newline, in either spelling: every editor and every
-    // `printf` that writes a secret to a file leaves one, and a password with
-    // an invisible byte on the end is a support ticket nobody solves. More
-    // than one is left alone — that is a file whose content was meant.
+    let set =
+        read_password_file(path).map_err(|why| refused(&format!("--requirepass-file: {why}")))?;
+    Ok((Some(set), PasswordSource::File(path.to_owned())))
+}
+
+/// Reads and parses the password file at `path`.
+///
+/// One function for the boot and for `SIGHUP`, so there is exactly one
+/// definition of a valid file: whatever the boot would refuse, a reload
+/// refuses, and the other way round.
+///
+/// # Errors
+///
+/// The path and the operating system's reason when the file cannot be read;
+/// otherwise [`parse_password_file`]'s.
+pub fn read_password_file(path: &str) -> Result<Passwords, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("{path}: {error}"))?;
+    parse_password_file(bytes)
+}
+
+/// The passwords in a file's bytes: one per line, one or two lines.
+///
+/// One trailing newline, in either spelling, is not part of the last
+/// password: every editor and every `printf` that writes a secret to a file
+/// leaves one, and a password with an invisible byte on the end is a support
+/// ticket nobody solves. Every other line break is a separator, so a second
+/// trailing newline is an empty line, and an empty line is refused — as is a
+/// line of nothing but whitespace, a third line, and a file with no line at
+/// all. A space *inside* a line is the password's.
+///
+/// # Errors
+///
+/// One sentence naming the rule and what was found.
+pub fn parse_password_file(mut bytes: Vec<u8>) -> Result<Passwords, String> {
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
         if bytes.last() == Some(&b'\r') {
             bytes.pop();
         }
     }
-    Ok(Some(non_empty(bytes, "--requirepass-file")?))
-}
-
-/// A password with bytes in it, or the refusal that says where the empty one
-/// came from.
-fn non_empty(bytes: Vec<u8>, source: &str) -> Result<Secret, String> {
-    if bytes.is_empty() {
-        return Err(refused(&format!("{source}: the password is empty")));
+    let mut lines: Vec<Vec<u8>> = bytes
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line).to_vec())
+        .collect();
+    let count = lines.len();
+    if count > 2 {
+        return Err(format!(
+            "one or two passwords, one per line; found {count} lines"
+        ));
     }
-    Ok(Secret::new(bytes))
+    if lines
+        .iter()
+        .any(|line| line.iter().all(u8::is_ascii_whitespace))
+    {
+        return Err("one or two passwords, one per line; found an empty line".to_owned());
+    }
+    let current = Secret::new(lines.remove(0));
+    Ok(match lines.pop() {
+        Some(next) => Passwords::two(current, Secret::new(next)),
+        None => Passwords::one(current),
+    })
 }
 
 /// The value that must follow `flag`.
@@ -317,7 +384,8 @@ pub struct Server {
     local_addr: SocketAddr,
     max_clients: usize,
     pool: ShardPool,
-    password: Option<Secret>,
+    passwords: PasswordStore,
+    source: PasswordSource,
     /// What this run of the process calls itself in `INFO`. Drawn where the
     /// keyspace seed is drawn, for the reason stated there.
     run_id: String,
@@ -345,7 +413,8 @@ impl Server {
             local_addr,
             max_clients: cfg.max_clients,
             pool: ShardPool::spawn_limited(SHARDS, executors(), seed, NoTrace, cfg.limit),
-            password: cfg.password,
+            passwords: PasswordStore::new(cfg.passwords),
+            source: cfg.source,
             run_id,
         })
     }
@@ -354,6 +423,14 @@ impl Server {
     #[must_use]
     pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// A handle on the node's password set — the one every connection reads
+    /// and `SIGHUP` writes. For the edge tests, which drive a reload without
+    /// a signal.
+    #[must_use]
+    pub fn password_store(&self) -> PasswordStore {
+        self.passwords.clone()
     }
 
     /// Accepts connections until the process is interrupted.
@@ -386,7 +463,7 @@ impl Server {
             now_unix_millis: wall_clock,
             memory: self.pool.memory(),
             limit: self.pool.limit(),
-            passwords: PasswordStore::new(self.password.clone().map(Passwords::one)),
+            passwords: self.passwords.clone(),
             run_id: self.run_id.clone(),
             process_id: std::process::id(),
             // A path this process cannot name is reported as unknown rather
@@ -603,8 +680,9 @@ pub fn emit(event: &Event, values: &[Field<'_>]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_BIND, EvictionMode, MAX_CLIENTS_REACHED, MemoryLimit, PASSWORD_ENV, SHARDS,
-        TcpListener, TcpStream, USAGE, configure_accepted, executors, line_for,
+        Config, DEFAULT_BIND, EvictionMode, MAX_CLIENTS_REACHED, MemoryLimit, PASSWORD_ENV,
+        PasswordSource, SHARDS, TcpListener, TcpStream, USAGE, configure_accepted, executors,
+        line_for, parse_password_file,
     };
     use seedstone_service::log::{Field, STOPPING};
 
@@ -746,22 +824,75 @@ mod tests {
 
         let cfg = Config::from_args_and_env(open.clone().chain(["--no-auth".to_owned()]), env(&[]))
             .unwrap();
-        assert!(cfg.password.is_none() && cfg.no_auth);
+        assert!(cfg.passwords.is_none() && cfg.no_auth);
 
         let cfg = Config::from_args_and_env(open, env(&[(PASSWORD_ENV, "pw")])).unwrap();
-        assert!(cfg.password.as_ref().is_some_and(|s| s.matches(b"pw")));
+        assert!(cfg.passwords.as_ref().is_some_and(|s| s.matches(b"pw")));
     }
 
+    /// One line or two, each a password; the file's final newline is not
+    /// part of the last one; `CRLF` is a newline.
     #[test]
-    fn the_password_comes_from_a_file_with_one_trailing_newline_stripped() {
-        let dir = scratch("pw");
+    fn a_password_file_holds_one_or_two_lines() {
+        let one = parse_password_file(b"pw\n".to_vec()).unwrap();
+        assert!(one.matches(b"pw") && one.count() == 1);
+        let bare = parse_password_file(b"pw".to_vec()).unwrap();
+        assert!(bare.matches(b"pw") && bare.count() == 1);
+        let two = parse_password_file(b"old\r\nnew\r\n".to_vec()).unwrap();
+        assert!(two.matches(b"old") && two.matches(b"new") && two.count() == 2);
+        let two_bare = parse_password_file(b"old\nnew".to_vec()).unwrap();
+        assert_eq!(two_bare.count(), 2);
+        // Spaces inside a line are the password's.
+        let spaced = parse_password_file(b"a b\n".to_vec()).unwrap();
+        assert!(spaced.matches(b"a b"));
+    }
+
+    /// Everything else is refused, and the refusal says why.
+    #[test]
+    fn a_password_file_with_any_other_shape_is_refused() {
+        for (bytes, what) in [
+            (&b""[..], "empty"),
+            (b"\n", "one empty line"),
+            (b"a\n\n", "an empty second line"),
+            (b"\nb\n", "an empty first line"),
+            (b"a\nb\nc\n", "three lines"),
+            (b"   \n", "whitespace only"),
+            (b"a\n  \n", "a whitespace-only second line"),
+        ] {
+            let refusal =
+                parse_password_file(bytes.to_vec()).expect_err(&format!("{what} was accepted"));
+            assert!(
+                refusal.contains("one or two passwords"),
+                "{what}: {refusal}"
+            );
+        }
+    }
+
+    /// The command line records where the password came from, because
+    /// only a file can be re-read later.
+    #[test]
+    fn the_config_records_the_password_source() {
+        let dir = scratch("pw-source");
         let path = dir.join("password");
         std::fs::write(&path, "pw\n").unwrap();
         let args = ["--requirepass-file", path.to_str().unwrap()]
             .into_iter()
             .map(ToString::to_string);
         let cfg = Config::from_args_and_env(args, env(&[])).unwrap();
-        assert!(cfg.password.unwrap().matches(b"pw"));
+        assert!(cfg.passwords.as_ref().unwrap().matches(b"pw"));
+        assert_eq!(
+            cfg.source,
+            PasswordSource::File(path.to_str().unwrap().to_owned())
+        );
+
+        let cfg =
+            Config::from_args_and_env(std::iter::empty(), env(&[(PASSWORD_ENV, "pw")])).unwrap();
+        assert!(cfg.passwords.as_ref().unwrap().matches(b"pw"));
+        assert_eq!(cfg.source, PasswordSource::Env);
+
+        let cfg = Config::from_args(std::iter::empty()).unwrap();
+        assert!(cfg.passwords.is_none());
+        assert_eq!(cfg.source, PasswordSource::None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
