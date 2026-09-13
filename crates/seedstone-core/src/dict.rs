@@ -56,7 +56,7 @@ pub struct DictSeed {
 /// The deadline is stored inline on every entry, whether or not that entry has
 /// one, and an `Option<Instant>` is 16 bytes — `Instant` is 16 and the niche
 /// absorbs the discriminant, so `None` is not cheaper. A bucket slot,
-/// `(u64, Vec<u8>, Entry)` — see [`Bucket`] — is therefore 80 bytes against
+/// `(u64, Vec<u8>, Entry)` — see `Bucket` — is therefore 80 bytes against
 /// the 48 a plain `(Vec<u8>, Vec<u8>)` would take: 8 for the stored hash,
 /// which is a deliberate trade of space for a cheaper chain scan, 16 for this
 /// field, which the great majority of keys in a real keyspace never use, and
@@ -468,7 +468,7 @@ impl Dict {
     /// The seed survives and nothing else does: the same key placed again
     /// lands in the same bucket it always did, which is what keeps a replayed
     /// run identical across a flush. The table goes back to
-    /// [`INITIAL_BUCKETS`] rather than keeping the capacity it had earned, and
+    /// `INITIAL_BUCKETS` rather than keeping the capacity it had earned, and
     /// an in-flight rehash is abandoned — a dict that has just been emptied
     /// costing close to nothing is the whole point of the operation, and the
     /// growth path is there to earn the capacity back.
@@ -837,7 +837,7 @@ const fn reverse_increment(cursor: u64, mask: u64) -> u64 {
 /// The order a keyspace walk's cursor advances in.
 ///
 /// Production has exactly one answer, [`ReverseBinary`], and the parameter
-/// exists for the reason [`ExpiryPolicy`](crate::shard::ExpiryPolicy)'s does:
+/// exists for the reason [`ExpiryPolicy`]'s does:
 /// so the simulator can serve its own workload through a cursor that is
 /// genuinely wrong, rather than through an imitation of what a wrong one would
 /// look like from outside. The advance is the whole of the walk's liveness
@@ -858,7 +858,7 @@ pub trait WalkOrder: Clone + Send + 'static {
     /// is claiming.
     ///
     /// Defaulted to the honest order, which is the opposite of what
-    /// [`ExpiryPolicy`](crate::shard::ExpiryPolicy) does with its three
+    /// [`ExpiryPolicy`] does with its three
     /// questions — and deliberately. There, every answer is a real decision a
     /// policy has to take a position on. Here there is exactly one correct
     /// answer and a defect is the only reason to write another, so the default

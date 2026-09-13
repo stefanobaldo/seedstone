@@ -52,7 +52,7 @@ pub struct ShardStats {
     /// rather than overrunning it.
     ///
     /// The three commands a single request sends to *every* shard are absent
-    /// from this: see [`crate::shard::executor::count_call`], which says why counting them here would
+    /// from this: see `executor::count_call`, which says why counting them here would
     /// report one request as sixteen.
     pub calls: [u64; KIND_SLOTS],
     /// How long those commands took, in microseconds, indexed the same way.
@@ -588,7 +588,7 @@ impl Router for ShardPool {
     }
 
     /// The shard comes from the caller instead of from the command, and the
-    /// range check that [`shard_for`](ShardPool::shard_for) would have applied
+    /// range check that `shard_for` would have applied
     /// is kept: this argument reaches here from a cursor a client supplied.
     fn dispatch_at(&self, shard: u16, cmd: Command) -> impl Future<Output = Reply> + Send {
         one_reply(self.send_one(shard, cmd))
