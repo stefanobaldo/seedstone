@@ -19,6 +19,7 @@
 //! the [`ReplyError`] set, and `every_error_constant_is_frame_safe` for the
 //! constants and the status texts.
 
+use crate::log::json_escaped;
 use crate::node::{EDGE_NAMES, KIND_NAMES, NodeInfo};
 use seedstone_core::shard::Reply;
 use seedstone_resp::{Frame, ParseError};
@@ -86,29 +87,6 @@ pub fn known_name(upper: &[u8]) -> Option<&'static str> {
         // match nothing a peer can send — but a table entry that matches by
         // being empty is not something to leave to the caller.
         .find(|name| !name.is_empty() && name.as_bytes().eq_ignore_ascii_case(upper))
-}
-
-/// Appends `raw` as the body of a JSON string — no surrounding quotes.
-///
-/// RESP arguments and error texts quote bytes the peer chose, including
-/// newlines and control characters. Without this, one argument can forge a
-/// whole log line in an aggregator that splits on newlines, which is a
-/// correctness problem and not a tidiness one.
-pub fn json_escaped(raw: &str, out: &mut String) {
-    use std::fmt::Write as _;
-    for ch in raw.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
 }
 
 /// One JSON line describing one error reply.
@@ -268,20 +246,6 @@ mod tests {
     use crate::node::FIXED_UNIX_MILLIS;
     use crate::tests::support::req;
     use seedstone_core::shard::ReplyError;
-
-    /// The escaper is the only thing standing between an argument a peer chose
-    /// and a log line the aggregator parses, so it is tested on the bytes that
-    /// break a line rather than on ordinary text.
-    #[test]
-    fn json_escaped_neutralises_everything_that_could_forge_a_line() {
-        let mut out = String::new();
-        json_escaped("a\"b\\c\nd\re\tf", &mut out);
-        assert_eq!(out, r#"a\"b\\c\nd\re\tf"#);
-
-        let mut out = String::new();
-        json_escaped("\u{1}", &mut out);
-        assert_eq!(out, r"\u0001");
-    }
 
     /// A recognised command names itself with no allocation; the label is the
     /// static name the stats tables already carry.
