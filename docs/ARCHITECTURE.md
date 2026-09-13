@@ -113,10 +113,12 @@ it means existing tools and client libraries can reach the server without
 modification, and it is deliberately the thinnest part of the system.
 
 The binary is the only place a socket is opened, a signal is handled, or
-entropy is drawn. Below it, the connection loop is generic over its transport;
-commands that concern the connection rather than the keyspace are answered
-there, and a command that names a key is routed to the executor that owns its
-shard. Two other routing shapes share that path: a command that names a *shard*
+entropy is drawn. How it is run — its command line, the lines it writes, the
+signals it answers and how its password is rotated — is documented in
+[operations.md](operations.md). Below it, the connection loop is generic over
+its transport; commands that concern the connection rather than the keyspace
+are answered there, and a command that names a key is routed to the executor
+that owns its shard. Two other routing shapes share that path: a command that names a *shard*
 instead of a key, which is how one step of a keyspace walk reaches the shard
 whose cursor it carries, and a command every shard must see, such as emptying
 the keyspace or counting it. Multi-key commands fan out from this layer, and so

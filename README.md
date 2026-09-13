@@ -29,7 +29,8 @@ answer and exit, in first position and nowhere else. The password may also
 arrive in `SEEDSTONE_REQUIREPASS`. It is never an argument — a command line is
 readable by every other process on the host. A bind outside loopback
 refuses to start without a password from either source, unless `--no-auth`
-says so deliberately.
+says so deliberately. [docs/operations.md](docs/operations.md) has every flag,
+the signals, and how a password is rotated without a restart.
 
 The same server ships as a container image, `ghcr.io/stefanobaldo/seedstone`,
 tagged per release. It runs as a non-root user and holds nothing but the
