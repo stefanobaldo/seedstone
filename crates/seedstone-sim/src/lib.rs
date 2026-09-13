@@ -65,9 +65,9 @@
 //! absence well before it is a **spurious death**. "Well" is a band inside
 //! which the client cannot tell what the server's clock said, so it declines
 //! to judge — and there are two of them, asymmetric, because the two sides do
-//! not owe the same thing. [`STALE_SLACK`] pays for one message's travel: the
+//! not owe the same thing. `STALE_SLACK` pays for one message's travel: the
 //! deadline the server computed lands that much after the instant the client
-//! recorded. [`LIVE_SLACK`] pays nothing, and is zero — that side judges from
+//! recorded. `LIVE_SLACK` pays nothing, and is zero — that side judges from
 //! the reply, which the handler produced before it, against a deadline the
 //! server set no earlier than the client's own. Both counters must be zero, and both must have
 //! actually decided something: [`SimOutcome`] carries the check counts beside
@@ -78,7 +78,7 @@
 //!
 //! The workload is over in a fraction of a simulated second, which is less
 //! than the deadlines it hands out. So a client ends by sleeping past them —
-//! [`SETTLE_CAP`] bounds how far — and reading back every key it owns: the
+//! `SETTLE_CAP` bounds how far — and reading back every key it owns: the
 //! volatile ones it waited out must be gone, and the plain ones, which no
 //! deadline was ever put on, must still be exactly what it wrote. That pass
 //! is what puts the active sweep under test. The sweep runs on a timer
@@ -295,7 +295,7 @@ const CLIENT_CHUNK: usize = 4096;
 /// # Panics
 ///
 /// If the simulation itself fails — a host returning an error, or
-/// [`SIM_DURATION`] elapsing with a client still running. Both are harness
+/// `SIM_DURATION` elapsing with a client still running. Both are harness
 /// bugs or deadlocks rather than findings about the system, and neither is
 /// something a sweep can carry on past.
 #[must_use]
