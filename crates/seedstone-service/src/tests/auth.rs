@@ -2,7 +2,9 @@
 //! what `HELLO` may carry instead.
 
 use super::support::{connected, node_with_password, read_frames, req};
-use crate::auth::{AUTH_NOT_CONFIGURED, NOAUTH, NOAUTH_HELLO, Secret, WRONGPASS};
+use crate::auth::{
+    AUTH_NOT_CONFIGURED, NOAUTH, NOAUTH_HELLO, PasswordStore, Passwords, Secret, WRONGPASS,
+};
 use crate::connection::serve_connection;
 use crate::hello::NOPROTO;
 use crate::node::NodeInfo;
@@ -352,4 +354,54 @@ fn the_secret_does_not_print_itself() {
     assert!(!secret.matches(b"hunter"));
     assert!(!secret.matches(b"hunter22"));
     assert!(!secret.matches(b""));
+}
+
+/// Either password authenticates, nothing else does, and a single-password
+/// set refuses the empty candidate — there is no sentinel a peer could hit.
+#[test]
+fn two_passwords_either_authenticates_and_nothing_else_does() {
+    let two = Passwords::two(Secret::new(b"old".to_vec()), Secret::new(b"new".to_vec()));
+    assert!(two.matches(b"old"));
+    assert!(two.matches(b"new"));
+    assert!(!two.matches(b""));
+    assert!(!two.matches(b"ol"));
+    assert!(!two.matches(b"newer"));
+    assert_eq!(two.count(), 2);
+
+    let one = Passwords::one(Secret::new(b"only".to_vec()));
+    assert!(one.matches(b"only"));
+    assert!(!one.matches(b""));
+    assert!(!one.matches(b"onl"));
+    assert!(!one.matches(b"only\n"));
+    assert_eq!(one.count(), 1);
+}
+
+/// A store is shared: what one handle stores, every clone loads.
+#[test]
+fn the_store_hands_out_what_was_last_stored() {
+    let store = PasswordStore::default();
+    assert!(!store.requires_auth());
+    assert!(store.load().is_none());
+
+    let peer = store.clone();
+    store.store(Some(Passwords::one(Secret::new(b"pw".to_vec()))));
+    assert!(peer.requires_auth());
+    assert!(peer.load().unwrap().matches(b"pw"));
+
+    store.store(None);
+    assert!(!peer.requires_auth());
+    assert!(peer.load().is_none());
+}
+
+#[test]
+fn passwords_do_not_print_themselves() {
+    let two = Passwords::two(Secret::new(b"old".to_vec()), Secret::new(b"new".to_vec()));
+    let store = PasswordStore::new(Some(two.clone()));
+    for rendered in [format!("{two:?}"), format!("{store:?}")] {
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(
+            !rendered.contains("old") && !rendered.contains("new"),
+            "{rendered}"
+        );
+    }
 }

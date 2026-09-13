@@ -5,6 +5,8 @@
 //! on a prefix is matching on this one — and they are held frame-safe by
 //! `every_error_constant_is_frame_safe` beside the rest.
 
+use std::sync::{Arc, RwLock};
+
 /// What a peer that has not authenticated is told, for every command but the
 /// three that are allowed before it.
 pub const NOAUTH: &str = "NOAUTH Authentication required.";
@@ -75,5 +77,132 @@ impl Secret {
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Secret(<redacted>)")
+    }
+}
+
+/// The one or two passwords a node accepts.
+///
+/// Two, during a rotation: the operator adds the new one as a second line
+/// of the password file and re-reads it, restarts the clients at their own
+/// pace, then removes the old line and re-reads again. At every moment one
+/// of the two lines is what every client holds, so no restart is ordered
+/// against another and no client is refused for the length of somebody
+/// else's boot.
+///
+/// `matches` costs the same whatever the count: two comparisons, always. With
+/// one password the second comparison is against the same password and its
+/// answer is dropped. There is no sentinel value standing in for the absent
+/// slot, because any byte string — the empty one included — is a string a
+/// peer can send, so there is no `Secret` that matches nothing; only a
+/// comparison whose result is not used.
+#[derive(Clone)]
+pub struct Passwords {
+    current: Secret,
+    next: Option<Secret>,
+}
+
+impl Passwords {
+    /// One password.
+    #[must_use]
+    pub const fn one(current: Secret) -> Self {
+        Self {
+            current,
+            next: None,
+        }
+    }
+
+    /// Two passwords, either of which authenticates.
+    #[must_use]
+    pub const fn two(current: Secret, next: Secret) -> Self {
+        Self {
+            current,
+            next: Some(next),
+        }
+    }
+
+    /// How many passwords this set holds: 1 or 2.
+    #[must_use]
+    pub const fn count(&self) -> usize {
+        if self.next.is_some() { 2 } else { 1 }
+    }
+
+    /// Whether `candidate` is one of the passwords, in time that does not
+    /// depend on which one it is or on how many there are.
+    #[must_use]
+    pub fn matches(&self, candidate: &[u8]) -> bool {
+        let first = self.current.matches(candidate);
+        let second = self.next.as_ref().map_or_else(
+            || {
+                // The same work as the arm above, so a timing tells nobody
+                // how many lines the file has. `black_box` keeps the compiler
+                // from noticing the answer is unused.
+                let _ = std::hint::black_box(self.current.matches(candidate));
+                false
+            },
+            |next| next.matches(candidate),
+        );
+        first || second
+    }
+}
+
+impl std::fmt::Debug for Passwords {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Passwords(<redacted>, count {})", self.count())
+    }
+}
+
+/// The node's passwords, shared between the accept loop that may replace
+/// them and every connection that reads them.
+///
+/// `None` is an open node. A connection reads the set once, at `AUTH` or at
+/// the `HELLO` that carries one; the edge writes it once per `SIGHUP`. A
+/// `RwLock` rather than an atomic pointer swap because there is no
+/// contention to buy out of at that rate, and because it is in `std`.
+///
+/// The simulator never writes to it, so a replayed run reads the set the
+/// original run read. Cloning is cheap and shares the cell: `NodeInfo` is
+/// cloned per connection, and every clone must see the same passwords.
+#[derive(Clone, Default)]
+pub struct PasswordStore(Arc<RwLock<Option<Passwords>>>);
+
+impl PasswordStore {
+    /// A store holding `passwords`; `None` is an open node.
+    #[must_use]
+    pub fn new(passwords: Option<Passwords>) -> Self {
+        Self(Arc::new(RwLock::new(passwords)))
+    }
+
+    /// The current set, cloned out from under the lock.
+    #[must_use]
+    pub fn load(&self) -> Option<Passwords> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replaces the set. Connections already authenticated are not affected:
+    /// authentication is a fact about the connection, decided when it
+    /// happened, as it is in Redis.
+    pub fn store(&self, passwords: Option<Passwords>) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = passwords;
+    }
+
+    /// Whether a connection must authenticate before it can run anything.
+    #[must_use]
+    pub fn requires_auth(&self) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+}
+
+impl std::fmt::Debug for PasswordStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PasswordStore(<redacted>)")
     }
 }
