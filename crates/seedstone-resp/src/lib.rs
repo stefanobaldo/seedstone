@@ -52,7 +52,7 @@ pub enum Frame {
 ///
 /// Encoding does not recurse. Nesting is walked with an explicit stack on the
 /// heap, so no frame — however deep — can overflow the call stack here. That
-/// is a stronger guarantee than [`MAX_ARRAY_DEPTH`] gives on the way in: the
+/// is a stronger guarantee than `MAX_ARRAY_DEPTH` gives on the way in: the
 /// depth limit says which frames [`parse`] will *produce*, and says nothing
 /// about a frame a caller built itself. Encoding one of those used to be an
 /// abort waiting for the first caller careless enough to construct it.
@@ -789,7 +789,7 @@ const fn payload_bytes(frame: &Frame) -> usize {
 /// elements it has already understood, so the same input is parsed once.
 ///
 /// It is also non-recursive. Nesting is held in a heap [`Vec`], not in the
-/// call stack, so [`MAX_ARRAY_DEPTH`] is a policy about what the protocol
+/// call stack, so `MAX_ARRAY_DEPTH` is a policy about what the protocol
 /// accepts rather than the only thing standing between a hostile frame and a
 /// stack overflow.
 ///
