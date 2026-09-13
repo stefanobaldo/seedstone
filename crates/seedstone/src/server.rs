@@ -168,7 +168,7 @@ impl Config {
     /// # The bind that must be defended
     ///
     /// A bind outside loopback with no password is refused unless `--no-auth`
-    /// says so deliberately. [`DEFAULT_BIND`] has always kept an unconfigured
+    /// says so deliberately. `DEFAULT_BIND` has always kept an unconfigured
     /// node off the network; this is the other half of the same property, for
     /// the node whose operator did configure an address.
     ///
@@ -364,7 +364,7 @@ impl Server {
     /// a peer that knows.
     ///
     /// Shutdown is a clean exit from the accept loop, on Ctrl-C or on SIGTERM
-    /// — see [`shutdown_requested`]: connections already running finish on
+    /// — see `shutdown_requested`: connections already running finish on
     /// their own tasks, and the process ends when the runtime does.
     pub async fn run(self) {
         let clients = Arc::new(Semaphore::new(self.max_clients));
