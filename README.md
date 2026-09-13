@@ -11,7 +11,7 @@ ordinary client libraries reach it without modification:
 
 ```console
 $ cargo run --release -p seedstone
-seedstone 0.0.0 listening on 127.0.0.1:6379
+{"ts":1757800000000,"level":"info","evt":"listening","version":"0.0.0","bind":"127.0.0.1","port":6379}
 
 $ redis-cli
 127.0.0.1:6379> set greeting hello ex 60
@@ -56,7 +56,9 @@ per-command time, carrying only fields this node can state truthfully —
 `CONFIG GET` over the parameters that describe how it was
 started, and `SLOWLOG` and `LATENCY` answering as the switched-off monitors
 they are, so that a scrape completes rather than logging a refusal on every
-pass.
+pass. What the server itself writes while it runs — one JSON line per event,
+with a level — and how it is operated are in
+[docs/operations.md](docs/operations.md).
 
 **What it does not have yet:** persistence — a restart is an empty keyspace —
 along with RESP3, replication, clustering, and every data type except strings.
