@@ -17,12 +17,12 @@
 //!
 //! # Why a handler is a plain `fn`
 //!
-//! [`crate::shard::apply::apply`] takes `&mut Dict` and returns a `Reply`. It is
+//! `apply::apply` takes `&mut Dict` and returns a `Reply`. It is
 //! not `async`, and that is the point: a handler that cannot `await` cannot yield the executor
 //! mid-command, so a command either has not started or has finished, and two
 //! commands on one key can never interleave. The rule is enforced by the
 //! signature rather than by review — the only `await`s in an executor task are
-//! the `select!` arms of [`crate::shard::executor::run_executor`]. A batch
+//! the `select!` arms of `executor::run_executor`. A batch
 //! inherits the property: no `await` separates its commands either, so nothing
 //! from another connection can land inside one.
 //!
