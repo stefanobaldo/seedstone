@@ -7,9 +7,10 @@
 //! like logic belongs in [`seedstone::server`], where it can be tested without
 //! a process.
 
-use seedstone::server::{Config, Server, USAGE};
+use seedstone::server::{Config, Server, USAGE, emit};
 use seedstone_core::dict::DictSeed;
 use seedstone_service::RUN_ID_HEX;
+use seedstone_service::log::{BIND_FAILED, Field, LISTENING};
 
 fn main() {
     let mut args = std::env::args().skip(1).peekable();
@@ -41,20 +42,32 @@ fn main() {
         }
     };
 
+    let bind = cfg.bind;
     let Entropy { seed, run_id } = entropy();
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
         let server = match Server::bind(cfg, seed, run_id).await {
             Ok(server) => server,
             Err(error) => {
-                eprintln!("bind failed: {error}");
+                emit(
+                    &BIND_FAILED,
+                    &[
+                        Field::Str(&bind.ip().to_string()),
+                        Field::Num(u64::from(bind.port())),
+                        Field::Str(&error.to_string()),
+                    ],
+                );
                 std::process::exit(1);
             }
         };
-        eprintln!(
-            "seedstone {} listening on {}",
-            env!("CARGO_PKG_VERSION"),
-            server.local_addr()
+        let addr = server.local_addr();
+        emit(
+            &LISTENING,
+            &[
+                Field::Str(env!("CARGO_PKG_VERSION")),
+                Field::Str(&addr.ip().to_string()),
+                Field::Num(u64::from(addr.port())),
+            ],
         );
         server.run().await;
     });
