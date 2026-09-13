@@ -6,10 +6,12 @@
 //! which is what this file is for. Ephemeral ports throughout — a fixed port
 //! is a test that fails on a machine already running something.
 
-use seedstone::server::{Config, MAX_CLIENTS_REACHED, Server};
+use seedstone::server::{
+    Config, MAX_CLIENTS_REACHED, PasswordSource, Reload, Server, reload_passwords,
+};
 use seedstone_core::dict::DictSeed;
 use seedstone_resp::{Frame, encode, parse};
-use seedstone_service::{Passwords, RUN_ID_HEX, Secret};
+use seedstone_service::{Passwords, RUN_ID_HEX, Secret, WRONGPASS};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -385,4 +387,79 @@ async fn read_frames<R: AsyncRead + Unpin>(r: &mut R, n: usize) -> Vec<Frame> {
         buf.extend_from_slice(&chunk[..got]);
     }
     frames
+}
+
+/// The reload, driven as a function rather than by a signal: the signal's
+/// delivery is exercised once, end to end, in `e2e/rotation.sh`; what it
+/// calls is exercised here against a running server on a real socket.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reload_swaps_the_passwords_under_a_running_server() {
+    let dir = std::env::temp_dir().join(format!("seedstone-reload-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("password");
+    std::fs::write(&path, "old\n").unwrap();
+    let path_str = path.to_str().unwrap().to_owned();
+    let cfg = Config::from_args(
+        ["--bind", "127.0.0.1:0", "--requirepass-file", &path_str]
+            .iter()
+            .map(ToString::to_string),
+    )
+    .unwrap();
+    let server = Server::bind(cfg, DictSeed { k0: 1, k1: 2 }, "t".repeat(RUN_ID_HEX))
+        .await
+        .unwrap();
+    let addr = server.local_addr();
+    let store = server.password_store();
+    let source = PasswordSource::File(path_str);
+    tokio::spawn(server.run());
+
+    let ok = Frame::Simple("OK".into());
+    let wrong = Frame::Error(WRONGPASS.to_owned());
+
+    let mut first = TcpStream::connect(addr).await.unwrap();
+    assert_eq!(round_trip(&mut first, &["AUTH", "new"]).await, wrong);
+    assert_eq!(round_trip(&mut first, &["AUTH", "old"]).await, ok);
+
+    // Step 1 of a rotation: the new password joins the file.
+    std::fs::write(&path, "old\nnew\n").unwrap();
+    assert!(matches!(
+        reload_passwords(&source, &store),
+        Reload::Reloaded(2)
+    ));
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    assert_eq!(round_trip(&mut second, &["AUTH", "new"]).await, ok);
+    let mut still_old = TcpStream::connect(addr).await.unwrap();
+    assert_eq!(round_trip(&mut still_old, &["AUTH", "old"]).await, ok);
+
+    // Step 3: the old one leaves. The connection that presented it stays
+    // authenticated; a new connection presenting it is refused.
+    std::fs::write(&path, "new\n").unwrap();
+    assert!(matches!(
+        reload_passwords(&source, &store),
+        Reload::Reloaded(1)
+    ));
+    assert_eq!(round_trip(&mut first, &["SET", "k", "v"]).await, ok);
+    let mut third = TcpStream::connect(addr).await.unwrap();
+    assert_eq!(round_trip(&mut third, &["AUTH", "old"]).await, wrong);
+    assert_eq!(round_trip(&mut third, &["AUTH", "new"]).await, ok);
+
+    // A file the boot would refuse is refused here, and the set stands.
+    std::fs::write(&path, "a\nb\nc\n").unwrap();
+    assert!(matches!(
+        reload_passwords(&source, &store),
+        Reload::Failed(_)
+    ));
+    let mut fourth = TcpStream::connect(addr).await.unwrap();
+    assert_eq!(round_trip(&mut fourth, &["AUTH", "new"]).await, ok);
+
+    // Nothing to re-read where the password did not come from a file.
+    assert!(matches!(
+        reload_passwords(&PasswordSource::Env, &store),
+        Reload::Skipped
+    ));
+    assert!(matches!(
+        reload_passwords(&PasswordSource::None, &store),
+        Reload::Skipped
+    ));
+    std::fs::remove_dir_all(dir).unwrap();
 }
