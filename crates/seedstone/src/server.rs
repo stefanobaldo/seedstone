@@ -15,7 +15,10 @@ use seedstone_core::dict::DictSeed;
 use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{NoTrace, ShardPool};
 use seedstone_resp::{Frame, encode};
-use seedstone_service::log::{Event, Field, STOPPING, line};
+use seedstone_service::log::{
+    Event, Field, PASSWORD_RELOAD_FAILED, PASSWORD_RELOAD_SKIPPED, PASSWORD_RELOADED, STOPPING,
+    line,
+};
 use seedstone_service::{NodeInfo, PasswordStore, Passwords, Secret, serve_connection};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -444,6 +447,9 @@ impl Server {
     /// Shutdown is a clean exit from the accept loop, on Ctrl-C or on SIGTERM
     /// — see `shutdown_requested`: connections already running finish on
     /// their own tasks, and the process ends when the runtime does.
+    ///
+    /// `SIGHUP` re-reads the password file — see [`reload_passwords`] — and
+    /// the result is one line, whichever way it went.
     pub async fn run(self) {
         let clients = Arc::new(Semaphore::new(self.max_clients));
         // Assembled once, here, because this is the only place that knows any
@@ -487,6 +493,7 @@ impl Server {
         // registrations.
         let shutdown = shutdown_requested();
         tokio::pin!(shutdown);
+        let mut hangups = Hangups::register();
         loop {
             tokio::select! {
                 // `biased` for the reason the shard loop states: unbiased arm
@@ -499,6 +506,8 @@ impl Server {
                     emit(&STOPPING, &[Field::Str(signal)]);
                     break;
                 }
+
+                () = hangups.recv() => report_reload(&reload_passwords(&self.source, &self.passwords)),
 
                 accepted = self.listener.accept() => {
                     // A failed accept is per-connection — the peer vanished
@@ -545,6 +554,79 @@ impl Server {
 /// only reached on the subset of those that return. `connected_clients` is a
 /// gauge, so an increment that is not always paired does not lose a sample —
 /// it makes every later reading wrong, for the lifetime of the process.
+/// What a `SIGHUP` did.
+#[derive(Debug)]
+pub enum Reload {
+    /// The file was re-read and the set replaced; this many passwords now.
+    Reloaded(usize),
+    /// The file was refused for the reason given; the previous set stands.
+    Failed(String),
+    /// The password did not come from a file; nothing to re-read.
+    Skipped,
+}
+
+/// Re-reads the password file named by `source` into `store`.
+///
+/// The same reader as the boot's, so what the boot would refuse this refuses
+/// too — and a refused file leaves the store as it was: a node is never left
+/// open, and never handed a set the operator did not mean.
+#[must_use]
+pub fn reload_passwords(source: &PasswordSource, store: &PasswordStore) -> Reload {
+    let PasswordSource::File(path) = source else {
+        return Reload::Skipped;
+    };
+    match read_password_file(path) {
+        Ok(set) => {
+            let count = set.count();
+            store.store(Some(set));
+            Reload::Reloaded(count)
+        }
+        Err(why) => Reload::Failed(why),
+    }
+}
+
+/// Writes the line a [`Reload`] earns.
+fn report_reload(reload: &Reload) {
+    match reload {
+        Reload::Reloaded(count) => emit(
+            &PASSWORD_RELOADED,
+            &[Field::Num(u64::try_from(*count).unwrap_or(u64::MAX))],
+        ),
+        Reload::Failed(why) => emit(&PASSWORD_RELOAD_FAILED, &[Field::Str(why)]),
+        Reload::Skipped => emit(&PASSWORD_RELOAD_SKIPPED, &[]),
+    }
+}
+
+/// `SIGHUP`, as a stream that never ends: `recv` resolves once per signal,
+/// and on a platform without the signal — or when registration failed — it
+/// never resolves, so the accept loop's `select!` simply never takes that
+/// arm. Created once and polled across every turn of the loop, like the
+/// shutdown watcher and for the same reason.
+struct Hangups(#[cfg(unix)] Option<tokio::signal::unix::Signal>);
+
+impl Hangups {
+    fn register() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self(signal(SignalKind::hangup()).ok())
+        }
+        #[cfg(not(unix))]
+        {
+            Self()
+        }
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        if let Some(signal) = &mut self.0 {
+            signal.recv().await;
+            return;
+        }
+        std::future::pending::<()>().await;
+    }
+}
+
 struct Attached(Arc<AtomicU64>);
 
 impl Attached {

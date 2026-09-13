@@ -106,8 +106,42 @@ pub static STOPPING: Event = Event {
     fields: &["signal"],
 };
 
+/// `SIGHUP` re-read the password file and the new set is in force.
+pub static PASSWORD_RELOADED: Event = Event {
+    name: "password_reloaded",
+    level: Level::Info,
+    fields: &["passwords"],
+};
+
+/// `SIGHUP` re-read the password file and refused it; the previous set
+/// stands. `error`: the operator asked for something the server could not
+/// do, and the file they wrote is not what they meant.
+pub static PASSWORD_RELOAD_FAILED: Event = Event {
+    name: "password_reload_failed",
+    level: Level::Error,
+    fields: &["error"],
+};
+
+/// `SIGHUP` arrived, but there is nothing to re-read.
+///
+/// The password came from the environment, or there is none. `warn`: a
+/// signal that did nothing in silence is a signal an operator sends twice.
+pub static PASSWORD_RELOAD_SKIPPED: Event = Event {
+    name: "password_reload_skipped",
+    level: Level::Warn,
+    fields: &[],
+};
+
 /// Every event the server can write, in the order the page lists them.
-pub static EVENTS: &[&Event] = &[&LISTENING, &BIND_FAILED, &ERROR_REPLY, &STOPPING];
+pub static EVENTS: &[&Event] = &[
+    &LISTENING,
+    &BIND_FAILED,
+    &ERROR_REPLY,
+    &STOPPING,
+    &PASSWORD_RELOADED,
+    &PASSWORD_RELOAD_FAILED,
+    &PASSWORD_RELOAD_SKIPPED,
+];
 
 /// One line: the envelope, then `event`'s fields with `values` in order.
 ///
