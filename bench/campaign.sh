@@ -17,6 +17,11 @@
 #              its memory bound is a log size with tail reclamation, not a
 #              ceiling with LRU eviction, and a comparable cell does not exist.
 #   multikey   MGET of 1, 4 and 16 keys at depth 64.
+#   keys       KEYS over a 7 000-key, 10 240-byte-value keyspace at depth 1.
+#              The keyspace is loaded by keys-load.sh, not by redis-benchmark;
+#              one prefix of 64 is matched per call, so every call answers the
+#              same ~109 keys. Depth 1 because a page cache does not pipeline
+#              KEYS; 20 000 calls per run because a call costs milliseconds.
 #
 # Discipline, every stage: one server up at a time, pinned to SERVER_CPUS, the
 # client pinned to CLIENT_CPUS; the keyspace populated before a read cell by
@@ -31,8 +36,8 @@
 # core; Garnet sizes its own threads. No allocator, hugepage or affinity
 # tuning, for any arm.
 #
-# Usage: campaign.sh <canary|calibrate|field|expiry|eviction|multikey|all>
-#        WARMUP=<W> is required by field, expiry, eviction and multikey.
+# Usage: campaign.sh <canary|calibrate|field|expiry|eviction|multikey|keys|all>
+#        WARMUP=<W> is required by field, expiry, eviction, multikey and keys.
 #        ARMS=<comma list> restricts the arms; the default is all seven.
 # Paths and cpusets are environment variables with the reference machine's
 # values as defaults, so the script runs elsewhere with none of them edited.
@@ -64,7 +69,7 @@ WARMUP=${WARMUP:-}
 CANARY_REFERENCE=2551021
 CANARY_TOLERANCE=5
 
-STAGE=${1:?usage: campaign.sh <canary|calibrate|field|expiry|eviction|multikey|all>}
+STAGE=${1:?usage: campaign.sh <canary|calibrate|field|expiry|eviction|multikey|keys|all>}
 
 wait_port() {
   for _ in $(seq 1 150); do
@@ -111,6 +116,8 @@ need() { [[ -x $1 ]] || { echo "FATAL: $2 binary not executable: $1" >&2; exit 1
 # start <port> <arm> <populate|clean> <workdir> -- <server cmd...>
 # Leaves $PID set to the server's pid. `populate` runs the standard population
 # step and probes it; `clean` starts empty, which the eviction stage declares.
+# `loadkeys` loads the KEYS cell's keyspace through keys-load.sh and prints what
+# landed.
 start() {
   local port=$1 arm=$2 mode=$3 workdir=$4; shift 5
   ( cd "$workdir" && exec taskset -c "$SERVER_CPUS" "$@" ) >"/tmp/bench-$port.log" 2>&1 &
@@ -124,6 +131,8 @@ start() {
   if [[ $mode == populate ]]; then
     populate "$port"
     probe_hits "$port"
+  elif [[ $mode == loadkeys ]]; then
+    bash "$HERE/keys-load.sh" "$port"
   fi
 }
 
@@ -190,7 +199,7 @@ canary() {
   }'
 }
 
-each_arm() {  # each_arm <populate|clean> <plain|ceiling> <fn> [skip-arms, comma-separated]
+each_arm() {  # each_arm <populate|clean|loadkeys> <plain|ceiling> <fn> [skip-arms, comma-separated]
   local mode=$1 bound=$2 fn=$3 skip=",${4:-}," arm
   for arm in ${ARMS//,/ }; do
     [[ $skip == *",$arm,"* ]] && { echo "### $arm skipped in this stage, by design"; echo; continue; }
@@ -267,12 +276,22 @@ multikey() {
   each_arm populate plain multikey_arm
 }
 
+keys() {
+  banner keys
+  echo "### keys: KEYS over 7 000 keys of 10 240 B, 64 prefixes, one fixed prefix matched per call"
+  echo "### (~109 keys); depth 1; 50 clients; 20 000 calls per run; keyspace loaded by keys-load.sh,"
+  echo "### the same keys every run; W=$WARMUP. ops is KEYS calls per second."
+  # A subshell, so the three overrides reach cell.sh for this stage and no other.
+  keys_arm() { ( export KEYSPACE=7000 PAYLOAD=10240 N=20000; runs "$PORT" "$1" keys 1 7 ); }
+  each_arm loadkeys plain keys_arm
+}
+
 # A stage that fails must fail the script. The canary and the calibration are
 # gates: a caller that reads only the exit status has to be told, and the
 # trailing "stage done" echo below would otherwise make every stage exit 0.
 STATUS=0
 case "$STAGE" in
-  canary|calibrate|field|expiry|eviction|multikey) "$STAGE" || STATUS=$?;;
+  canary|calibrate|field|expiry|eviction|multikey|keys) "$STAGE" || STATUS=$?;;
   all)
     canary || { echo "### campaign stopped: the canary did not pass"; exit 1; }
     calibrate || STATUS=$?
@@ -282,6 +301,7 @@ case "$STAGE" in
     echo "###   WARMUP=<W> bash bench/campaign.sh expiry    > 04-expiry.log"
     echo "###   WARMUP=<W> bash bench/campaign.sh eviction  > 05-eviction.log"
     echo "###   WARMUP=<W> bash bench/campaign.sh multikey  > 06-multikey.log"
+    echo "###   WARMUP=<W> bash bench/campaign.sh keys      > 07-keys.log"
     ;;
   *) echo "unknown stage: $STAGE" >&2; exit 2;;
 esac
