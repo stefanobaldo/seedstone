@@ -8,7 +8,10 @@ this directory is what produced them.
   its cores, the client's cores, and every declaration the run was made under.
 - `campaign.sh` — the stages, in the only order that makes them readable:
   `canary` (a gate), `calibrate` (produces `W`), then `field`, `expiry`,
-  `eviction`, `multikey`.
+  `eviction`, `multikey`, `keys`.
+- `keys-load.sh` — the keyspace the `keys` stage walks: 7 000 keys shaped
+  like a page cache's, 10 240-byte values, the same keys every run, loaded
+  through `redis-cli --pipe`.
 - `report.py` — turns the raw logs into the tables, applies the reading rule,
   and derives `W` from the calibration log. Standard library only.
 - `results/<tag>/` — the raw logs of each published run, one per stage,
