@@ -27,6 +27,7 @@
 #   set-ex <seconds>    SET ... EX <seconds>                  (explicit command)
 #   set-large <bytes>   SET of a <bytes>-byte value           (explicit command)
 #   mget <k>            MGET of <k> keys, each drawn independently
+#   keys <i>            KEYS <prefix i>*  over the keyspace keys-load.sh loaded
 #
 # The explicit-command form ignores -d, so the payload is a literal there; it
 # is the same bytes on the wire. Its -q title is the command rather than the
@@ -40,7 +41,7 @@
 set -uo pipefail
 export LC_ALL=C
 
-USAGE="usage: cell.sh <port> <pid> <arm> <kind> <get|set|set-ex|set-large|mget> <depth> <clients> [shape-arg]"
+USAGE="usage: cell.sh <port> <pid> <arm> <kind> <get|set|set-ex|set-large|mget|keys> <depth> <clients> [shape-arg]"
 PORT=${1:?$USAGE}
 PID=${2:?$USAGE}
 ARM=${3:?$USAGE}
@@ -76,6 +77,13 @@ case $SHAPE in
   mget)
     ARG=${ARG:-1}; BYTES=$PAYLOAD
     CMD=(MGET); for _ in $(seq 1 "$ARG"); do CMD+=("key:__rand_int__"); done;;
+  keys)
+    # The pattern names one of the loader's prefixes, so every call answers the
+    # same keys. PAYLOAD is the values' size and KEYSPACE the key count, both
+    # set by the stage; -r is passed as always and matters to nothing here,
+    # because the command carries no __rand_int__.
+    ARG=${ARG:-7}; BYTES=$PAYLOAD
+    CMD=(KEYS "$(bash "$(dirname "$0")/keys-load.sh" --pattern "$ARG")");;
   *) echo "$USAGE" >&2; exit 2;;
 esac
 
