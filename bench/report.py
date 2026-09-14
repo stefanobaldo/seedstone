@@ -54,6 +54,11 @@ def rowkey(d):
 def describe(key):
     shape, arg, depth, clients, keyspace, payload = key
     size = fmt(int(payload))
+    if shape == "keys":
+        # The loader's keyspace: `payload` is the values' size and `keyspace`
+        # the key count; `arg` is which prefix every call matched.
+        return (f"KEYS over {fmt(int(keyspace))} keys of {size} B, one prefix of 64 "
+                f"matched per call, depth {depth}, {clients} clients")
     what = {
         "get": f"GET {size} B",
         "set": f"SET {size} B",
@@ -168,6 +173,9 @@ def report(path):
         present = summary[key]
         base = present.get("seedstone")
         print(f"### {describe(key)}\n")
+        if key[0] == "keys":
+            print("`ops/s` on these rows is `KEYS` calls per second; every call answers "
+                  "the same prefix's keys, so the rows are comparable across arms.\n")
         print(table(PRIMARY, present, base))
         if any(a in present for a in OTHER):
             print("\nOther engines:\n")
@@ -231,6 +239,10 @@ def selftest():
             "cores=0.98 client_cores=0.40 evicted=- evicted_per_op=-")
     d = dict(FIELD.findall(line[5:]))
     assert d["arm"] == "redis-iot1" and d["ops"] == "2583979.25" and d["evicted_per_op"] == "-"
+    assert describe(("keys", "7", "1", "50", "7000", "10240")) == (
+        "KEYS over 7\u202f000 keys of 10\u202f240 B, one prefix of 64 matched per call, "
+        "depth 1, 50 clients")
+    assert sortkey(("keys", "7", "1", "50", "7000", "10240")) == ("keys", 1, 7, "7")
     print("selftest ok")
 
 
