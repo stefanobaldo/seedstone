@@ -8,6 +8,7 @@ use crate::fan_out::{KEYS_TOO_LARGE, keys};
 use crate::node::NodeInfo;
 use crate::options::wrong_arity;
 use crate::walk::{pack_cursor, unpack_cursor};
+use bytes::Bytes;
 use seedstone_core::dict::DictSeed;
 use seedstone_core::shard::{Command, NoTrace, Reply, ReplyError, Router, ShardPool};
 use seedstone_resp::{Frame, encode};
@@ -34,7 +35,7 @@ async fn keys_returns_every_matching_key_across_shards_without_repeating_one() {
     let mut names: Vec<Vec<u8>> = items
         .iter()
         .map(|f| match f {
-            Frame::Bulk(b) => b.clone(),
+            Frame::Bulk(b) => b.to_vec(),
             other => panic!("KEYS must answer bulk strings, got {other:?}"),
         })
         .collect();
@@ -81,7 +82,7 @@ async fn a_multi_step_walk_neither_loses_a_key_nor_repeats_one() {
     w.flush().await.unwrap();
     let frames = read_frames(&mut r, 2002).await;
     assert!(matches!(&frames[2000], Frame::Array(a) if a.len() == 2000));
-    assert_eq!(frames[2001], Frame::Bulk(b"v".to_vec()));
+    assert_eq!(frames[2001], Frame::Bulk("v".into()));
 }
 
 /// The claim the design rests on: a walk occupies a shard for one step,
@@ -181,8 +182,8 @@ async fn a_keys_reply_past_the_ceiling_is_refused_rather_than_gathered() {
         let mut key = format!("{i:02}-").into_bytes();
         key.resize(2 * 1024, b'k');
         pool.dispatch(Command::Set {
-            key,
-            value: b"v".to_vec(),
+            key: Bytes::from(key),
+            value: "v".into(),
             expiry: None,
             cond: None,
             keep_ttl: false,
@@ -262,9 +263,9 @@ async fn a_full_scan_returns_every_key_and_ends_at_zero() {
             let Frame::Bulk(k) = key else {
                 panic!("keys are bulk strings")
             };
-            seen.push(k.clone());
+            seen.push(k.to_vec());
         }
-        cursor = String::from_utf8(next.clone()).unwrap();
+        cursor = String::from_utf8(next.to_vec()).unwrap();
         if unpack_cursor(cursor.parse().expect("this server issued this cursor")).1 != 0 {
             resumed_mid_table = true;
         }
@@ -347,9 +348,9 @@ async fn one_scan_call_crosses_shards_until_it_has_count_keys() {
             let Frame::Bulk(k) = key else {
                 panic!("keys are bulk strings")
             };
-            seen.push(k.clone());
+            seen.push(k.to_vec());
         }
-        cursor = String::from_utf8(next.clone()).unwrap();
+        cursor = String::from_utf8(next.to_vec()).unwrap();
         calls += 1;
         if cursor == "0" {
             break;
@@ -399,9 +400,9 @@ async fn a_scan_with_match_returns_only_the_keys_that_match() {
                 "MATCH let through {}",
                 String::from_utf8_lossy(k)
             );
-            seen.push(k.clone());
+            seen.push(k.to_vec());
         }
-        cursor = String::from_utf8(next.clone()).unwrap();
+        cursor = String::from_utf8(next.to_vec()).unwrap();
         if cursor == "0" {
             break;
         }
@@ -468,8 +469,8 @@ async fn a_scan_step_that_skips_dispatch_at_is_refused_rather_than_misrouted() {
     let pool = ShardPool::spawn(4, 2, DictSeed { k0: 1, k1: 2 }, NoTrace);
     for i in 0..64u32 {
         pool.dispatch(Command::Set {
-            key: format!("k-{i}").into_bytes(),
-            value: b"v".to_vec(),
+            key: Bytes::from(format!("k-{i}")),
+            value: "v".into(),
             expiry: None,
             cond: None,
             keep_ttl: false,

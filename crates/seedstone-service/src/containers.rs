@@ -6,6 +6,7 @@ use crate::dispatch::{Action, COMMANDS, bulk};
 use crate::node::NodeInfo;
 use crate::options::wrong_arity;
 use crate::reply::quote;
+use bytes::Bytes;
 use seedstone_core::glob;
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
 use seedstone_core::shard::{ReplyError, parse_i64};
@@ -124,8 +125,8 @@ pub fn config(sub: &[u8], globs: &[Frame], node: &NodeInfo) -> Result<Action, St
             .iter()
             .any(|pattern| glob::matches(pattern, name.as_bytes()))
         {
-            reply.push(Frame::Bulk(name.as_bytes().to_vec()));
-            reply.push(Frame::Bulk(config_value(name, node).into_bytes()));
+            reply.push(Frame::Bulk(Bytes::from_static(name.as_bytes())));
+            reply.push(Frame::Bulk(Bytes::from(config_value(name, node))));
         }
     }
     Ok(Action::Reply(Frame::Array(reply)))

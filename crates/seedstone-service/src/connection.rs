@@ -751,7 +751,7 @@ mod tests {
         // `MAX_ARRAY_LEN` elements is a length the codec accepts, and its
         // empty `Frame`s alone must fit — otherwise `*1048576\r\n` starts
         // being refused at its header with nothing here to say so. The margin
-        // today is 32 MiB against 64 MiB, and neither `size_of::<Frame>()` nor
+        // today is 40 MiB against 64 MiB, and neither `size_of::<Frame>()` nor
         // `MAX_ARRAY_LEN` is a contract: one wider variant, or one doubling,
         // closes it.
         assert!(MAX_ARRAY_LEN.saturating_mul(size_of::<Frame>()) < MAX_REQUEST_BYTES);

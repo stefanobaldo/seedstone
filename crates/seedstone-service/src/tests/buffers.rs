@@ -7,6 +7,7 @@ use crate::connection::{
     append_frame, flush_replies, resize_connection_buffers, serve_connection_limited,
 };
 use crate::node::NodeInfo;
+use bytes::Bytes;
 use seedstone_core::dict::DictSeed;
 use seedstone_core::shard::{NoTrace, ShardPool};
 use seedstone_resp::{Decoder, DecoderLimits, Frame, MAX_ARRAY_LEN, MAX_BULK_LEN, encode};
@@ -208,9 +209,9 @@ async fn a_request_spanning_many_reads_arrives_whole() {
     let mut out = Vec::new();
     encode(
         &Frame::Array(vec![
-            Frame::Bulk(b"SET".to_vec()),
-            Frame::Bulk(b"k".to_vec()),
-            Frame::Bulk(value.clone()),
+            Frame::Bulk("SET".into()),
+            Frame::Bulk("k".into()),
+            Frame::Bulk(Bytes::from(value.clone())),
         ]),
         &mut out,
     );
@@ -220,7 +221,7 @@ async fn a_request_spanning_many_reads_arrives_whole() {
 
     let frames = read_frames(&mut r, 2).await;
     assert_eq!(frames[0], Frame::Simple("OK".into()));
-    assert_eq!(frames[1], Frame::Bulk(value));
+    assert_eq!(frames[1], Frame::Bulk(Bytes::from(value)));
 }
 
 /// A large reply must not leave its allocation attached to the connection.
@@ -239,7 +240,7 @@ async fn a_large_reply_sheds_its_buffer_before_the_next_one() {
     let mut sink: Vec<u8> = Vec::new();
     let mut out: Vec<u8> = Vec::new();
 
-    append_frame(&mut out, &Frame::Bulk(vec![b'v'; 4 * REPLY_SHED]));
+    append_frame(&mut out, &Frame::Bulk(vec![b'v'; 4 * REPLY_SHED].into()));
     assert!(flush_replies(&mut sink, &mut out, &AtomicU64::new(0)).await);
     assert!(sink.len() > 4 * REPLY_SHED, "the reply was truncated");
     assert!(
@@ -301,11 +302,11 @@ async fn a_quiet_connection_sheds_every_buffer_it_grew() {
     let big = vec![b'v'; 4 * DecoderLimits::SHED];
     let mut wire = Vec::new();
     encode(&req(&["ECHO"]), &mut wire);
-    encode(&Frame::Bulk(big.clone()), &mut wire);
+    encode(&Frame::Bulk(Bytes::from(big.clone())), &mut wire);
     decoder.feed(&wire);
     while matches!(decoder.try_next(), Ok(Some(_))) {}
     let mut sink: Vec<u8> = Vec::new();
-    append_frame(&mut out, &Frame::Bulk(big));
+    append_frame(&mut out, &Frame::Bulk(Bytes::from(big)));
     assert!(flush_replies(&mut sink, &mut out, &AtomicU64::new(0)).await);
     for _ in 0..32 {
         let got = read_buf.len();
@@ -427,9 +428,9 @@ async fn a_connection_that_goes_silent_gives_its_buffers_back() {
     let mut request = Vec::new();
     encode(
         &Frame::Array(vec![
-            Frame::Bulk(b"SET".to_vec()),
-            Frame::Bulk(b"k".to_vec()),
-            Frame::Bulk(value),
+            Frame::Bulk("SET".into()),
+            Frame::Bulk("k".into()),
+            Frame::Bulk(Bytes::from(value)),
         ]),
         &mut request,
     );
@@ -563,9 +564,9 @@ async fn a_connection_the_reads_already_emptied_holds_no_timer() {
     let mut big = Vec::new();
     encode(
         &Frame::Array(vec![
-            Frame::Bulk(b"SET".to_vec()),
-            Frame::Bulk(b"k".to_vec()),
-            Frame::Bulk(vec![b'x'; 512 * 1024]),
+            Frame::Bulk("SET".into()),
+            Frame::Bulk("k".into()),
+            Frame::Bulk(vec![b'x'; 512 * 1024].into()),
         ]),
         &mut big,
     );
@@ -634,7 +635,7 @@ async fn shedding_mid_frame_does_not_disturb_the_frame() {
     let value = vec![b'v'; 4 * DecoderLimits::SHED];
     let mut wire = Vec::new();
     encode(&req(&["ECHO"]), &mut wire);
-    encode(&Frame::Bulk(value.clone()), &mut wire);
+    encode(&Frame::Bulk(Bytes::from(value.clone())), &mut wire);
     let (head, tail) = wire.split_at(wire.len() / 2);
     decoder.feed(head);
     assert!(matches!(decoder.try_next(), Ok(Some(_))), "the name frame");
@@ -652,5 +653,8 @@ async fn shedding_mid_frame_does_not_disturb_the_frame() {
     );
 
     decoder.feed(tail);
-    assert_eq!(decoder.try_next().unwrap(), Some(Frame::Bulk(value)));
+    assert_eq!(
+        decoder.try_next().unwrap(),
+        Some(Frame::Bulk(Bytes::from(value)))
+    );
 }

@@ -10,6 +10,9 @@ publish = false
 [dependencies]
 seedstone-core = { path = "../seedstone-core" }
 seedstone-resp = { path = "../seedstone-resp" }
+# A bulk's payload, as the codec carries it: requests hand it to the core and
+# replies take it back without a copy.
+bytes.workspace = true
 # The workspace entry, and deliberately without the `net` feature: the
 # simulator drives this crate over a simulated transport, so a socket here
 # would put tokio's networking in the deterministic path and unify the feature

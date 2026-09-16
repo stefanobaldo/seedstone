@@ -9,6 +9,7 @@ use crate::expiry::{
     ExpiryForm, ExpiryOption, ExpiryUnit, expiry_unit, remaining_from, set_expire_value,
 };
 use crate::fan_out::SCAN_DEFAULT_COUNT;
+use bytes::Bytes;
 use seedstone_core::shard::{Command, Cond, Expiry, ReplyError, parse_i64};
 use seedstone_resp::Frame;
 
@@ -31,7 +32,7 @@ pub fn per_key(
     args: &mut [Frame],
     name: &'static str,
     fold: Fold,
-    command: fn(Vec<u8>) -> Command,
+    command: fn(Bytes) -> Command,
 ) -> Result<Action, String> {
     match args {
         [] => Err(wrong_arity(name)),
@@ -281,7 +282,7 @@ mod tests {
         let opts = |parts: &[&str]| -> (Option<Vec<u8>>, usize) {
             let owned: Vec<Frame> = parts
                 .iter()
-                .map(|p| Frame::Bulk(p.as_bytes().to_vec()))
+                .map(|p| Frame::Bulk(Bytes::copy_from_slice(p.as_bytes())))
                 .collect();
             scan_options(&owned).expect("these options parse")
         };
@@ -308,8 +309,8 @@ mod tests {
         // the same answer Redis gives, and a different one from a COUNT of
         // zero.
         let owned = vec![
-            Frame::Bulk(b"COUNT".to_vec()),
-            Frame::Bulk(u64::MAX.to_string().into_bytes()),
+            Frame::Bulk("COUNT".into()),
+            Frame::Bulk(Bytes::from(u64::MAX.to_string())),
         ];
         assert_eq!(
             scan_options(&owned),

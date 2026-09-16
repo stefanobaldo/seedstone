@@ -6,6 +6,7 @@ use crate::auth::{AUTH_NOT_CONFIGURED, WRONGPASS};
 use crate::dispatch::{Action, bulk};
 use crate::node::{NodeInfo, SERVER_MODE, SERVER_NAME};
 use crate::reply::{quote, safe_error};
+use bytes::Bytes;
 use seedstone_core::shard::parse_i64;
 use seedstone_resp::Frame;
 
@@ -117,16 +118,16 @@ pub struct Credentials<'a> {
 /// the same two things by construction.
 pub fn hello_frame(node: &NodeInfo) -> Frame {
     Frame::Array(vec![
-        Frame::Bulk(b"server".to_vec()),
-        Frame::Bulk(SERVER_NAME.as_bytes().to_vec()),
-        Frame::Bulk(b"version".to_vec()),
-        Frame::Bulk(node.version.as_bytes().to_vec()),
-        Frame::Bulk(b"proto".to_vec()),
+        Frame::Bulk(Bytes::from_static(b"server")),
+        Frame::Bulk(Bytes::from_static(SERVER_NAME.as_bytes())),
+        Frame::Bulk(Bytes::from_static(b"version")),
+        Frame::Bulk(Bytes::from_static(node.version.as_bytes())),
+        Frame::Bulk(Bytes::from_static(b"proto")),
         Frame::Integer(2),
-        Frame::Bulk(b"mode".to_vec()),
-        Frame::Bulk(SERVER_MODE.as_bytes().to_vec()),
-        Frame::Bulk(b"role".to_vec()),
-        Frame::Bulk(b"master".to_vec()),
+        Frame::Bulk(Bytes::from_static(b"mode")),
+        Frame::Bulk(Bytes::from_static(SERVER_MODE.as_bytes())),
+        Frame::Bulk(Bytes::from_static(b"role")),
+        Frame::Bulk(Bytes::from_static(b"master")),
     ])
 }
 

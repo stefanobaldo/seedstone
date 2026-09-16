@@ -44,7 +44,7 @@ pub fn listed_keys(reply: &Frame) -> Option<(BTreeSet<Vec<u8>>, bool)> {
         let Frame::Bulk(key) = item else {
             return None;
         };
-        repeated |= !keys.insert(key.clone());
+        repeated |= !keys.insert(key.to_vec());
     }
     Some((keys, repeated))
 }

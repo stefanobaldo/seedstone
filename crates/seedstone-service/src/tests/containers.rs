@@ -6,6 +6,7 @@ use crate::connection::serve_connection;
 use crate::containers::CONFIG_PARAMETERS;
 use crate::dispatch::COMMANDS;
 use crate::node::NodeInfo;
+use bytes::Bytes;
 use seedstone_core::dict::DictSeed;
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
 use seedstone_core::shard::{NoTrace, ReplyError, ShardPool};
@@ -24,16 +25,16 @@ async fn hello_reply_shape() {
     assert_eq!(
         frames[0],
         Frame::Array(vec![
-            Frame::Bulk(b"server".to_vec()),
-            Frame::Bulk(b"seedstone".to_vec()),
-            Frame::Bulk(b"version".to_vec()),
-            Frame::Bulk(env!("CARGO_PKG_VERSION").as_bytes().to_vec()),
-            Frame::Bulk(b"proto".to_vec()),
+            Frame::Bulk("server".into()),
+            Frame::Bulk("seedstone".into()),
+            Frame::Bulk("version".into()),
+            Frame::Bulk(Bytes::copy_from_slice(env!("CARGO_PKG_VERSION").as_bytes())),
+            Frame::Bulk("proto".into()),
             Frame::Integer(2),
-            Frame::Bulk(b"mode".to_vec()),
-            Frame::Bulk(b"standalone".to_vec()),
-            Frame::Bulk(b"role".to_vec()),
-            Frame::Bulk(b"master".to_vec()),
+            Frame::Bulk("mode".into()),
+            Frame::Bulk("standalone".into()),
+            Frame::Bulk("role".into()),
+            Frame::Bulk("master".into()),
         ])
     );
 }
@@ -79,12 +80,12 @@ async fn command_subcommands_answer_without_breaking_the_session() {
     );
     assert_eq!(frames[3], Frame::Simple("OK".into()));
     assert_eq!(frames[4], Frame::Array(Vec::new()));
-    assert_eq!(frames[5], Frame::Bulk(b"2".to_vec()));
+    assert_eq!(frames[5], Frame::Bulk("2".into()));
     assert_eq!(
         frames[6],
         Frame::Error("ERR unknown subcommand 'NOSUCH'. Try COMMAND HELP.".into())
     );
-    assert_eq!(frames[7], Frame::Bulk(b"1".to_vec()));
+    assert_eq!(frames[7], Frame::Bulk("1".into()));
 }
 
 /// `COMMAND COUNT` is the table's length, so the number is only truthful
@@ -106,7 +107,10 @@ async fn every_name_in_the_command_table_is_a_command_the_server_runs() {
         .collect();
     let mut out = Vec::new();
     for name in &names {
-        encode(&Frame::Array(vec![Frame::Bulk(name.to_vec())]), &mut out);
+        encode(
+            &Frame::Array(vec![Frame::Bulk(Bytes::copy_from_slice(name))]),
+            &mut out,
+        );
     }
     w.write_all(&out).await.unwrap();
     w.flush().await.unwrap();
@@ -302,10 +306,7 @@ async fn config_get_matches_a_parameter_without_case_and_a_key_with_it() {
         Frame::Array(Vec::new()),
         "a key walk folded case, and keys are bytes"
     );
-    assert_eq!(
-        frames[5],
-        Frame::Array(vec![Frame::Bulk(b"Alpha".to_vec())])
-    );
+    assert_eq!(frames[5], Frame::Array(vec![Frame::Bulk("Alpha".into())]));
 }
 
 /// The password is never in the reply. Redis reports `requirepass` as an
@@ -504,8 +505,8 @@ fn pairs(entries: &[(&str, &str)]) -> Frame {
             .iter()
             .flat_map(|(name, value)| {
                 [
-                    Frame::Bulk(name.as_bytes().to_vec()),
-                    Frame::Bulk(value.as_bytes().to_vec()),
+                    Frame::Bulk(Bytes::copy_from_slice(name.as_bytes())),
+                    Frame::Bulk(Bytes::copy_from_slice(value.as_bytes())),
                 ]
             })
             .collect(),

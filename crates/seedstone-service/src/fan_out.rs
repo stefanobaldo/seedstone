@@ -7,6 +7,7 @@ use crate::connection::CHUNK_COMMANDS;
 use crate::dispatch::{Fold, Gather};
 use crate::reply::{UNRENDERABLE_REPLY, reply_to_frame};
 use crate::walk;
+use bytes::Bytes;
 use seedstone_core::shard::{Command, Reply, ReplyError, Router};
 use seedstone_resp::Frame;
 use std::future::{Future, poll_fn};
@@ -35,14 +36,14 @@ use std::task::Poll;
 /// budget.
 ///
 /// **The per-key constant is worth writing out, because "a constant" reads as
-/// small and this one is not.** Every gathered key costs a `Frame` — 32 bytes,
-/// the `Vec` header inline in the enum — plus its own heap allocation, which
+/// small and this one is not.** Every gathered key costs a `Frame` — 40 bytes,
+/// the `Bytes` header inline in the enum — plus its own heap allocation, which
 /// no allocator serves below about 16 bytes however short the key is. Call it
-/// ~48 bytes of overhead against however many bytes of key name are counted
+/// ~56 bytes of overhead against however many bytes of key name are counted
 /// here. At the short keys a cache actually holds that ratio is the whole
 /// story: **one-byte keys reach this ceiling only after ~67 million of them,
-/// whose headers and allocations alone are over 3 GB** — some fifty times the
-/// figure this constant names, and none of it counted. The reason that is
+/// whose headers and allocations alone are over 3.5 GB** — some fifty-five
+/// times the figure this constant names, and none of it counted. The reason that is
 /// tolerable is not the arithmetic but the keyspace: `maxmemory` bounds how
 /// many keys can exist to be gathered, and a node that could hold 67 million
 /// of them was configured to.
@@ -288,7 +289,11 @@ pub async fn keys<R: Router>(router: &R, pattern: Vec<u8>, ceiling: usize) -> Fr
     }
     all.sort_unstable();
     all.dedup();
-    Frame::Array(all.into_iter().map(Frame::Bulk).collect())
+    Frame::Array(
+        all.into_iter()
+            .map(|key| Frame::Bulk(Bytes::from(key)))
+            .collect(),
+    )
 }
 
 /// One `SCAN` call: as many shards as its budget crosses, and the cursor the
@@ -368,8 +373,12 @@ pub async fn scan<R: Router>(
         // A bulk string, not an integer: that is what Redis sends and what
         // clients parse. A client that fed an integer back would be sending a
         // cursor this server never issued.
-        Frame::Bulk(next.to_string().into_bytes()),
-        Frame::Array(keys.into_iter().map(Frame::Bulk).collect()),
+        Frame::Bulk(Bytes::from(next.to_string())),
+        Frame::Array(
+            keys.into_iter()
+                .map(|key| Frame::Bulk(Bytes::from(key)))
+                .collect(),
+        ),
     ])
 }
 

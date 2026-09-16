@@ -67,7 +67,7 @@ async fn a_password_gates_every_command_until_auth() {
     );
     assert_eq!(after[2], Frame::Simple("OK".into()));
     assert_eq!(after[3], Frame::Simple("OK".into()));
-    assert_eq!(after[4], Frame::Bulk(b"v".to_vec()));
+    assert_eq!(after[4], Frame::Bulk("v".into()));
     assert_eq!(
         after[5],
         Frame::Simple("OK".into()),
@@ -255,7 +255,7 @@ async fn a_refused_hello_is_counted_in_commandstats() {
     let Frame::Bulk(text) = &frames[2] else {
         panic!("INFO answered {:?}", frames[2])
     };
-    let text = String::from_utf8(text.clone()).unwrap();
+    let text = String::from_utf8(text.to_vec()).unwrap();
     assert!(
         text.contains("cmdstat_hello:calls=1,"),
         "one refused handshake, one call: {text}"
@@ -482,5 +482,5 @@ async fn a_swap_keeps_the_authenticated_connection_and_gates_the_next() {
     let frames = read_frames(&mut r2, 3).await;
     assert_eq!(frames[0], Frame::Error(WRONGPASS.to_owned()));
     assert_eq!(frames[1], Frame::Simple("OK".into()));
-    assert_eq!(frames[2], Frame::Bulk(b"v".to_vec()));
+    assert_eq!(frames[2], Frame::Bulk("v".into()));
 }

@@ -4,6 +4,7 @@
 use crate::auth::{PasswordStore, Passwords, Secret};
 use crate::connection::serve_connection;
 use crate::node::NodeInfo;
+use bytes::Bytes;
 use seedstone_core::dict::DictSeed;
 use seedstone_core::shard::{NoTrace, ShardPool};
 use seedstone_resp::{Frame, parse};
@@ -90,7 +91,7 @@ pub fn req(parts: &[&str]) -> Frame {
     Frame::Array(
         parts
             .iter()
-            .map(|p| Frame::Bulk(p.as_bytes().to_vec()))
+            .map(|p| Frame::Bulk(Bytes::copy_from_slice(p.as_bytes())))
             .collect(),
     )
 }

@@ -273,6 +273,7 @@ dependencies = [
 name = "seedstone-service"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "seedstone-core",
  "seedstone-resp",
  "tokio",
@@ -282,6 +283,7 @@ dependencies = [
 name = "seedstone-sim"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "rand 0.10.2",
  "seedstone-core",
  "seedstone-resp",

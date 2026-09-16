@@ -10,6 +10,7 @@ use crate::hello::NOPROTO;
 use crate::node::NodeInfo;
 use crate::options::SYNTAX_ERROR;
 use crate::reply::{UNRENDERABLE_REPLY, reply_to_frame};
+use bytes::Bytes;
 use seedstone_core::dict::DictSeed;
 use seedstone_core::shard::{Command, NoTrace, Reply, Router, ShardPool};
 use seedstone_resp::{Frame, MAX_ARRAY_LEN, MAX_BULK_LEN};
@@ -65,8 +66,8 @@ async fn every_error_constant_is_frame_safe() {
 
     let pool = ShardPool::spawn(1, 1, DictSeed { k0: 3, k1: 5 }, NoTrace);
     pool.dispatch(Command::Set {
-        key: b"present".to_vec(),
-        value: b"v".to_vec(),
+        key: "present".into(),
+        value: "v".into(),
         expiry: None,
         cond: None,
         keep_ttl: false,
@@ -75,7 +76,11 @@ async fn every_error_constant_is_frame_safe() {
     .await;
     for key in [b"present".to_vec(), b"absent".to_vec()] {
         let named = String::from_utf8_lossy(&key).into_owned();
-        let reply = pool.dispatch(Command::Type { key }).await;
+        let reply = pool
+            .dispatch(Command::Type {
+                key: Bytes::from(key),
+            })
+            .await;
         assert!(
             matches!(reply, Reply::Status(_)),
             "TYPE {named} answered {reply:?} rather than a status"
