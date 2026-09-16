@@ -12,6 +12,11 @@ use seedstone_core::dict::DictSeed;
 use seedstone_service::RUN_ID_HEX;
 use seedstone_service::log::{BIND_FAILED, Field, LISTENING};
 
+/// The process's allocator — see the manifest for why it is this one and
+/// why it is declared in the binary alone.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let mut args = std::env::args().skip(1).peekable();
     // Answered before anything is parsed, bound, or drawn from the operating

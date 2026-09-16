@@ -17,6 +17,18 @@ seedstone-service = { path = "../seedstone-service" }
 # only while their tokio stays netless.
 tokio = { workspace = true, features = ["net", "signal", "rt-multi-thread"] }
 getrandom.workspace = true
+# The binary's global allocator. Profiled with perf (aarch64, glibc 2.39,
+# 2026-09-14), glibc's malloc and free — arena locking included — sat under
+# 46 to 63 % of the server's CPU samples on five shapes: deep-pipelined GET,
+# SET, SET with an expiry, MGET and KEYS; under the same instrument Redis
+# 8.10.0 spent 0.02 to 0.28 % in any allocator on the GET, MGET and KEYS
+# shapes. This server frees across threads on its request path: a connection
+# allocates the command an executor frees, and the executor allocates the
+# reply the connection frees. mimalloc keeps per-thread free
+# lists and takes a free from another thread without a shared lock.
+# Declared here and nowhere else: the library crates and the simulator stay
+# on the system allocator, so nothing in the deterministic core depends on it.
+mimalloc = "0.1.52"
 
 [lints]
 workspace = true
