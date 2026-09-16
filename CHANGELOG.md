@@ -65,6 +65,9 @@ SemVer and are `0.x` until the server persists data;
 
 ### Fixed
 
+- An empty line between pipelined commands is ignored, as Redis ignores it.
+  `redis-cli --pipe` writes one at the end of every transfer, and a transfer
+  that ended in a protocol error and a closed connection now completes.
 - The largest expiry span a command accepts is now Redis's: `now` plus the span
   must fit a signed 64-bit millisecond clock, so the ceiling is clock-relative
   and moves by one every second. `SET … EX`, `SETEX`, `EXPIRE` and their

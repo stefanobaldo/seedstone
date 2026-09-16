@@ -131,6 +131,16 @@ expect "expireat refuses a non-integer" \
 r info | grep -q '^# Server'
 r info | grep -q '^connected_clients:'
 
+# `--pipe` writes a bare CRLF after the last command it was given, ahead of
+# the ECHO that closes the transfer, and Redis skips it. `--pipe` reports what
+# it saw; one reply per command and no errors is the assertion.
+pipe=$(printf '*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$4\r\npipe\r\n$2\r\nok\r\n' | redis-cli -p "$PORT" --pipe)
+case $pipe in
+    *"errors: 0, replies: 2"*) ;;
+    *) echo "pipe: expected 'errors: 0, replies: 2' in: $pipe" >&2; exit 1 ;;
+esac
+expect "the value the pipe wrote" ok r get pipe
+
 # Exit code is the whole assertion: the benchmark fails the run if a single
 # reply is malformed, and it is the only client here that pipelines.
 redis-benchmark -p "$PORT" -n 1000 -c 8 -t set,get -q

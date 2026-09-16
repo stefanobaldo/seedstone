@@ -115,3 +115,12 @@ page was written. One shape covers all of them — `ERR unknown command
   decide it in. The `NOAUTH` sentence a bare unauthenticated `HELLO 2` gets is
   6.2.24's wording; 8.10.1 spells the same refusal with `the HELLO <proto> AUTH
   <user> <pass> option`.
+
+- **An empty line between commands is ignored.** `\r\n` where a command
+  would start is skipped, as Redis 7.4.11 does — it reads the line as an
+  inline command with no words. `redis-cli --pipe` (8.10.0) writes one after
+  the last command of every transfer, ahead of the `ECHO` it closes the
+  transfer with, so a transfer that ended in `ERR Protocol error: unknown
+  RESP2 type byte: 0x0d` and a closed connection now completes. Inside a
+  command — where an array element is due — the same bytes are still a
+  protocol error, as they are on 7.4.11.
