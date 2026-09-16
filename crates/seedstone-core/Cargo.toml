@@ -10,6 +10,10 @@ publish = false
 [dependencies]
 tokio.workspace = true
 siphasher.workspace = true
+# A byte string whose clone is a refcount. Values and keys are stored as
+# one so a `GET` hands the reply the stored bytes by reference rather than
+# by copy; the crate is already in the graph through tokio's `io-util`.
+bytes.workspace = true
 
 
 # `test-util` is what makes `tokio::time` a clock a test can hold still and

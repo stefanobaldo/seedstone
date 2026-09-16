@@ -1288,3 +1288,31 @@ fn an_empty_dict_offers_no_victim() {
     let dict = Dict::with_seed(DictSeed { k0: 1, k1: 2 });
     assert_eq!(dict.sample_oldest(&mut 0, 5, None), None);
 }
+
+/// `Bytes::from(Vec<u8>)` keeps the vector's allocation — with and without
+/// spare capacity. Measured rather than assumed: the whole point of storing
+/// a `Bytes` is that the bytes the codec produced go into the keyspace
+/// without a second copy, and a library that copied here would move the
+/// copy from `GET` to `SET` instead of removing it.
+#[test]
+fn a_bytes_from_a_vec_keeps_the_vecs_allocation() {
+    for capacity in [64usize, 100] {
+        let mut vec = Vec::with_capacity(capacity);
+        vec.extend_from_slice(&[7u8; 64]);
+        let ptr = vec.as_ptr();
+        let bytes = bytes::Bytes::from(vec);
+        assert_eq!(
+            bytes.as_ptr(),
+            ptr,
+            "capacity {capacity}: the bytes were copied"
+        );
+        assert_eq!(&bytes[..], &[7u8; 64]);
+    }
+}
+
+/// A `Bytes` is four words. The per-entry overhead below is derived from
+/// it, so the number is held here rather than trusted.
+#[test]
+fn bytes_is_four_words() {
+    assert_eq!(size_of::<bytes::Bytes>(), 32);
+}
