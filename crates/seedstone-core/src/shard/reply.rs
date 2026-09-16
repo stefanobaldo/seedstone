@@ -108,7 +108,7 @@ pub enum Reply {
         /// The keys this step visited that survived the pattern, in the order
         /// the table gave them up. Possibly empty with a non-zero cursor: a
         /// step's budget is buckets, and buckets can be empty.
-        keys: Vec<Vec<u8>>,
+        keys: Vec<Bytes>,
         /// How many buckets this step visited — the edge's unit of budget
         /// when one call walks more than one shard. At least one; at most
         /// what the step was asked for; exactly the table's size when the
