@@ -489,6 +489,32 @@ impl Decoding {
             return Ok(self.finish_bulk(buf, header, len)?.map(Element::Value));
         }
 
+        // An empty line between two frames is no frame. Redis reads it as an
+        // inline command with no words and does nothing — measured on 7.4.11:
+        // `\r\n*1\r\n$4\r\nPING\r\n` answers `+PONG` — and `redis-cli --pipe`
+        // (8.10.0) writes one after the last command of every transfer, ahead
+        // of the `ECHO` it closes the transfer with. Only at the top level:
+        // inside an array an element is owed, and a `\r` where a type byte is
+        // due is the unknown byte it always was. The skipped bytes move
+        // `frame_start` so they are compacted with the frames before them
+        // and never priced against the frame that follows.
+        if self.stack.is_empty() && matches!(self.partial, Partial::Start) {
+            while buf.get(self.scan) == Some(&b'\r') {
+                match buf.get(self.scan + 1) {
+                    Some(b'\n') => {
+                        self.scan += 2;
+                        self.frame_start = self.scan;
+                        self.examined = self.examined.saturating_add(2);
+                    }
+                    // A lone `\r` at the end: wait for the byte after it.
+                    None => return Ok(None),
+                    // `\r` followed by anything else is a type byte — the
+                    // refusal below names it.
+                    Some(_) => break,
+                }
+            }
+        }
+
         let Some(&type_byte) = buf.get(self.scan) else {
             return Ok(None);
         };

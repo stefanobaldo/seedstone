@@ -297,6 +297,69 @@ fn an_unknown_type_byte_is_refused_before_a_terminator_is_waited_for() {
     }
 }
 
+/// An empty line between two top-level frames is not a frame: Redis
+/// 7.4.11 answers `+PONG` to `\r\n*1\r\n$4\r\nPING\r\n`, and `redis-cli
+/// --pipe` (8.10.0) writes `\r\n` between the last command of a transfer
+/// and the `ECHO` that closes it. The skipped bytes count as consumed, so the
+/// caller's cursor lands on the frame that followed them.
+#[test]
+fn an_empty_line_between_frames_is_skipped() {
+    let wire = b"\r\n*1\r\n$4\r\nPING\r\n";
+    assert_eq!(
+        parse(wire),
+        Ok(Some((
+            Frame::Array(vec![Frame::Bulk(b"PING".to_vec())]),
+            wire.len()
+        )))
+    );
+    // Several in a row, and one after a frame: each is skipped on its own.
+    let wire = b"\r\n\r\n+OK\r\n\r\n:1\r\n";
+    let (first, used) = parse(wire).unwrap().unwrap();
+    assert_eq!(first, Frame::Simple("OK".into()));
+    assert_eq!(&wire[used..], b"\r\n:1\r\n");
+    let (second, used2) = parse(&wire[used..]).unwrap().unwrap();
+    assert_eq!(second, Frame::Integer(1));
+    assert_eq!(used + used2, wire.len());
+}
+
+/// The skip is a property of the frame boundary, not of the bytes: a
+/// `\r\n` where an array element is due is still an unknown type byte —
+/// Redis 7.4.11 refuses the same bytes as a protocol error and closes — and
+/// a lone `\r` at the end of the input waits for the byte after it.
+#[test]
+fn an_empty_line_inside_an_array_is_still_refused() {
+    let err = parse(b"*2\r\n\r\n$1\r\na\r\n").unwrap_err();
+    assert!(
+        err.to_string().starts_with("unknown RESP2 type byte: 0x0d"),
+        "{err}"
+    );
+    assert_eq!(parse(b"\r"), Ok(None));
+    assert_eq!(
+        parse(b"+OK\r\n\r"),
+        Ok(Some((Frame::Simple("OK".into()), 5)))
+    );
+    // A `\r` followed by anything but `\n` is a type byte, and an unknown one.
+    let err = parse(b"\rx").unwrap_err();
+    assert!(
+        err.to_string().starts_with("unknown RESP2 type byte: 0x0d"),
+        "{err}"
+    );
+}
+
+/// The skip survives every chunking: a `\r` that arrives alone waits for
+/// its `\n`, and the frame behind the empty line is delivered whole.
+#[test]
+fn an_empty_line_is_skipped_under_every_chunking() {
+    let wire = b"\r\n*1\r\n$4\r\nPING\r\n\r\n+OK\r\n";
+    let want = vec![
+        Frame::Array(vec![Frame::Bulk(b"PING".to_vec())]),
+        Frame::Simple("OK".into()),
+    ];
+    for chunk in 1..=wire.len() {
+        assert_eq!(drain_in_chunks(wire, chunk).unwrap(), want, "chunk={chunk}");
+    }
+}
+
 #[test]
 fn parse_refuses_an_incomplete_frame_past_the_buffering_limit() {
     // `parse` runs on `DecoderLimits::default()`, so the one-shot path
