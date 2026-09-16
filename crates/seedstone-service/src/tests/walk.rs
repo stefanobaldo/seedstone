@@ -194,7 +194,7 @@ async fn a_keys_reply_past_the_ceiling_is_refused_rather_than_gathered() {
 
     // Matched rather than compared, here and below, so a failure reports
     // the shape it got instead of printing 128 KiB of key names.
-    match keys(&pool, b"*".to_vec(), 4096).await {
+    match keys(&pool, Bytes::from_static(b"*"), 4096).await {
         Frame::Error(text) => assert_eq!(text, KEYS_TOO_LARGE),
         Frame::Array(gathered) => panic!(
             "128 KiB of key names under a 4 KiB ceiling gathered {} keys instead of refusing",
@@ -203,7 +203,7 @@ async fn a_keys_reply_past_the_ceiling_is_refused_rather_than_gathered() {
         other => panic!("KEYS answered {other:?} rather than refusing"),
     }
 
-    let answer = keys(&pool, b"*".to_vec(), usize::MAX).await;
+    let answer = keys(&pool, Bytes::from_static(b"*"), usize::MAX).await;
     let Frame::Array(found) = answer else {
         panic!("an unbounded KEYS must answer an array, got {answer:?}");
     };

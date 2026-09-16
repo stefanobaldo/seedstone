@@ -193,17 +193,24 @@ pub fn claim(held: &mut Option<ExpiryOption>, option: ExpiryOption) -> Result<()
 /// server's own occupancy ceiling bounds anyway: [`WALK_STEP_BUCKETS`] ends
 /// the call whatever the target says, and one call dispatches at most one
 /// envelope per shard.
-pub fn scan_options(mut rest: &[Frame]) -> Result<(Option<Vec<u8>>, usize), String> {
+///
+/// The pattern is taken out of its frame rather than copied, so a walk carries
+/// the bytes the request arrived with to every step it takes.
+pub fn scan_options(mut rest: &mut [Frame]) -> Result<(Option<Bytes>, usize), String> {
     let mut pattern = None;
     let mut count = SCAN_DEFAULT_COUNT;
-    while let Some((option, tail)) = rest.split_first() {
-        let (value, after) = tail.split_first().ok_or_else(|| SYNTAX_ERROR.to_owned())?;
-        let (option, value) = (bulk(option), bulk(value));
+    // Taken rather than reborrowed, so that `rest = after` can hand the tail
+    // back for the whole of the slice's lifetime.
+    while let Some((option, tail)) = std::mem::take(&mut rest).split_first_mut() {
+        let (value, after) = tail
+            .split_first_mut()
+            .ok_or_else(|| SYNTAX_ERROR.to_owned())?;
+        let option = bulk(option);
         if option.eq_ignore_ascii_case(b"MATCH") {
-            pattern = Some(value.to_vec());
+            pattern = Some(take_bulk(value));
         } else if option.eq_ignore_ascii_case(b"COUNT") {
-            let n =
-                parse_i64(value).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
+            let n = parse_i64(bulk(value))
+                .ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
             if n <= 0 {
                 return Err(SYNTAX_ERROR.to_owned());
             }
@@ -279,19 +286,19 @@ mod tests {
     /// number substituted at parse time.
     #[test]
     fn scan_options_take_the_last_occurrence_and_pass_count_through() {
-        let opts = |parts: &[&str]| -> (Option<Vec<u8>>, usize) {
-            let owned: Vec<Frame> = parts
+        let opts = |parts: &[&str]| -> (Option<Bytes>, usize) {
+            let mut owned: Vec<Frame> = parts
                 .iter()
                 .map(|p| Frame::Bulk(Bytes::copy_from_slice(p.as_bytes())))
                 .collect();
-            scan_options(&owned).expect("these options parse")
+            scan_options(&mut owned).expect("these options parse")
         };
 
         assert_eq!(opts(&[]), (None, SCAN_DEFAULT_COUNT));
         assert_eq!(opts(&["COUNT", "7"]).1, 7);
         assert_eq!(
             opts(&["MATCH", "a*", "MATCH", "b*"]).0,
-            Some(b"b*".to_vec()),
+            Some(Bytes::from_static(b"b*")),
             "a repeated option is its last occurrence, as SET's are"
         );
 
@@ -308,12 +315,12 @@ mod tests {
         // Past what an i64 spells is not a large COUNT, it is not a number —
         // the same answer Redis gives, and a different one from a COUNT of
         // zero.
-        let owned = vec![
+        let mut owned = vec![
             Frame::Bulk("COUNT".into()),
             Frame::Bulk(Bytes::from(u64::MAX.to_string())),
         ];
         assert_eq!(
-            scan_options(&owned),
+            scan_options(&mut owned),
             Err(ReplyError::NotAnInteger.wire_text().to_owned())
         );
     }

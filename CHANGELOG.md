@@ -62,6 +62,8 @@ SemVer and are `0.x` until the server persists data;
   reference-counted byte strings. The fixed cost per key in `used_memory`'s
   accounting is 96 bytes where it was 80, so the same `--maxmemory` holds
   somewhat fewer keys before evicting.
+- `KEYS` and `SCAN` return key names without copying them, and the pattern
+  is shared across the steps of a walk rather than copied per step.
 
 ### Removed
 
