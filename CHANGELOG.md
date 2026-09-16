@@ -54,6 +54,9 @@ SemVer and are `0.x` until the server persists data;
 - A password file with an empty line, a whitespace-only line or more than
   two lines is refused at startup, naming the rule. Before, a file ending in
   two newlines was accepted with the second newline as part of the password.
+- A command's name is matched against the table without being copied, and
+  its arguments are read in place; a request no longer costs two
+  allocations before its handler runs.
 
 ### Removed
 

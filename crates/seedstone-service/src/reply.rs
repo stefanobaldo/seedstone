@@ -63,8 +63,8 @@ impl CommandLabel {
     }
 }
 
-/// The static name a recognised command is logged under, given its
-/// ASCII-uppercased name, or `None` for a name neither table holds.
+/// The static name a recognised command is logged under, given its name in
+/// any case, or `None` for a name neither table holds.
 ///
 /// [`KIND_NAMES`] and [`EDGE_NAMES`] are the two vocabularies `commandstats`
 /// prints, so a log line drawn from them names a command exactly as the
@@ -78,7 +78,7 @@ impl CommandLabel {
 /// `get` and `set` resolve in two comparisons of three bytes, and the scan a
 /// keyed command pays here is the shape of the one it already pays in
 /// [`edge_slot`].
-pub fn known_name(upper: &[u8]) -> Option<&'static str> {
+pub fn known_name(name: &[u8]) -> Option<&'static str> {
     KIND_NAMES
         .iter()
         .chain(EDGE_NAMES.iter())
@@ -86,7 +86,7 @@ pub fn known_name(upper: &[u8]) -> Option<&'static str> {
         // Slot `0` of `KIND_NAMES` is no command, and its empty name would
         // match nothing a peer can send — but a table entry that matches by
         // being empty is not something to leave to the caller.
-        .find(|name| !name.is_empty() && name.as_bytes().eq_ignore_ascii_case(upper))
+        .find(|known| !known.is_empty() && known.as_bytes().eq_ignore_ascii_case(name))
 }
 
 /// One JSON line describing one error reply: [`ERROR_REPLY`] rendered by

@@ -343,7 +343,38 @@ pub fn frame_to_action(frame: Frame, node: &NodeInfo) -> (Action, CommandLabel) 
 /// command has any use for the node it is handed. The uniformity is the point:
 /// it is what lets the surface be a table rather than a match, and the table is
 /// what keeps `COMMAND COUNT` from drifting away from it.
-pub type Handler = fn(&mut [Vec<u8>], &NodeInfo) -> Result<Action, String>;
+///
+/// The arguments are the frame's own parts, every one a [`Frame::Bulk`] by
+/// the time a handler sees them. They are handed over in place rather than
+/// copied into a `Vec<Vec<u8>>` first: that vector was one allocation per
+/// request, on every request, for the sake of a nicer slice pattern. [`bulk`]
+/// and [`take_bulk`] are the two ways a handler reads a part.
+pub type Handler = fn(&mut [Frame], &NodeInfo) -> Result<Action, String>;
+
+/// The bytes of one argument.
+///
+/// Every part reaching a handler is a bulk — [`action_for`] refuses the
+/// request before any handler runs otherwise — so the other arms are not
+/// reachable. They answer an empty slice rather than panicking, because a
+/// handler that read an argument the check let through is a bug to find in a
+/// test, not a reason to take a connection down.
+#[must_use]
+pub fn bulk(frame: &Frame) -> &[u8] {
+    match frame {
+        Frame::Bulk(bytes) => bytes,
+        _ => &[],
+    }
+}
+
+/// One argument, taken: the bulk's bytes move out and an empty bulk stays
+/// behind, which is what `take` on a vector of arguments did.
+#[must_use]
+pub fn take_bulk(frame: &mut Frame) -> Vec<u8> {
+    match frame {
+        Frame::Bulk(bytes) => take(bytes),
+        _ => Vec::new(),
+    }
+}
 
 /// Every command name this server answers.
 ///
@@ -372,7 +403,9 @@ pub fn command_names() -> impl Iterator<Item = &'static [u8]> {
 /// `args` is emptied as it is matched: see [`action_for`].
 pub const COMMANDS: &[(&[u8], Handler)] = &[
     (b"GET", |args, _| match args {
-        [key] => Ok(Action::Dispatch(Command::Get { key: take(key) })),
+        [key] => Ok(Action::Dispatch(Command::Get {
+            key: take_bulk(key),
+        })),
         _ => Err(wrong_arity("get")),
     }),
     (b"SET", |args, node| match args {
@@ -381,8 +414,8 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
             // option leaves nothing half-consumed.
             let options = set_options(options, node)?;
             Ok(Action::Dispatch(Command::Set {
-                key: take(key),
-                value: take(value),
+                key: take_bulk(key),
+                value: take_bulk(value),
                 expiry: options.expiry,
                 cond: options.cond,
                 keep_ttl: options.keep_ttl,
@@ -405,41 +438,47 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
     }),
     (b"EXPIRE", |args, node| match args {
         [key, seconds] => {
-            let seconds = expire_seconds(seconds, node)?;
+            let seconds = expire_seconds(bulk(seconds), node)?;
             Ok(Action::Dispatch(Command::Expire {
-                key: take(key),
+                key: take_bulk(key),
                 seconds,
             }))
         }
         _ => Err(wrong_arity("expire")),
     }),
     (b"TTL", |args, _| match args {
-        [key] => Ok(Action::Dispatch(Command::Ttl { key: take(key) })),
+        [key] => Ok(Action::Dispatch(Command::Ttl {
+            key: take_bulk(key),
+        })),
         _ => Err(wrong_arity("ttl")),
     }),
     (b"PEXPIRE", |args, node| match args {
         [key, millis] => {
-            let millis = expire_millis(millis, node)?;
+            let millis = expire_millis(bulk(millis), node)?;
             Ok(Action::Dispatch(Command::PExpire {
-                key: take(key),
+                key: take_bulk(key),
                 millis,
             }))
         }
         _ => Err(wrong_arity("pexpire")),
     }),
     (b"PERSIST", |args, _| match args {
-        [key] => Ok(Action::Dispatch(Command::Persist { key: take(key) })),
+        [key] => Ok(Action::Dispatch(Command::Persist {
+            key: take_bulk(key),
+        })),
         _ => Err(wrong_arity("persist")),
     }),
     (b"PTTL", |args, _| match args {
-        [key] => Ok(Action::Dispatch(Command::PTtl { key: take(key) })),
+        [key] => Ok(Action::Dispatch(Command::PTtl {
+            key: take_bulk(key),
+        })),
         _ => Err(wrong_arity("pttl")),
     }),
     (b"EXPIREAT", |args, node| match args {
         [key, at] => {
-            let millis = absolute_deadline_span(at, 1000, "expireat", node)?;
+            let millis = absolute_deadline_span(bulk(at), 1000, "expireat", node)?;
             Ok(Action::Dispatch(Command::ExpireAt {
-                key: take(key),
+                key: take_bulk(key),
                 millis,
             }))
         }
@@ -447,9 +486,9 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
     }),
     (b"PEXPIREAT", |args, node| match args {
         [key, at] => {
-            let millis = absolute_deadline_span(at, 1, "pexpireat", node)?;
+            let millis = absolute_deadline_span(bulk(at), 1, "pexpireat", node)?;
             Ok(Action::Dispatch(Command::PExpireAt {
-                key: take(key),
+                key: take_bulk(key),
                 millis,
             }))
         }
@@ -457,21 +496,25 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
     }),
     (b"INCRBY", |args, _| match args {
         [key, delta] => {
-            let delta =
-                parse_i64(delta).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
+            let delta = parse_i64(bulk(delta))
+                .ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
             Ok(Action::Dispatch(Command::IncrBy {
-                key: take(key),
+                key: take_bulk(key),
                 delta,
             }))
         }
         _ => Err(wrong_arity("incrby")),
     }),
     (b"TYPE", |args, _| match args {
-        [key] => Ok(Action::Dispatch(Command::Type { key: take(key) })),
+        [key] => Ok(Action::Dispatch(Command::Type {
+            key: take_bulk(key),
+        })),
         _ => Err(wrong_arity("type")),
     }),
     (b"STRLEN", |args, _| match args {
-        [key] => Ok(Action::Dispatch(Command::StrLen { key: take(key) })),
+        [key] => Ok(Action::Dispatch(Command::StrLen {
+            key: take_bulk(key),
+        })),
         _ => Err(wrong_arity("strlen")),
     }),
     // The last of the keyed commands, and the one with the least traffic
@@ -489,12 +532,17 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
             // The ceiling is `SET … EX`'s, so the two spellings of one write
             // agree with each other. Whether that ceiling is Redis's is a
             // separate question, answered at `MAX_EXPIRE_SECONDS`.
-            let seconds =
-                set_expire_value(seconds, MAX_EXPIRE_SECONDS, "setex", node, Some(1_000))?;
+            let seconds = set_expire_value(
+                bulk(seconds),
+                MAX_EXPIRE_SECONDS,
+                "setex",
+                node,
+                Some(1_000),
+            )?;
             Ok(Action::Dispatch(Command::SetEx {
-                key: take(key),
+                key: take_bulk(key),
                 seconds,
-                value: take(value),
+                value: take_bulk(value),
             }))
         }
         _ => Err(wrong_arity("setex")),
@@ -504,8 +552,8 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
     // ahead of the keyed commands that carry the load.
     (b"SETNX", |args, _| match args {
         [key, value] => Ok(Action::Dispatch(Command::SetNx {
-            key: take(key),
-            value: take(value),
+            key: take_bulk(key),
+            value: take_bulk(value),
         })),
         _ => Err(wrong_arity("setnx")),
     }),
@@ -524,11 +572,12 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
             // span command shares — see [`refuse_past_the_clock`]. Measured
             // on 6.2.24 and 8.10.1, `PSETEX k 9223372036854775807 v` is
             // refused, and so is `SET k v PX 9223372036854775807`.
-            let millis = set_expire_value(millis, MAX_EXPIRE_MILLIS, "psetex", node, Some(1))?;
+            let millis =
+                set_expire_value(bulk(millis), MAX_EXPIRE_MILLIS, "psetex", node, Some(1))?;
             Ok(Action::Dispatch(Command::PSetEx {
-                key: take(key),
+                key: take_bulk(key),
                 millis,
-                value: take(value),
+                value: take_bulk(value),
             }))
         }
         _ => Err(wrong_arity("psetex")),
@@ -542,12 +591,12 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
         _ => Err(wrong_arity("dbsize")),
     }),
     (b"KEYS", |args, _| match args {
-        [pattern] => Ok(Action::Unbatched(Unbatched::Keys(take(pattern)))),
+        [pattern] => Ok(Action::Unbatched(Unbatched::Keys(take_bulk(pattern)))),
         _ => Err(wrong_arity("keys")),
     }),
     (b"SCAN", |args, _| match args {
         [cursor, options @ ..] => {
-            let cursor = parse_u64(cursor).ok_or_else(|| INVALID_CURSOR.to_owned())?;
+            let cursor = parse_u64(bulk(cursor)).ok_or_else(|| INVALID_CURSOR.to_owned())?;
             let (pattern, count) = scan_options(options)?;
             Ok(Action::Unbatched(Unbatched::Scan {
                 cursor,
@@ -570,17 +619,17 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
     // ever hearing of it, because there is no key to route on.
     (b"PING", |args, _| match args {
         [] => Ok(Action::Reply(Frame::Simple("PONG".into()))),
-        [message] => Ok(Action::Reply(Frame::Bulk(take(message)))),
+        [message] => Ok(Action::Reply(Frame::Bulk(take_bulk(message)))),
         _ => Err(wrong_arity("ping")),
     }),
     (b"ECHO", |args, _| match args {
-        [message] => Ok(Action::Reply(Frame::Bulk(take(message)))),
+        [message] => Ok(Action::Reply(Frame::Bulk(take_bulk(message)))),
         _ => Err(wrong_arity("echo")),
     }),
     (b"AUTH", |args, node| {
         let (user, pass) = match &*args {
-            [pass] => (None, pass),
-            [user, pass] => (Some(user), pass),
+            [pass] => (None, bulk(pass)),
+            [user, pass] => (Some(bulk(user)), bulk(pass)),
             _ => return Err(wrong_arity("auth")),
         };
         let Some(passwords) = node.passwords.load() else {
@@ -604,7 +653,7 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
         // document describes the keyspace, so it is rendered after the writes
         // the peer pipelined in front of it, not before them.
         Ok(Action::Unbatched(Unbatched::Info(
-            args.iter_mut().map(take).collect(),
+            args.iter_mut().map(take_bulk).collect(),
         )))
     }),
     (b"COMMAND", |args, _| match args {
@@ -612,23 +661,23 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
         // has nothing to describe, and an empty array is a client with no
         // hints rather than a client that failed to connect.
         [] => Ok(Action::Reply(Frame::Array(Vec::new()))),
-        [sub, rest @ ..] => command(sub, rest),
+        [sub, rest @ ..] => command(bulk(sub), rest),
     }),
     (b"CLIENT", |args, _| match args {
         [] => Err(wrong_arity("client")),
-        [sub, rest @ ..] => client(sub, rest),
+        [sub, rest @ ..] => client(bulk(sub), rest),
     }),
     (b"CONFIG", |args, node| match args {
         [] => Err(wrong_arity("config")),
-        [sub, globs @ ..] => config(sub, globs, node),
+        [sub, globs @ ..] => config(bulk(sub), globs, node),
     }),
     (b"SLOWLOG", |args, _| match args {
         [] => Err(wrong_arity("slowlog")),
-        [sub, rest @ ..] => slowlog(sub, rest),
+        [sub, rest @ ..] => slowlog(bulk(sub), rest),
     }),
     (b"LATENCY", |args, _| match args {
         [] => Err(wrong_arity("latency")),
-        [sub, rest @ ..] => latency(sub, rest),
+        [sub, rest @ ..] => latency(bulk(sub), rest),
     }),
     (b"QUIT", |args, _| match args {
         [] => Ok(Action::ReplyThenClose(Frame::Simple("OK".into()))),
@@ -643,38 +692,36 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
 /// The arguments are taken apart rather than read: a decoded frame already owns
 /// its bulk payloads, so every one of them that ends up in a [`Command`] or a
 /// reply is *moved* out of the array the codec built. What is left behind is an
-/// empty `Vec` that dies with the array, and the alternative is a second copy
-/// of every value the peer wrote, on the path every write takes.
+/// empty bulk that dies with the array, and the alternative is a second copy
+/// of every value the peer wrote, on the path every write takes. The array
+/// itself is handed to the handler in place, for the same reason: see
+/// [`Handler`].
 pub fn action_for(
     frame: Frame,
     node: &NodeInfo,
     label: &mut CommandLabel,
 ) -> Result<Action, String> {
-    let Frame::Array(parts) = frame else {
+    let Frame::Array(mut parts) = frame else {
         return Err("ERR Protocol error: expected an array of bulk strings".into());
     };
-
-    let mut args: Vec<Vec<u8>> = Vec::with_capacity(parts.len());
-    for part in parts {
-        match part {
-            Frame::Bulk(bytes) => args.push(bytes),
-            _ => return Err("ERR Protocol error: expected an array of bulk strings".into()),
-        }
+    if parts.iter().any(|part| !matches!(part, Frame::Bulk(_))) {
+        return Err("ERR Protocol error: expected an array of bulk strings".into());
     }
 
     // Split rather than indexed, so the name and the arguments are two disjoint
     // borrows: the name is read to the end — an unknown command is quoted back
     // by it — while the arguments are being emptied.
-    let Some((name, args)) = args.split_first_mut() else {
+    let Some((name, args)) = parts.split_first_mut() else {
         return Err("ERR Protocol error: empty command".into());
     };
+    let name = bulk(name);
 
-    // ASCII-uppercase only, which is what the command names are.
-    let upper: Vec<u8> = name.to_ascii_uppercase();
-
-    let Some((_, handler)) = COMMANDS
+    // Matched without upper-casing the name first: the table's names are
+    // upper-case ASCII, so a case-insensitive comparison is the same test
+    // without the copy it would cost on every request.
+    let Some((known, handler)) = COMMANDS
         .iter()
-        .find(|(known, _)| *known == upper.as_slice())
+        .find(|(known, _)| known.eq_ignore_ascii_case(name))
     else {
         // The one place a label allocates, and it is already an error path:
         // the reply below quotes the same bytes, so the request was going to
@@ -687,7 +734,7 @@ pub fn action_for(
     // wrong arity, an unparsable expiry — is attributed rather than anonymous.
     // `known_name` covers every entry of the table just matched, so this
     // borrows a static name and allocates nothing.
-    if let Some(known) = known_name(&upper) {
+    if let Some(known) = known_name(known) {
         *label = CommandLabel::Known(known);
     }
     // A command that travels is counted by the shard that runs it, so this
@@ -705,7 +752,7 @@ pub fn action_for(
     // after this: on a node with a password, a `PING` answered `NOAUTH` lands
     // in the count below. See [`commandstats_section`], which states what that
     // makes the figure mean.
-    let edge = edge_slot(&upper);
+    let edge = edge_slot(known);
     let started = edge.map(|_| Instant::now());
     let action = handler(args, node)?;
     if let (Some(index), Some(started)) = (edge, started)

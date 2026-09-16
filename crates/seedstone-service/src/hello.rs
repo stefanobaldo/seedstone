@@ -3,7 +3,7 @@
 //! authentication gate — see [`crate::gated`].
 
 use crate::auth::{AUTH_NOT_CONFIGURED, WRONGPASS};
-use crate::dispatch::Action;
+use crate::dispatch::{Action, bulk};
 use crate::node::{NodeInfo, SERVER_MODE, SERVER_NAME};
 use crate::reply::{quote, safe_error};
 use seedstone_core::shard::parse_i64;
@@ -36,13 +36,13 @@ pub const NOPROTO: &str = "NOPROTO unsupported protocol version";
 /// through in every connection state — so an unauthenticated `HELLO 99` is
 /// told `NOPROTO`, as Redis tells it (6.2.24, 8.10.1), and the credential-less
 /// `HELLO 2` that parsed is told [`NOAUTH_HELLO`] by the gate as before.
-pub fn hello(args: &[Vec<u8>], node: &NodeInfo) -> Result<Action, String> {
+pub fn hello(args: &[Frame], node: &NodeInfo) -> Result<Action, String> {
     // No version at all is `HELLO` bare, which names no version to disagree
     // with and carries no options to read.
     let credentials = match args {
         [] => None,
         [version, rest @ ..] => {
-            let Some(version) = parse_i64(version) else {
+            let Some(version) = parse_i64(bulk(version)) else {
                 return Ok(Action::Refuse(safe_error(
                     "ERR Protocol version is not an integer or out of range",
                 )));
@@ -83,15 +83,18 @@ pub fn hello(args: &[Vec<u8>], node: &NodeInfo) -> Result<Action, String> {
 /// because this server has no client name to set and ignoring the option
 /// would let a client believe it took effect — the same reason the refusal
 /// was there before `AUTH` was accepted beside it.
-pub fn hello_auth(options: &[Vec<u8>]) -> Result<Option<Credentials<'_>>, String> {
+pub fn hello_auth(options: &[Frame]) -> Result<Option<Credentials<'_>>, String> {
     match options {
         [] => Ok(None),
-        [keyword, user, pass] if keyword.eq_ignore_ascii_case(b"auth") => {
-            Ok(Some(Credentials { user, pass }))
+        [keyword, user, pass] if bulk(keyword).eq_ignore_ascii_case(b"auth") => {
+            Ok(Some(Credentials {
+                user: bulk(user),
+                pass: bulk(pass),
+            }))
         }
         [option, ..] => Err(format!(
             "ERR Syntax error in HELLO option '{}'",
-            quote(option)
+            quote(bulk(option))
         )),
     }
 }
