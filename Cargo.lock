@@ -265,6 +265,9 @@ dependencies = [
 [[package]]
 name = "seedstone-resp"
 version = "0.0.0"
+dependencies = [
+ "bytes",
+]
 
 [[package]]
 name = "seedstone-service"

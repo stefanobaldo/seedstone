@@ -6,18 +6,18 @@ fn encodes_every_frame_type() {
         (Frame::Simple("OK".into()), b"+OK\r\n"),
         (Frame::Error("ERR boom".into()), b"-ERR boom\r\n"),
         (Frame::Integer(-7), b":-7\r\n"),
-        (Frame::Bulk(b"hi".to_vec()), b"$2\r\nhi\r\n"),
+        (Frame::Bulk(Bytes::from_static(b"hi")), b"$2\r\nhi\r\n"),
         // The empty bulk is the one length-prefixed frame whose payload
         // and terminator are adjacent, so it is exactly where an
         // off-by-one in the encoder would hide. It is also not `Null`:
         // "a value that is zero bytes long" and "no value" are different
         // frames, and the pair is here so nobody collapses them.
-        (Frame::Bulk(Vec::new()), b"$0\r\n\r\n"),
+        (Frame::Bulk(Bytes::new()), b"$0\r\n\r\n"),
         (Frame::Null, b"$-1\r\n"),
         (
             Frame::Array(vec![
-                Frame::Bulk(b"GET".to_vec()),
-                Frame::Bulk(b"k".to_vec()),
+                Frame::Bulk(Bytes::from_static(b"GET")),
+                Frame::Bulk(Bytes::from_static(b"k")),
             ]),
             b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
         ),
@@ -35,11 +35,11 @@ fn parse_round_trips_every_frame_type() {
         Frame::Simple("OK".into()),
         Frame::Error("ERR boom".into()),
         Frame::Integer(-7),
-        Frame::Bulk(b"hi".to_vec()),
+        Frame::Bulk(Bytes::from_static(b"hi")),
         Frame::Null,
         Frame::Array(vec![
-            Frame::Bulk(b"GET".to_vec()),
-            Frame::Bulk(b"k".to_vec()),
+            Frame::Bulk(Bytes::from_static(b"GET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
         ]),
         Frame::Array(vec![]),
         Frame::Array(vec![Frame::Array(vec![Frame::Integer(1)])]),
@@ -58,7 +58,7 @@ fn bulk_strings_carry_arbitrary_bytes() {
     // The length prefix is what makes a bulk string binary-safe: a payload
     // holding the terminator itself, a NUL and a non-UTF-8 byte must come
     // back byte for byte.
-    let frame = Frame::Bulk(b"a\r\nb\x00c\xffd".to_vec());
+    let frame = Frame::Bulk(Bytes::from_static(b"a\r\nb\x00c\xffd"));
     let mut out = Vec::new();
     encode(&frame, &mut out);
     let (parsed, consumed) = parse(&out).unwrap().unwrap();
@@ -89,11 +89,13 @@ fn encoding_a_simple_string_holding_a_terminator_trips_the_debug_assertion() {
 #[test]
 fn parse_returns_none_on_partial_input() {
     let mut bulk = Vec::new();
-    encode(&Frame::Bulk(b"hello".to_vec()), &mut bulk);
+    encode(&Frame::Bulk(Bytes::from_static(b"hello")), &mut bulk);
 
     let mut nested_array = Vec::new();
     encode(
-        &Frame::Array(vec![Frame::Array(vec![Frame::Bulk(b"x".to_vec())])]),
+        &Frame::Array(vec![Frame::Array(vec![Frame::Bulk(Bytes::from_static(
+            b"x",
+        ))])]),
         &mut nested_array,
     );
 
@@ -204,13 +206,13 @@ fn streaming_cases() -> Vec<Frame> {
         Frame::Simple("OK".into()),
         Frame::Error("ERR boom".into()),
         Frame::Integer(-7),
-        Frame::Bulk(b"hi".to_vec()),
-        Frame::Bulk(Vec::new()),
-        Frame::Bulk(b"a\r\nb\x00c\xffd".to_vec()),
+        Frame::Bulk(Bytes::from_static(b"hi")),
+        Frame::Bulk(Bytes::new()),
+        Frame::Bulk(Bytes::from_static(b"a\r\nb\x00c\xffd")),
         Frame::Null,
         Frame::Array(vec![
-            Frame::Bulk(b"GET".to_vec()),
-            Frame::Bulk(b"k".to_vec()),
+            Frame::Bulk(Bytes::from_static(b"GET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
         ]),
         Frame::Array(vec![]),
         Frame::Array(vec![Frame::Array(vec![Frame::Integer(1)])]),
@@ -219,7 +221,7 @@ fn streaming_cases() -> Vec<Frame> {
             Frame::Array(vec![Frame::Null, Frame::Array(vec![])]),
             Frame::Integer(i64::MIN),
         ]),
-        Frame::Bulk(vec![b'q'; 5000]),
+        Frame::Bulk(vec![b'q'; 5000].into()),
     ]
 }
 
@@ -308,7 +310,7 @@ fn an_empty_line_between_frames_is_skipped() {
     assert_eq!(
         parse(wire),
         Ok(Some((
-            Frame::Array(vec![Frame::Bulk(b"PING".to_vec())]),
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))]),
             wire.len()
         )))
     );
@@ -352,7 +354,7 @@ fn an_empty_line_inside_an_array_is_still_refused() {
 fn an_empty_line_is_skipped_under_every_chunking() {
     let wire = b"\r\n*1\r\n$4\r\nPING\r\n\r\n+OK\r\n";
     let want = vec![
-        Frame::Array(vec![Frame::Bulk(b"PING".to_vec())]),
+        Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))]),
         Frame::Simple("OK".into()),
     ];
     for chunk in 1..=wire.len() {
@@ -387,7 +389,11 @@ fn parse_refuses_a_complete_frame_whose_parsed_form_is_too_large() {
     // deep. Only the sum is too much — which is the whole point of
     // bounding the parsed form rather than the bytes read.
     let budget = DecoderLimits::default().max_in_memory;
-    let per_array = budget / (2 * size_of::<Frame>());
+    // Rounded up, so the two arrays' elements are never less than the whole
+    // budget: rounded down, a `Frame` whose size does not divide it leaves
+    // enough remainder for the second header to pass, and the refusal moves
+    // onto its elements.
+    let per_array = budget.div_ceil(2 * size_of::<Frame>());
     assert!(per_array <= MAX_ARRAY_LEN, "each array is a legal length");
 
     // Integers are the cheapest way to reach the budget: 4 bytes on the
@@ -464,7 +470,7 @@ fn the_verdict_does_not_depend_on_how_the_peer_chunks() {
     line.extend(std::iter::repeat_n(b'x', 100));
     line.extend_from_slice(b"\r\n");
     let mut bulk = Vec::new();
-    encode(&Frame::Bulk(vec![b'w'; 80]), &mut bulk);
+    encode(&Frame::Bulk(vec![b'w'; 80].into()), &mut bulk);
     let pipeline = bulk.repeat(3);
 
     let ample = DecoderLimits::default().max_in_memory;
@@ -558,12 +564,12 @@ fn decoder_work_is_linear_in_input() {
     // One large bulk, dribbled a byte at a time. Parsing from offset zero
     // on every chunk re-reads the length line a million times.
     let mut wire = Vec::new();
-    encode(&Frame::Bulk(vec![b'x'; 1024 * 1024]), &mut wire);
+    encode(&Frame::Bulk(vec![b'x'; 1024 * 1024].into()), &mut wire);
     let mut decoder = Decoder::new(DecoderLimits::default());
     for byte in &wire {
         decoder.feed(std::slice::from_ref(byte));
         if let Some(frame) = decoder.try_next().unwrap() {
-            assert_eq!(frame, Frame::Bulk(vec![b'x'; 1024 * 1024]));
+            assert_eq!(frame, Frame::Bulk(vec![b'x'; 1024 * 1024].into()));
         }
     }
     assert!(
@@ -576,7 +582,9 @@ fn decoder_work_is_linear_in_input() {
     // Many tiny elements in one array — the adversarial shape, where
     // re-parsing from offset zero also re-allocates every completed
     // element and the total work is quadratic.
-    let elements: Vec<Frame> = (0..20_000).map(|_| Frame::Bulk(b"k".to_vec())).collect();
+    let elements: Vec<Frame> = (0..20_000)
+        .map(|_| Frame::Bulk(Bytes::from_static(b"k")))
+        .collect();
     let array = Frame::Array(elements);
     let mut wire = Vec::new();
     encode(&array, &mut wire);
@@ -695,7 +703,7 @@ fn decoder_bounds_the_parsed_representation() {
     let payload = 64 * 1024;
     let count = 100;
     assert!(count * size_of::<Frame>() < budget, "the header is payable");
-    let element = Frame::Bulk(vec![b'p'; payload]);
+    let element = Frame::Bulk(vec![b'p'; payload].into());
     let mut wire = format!("*{count}\r\n").into_bytes();
     for _ in 0..count {
         encode(&element, &mut wire);
@@ -720,13 +728,13 @@ fn decoder_bounds_the_parsed_representation() {
 #[test]
 fn decoder_sheds_capacity_after_a_large_frame() {
     let mut wire = Vec::new();
-    encode(&Frame::Bulk(vec![b'z'; 4 * 1024 * 1024]), &mut wire);
+    encode(&Frame::Bulk(vec![b'z'; 4 * 1024 * 1024].into()), &mut wire);
     let mut decoder = Decoder::new(DecoderLimits::default());
     decoder.feed(&wire);
     assert!(decoder.buf.capacity() > DecoderLimits::SHED);
 
     let frame = decoder.try_next().unwrap().unwrap();
-    assert_eq!(frame, Frame::Bulk(vec![b'z'; 4 * 1024 * 1024]));
+    assert_eq!(frame, Frame::Bulk(vec![b'z'; 4 * 1024 * 1024].into()));
     assert_eq!(decoder.buffered(), 0);
 
     // The shed happens when the decoder runs out of input, not when the
@@ -749,7 +757,10 @@ fn decoder_compacts_once_per_batch_not_once_per_frame() {
     // it, so compacting per frame makes draining a pipelined read cost
     // about `bytes × frames / 2` in memory traffic instead of `bytes`.
     let mut one = Vec::new();
-    encode(&Frame::Array(vec![Frame::Bulk(b"PING".to_vec())]), &mut one);
+    encode(
+        &Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))]),
+        &mut one,
+    );
     let count = 64;
     let batch = one.repeat(count);
 
@@ -757,7 +768,10 @@ fn decoder_compacts_once_per_batch_not_once_per_frame() {
     decoder.feed(&batch);
     for taken in 1..=count {
         let frame = decoder.try_next().unwrap().expect("a frame per repeat");
-        assert_eq!(frame, Frame::Array(vec![Frame::Bulk(b"PING".to_vec())]));
+        assert_eq!(
+            frame,
+            Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))])
+        );
         // Nothing has been moved yet: the delivered frames' bytes are
         // still sitting in front of the cursor.
         assert_eq!(
@@ -792,7 +806,9 @@ fn decoder_compacts_once_per_batch_not_once_per_frame() {
     decoder.feed(&one[3..]);
     assert_eq!(
         decoder.try_next(),
-        Ok(Some(Frame::Array(vec![Frame::Bulk(b"PING".to_vec())])))
+        Ok(Some(Frame::Array(vec![Frame::Bulk(Bytes::from_static(
+            b"PING"
+        ))])))
     );
 }
 

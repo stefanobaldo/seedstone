@@ -1,4 +1,6 @@
-//! SeedStone RESP2 codec: no external dependencies.
+//! SeedStone RESP2 codec. One dependency, `bytes`, for the bulk's payload.
+
+use bytes::Bytes;
 
 /// A RESP2 frame — the wire protocol unit for Redis Serialization Protocol version 2.
 ///
@@ -21,7 +23,12 @@ pub enum Frame {
     /// Integer: `:-7\r\n`
     Integer(i64),
     /// Bulk string: `$2\r\nhi\r\n`
-    Bulk(Vec<u8>),
+    ///
+    /// A `Bytes` rather than a `Vec<u8>`, so that whoever stores the payload
+    /// can hand it back later by reference count instead of by copy: the
+    /// decoder produces it once, the keyspace keeps it, and a reply carrying
+    /// the same bytes clones a pointer.
+    Bulk(Bytes),
     /// Null bulk string: `$-1\r\n`
     Null,
     /// Array of frames: `*2\r\n...`
@@ -656,7 +663,7 @@ impl Decoding {
             return Err(ParseError("bulk payload missing CRLF terminator".into()));
         }
         self.examined = self.examined.saturating_add(len);
-        let payload = buf[payload_start..payload_end].to_vec();
+        let payload = Bytes::copy_from_slice(&buf[payload_start..payload_end]);
         self.scan = end;
         self.partial = Partial::Start;
         Ok(Some(Frame::Bulk(payload)))
@@ -830,7 +837,7 @@ const fn payload_bytes(frame: &Frame) -> usize {
 /// decoder.feed(b"\r\n");
 /// assert_eq!(
 ///     decoder.try_next(),
-///     Ok(Some(Frame::Array(vec![Frame::Bulk(b"GET".to_vec())]))),
+///     Ok(Some(Frame::Array(vec![Frame::Bulk("GET".into())]))),
 /// );
 /// assert_eq!(decoder.buffered(), 0);
 /// ```
