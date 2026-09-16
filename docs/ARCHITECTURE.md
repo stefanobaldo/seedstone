@@ -214,7 +214,13 @@ the cursor comes back `0`.
 shard's keyspace reports what it is accounted at — a fixed overhead per entry
 plus the lengths of its key and value, plus a fixed cost per bucket of every
 table it holds — and the node's figure is the sum, kept current by the shard
-executors as they run commands. Nothing asks the allocator. The reason is the
+executors as they run commands. The fixed overhead is what one entry's slot
+costs as the compiler lays it out — 96 bytes: the stored hash, the key's and
+the value's `Bytes` headers, the optional deadline and the LRU stamp — and it
+is held to that layout by a test, so it moves only when the layout does. Key
+and value are `Bytes` so that a `GET` hands the stored bytes back by reference
+count rather than by copy; the two 32-byte headers are what that costs per
+entry. Nothing asks the allocator. The reason is the
 one behind everything else here: an allocator's answer depends on the
 allocator, the platform and the fragmentation history of the process, so a
 replayed run would not reproduce it, and a memory ceiling derived from it

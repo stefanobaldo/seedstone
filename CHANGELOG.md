@@ -57,6 +57,11 @@ SemVer and are `0.x` until the server persists data;
 - A command's name is matched against the table without being copied, and
   its arguments are read in place; a request no longer costs two
   allocations before its handler runs.
+- `GET` hands back the stored value without copying it, and `SET` stores the
+  bytes it received without copying them: key and value are kept as
+  reference-counted byte strings. The fixed cost per key in `used_memory`'s
+  accounting is 96 bytes where it was 80, so the same `--maxmemory` holds
+  somewhat fewer keys before evicting.
 
 ### Removed
 
