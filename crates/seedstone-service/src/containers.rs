@@ -2,7 +2,7 @@
 //! `LATENCY` — each a subcommand dispatcher answered at the edge. What each
 //! answers, and how it differs from Redis, is on `docs/compatibility.md`.
 
-use crate::dispatch::{Action, COMMANDS};
+use crate::dispatch::{Action, COMMANDS, bulk};
 use crate::node::NodeInfo;
 use crate::options::wrong_arity;
 use crate::reply::quote;
@@ -18,7 +18,7 @@ use seedstone_resp::Frame;
 /// the reply before it prints a prompt — so an error there is not an
 /// unfriendly message, it is a session that never starts. Answering with
 /// nothing costs the user their command hints and nothing else.
-pub fn command(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
+pub fn command(sub: &[u8], rest: &[Frame]) -> Result<Action, String> {
     if sub.eq_ignore_ascii_case(b"COUNT") {
         if !rest.is_empty() {
             return Err(wrong_arity("command|count"));
@@ -44,7 +44,7 @@ pub fn command(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
 /// go-redis and redis-py both send `SETINFO` as part of establishing a
 /// connection and treat a refusal as a failed one, so the stub answers `OK`
 /// rather than being honest about doing nothing with it.
-pub fn client(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
+pub fn client(sub: &[u8], rest: &[Frame]) -> Result<Action, String> {
     let (name, arity) = if sub.eq_ignore_ascii_case(b"SETNAME") {
         ("client|setname", 1)
     } else if sub.eq_ignore_ascii_case(b"SETINFO") {
@@ -105,7 +105,7 @@ pub const CONFIG_PARAMETERS: [&str; 9] = [
 /// is already running, and accepting a new ceiling at runtime would mean
 /// moving a keyspace under one. Refusing it as an unknown subcommand is the
 /// honest answer, and it is the one Redis gives for a subcommand it lacks.
-pub fn config(sub: &[u8], globs: &[Vec<u8>], node: &NodeInfo) -> Result<Action, String> {
+pub fn config(sub: &[u8], globs: &[Frame], node: &NodeInfo) -> Result<Action, String> {
     if !sub.eq_ignore_ascii_case(b"GET") {
         return Err(unknown_subcommand("CONFIG", sub));
     }
@@ -115,7 +115,10 @@ pub fn config(sub: &[u8], globs: &[Vec<u8>], node: &NodeInfo) -> Result<Action, 
     let mut reply = Vec::new();
     // Folded once, not once per row: the peer sends a handful of patterns and
     // the table is walked whole for each of them.
-    let folded: Vec<Vec<u8>> = globs.iter().map(|glob| glob.to_ascii_lowercase()).collect();
+    let folded: Vec<Vec<u8>> = globs
+        .iter()
+        .map(|glob| bulk(glob).to_ascii_lowercase())
+        .collect();
     for name in CONFIG_PARAMETERS {
         if folded
             .iter()
@@ -181,7 +184,7 @@ pub fn config_value(name: &str, node: &NodeInfo) -> String {
 /// reports as `-1`. The alternative to answering is refusing, and a refusal
 /// carries a different fact: that the command does not exist. An exporter
 /// reads the first as the node's answer and the second as a failed scrape.
-pub fn slowlog(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
+pub fn slowlog(sub: &[u8], rest: &[Frame]) -> Result<Action, String> {
     if sub.eq_ignore_ascii_case(b"GET") {
         match rest {
             [] => {}
@@ -189,7 +192,8 @@ pub fn slowlog(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
             // non-integer whatever the log holds. What the count then selects
             // is a prefix of nothing, so it is parsed and dropped.
             [count] => {
-                parse_i64(count).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
+                parse_i64(bulk(count))
+                    .ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
             }
             _ => return Err(wrong_arity("slowlog|get")),
         }
@@ -220,7 +224,7 @@ pub fn slowlog(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
 /// sampled, so there is no latest reading, no history for any event, no event
 /// a reset can remove, and no command with a histogram of its own. The
 /// argument for answering rather than refusing is [`slowlog`]'s.
-pub fn latency(sub: &[u8], rest: &[Vec<u8>]) -> Result<Action, String> {
+pub fn latency(sub: &[u8], rest: &[Frame]) -> Result<Action, String> {
     if sub.eq_ignore_ascii_case(b"LATEST") {
         if !rest.is_empty() {
             return Err(wrong_arity("latency|latest"));

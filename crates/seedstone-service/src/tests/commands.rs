@@ -10,6 +10,26 @@ use seedstone_core::shard::{NoTrace, ShardPool};
 use seedstone_resp::{Frame, encode};
 use tokio::io::AsyncWriteExt;
 
+/// The name is matched without regard to case and never copied: a
+/// mixed-case name reaches its handler, and an unknown one is quoted back
+/// exactly as the peer spelt it.
+#[tokio::test]
+async fn a_command_name_is_matched_in_any_case_and_quoted_as_sent() {
+    let (mut r, mut w, _pool) = connected(4);
+    let mut out = Vec::new();
+    encode(&req(&["sEt", "k", "v"]), &mut out);
+    encode(&req(&["gEt", "k"]), &mut out);
+    encode(&req(&["CoMmAnD", "count"]), &mut out);
+    encode(&req(&["nOpE", "x"]), &mut out);
+    w.write_all(&out).await.unwrap();
+    w.flush().await.unwrap();
+    let frames = read_frames(&mut r, 4).await;
+    assert_eq!(frames[0], Frame::Simple("OK".into()));
+    assert_eq!(frames[1], Frame::Bulk(b"v".to_vec()));
+    assert!(matches!(frames[2], Frame::Integer(_)), "{:?}", frames[2]);
+    assert_eq!(frames[3], Frame::Error("ERR unknown command 'nOpE'".into()));
+}
+
 #[tokio::test]
 async fn every_command_maps_to_its_reply_frame() {
     let (mut r, mut w, _pool) = connected(16);

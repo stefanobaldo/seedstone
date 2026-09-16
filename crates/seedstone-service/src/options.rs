@@ -4,13 +4,13 @@
 
 use crate::node::NodeInfo;
 
-use crate::dispatch::{Action, Fold, Unbatched};
+use crate::dispatch::{Action, Fold, Unbatched, bulk, take_bulk};
 use crate::expiry::{
     ExpiryForm, ExpiryOption, ExpiryUnit, expiry_unit, remaining_from, set_expire_value,
 };
 use crate::fan_out::SCAN_DEFAULT_COUNT;
 use seedstone_core::shard::{Command, Cond, Expiry, ReplyError, parse_i64};
-use std::mem::take;
+use seedstone_resp::Frame;
 
 /// What a peer spelling a command's options wrong is told.
 ///
@@ -28,16 +28,16 @@ pub const SYNTAX_ERROR: &str = "ERR syntax error";
 /// what sends a one-key `MGET` through the fan-out to be wrapped in the array
 /// of one it is owed.
 pub fn per_key(
-    args: &mut [Vec<u8>],
+    args: &mut [Frame],
     name: &'static str,
     fold: Fold,
     command: fn(Vec<u8>) -> Command,
 ) -> Result<Action, String> {
     match args {
         [] => Err(wrong_arity(name)),
-        [key] if fold.is_identity_on_one() => Ok(Action::Dispatch(command(take(key)))),
+        [key] if fold.is_identity_on_one() => Ok(Action::Dispatch(command(take_bulk(key)))),
         keys => Ok(Action::Unbatched(Unbatched::FanOut {
-            cmds: keys.iter_mut().map(|key| command(take(key))).collect(),
+            cmds: keys.iter_mut().map(|key| command(take_bulk(key))).collect(),
             name,
             fold,
         })),
@@ -90,7 +90,7 @@ pub struct SetOptions {
 /// Both paragraphs are measurements of a live `redis-server v=8.10.0` rather
 /// than reasoning about what a parser ought to do — they are the kind of
 /// behaviour a server grows by accident and clients then depend on.
-pub fn set_options(mut rest: &[Vec<u8>], node: &NodeInfo) -> Result<SetOptions, String> {
+pub fn set_options(mut rest: &[Frame], node: &NodeInfo) -> Result<SetOptions, String> {
     // The surviving expiry option and the bytes that followed it, unread.
     let mut expiry_arg: Option<(ExpiryUnit, &[u8])> = None;
     let mut named: Option<ExpiryOption> = None;
@@ -98,12 +98,13 @@ pub fn set_options(mut rest: &[Vec<u8>], node: &NodeInfo) -> Result<SetOptions, 
     let mut keep_ttl = false;
     let mut get = false;
     while let Some((option, tail)) = rest.split_first() {
+        let option = bulk(option);
         if let Some(unit) = expiry_unit(option) {
             claim(&mut named, unit.option)?;
             let Some((value, after)) = tail.split_first() else {
                 return Err(SYNTAX_ERROR.to_owned());
             };
-            expiry_arg = Some((unit, value));
+            expiry_arg = Some((unit, bulk(value)));
             rest = after;
         } else if option.eq_ignore_ascii_case(b"KEEPTTL") {
             // In the expiry family, so it conflicts with all of it: a peer
@@ -191,13 +192,14 @@ pub fn claim(held: &mut Option<ExpiryOption>, option: ExpiryOption) -> Result<()
 /// server's own occupancy ceiling bounds anyway: [`WALK_STEP_BUCKETS`] ends
 /// the call whatever the target says, and one call dispatches at most one
 /// envelope per shard.
-pub fn scan_options(mut rest: &[Vec<u8>]) -> Result<(Option<Vec<u8>>, usize), String> {
+pub fn scan_options(mut rest: &[Frame]) -> Result<(Option<Vec<u8>>, usize), String> {
     let mut pattern = None;
     let mut count = SCAN_DEFAULT_COUNT;
     while let Some((option, tail)) = rest.split_first() {
         let (value, after) = tail.split_first().ok_or_else(|| SYNTAX_ERROR.to_owned())?;
+        let (option, value) = (bulk(option), bulk(value));
         if option.eq_ignore_ascii_case(b"MATCH") {
-            pattern = Some(value.clone());
+            pattern = Some(value.to_vec());
         } else if option.eq_ignore_ascii_case(b"COUNT") {
             let n =
                 parse_i64(value).ok_or_else(|| ReplyError::NotAnInteger.wire_text().to_owned())?;
@@ -277,7 +279,10 @@ mod tests {
     #[test]
     fn scan_options_take_the_last_occurrence_and_pass_count_through() {
         let opts = |parts: &[&str]| -> (Option<Vec<u8>>, usize) {
-            let owned: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+            let owned: Vec<Frame> = parts
+                .iter()
+                .map(|p| Frame::Bulk(p.as_bytes().to_vec()))
+                .collect();
             scan_options(&owned).expect("these options parse")
         };
 
@@ -302,7 +307,10 @@ mod tests {
         // Past what an i64 spells is not a large COUNT, it is not a number —
         // the same answer Redis gives, and a different one from a COUNT of
         // zero.
-        let owned = vec![b"COUNT".to_vec(), u64::MAX.to_string().into_bytes()];
+        let owned = vec![
+            Frame::Bulk(b"COUNT".to_vec()),
+            Frame::Bulk(u64::MAX.to_string().into_bytes()),
+        ];
         assert_eq!(
             scan_options(&owned),
             Err(ReplyError::NotAnInteger.wire_text().to_owned())
