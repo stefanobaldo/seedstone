@@ -4,6 +4,7 @@
 //! shape the pinned hash is taken on.
 
 use crate::Plant;
+use seedstone_core::dict::{BUCKET_OVERHEAD, ENTRY_OVERHEAD};
 
 /// How a simulation run is shaped.
 ///
@@ -122,6 +123,23 @@ pub struct SimConfig {
     pub maxmemory: Option<u64>,
 }
 
+/// How many entries [`SimConfig::eviction`]'s ceiling holds: about half of
+/// the shape's steady-state keyspace — 256 plain keys, 128 volatile, the
+/// counters and the walk keys.
+///
+/// The middle of the range, 190 to 202, over which every seed
+/// `tests/planted_eviction.rs` runs evicts, observes an eviction, and still
+/// decides more than ten plain reads per eviction observed. The edges of
+/// that range move with the schedule, so the middle is the value a small
+/// change to the schedule leaves calibrated.
+const EVICTION_ENTRIES: u64 = 196;
+
+/// What one of that shape's entries is accounted at: the dict's fixed
+/// overhead, the bucket a load factor of one gives each entry on average,
+/// and about sixteen bytes of key and value — `plain-<index>` holding
+/// `<seq>@<index>`.
+const EVICTION_ENTRY_BYTES: u64 = ENTRY_OVERHEAD + BUCKET_OVERHEAD + 16;
+
 impl SimConfig {
     /// The sweep configuration: the shape measured to be schedule-sensitive,
     /// which is what makes a seed sweep find anything.
@@ -222,6 +240,11 @@ impl SimConfig {
     /// once. Calibrated by `tests/planted_eviction.rs`, which requires every
     /// honest seed to evict something and to decide plain checks all the
     /// same.
+    ///
+    /// The ceiling is stated in entries and priced through the dict's own
+    /// constants — see `EVICTION_ENTRIES` — so a change to what one entry
+    /// is accounted at keeps the calibration instead of quietly tightening
+    /// or loosening it.
     #[must_use]
     pub const fn eviction(workload_seed: u64, sim_seed: u64) -> Self {
         Self {
@@ -238,7 +261,7 @@ impl SimConfig {
             quiescent_walk: false,
             concurrent_scan_cycle: false,
             planted: None,
-            maxmemory: Some(24 * 1024),
+            maxmemory: Some(EVICTION_ENTRIES * EVICTION_ENTRY_BYTES),
         }
     }
 
