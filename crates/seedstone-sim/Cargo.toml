@@ -11,6 +11,8 @@ publish = false
 seedstone-core = { path = "../seedstone-core" }
 seedstone-resp = { path = "../seedstone-resp" }
 seedstone-service = { path = "../seedstone-service" }
+# The codec's bulk payload, which the workload builds its requests from.
+bytes.workspace = true
 turmoil.workspace = true
 rand.workspace = true
 tokio.workspace = true

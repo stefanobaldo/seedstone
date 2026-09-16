@@ -14,6 +14,7 @@
 //! with far more shards than keys, and three hundred over a thousand shards
 //! is that shape more sharply than a thousand would be.
 
+use bytes::Bytes;
 use seedstone_core::dict::DictSeed;
 use seedstone_core::shard::{Command, NoTrace, Router as _, ShardPool};
 use seedstone_resp::{Frame, encode, parse};
@@ -64,7 +65,7 @@ impl Client {
         let request = Frame::Array(
             parts
                 .iter()
-                .map(|p| Frame::Bulk(p.as_bytes().to_vec()))
+                .map(|p| Frame::Bulk(Bytes::copy_from_slice(p.as_bytes())))
                 .collect(),
         );
         let mut out = Vec::new();
@@ -91,12 +92,12 @@ impl Client {
                 let keys = keys
                     .iter()
                     .map(|key| match key {
-                        Frame::Bulk(bytes) => bytes.clone(),
+                        Frame::Bulk(bytes) => bytes.to_vec(),
                         other => panic!("keys are bulk strings, got {other:?}"),
                     })
                     .collect();
                 return (
-                    String::from_utf8(cursor.clone()).expect("a cursor is decimal ASCII"),
+                    String::from_utf8(cursor.to_vec()).expect("a cursor is decimal ASCII"),
                     keys,
                 );
             }
@@ -118,8 +119,8 @@ async fn loaded(shards: u16, n: usize) -> (ShardPool, BTreeSet<Vec<u8>>) {
     for i in 0..n {
         let key = format!("key:{i:06}").into_bytes();
         pool.dispatch(Command::Set {
-            key: key.clone(),
-            value: b"v".to_vec(),
+            key: Bytes::from(key.clone()),
+            value: "v".into(),
             expiry: None,
             cond: None,
             keep_ttl: false,

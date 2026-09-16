@@ -20,6 +20,7 @@ use crate::node::{KIND_NAMES, NodeInfo, edge_slot, micros_since};
 use crate::options::{parse_u64, per_key, scan_options, set_options, wrong_arity};
 use crate::reply::{CommandLabel, known_name, quote, safe_error};
 use crate::{INVALID_CURSOR, KEYS_REPLY_BYTES};
+use bytes::Bytes;
 use seedstone_core::shard::{Command, ReplyError, Router, parse_i64};
 use seedstone_resp::Frame;
 use std::mem::take;
@@ -289,7 +290,7 @@ impl Unbatched {
                 pattern,
                 count,
             } => scan(router, cursor, pattern, count).await,
-            Self::Info(wanted) => Frame::Bulk(info(router, node, &wanted).await.into_bytes()),
+            Self::Info(wanted) => Frame::Bulk(Bytes::from(info(router, node, &wanted).await)),
         };
         if let (Some(slot), Some(started)) = (slot, started) {
             node.edge_usec[slot].fetch_add(micros_since(started), Ordering::Relaxed);
@@ -369,10 +370,10 @@ pub fn bulk(frame: &Frame) -> &[u8] {
 /// One argument, taken: the bulk's bytes move out and an empty bulk stays
 /// behind, which is what `take` on a vector of arguments did.
 #[must_use]
-pub fn take_bulk(frame: &mut Frame) -> Vec<u8> {
+pub fn take_bulk(frame: &mut Frame) -> Bytes {
     match frame {
         Frame::Bulk(bytes) => take(bytes),
-        _ => Vec::new(),
+        _ => Bytes::new(),
     }
 }
 
@@ -591,7 +592,7 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
         _ => Err(wrong_arity("dbsize")),
     }),
     (b"KEYS", |args, _| match args {
-        [pattern] => Ok(Action::Unbatched(Unbatched::Keys(take_bulk(pattern)))),
+        [pattern] => Ok(Action::Unbatched(Unbatched::Keys(bulk(pattern).to_vec()))),
         _ => Err(wrong_arity("keys")),
     }),
     (b"SCAN", |args, _| match args {
@@ -653,7 +654,7 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
         // document describes the keyspace, so it is rendered after the writes
         // the peer pipelined in front of it, not before them.
         Ok(Action::Unbatched(Unbatched::Info(
-            args.iter_mut().map(take_bulk).collect(),
+            args.iter().map(|x| bulk(x).to_vec()).collect(),
         )))
     }),
     (b"COMMAND", |args, _| match args {

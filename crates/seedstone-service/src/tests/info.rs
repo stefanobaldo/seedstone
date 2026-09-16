@@ -6,6 +6,7 @@ use crate::connection::serve_connection;
 use crate::info::{errorstats_section, info};
 use crate::node::{NodeInfo, RUN_ID_HEX};
 use crate::reply::count_error_reply;
+use bytes::Bytes;
 use seedstone_core::dict::DictSeed;
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
 use seedstone_core::shard::{NoTrace, ShardPool};
@@ -31,7 +32,7 @@ async fn info_memory_reports_what_the_pool_accounts() {
     let Frame::Bulk(text) = &frames[1] else {
         panic!("INFO answered {:?}", frames[1])
     };
-    let text = String::from_utf8(text.clone()).unwrap();
+    let text = String::from_utf8(text.to_vec()).unwrap();
     assert!(text.starts_with("# Memory\r\n"), "{text}");
     let used: u64 = text
         .lines()
@@ -109,7 +110,7 @@ async fn info_stats_reports_the_evictions_the_shards_counted() {
     let Frame::Bulk(text) = &frames[8] else {
         panic!("INFO answered {:?}", frames[8])
     };
-    let text = String::from_utf8(text.clone()).unwrap();
+    let text = String::from_utf8(text.to_vec()).unwrap();
     assert!(text.starts_with("# Stats\r\n"), "{text}");
     let evicted: u64 = text
         .lines()
@@ -154,7 +155,7 @@ async fn info_reports_every_section_the_exporter_reads() {
     let Frame::Bulk(text) = &frames[5] else {
         panic!("INFO answered {:?}", frames[5])
     };
-    let text = String::from_utf8(text.clone()).unwrap();
+    let text = String::from_utf8(text.to_vec()).unwrap();
     let has = |line: &str| {
         assert!(
             text.lines().any(|written| written == line),
@@ -327,7 +328,7 @@ async fn commandstats_counts_requests_rather_than_the_commands_they_became() {
     let Frame::Bulk(text) = &frames[3] else {
         panic!("INFO answered {:?}", frames[3])
     };
-    let text = String::from_utf8(text.clone()).unwrap();
+    let text = String::from_utf8(text.to_vec()).unwrap();
     assert!(text.contains("cmdstat_mget:calls=1,"), "{text}");
     assert!(
         text.contains("cmdstat_get:calls=3,"),
@@ -369,7 +370,7 @@ async fn commandstats_carries_usec_and_usec_per_call_in_redis_order() {
     let Frame::Bulk(text) = &frames[3] else {
         panic!("INFO answered {:?}", frames[3])
     };
-    let text = String::from_utf8(text.clone()).unwrap();
+    let text = String::from_utf8(text.to_vec()).unwrap();
     let line = text
         .lines()
         .find(|line| line.starts_with("cmdstat_set:"))
@@ -478,7 +479,7 @@ async fn info_prints_the_minimal_sections() {
 
     assert_eq!(
         frames[4],
-        Frame::Bulk(Vec::new()),
+        Frame::Bulk(Bytes::new()),
         "an unknown section is an empty bulk, not an error"
     );
 
@@ -571,7 +572,7 @@ async fn info_default_leaves_out_the_sections_redis_leaves_out() {
 /// The text of a bulk reply, for the assertions that read `INFO`.
 fn bulk_text(frame: &Frame) -> String {
     match frame {
-        Frame::Bulk(bytes) => String::from_utf8(bytes.clone()).expect("INFO is not UTF-8"),
+        Frame::Bulk(bytes) => String::from_utf8(bytes.to_vec()).expect("INFO is not UTF-8"),
         other => panic!("expected a bulk reply, got {other:?}"),
     }
 }

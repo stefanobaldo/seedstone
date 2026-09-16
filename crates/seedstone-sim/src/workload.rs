@@ -2,6 +2,7 @@
 //! operations a client may compose, what each expects back, and the wire the
 //! client speaks over.
 
+use bytes::Bytes;
 use rand::RngExt;
 use rand::rngs::ChaCha8Rng;
 use seedstone_resp::{Decoder, DecoderLimits, Frame, encode};
@@ -486,7 +487,7 @@ pub fn command(parts: &[&str]) -> Frame {
     Frame::Array(
         parts
             .iter()
-            .map(|part| Frame::Bulk(part.as_bytes().to_vec()))
+            .map(|part| Frame::Bulk(Bytes::copy_from_slice(part.as_bytes())))
             .collect(),
     )
 }

@@ -25,7 +25,7 @@ async fn a_command_name_is_matched_in_any_case_and_quoted_as_sent() {
     w.flush().await.unwrap();
     let frames = read_frames(&mut r, 4).await;
     assert_eq!(frames[0], Frame::Simple("OK".into()));
-    assert_eq!(frames[1], Frame::Bulk(b"v".to_vec()));
+    assert_eq!(frames[1], Frame::Bulk("v".into()));
     assert!(matches!(frames[2], Frame::Integer(_)), "{:?}", frames[2]);
     assert_eq!(frames[3], Frame::Error("ERR unknown command 'nOpE'".into()));
 }
@@ -52,7 +52,7 @@ async fn every_command_maps_to_its_reply_frame() {
     let frames = read_frames(&mut r, 8).await;
     assert_eq!(frames[0], Frame::Integer(5));
     assert_eq!(frames[1], Frame::Integer(3));
-    assert_eq!(frames[2], Frame::Bulk(b"3".to_vec()));
+    assert_eq!(frames[2], Frame::Bulk("3".into()));
     assert_eq!(frames[3], Frame::Null, "a missing key is a null bulk");
     assert_eq!(frames[4], Frame::Integer(1), "Del that removed something");
     assert_eq!(frames[5], Frame::Integer(0), "Del that removed nothing");
@@ -133,7 +133,7 @@ async fn set_options_parse_as_redis_does() {
         Frame::Simple("OK".into()),
         Frame::Integer(10),
         Frame::Null,
-        Frame::Bulk(b"v".to_vec()),
+        Frame::Bulk("v".into()),
         Frame::Simple("OK".into()),
         Frame::Simple("OK".into()),
         // A `SET` with no expiry option clears the deadline it overwrote.
@@ -151,7 +151,7 @@ async fn set_options_parse_as_redis_does() {
         Frame::Error("ERR value is not an integer or out of range".into()),
         Frame::Error("ERR syntax error".into()),
         // Every refusal above left the connection usable.
-        Frame::Bulk(b"v".to_vec()),
+        Frame::Bulk("v".into()),
     ];
     for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
         assert_eq!(got, want, "request {i}: {:?}", requests[i]);
@@ -248,12 +248,12 @@ async fn set_keeps_a_ttl_answers_the_old_value_and_takes_a_deadline() {
         Frame::Integer(50),
         Frame::Simple("OK".into()),
         Frame::Integer(50),
-        Frame::Bulk(b"kept".to_vec()),
+        Frame::Bulk("kept".into()),
         syntax.clone(),
         syntax.clone(),
         Frame::Null,
         Frame::Integer(50),
-        Frame::Bulk(b"kept".to_vec()),
+        Frame::Bulk("kept".into()),
         Frame::Null,
         Frame::Simple("OK".into()),
         // Asserted below rather than here; see CLOCK_ROWS.
@@ -268,9 +268,9 @@ async fn set_keeps_a_ttl_answers_the_old_value_and_takes_a_deadline() {
         Frame::Integer(0),
         syntax,
         Frame::Simple("OK".into()),
-        Frame::Bulk(b"v".to_vec()),
-        Frame::Bulk(b"v".to_vec()),
-        Frame::Bulk(b"v".to_vec()),
+        Frame::Bulk("v".into()),
+        Frame::Bulk("v".into()),
+        Frame::Bulk("v".into()),
         Frame::Null,
         Frame::Integer(0),
     ];
@@ -496,7 +496,7 @@ async fn setex_is_set_with_ex_under_its_old_name() {
     let not_int = Frame::Error("ERR value is not an integer or out of range".into());
     let expected: [Frame; 23] = [
         Frame::Simple("OK".into()),
-        Frame::Bulk(b"hello".to_vec()),
+        Frame::Bulk("hello".into()),
         Frame::Integer(100),
         Frame::Simple("string".into()),
         Frame::Simple("OK".into()),
@@ -513,11 +513,11 @@ async fn setex_is_set_with_ex_under_its_old_name() {
         Frame::Simple("OK".into()),
         Frame::Simple("OK".into()),
         Frame::Simple("OK".into()),
-        Frame::Bulk(b"replaced".to_vec()),
+        Frame::Bulk("replaced".into()),
         Frame::Integer(50),
         expire,
         Frame::Error("ERR value is not an integer or out of range".into()),
-        Frame::Bulk(b"hello".to_vec()),
+        Frame::Bulk("hello".into()),
     ];
     for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
         assert_eq!(got, want, "request {i}: {:?}", requests[i]);
@@ -542,7 +542,7 @@ async fn setex_is_counted_apart_from_set() {
     let Frame::Bulk(text) = &frames[3] else {
         panic!("INFO answered {:?}", frames[3])
     };
-    let text = String::from_utf8(text.clone()).unwrap();
+    let text = String::from_utf8(text.to_vec()).unwrap();
     let counted = |prefix: &str| {
         assert!(
             text.lines().any(|written| written.starts_with(prefix)),
@@ -594,10 +594,10 @@ async fn setnx_writes_only_a_key_that_is_not_there() {
     let arity = Frame::Error("ERR wrong number of arguments for 'setnx' command".into());
     let expected: [Frame; 12] = [
         Frame::Integer(1),
-        Frame::Bulk(b"hello".to_vec()),
+        Frame::Bulk("hello".into()),
         Frame::Integer(-1),
         Frame::Integer(0),
-        Frame::Bulk(b"hello".to_vec()),
+        Frame::Bulk("hello".into()),
         Frame::Integer(1),
         arity.clone(),
         arity.clone(),
@@ -643,12 +643,12 @@ async fn psetex_writes_a_value_and_a_millisecond_deadline() {
     let frames = read_frames(&mut r, requests.len()).await;
     let expected: [Frame; 7] = [
         Frame::Simple("OK".into()),
-        Frame::Bulk(b"hello".to_vec()),
+        Frame::Bulk("hello".into()),
         Frame::Simple("string".into()),
         Frame::Simple("OK".into()),
         Frame::Simple("OK".into()),
         Frame::Simple("OK".into()),
-        Frame::Bulk(b"replaced".to_vec()),
+        Frame::Bulk("replaced".into()),
     ];
     for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
         assert_eq!(got, want, "request {i}: {:?}", requests[i]);
@@ -702,7 +702,7 @@ async fn psetex_refuses_a_span_and_writes_nothing() {
         expire,
         not_int.clone(),
         not_int,
-        Frame::Bulk(b"original".to_vec()),
+        Frame::Bulk("original".into()),
         Frame::Integer(-1),
     ];
     for (i, (got, want)) in frames.iter().zip(&expected).enumerate() {
@@ -938,15 +938,15 @@ async fn mget_answers_one_entry_per_argument_in_order() {
     assert_eq!(
         frames[2],
         Frame::Array(vec![
-            Frame::Bulk(b"1".to_vec()),
+            Frame::Bulk("1".into()),
             Frame::Null,
-            Frame::Bulk(b"3".to_vec()),
-            Frame::Bulk(b"1".to_vec()),
+            Frame::Bulk("3".into()),
+            Frame::Bulk("1".into()),
         ])
     );
     assert_eq!(
         frames[3],
-        Frame::Array(vec![Frame::Bulk(b"1".to_vec())]),
+        Frame::Array(vec![Frame::Bulk("1".into())]),
         "one key is still an array"
     );
     assert!(matches!(&frames[4], Frame::Error(e) if e.contains("wrong number of arguments")));
@@ -1229,7 +1229,7 @@ async fn the_absolute_deadlines_are_counted_apart_from_the_spans() {
     let Frame::Bulk(text) = &frames[4] else {
         panic!("INFO answered {:?}", frames[4])
     };
-    let text = String::from_utf8(text.clone()).unwrap();
+    let text = String::from_utf8(text.to_vec()).unwrap();
     let counted = |prefix: &str| {
         assert!(
             text.lines().any(|written| written.starts_with(prefix)),

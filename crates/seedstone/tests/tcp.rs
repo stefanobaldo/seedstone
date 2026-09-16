@@ -28,7 +28,7 @@ async fn serves_get_set_over_real_tcp() {
 
     let frames = read_frames(&mut stream, 2).await;
     assert_eq!(frames[0], Frame::Simple("OK".into()));
-    assert_eq!(frames[1], Frame::Bulk(b"v".to_vec()));
+    assert_eq!(frames[1], Frame::Bulk("v".into()));
 }
 
 /// Two connections in sequence reach the same keyspace: the pool outlives the
@@ -45,7 +45,7 @@ async fn a_second_connection_reads_what_the_first_wrote() {
     let mut second = TcpStream::connect(addr).await.unwrap();
     assert_eq!(
         round_trip(&mut second, &["GET", "shared"]).await,
-        Frame::Bulk(b"value".to_vec())
+        Frame::Bulk("value".into())
     );
 }
 
@@ -78,7 +78,7 @@ async fn over_limit_connections_are_told_and_closed() {
     let mut next = None;
     for _ in 0..100 {
         let mut candidate = TcpStream::connect(addr).await.unwrap();
-        if round_trip(&mut candidate, &["GET", "k"]).await == Frame::Bulk(b"v".to_vec()) {
+        if round_trip(&mut candidate, &["GET", "k"]).await == Frame::Bulk("v".into()) {
             next = Some(candidate);
             break;
         }
@@ -272,7 +272,7 @@ async fn error_replies_are_counted_by_code_and_in_total() {
     let Frame::Bulk(errorstats) = round_trip(&mut stream, &["INFO", "errorstats"]).await else {
         panic!("INFO answers a bulk")
     };
-    let errorstats = String::from_utf8(errorstats).unwrap();
+    let errorstats = String::from_utf8(errorstats.to_vec()).unwrap();
     assert!(errorstats.starts_with("# Errorstats\r\n"), "{errorstats}");
     assert!(
         errorstats.contains("errorstat_ERR:count=2\r\n"),
@@ -301,7 +301,7 @@ async fn a_noauth_refusal_is_an_error_reply_too() {
     let Frame::Bulk(errorstats) = round_trip(&mut stream, &["INFO", "errorstats"]).await else {
         panic!("INFO answers a bulk")
     };
-    let errorstats = String::from_utf8(errorstats).unwrap();
+    let errorstats = String::from_utf8(errorstats.to_vec()).unwrap();
     assert!(
         errorstats.contains("errorstat_NOAUTH:count=1\r\n"),
         "{errorstats}"
@@ -342,7 +342,7 @@ async fn round_trip(stream: &mut TcpStream, parts: &[&str]) -> Frame {
 /// The text of one `INFO` reply.
 async fn info_text(stream: &mut TcpStream) -> String {
     match round_trip(stream, &["INFO"]).await {
-        Frame::Bulk(bytes) => String::from_utf8(bytes).expect("INFO is not UTF-8"),
+        Frame::Bulk(bytes) => String::from_utf8(bytes.to_vec()).expect("INFO is not UTF-8"),
         other => panic!("INFO answered {other:?}"),
     }
 }
@@ -367,7 +367,7 @@ fn req(parts: &[&str]) -> Frame {
     Frame::Array(
         parts
             .iter()
-            .map(|p| Frame::Bulk(p.as_bytes().to_vec()))
+            .map(|p| Frame::Bulk(p.as_bytes().to_vec().into()))
             .collect(),
     )
 }

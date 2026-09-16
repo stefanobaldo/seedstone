@@ -7,6 +7,7 @@ use crate::connection::{CHUNK_COMMANDS, READ_CEILING, REPLY_HIGH_WATER, serve_co
 use crate::hello::NOPROTO;
 use crate::node::NodeInfo;
 use crate::reply::UNRENDERABLE_REPLY;
+use bytes::Bytes;
 use seedstone_core::dict::DictSeed;
 use seedstone_core::shard::{Command, NoTrace, Reply, Router, ShardPool};
 use seedstone_resp::{Frame, encode};
@@ -26,7 +27,7 @@ async fn serves_resp_over_a_duplex_stream() {
     w.flush().await.unwrap();
     let frames = read_frames(&mut r, 3).await;
     assert_eq!(frames[0], Frame::Simple("OK".into()));
-    assert_eq!(frames[1], Frame::Bulk(b"v".to_vec()));
+    assert_eq!(frames[1], Frame::Bulk("v".into()));
     assert!(matches!(&frames[2], Frame::Error(e) if e.contains("unknown command")));
 }
 
@@ -93,9 +94,9 @@ async fn connection_commands_never_reach_the_router() {
     let frames = read_frames(&mut r, 13).await;
     assert_eq!(frames[0], Frame::Simple("PONG".into()));
     assert_eq!(frames[1], Frame::Simple("PONG".into()), "case-insensitive");
-    assert_eq!(frames[2], Frame::Bulk(b"hi".to_vec()));
+    assert_eq!(frames[2], Frame::Bulk("hi".into()));
     assert!(matches!(&frames[3], Frame::Error(e) if e.contains("wrong number of arguments")));
-    assert_eq!(frames[4], Frame::Bulk(b"x".to_vec()));
+    assert_eq!(frames[4], Frame::Bulk("x".into()));
     assert!(matches!(&frames[5], Frame::Error(e) if e.contains("wrong number of arguments")));
     assert_eq!(frames[6], frames[7], "HELLO and HELLO 2 answer the same");
     assert_eq!(frames[8], Frame::Error(NOPROTO.into()));
@@ -287,7 +288,7 @@ async fn a_long_mget_is_dispatched_in_bounded_slices() {
             if i == MISSING {
                 Frame::Null
             } else {
-                Frame::Bulk(i.to_string().into_bytes())
+                Frame::Bulk(Bytes::from(i.to_string()))
             }
         })
         .collect();
@@ -499,7 +500,7 @@ async fn a_drain_writes_before_it_accumulates_without_bound() {
     assert!(
         frames
             .iter()
-            .all(|frame| *frame == Frame::Bulk(value.as_bytes().to_vec())),
+            .all(|frame| *frame == Frame::Bulk(Bytes::copy_from_slice(value.as_bytes()))),
         "every reply of the batch must arrive whole and in order"
     );
 
@@ -537,8 +538,8 @@ async fn connection_and_keyed_commands_interleave_in_one_pipeline() {
     assert!(matches!(frames[0], Frame::Array(_)));
     assert_eq!(frames[1], Frame::Simple("OK".into()));
     assert_eq!(frames[2], Frame::Simple("PONG".into()));
-    assert_eq!(frames[3], Frame::Bulk(b"v".to_vec()));
-    assert_eq!(frames[4], Frame::Bulk(b"done".to_vec()));
+    assert_eq!(frames[3], Frame::Bulk("v".into()));
+    assert_eq!(frames[4], Frame::Bulk("done".into()));
 }
 
 /// Replies come back in request order even though keyed commands scatter
@@ -586,7 +587,7 @@ async fn a_pipelined_mix_is_answered_in_request_order() {
     // interleaved.
     let mut in_request_order = Vec::new();
     for i in 0..48u32 {
-        in_request_order.push(Frame::Bulk(i.to_string().into_bytes()));
+        in_request_order.push(Frame::Bulk(Bytes::from(i.to_string())));
         if i % 8 == 0 {
             in_request_order.push(Frame::Simple("PONG".into()));
         }
@@ -604,7 +605,7 @@ async fn command_names_are_case_insensitive() {
     w.flush().await.unwrap();
     let frames = read_frames(&mut r, 2).await;
     assert_eq!(frames[0], Frame::Simple("OK".into()));
-    assert_eq!(frames[1], Frame::Bulk(b"v".to_vec()));
+    assert_eq!(frames[1], Frame::Bulk("v".into()));
 }
 
 #[tokio::test]

@@ -2,6 +2,7 @@
 //! rewrites requests as a plant dictates, one that skips a shard on a
 //! keyspace walk.
 
+use bytes::Bytes;
 use seedstone_core::shard::{Command, Reply, ReplyError, Router, ShardPool, parse_i64};
 use seedstone_service::WALK_STEP_BUCKETS;
 
@@ -101,7 +102,7 @@ impl PlantedRouter {
             .pool
             .dispatch(Command::Set {
                 key,
-                value: updated.to_string().into_bytes(),
+                value: Bytes::from(updated.to_string()),
                 // The write the honest `INCRBY` would have made: same value,
                 // same absence of options. The only thing planted here is that
                 // it is a second message.
