@@ -38,6 +38,13 @@ when the address could not be bound (after a `bind_failed` line); `2` on a
 command line the server does not understand (after the usage text, in plain
 text, on stderr).
 
+The binary's allocator is mimalloc. It reads its own tuning from the
+`MIMALLOC_*` environment variables, none of which this server sets or
+needs; the process's resident size grows and is released on mimalloc's
+schedule, which is not glibc's — an operator sizing a ceiling against the
+machine reads `used_memory` for the keyspace and the process's RSS for the
+rest, as before.
+
 ## Output
 
 Everything the server writes about itself goes to **stderr**, one JSON object

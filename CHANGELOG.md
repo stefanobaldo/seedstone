@@ -64,6 +64,10 @@ SemVer and are `0.x` until the server persists data;
   somewhat fewer keys before evicting.
 - `KEYS` and `SCAN` return key names without copying them, and the pattern
   is shared across the steps of a walk rather than copied per step.
+- The binary's allocator is mimalloc. Resident memory grows and is released
+  on its schedule rather than glibc's, and the `MIMALLOC_*` environment
+  variables reach it; `used_memory` is unaffected, being an accounting
+  formula over the keyspace.
 
 ### Removed
 

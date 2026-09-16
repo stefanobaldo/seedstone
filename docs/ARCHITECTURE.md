@@ -235,7 +235,9 @@ would read as a measured healthy figure when nothing measured it, so the field
 is absent instead. The formula also means the process's resident size is
 larger than `used_memory` — by the allocator's rounding and by everything the
 process holds outside the keyspace — so an operator sizing a ceiling against
-the machine should leave room for the difference.
+the machine should leave room for the difference. The allocator is mimalloc,
+declared in the binary alone; the accounting formula does not depend on it,
+which is the point of a formula.
 
 **Eviction samples from the shard that is writing, against a ceiling the whole
 node shares.** `maxmemory` is compared with one figure — the sum of what every
