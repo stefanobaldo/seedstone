@@ -27,7 +27,7 @@ use std::task::Poll;
 /// side, and the two halves are held to the same figure so the pair is one
 /// number rather than two to keep in step.
 ///
-/// **It prices the key bytes and nothing else.** Not the `Vec` per key, not the
+/// **It prices the key bytes and nothing else.** Not the header per key, not the
 /// `$<len>\r\n` each one costs on the wire, not the capacity the gathering
 /// vectors grew to hold them. So this is a bound on accumulation rather than a
 /// measurement of the frame — the same undercounting [`crate::MAX_REQUEST_BYTES`]
@@ -36,14 +36,18 @@ use std::task::Poll;
 /// budget.
 ///
 /// **The per-key constant is worth writing out, because "a constant" reads as
-/// small and this one is not.** Every gathered key costs a `Frame` — 40 bytes,
-/// the `Bytes` header inline in the enum — plus its own heap allocation, which
-/// no allocator serves below about 16 bytes however short the key is. Call it
-/// ~56 bytes of overhead against however many bytes of key name are counted
-/// here. At the short keys a cache actually holds that ratio is the whole
-/// story: **one-byte keys reach this ceiling only after ~67 million of them,
-/// whose headers and allocations alone are over 3.5 GB** — some fifty-five
-/// times the figure this constant names, and none of it counted. The reason that is
+/// small and this one is not.** Every gathered key costs a `Bytes` header — 32
+/// bytes — in the vectors the walks gather into, and then a `Frame` — 40
+/// bytes, the same header inline in the enum — in the reply, and the two
+/// coexist while the one is turned into the other: 72 bytes at the peak. What
+/// it no longer costs is an allocation of its own. The name is a reference
+/// count on the key the keyspace holds, whose shared header the `SET` that
+/// stored it already made. At the short keys a cache actually holds that
+/// ratio is the whole story: **one-byte keys reach this ceiling only after ~67
+/// million of them, whose headers alone are over 4.5 GB at the peak** — some
+/// seventy times the figure this constant names, and none of it counted. A
+/// name held this way also keeps its key's bytes allocated until the reply is
+/// written, even if a write removes the key meanwhile. The reason that is
 /// tolerable is not the arithmetic but the keyspace: `maxmemory` bounds how
 /// many keys can exist to be gathered, and a node that could hold 67 million
 /// of them was configured to.
@@ -207,7 +211,7 @@ pub enum WalkStop {
 /// It is checked once per step rather than once per key, so what is held can
 /// exceed the ceiling by up to one step's keys per shard — a bound with a
 /// known slack, which is what a ceiling on accumulation needs to be.
-pub async fn keys<R: Router>(router: &R, pattern: Vec<u8>, ceiling: usize) -> Frame {
+pub async fn keys<R: Router>(router: &R, pattern: Bytes, ceiling: usize) -> Frame {
     // Shared by every walk, and a plain `&` reaches all of them: these are
     // futures joined inside one task, not tasks of their own. `Relaxed` is the
     // whole ordering requirement — nothing is published alongside the count,
@@ -219,7 +223,7 @@ pub async fn keys<R: Router>(router: &R, pattern: Vec<u8>, ceiling: usize) -> Fr
             let pattern = pattern.clone();
             let gathered = &gathered;
             async move {
-                let mut found: Vec<Vec<u8>> = Vec::new();
+                let mut found: Vec<Bytes> = Vec::new();
                 let mut cursor = 0u64;
                 loop {
                     let reply = router
@@ -228,15 +232,9 @@ pub async fn keys<R: Router>(router: &R, pattern: Vec<u8>, ceiling: usize) -> Fr
                             Command::ScanStep {
                                 cursor,
                                 count: WALK_STEP_BUCKETS,
-                                // Cloned per step, and it has to be: the
-                                // command is moved into the router and the
-                                // reply does not hand the pattern back, so
-                                // there is nothing to carry forward. Hoisting
-                                // it would need a shared, cheaply-cloned
-                                // pattern in the command, which is a wider
-                                // change than a keyspace walk's per-step
-                                // allocation is worth beside the keys it
-                                // returns in the same step.
+                                // A reference count per step. Only the
+                                // call's first clone allocates, to share the
+                                // bytes the request arrived with.
                                 pattern: Some(pattern.clone()),
                             },
                         )
@@ -249,7 +247,7 @@ pub async fn keys<R: Router>(router: &R, pattern: Vec<u8>, ceiling: usize) -> Fr
                             // bounds an accumulation, and paying an atomic
                             // per key would price the bound at more than the
                             // gathering it guards.
-                            let step_bytes: usize = keys.iter().map(Vec::len).sum();
+                            let step_bytes: usize = keys.iter().map(Bytes::len).sum();
                             found.extend(keys);
                             let total = gathered
                                 .fetch_add(step_bytes, Ordering::Relaxed)
@@ -274,7 +272,7 @@ pub async fn keys<R: Router>(router: &R, pattern: Vec<u8>, ceiling: usize) -> Fr
         })
         .collect();
 
-    let mut all: Vec<Vec<u8>> = Vec::new();
+    let mut all: Vec<Bytes> = Vec::new();
     for walk in join_all(walks).await {
         match walk {
             Ok(found) => all.extend(found),
@@ -289,11 +287,7 @@ pub async fn keys<R: Router>(router: &R, pattern: Vec<u8>, ceiling: usize) -> Fr
     }
     all.sort_unstable();
     all.dedup();
-    Frame::Array(
-        all.into_iter()
-            .map(|key| Frame::Bulk(Bytes::from(key)))
-            .collect(),
-    )
+    Frame::Array(all.into_iter().map(Frame::Bulk).collect())
 }
 
 /// One `SCAN` call: as many shards as its budget crosses, and the cursor the
@@ -327,7 +321,7 @@ pub async fn keys<R: Router>(router: &R, pattern: Vec<u8>, ceiling: usize) -> Fr
 pub async fn scan<R: Router>(
     router: &R,
     cursor: u64,
-    pattern: Option<Vec<u8>>,
+    pattern: Option<Bytes>,
     key_target: usize,
 ) -> Frame {
     // The cursor came out of an integer the peer chose, so this is where it
@@ -347,10 +341,9 @@ pub async fn scan<R: Router>(
                 Command::ScanStep {
                     cursor: step.cursor,
                     count: step.count,
-                    // Cloned once per shard the call crosses, which is the
-                    // same per-step cost the walk always paid: the command is
-                    // moved into the router and the reply does not hand the
-                    // pattern back, so there is nothing to carry forward.
+                    // A reference count per shard the call crosses. Only the
+                    // call's first clone allocates, to share the bytes the
+                    // request arrived with.
                     pattern: pattern.clone(),
                 },
             )
@@ -374,11 +367,7 @@ pub async fn scan<R: Router>(
         // clients parse. A client that fed an integer back would be sending a
         // cursor this server never issued.
         Frame::Bulk(Bytes::from(next.to_string())),
-        Frame::Array(
-            keys.into_iter()
-                .map(|key| Frame::Bulk(Bytes::from(key)))
-                .collect(),
-        ),
+        Frame::Array(keys.into_iter().map(Frame::Bulk).collect()),
     ])
 }
 

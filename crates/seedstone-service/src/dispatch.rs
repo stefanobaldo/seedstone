@@ -161,7 +161,7 @@ pub enum Unbatched {
     /// shard itself, a bounded step at a time, and gathers what matches — see
     /// [`keys`]. It is not an [`Every`](Unbatched::Every) because one command
     /// per shard is not one *step* per shard: a walk is a loop.
-    Keys(Vec<u8>),
+    Keys(Bytes),
     /// One step of a client-driven walk: the cursor says which shard and
     /// where in it, and the answer says where to resume — see [`scan`]. It is
     /// the only one of these that reaches a single shard, and it is here
@@ -171,7 +171,7 @@ pub enum Unbatched {
         /// The packed cursor the client sent, untrusted.
         cursor: u64,
         /// `MATCH`, filtered on the shard rather than here.
-        pattern: Option<Vec<u8>>,
+        pattern: Option<Bytes>,
         /// `COUNT`: how many keys the client wants back, bounded when the
         /// call runs by [`WALK_STEP_BUCKETS`] rather than when it is parsed.
         count: usize,
@@ -592,7 +592,7 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
         _ => Err(wrong_arity("dbsize")),
     }),
     (b"KEYS", |args, _| match args {
-        [pattern] => Ok(Action::Unbatched(Unbatched::Keys(bulk(pattern).to_vec()))),
+        [pattern] => Ok(Action::Unbatched(Unbatched::Keys(take_bulk(pattern)))),
         _ => Err(wrong_arity("keys")),
     }),
     (b"SCAN", |args, _| match args {

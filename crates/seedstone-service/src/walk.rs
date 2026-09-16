@@ -16,6 +16,8 @@
 //! 4. **Only the last shard being spent answers `0`.** Every other stopping
 //!    point is the packed `(shard, internal)` of wherever the call stopped.
 
+use bytes::Bytes;
+
 /// How many low bits of a `SCAN` cursor belong to a shard's own cursor.
 ///
 /// The remaining 16 carry the shard. A shard count is a `u16` everywhere it
@@ -86,7 +88,7 @@ pub struct Crossing {
     /// How much of the call's bucket ceiling is unspent.
     buckets_left: usize,
     /// What has been gathered so far, in dispatch order.
-    keys: Vec<Vec<u8>>,
+    keys: Vec<Bytes>,
     /// Whether the last shard is spent, which is the only way to answer `0`.
     finished: bool,
 }
@@ -150,7 +152,7 @@ impl Crossing {
     /// `visited` is charged against the call's budget with a floor of one, so
     /// a step that reported nothing still costs something and the loop cannot
     /// spin on a shard that never advances.
-    pub fn feed(&mut self, next_cursor: u64, keys: Vec<Vec<u8>>, visited: usize) {
+    pub fn feed(&mut self, next_cursor: u64, keys: Vec<Bytes>, visited: usize) {
         self.keys.extend(keys);
         self.buckets_left = self.buckets_left.saturating_sub(visited.max(1));
         if next_cursor != 0 {
@@ -172,7 +174,7 @@ impl Crossing {
     ///
     /// `0` only when the last shard is spent; otherwise the packed position
     /// the call stopped at, which a later call resumes from exactly.
-    pub fn finish(self) -> (u64, Vec<Vec<u8>>) {
+    pub fn finish(self) -> (u64, Vec<Bytes>) {
         let cursor = if self.finished {
             0
         } else {
@@ -185,6 +187,7 @@ impl Crossing {
 #[cfg(test)]
 mod tests {
     use super::{CURSOR_INTERNAL_BITS, Crossing, pack_cursor, unpack_cursor};
+    use bytes::Bytes;
 
     /// Drives a whole call against a stand-in for the shards.
     ///
@@ -198,8 +201,8 @@ mod tests {
         start: u64,
         target: usize,
         ceiling: usize,
-        mut shard_answers: impl FnMut(u16, u64, usize) -> (u64, Vec<Vec<u8>>, usize),
-    ) -> (u64, Vec<Vec<u8>>, usize) {
+        mut shard_answers: impl FnMut(u16, u64, usize) -> (u64, Vec<Bytes>, usize),
+    ) -> (u64, Vec<Bytes>, usize) {
         let mut crossing = Crossing::begin(shards, start, target, ceiling)
             .expect("this test's start cursor names a shard that exists");
         let mut steps = 0;
@@ -244,7 +247,7 @@ mod tests {
         // production shape, exaggerated: the old walk cost four round trips
         // here and this one costs a client a single call.
         let (cursor, keys, steps) = drive(4, 0, 10, 256, |shard, _, _| {
-            (0, vec![vec![u8::try_from(shard).unwrap()]], 1)
+            (0, vec![Bytes::from(vec![u8::try_from(shard).unwrap()])], 1)
         });
         assert_eq!(
             cursor, 0,
@@ -257,7 +260,7 @@ mod tests {
     #[test]
     fn the_key_target_ends_the_call_with_the_next_shards_start() {
         let (cursor, keys, steps) = drive(4, 0, 2, 256, |shard, _, _| {
-            (0, vec![vec![u8::try_from(shard).unwrap()]], 1)
+            (0, vec![Bytes::from(vec![u8::try_from(shard).unwrap()])], 1)
         });
         assert_eq!(keys.len(), 2);
         assert_eq!(steps, 2);
@@ -299,7 +302,7 @@ mod tests {
         let mut asked = Vec::new();
         drive(4, pack_cursor(2, 77), 1, 256, |shard, cursor, _| {
             asked.push((shard, cursor));
-            (0, vec![vec![1]], 1)
+            (0, vec![Bytes::from_static(&[1])], 1)
         });
         assert_eq!(asked, vec![(2, 77)]);
     }
@@ -321,11 +324,15 @@ mod tests {
     fn keys_come_back_in_dispatch_order() {
         let (_, keys, _) = drive(2, 0, 10, 256, |shard, _, _| {
             let shard = u8::try_from(shard).unwrap();
-            (0, vec![vec![shard, 0], vec![shard, 1]], 1)
+            (
+                0,
+                vec![Bytes::from(vec![shard, 0]), Bytes::from(vec![shard, 1])],
+                1,
+            )
         });
         assert_eq!(
             keys,
-            vec![vec![0, 0], vec![0, 1], vec![1, 0], vec![1, 1]],
+            vec![&[0, 0][..], &[0, 1], &[1, 0], &[1, 1]],
             "shards are dispatched in order and their keys are concatenated in it"
         );
     }
@@ -339,7 +346,7 @@ mod tests {
             for target in [1usize, 2, 10] {
                 for ceiling in [1usize, 2, 8, 256] {
                     let (_, _, steps) = drive(shards, 0, target, ceiling, |_, _, count| {
-                        (0, vec![vec![0]], count.min(3))
+                        (0, vec![Bytes::from_static(&[0])], count.min(3))
                     });
                     assert!(
                         steps <= usize::from(shards),
