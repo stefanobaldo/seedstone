@@ -1,6 +1,8 @@
 //! What a shard answers: the reply shapes and the errors a shard can hand
 //! back, each with its wire text.
 
+use bytes::Bytes;
+
 use crate::shard::ShardStats;
 
 /// Every way a shard can refuse a command.
@@ -73,7 +75,10 @@ impl ReplyError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
     /// A value, or its absence.
-    Bulk(Option<Vec<u8>>),
+    ///
+    /// The stored bytes by reference count: a `GET` clones the dict's `Bytes`
+    /// and the connection drops it after encoding.
+    Bulk(Option<Bytes>),
     /// The command succeeded and has nothing to return.
     Ok,
     /// A one-word answer that travels as a simple string rather than a bulk.

@@ -6,6 +6,7 @@ use crate::dict::DictSeed;
 use crate::log::{Record, ReplicationLog};
 use crate::shard::{Command, HOUSEKEEPING_TICK, NoTrace, Reply, ReplyError, Router, ShardPool};
 use crate::slot::shard_of;
+use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,7 +45,7 @@ async fn a_command_is_traced_where_its_effects_begin_not_where_its_record_landed
     pool.dispatch_many(vec![
         set(b"written", b"again"),
         Command::IncrBy {
-            key: b"counted".to_vec(),
+            key: Bytes::from_static(b"counted"),
             delta: 7,
         },
     ])
@@ -64,7 +65,7 @@ async fn a_command_is_traced_where_its_effects_begin_not_where_its_record_landed
             (0, 4, 4, Reply::Integer(7)),
             // Which leaves the next command at 6: four positions for two
             // commands is exactly what the contract says can happen.
-            (0, 6, 1, Reply::Bulk(Some(b"again".to_vec()))),
+            (0, 6, 1, Reply::Bulk(Some(Bytes::from_static(b"again")))),
         ]
     );
 }
@@ -76,15 +77,18 @@ async fn the_sink_sees_every_command_at_its_replication_position() {
     // positions are a single sequence rather than an interleaving.
     let pool = ShardPool::spawn(1, 1, DictSeed { k0: 2, k1: 3 }, sink.clone());
 
-    pool.dispatch(Command::Get { key: b"k".to_vec() }).await;
+    pool.dispatch(Command::Get {
+        key: Bytes::from_static(b"k"),
+    })
+    .await;
     pool.dispatch(set(b"k", b"1")).await;
     pool.dispatch(Command::IncrBy {
-        key: b"k".to_vec(),
+        key: Bytes::from_static(b"k"),
         delta: 4,
     })
     .await;
     pool.dispatch(Command::Del {
-        key: b"gone".to_vec(),
+        key: Bytes::from_static(b"gone"),
     })
     .await;
 
@@ -161,13 +165,16 @@ async fn a_supplied_log_receives_every_mutation() {
     });
 
     pool.dispatch(set(b"k", b"v")).await;
-    pool.dispatch(Command::Get { key: b"k".to_vec() }).await;
+    pool.dispatch(Command::Get {
+        key: Bytes::from_static(b"k"),
+    })
+    .await;
     pool.dispatch(Command::Del {
-        key: b"absent".to_vec(),
+        key: Bytes::from_static(b"absent"),
     })
     .await;
     pool.dispatch(Command::IncrBy {
-        key: b"n".to_vec(),
+        key: Bytes::from_static(b"n"),
         delta: 1,
     })
     .await;
@@ -205,7 +212,10 @@ async fn a_log_that_cannot_write_refuses_the_mutation() {
     );
     // And the write did not land: the refusal is not cosmetic.
     assert_eq!(
-        pool.dispatch(Command::Get { key: b"k".to_vec() }).await,
+        pool.dispatch(Command::Get {
+            key: Bytes::from_static(b"k")
+        })
+        .await,
         Reply::Bulk(None),
         "the value was stored despite its record failing"
     );
@@ -213,7 +223,7 @@ async fn a_log_that_cannot_write_refuses_the_mutation() {
     // incrementing and reporting a number nothing recorded.
     assert_eq!(
         pool.dispatch(Command::IncrBy {
-            key: b"n".to_vec(),
+            key: Bytes::from_static(b"n"),
             delta: 5
         })
         .await,

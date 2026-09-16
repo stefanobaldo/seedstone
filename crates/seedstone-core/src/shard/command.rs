@@ -1,6 +1,8 @@
 //! What a shard is asked to do: the command set, how each command is routed,
 //! and the kind tags the edge counts by.
 
+use bytes::Bytes;
+
 /// How long a `Set` asks its key to live, in the unit the client chose.
 ///
 /// Kept in that unit rather than resolved to a [`std::time::Duration`] at the service
@@ -33,14 +35,14 @@ pub enum Command {
     /// Read the value stored under `key`.
     Get {
         /// The key to read.
-        key: Vec<u8>,
+        key: Bytes,
     },
     /// Store `value` under `key`, replacing whatever was there.
     Set {
         /// The key to write.
-        key: Vec<u8>,
+        key: Bytes,
         /// The bytes to store, kept verbatim.
-        value: Vec<u8>,
+        value: Bytes,
         /// How long the key should live, or `None` to store it without a
         /// deadline. A `Set` with no expiry clears any deadline the key it
         /// overwrote was carrying — Redis's semantics, and the reason the
@@ -76,13 +78,13 @@ pub enum Command {
     /// other option.
     SetEx {
         /// The key to write.
-        key: Vec<u8>,
+        key: Bytes,
         /// How many seconds from now the key dies. Strictly positive: the
         /// service layer refuses zero and negatives before dispatch, as
         /// Redis 6.2.24 and 8.10.1 do.
         seconds: u64,
         /// The bytes to store, kept verbatim.
-        value: Vec<u8>,
+        value: Bytes,
     },
     /// `SETNX key value` — `SET key value NX` under the name Redis gave it
     /// before `SET` grew options, which redis-py's `setnx()` still puts on
@@ -100,9 +102,9 @@ pub enum Command {
     /// truthy `OK` for a write that was refused.
     SetNx {
         /// The key to write, only if it is not already there.
-        key: Vec<u8>,
+        key: Bytes,
         /// The bytes to store, kept verbatim.
-        value: Vec<u8>,
+        value: Bytes,
     },
     /// `PSETEX key milliseconds value` — `SET key value PX milliseconds`
     /// under the name Redis gave it before `SET` grew options.
@@ -115,13 +117,13 @@ pub enum Command {
     /// exactly what the option spelling answers.
     PSetEx {
         /// The key to write.
-        key: Vec<u8>,
+        key: Bytes,
         /// How many milliseconds from now the key dies. Strictly positive:
         /// the service layer refuses zero and negatives before dispatch, as
         /// Redis 6.2.24 and 8.10.1 do.
         millis: u64,
         /// The bytes to store, kept verbatim.
-        value: Vec<u8>,
+        value: Bytes,
     },
     /// Report how long `key` has left, in milliseconds.
     ///
@@ -131,7 +133,7 @@ pub enum Command {
     /// (6.2.24, 8.10.1). The read is `Ttl`'s arm without the rounding.
     PTtl {
         /// The key to ask about.
-        key: Vec<u8>,
+        key: Bytes,
     },
     /// Give `key` the deadline `EXPIREAT` named, or delete it if that deadline
     /// has passed.
@@ -144,7 +146,7 @@ pub enum Command {
     /// 8.10.1).
     ExpireAt {
         /// The key to put a deadline on.
-        key: Vec<u8>,
+        key: Bytes,
         /// Milliseconds left until the deadline the client named, as the edge
         /// computed them; zero or negative means the deadline has passed.
         millis: i64,
@@ -153,20 +155,20 @@ pub enum Command {
     /// counted under its own name (`cmdstat_pexpireat`, 6.2.24 and 8.10.1).
     PExpireAt {
         /// The key to put a deadline on.
-        key: Vec<u8>,
+        key: Bytes,
         /// Milliseconds left until the deadline the client named.
         millis: i64,
     },
     /// Remove `key`.
     Del {
         /// The key to remove.
-        key: Vec<u8>,
+        key: Bytes,
     },
     /// Add `delta` to the integer stored under `key`, treating a missing key
     /// as zero.
     IncrBy {
         /// The key to update.
-        key: Vec<u8>,
+        key: Bytes,
         /// The amount to add; may be negative.
         delta: i64,
     },
@@ -174,7 +176,7 @@ pub enum Command {
     /// is not in the future.
     Expire {
         /// The key to put a deadline on.
-        key: Vec<u8>,
+        key: Bytes,
         /// How many seconds from now; zero or negative deletes the key.
         seconds: i64,
     },
@@ -188,24 +190,24 @@ pub enum Command {
     /// command to, which is the one place that argument belongs.
     PExpire {
         /// The key to put a deadline on.
-        key: Vec<u8>,
+        key: Bytes,
         /// How many milliseconds from now; zero or negative deletes the key.
         millis: i64,
     },
     /// Report how long `key` has left.
     Ttl {
         /// The key to ask about.
-        key: Vec<u8>,
+        key: Bytes,
     },
     /// Take `key`'s deadline away, leaving the key itself where it is.
     Persist {
         /// The key to make permanent.
-        key: Vec<u8>,
+        key: Bytes,
     },
     /// Report whether `key` exists.
     Exists {
         /// The key to ask about.
-        key: Vec<u8>,
+        key: Bytes,
     },
     /// Report what kind of value `key` holds.
     ///
@@ -215,7 +217,7 @@ pub enum Command {
     /// arrive with the command that stores a second type, not before.
     Type {
         /// The key to ask about.
-        key: Vec<u8>,
+        key: Bytes,
     },
     /// Report how many bytes `key`'s value holds.
     ///
@@ -224,7 +226,7 @@ pub enum Command {
     /// indistinguishable here because they hold the same number of bytes.
     StrLen {
         /// The key to measure.
-        key: Vec<u8>,
+        key: Bytes,
     },
     /// Remove every key the shard holds.
     ///
@@ -462,26 +464,26 @@ mod tests {
     #[test]
     fn every_kind_tag_is_contiguous_and_bounded() {
         let every = [
-            Command::Get { key: Vec::new() },
+            Command::Get { key: Bytes::new() },
             Command::Set {
-                key: Vec::new(),
-                value: Vec::new(),
+                key: Bytes::new(),
+                value: Bytes::new(),
                 expiry: None,
                 cond: None,
                 keep_ttl: false,
                 get: false,
             },
-            Command::Del { key: Vec::new() },
+            Command::Del { key: Bytes::new() },
             Command::IncrBy {
-                key: Vec::new(),
+                key: Bytes::new(),
                 delta: 1,
             },
             Command::Expire {
-                key: Vec::new(),
+                key: Bytes::new(),
                 seconds: 1,
             },
-            Command::Ttl { key: Vec::new() },
-            Command::Exists { key: Vec::new() },
+            Command::Ttl { key: Bytes::new() },
+            Command::Exists { key: Bytes::new() },
             Command::FlushDb,
             Command::DbSize,
             Command::ScanStep {
@@ -490,34 +492,34 @@ mod tests {
                 pattern: None,
             },
             Command::PExpire {
-                key: Vec::new(),
+                key: Bytes::new(),
                 millis: 1,
             },
-            Command::Persist { key: Vec::new() },
-            Command::Type { key: Vec::new() },
-            Command::StrLen { key: Vec::new() },
+            Command::Persist { key: Bytes::new() },
+            Command::Type { key: Bytes::new() },
+            Command::StrLen { key: Bytes::new() },
             Command::Stats,
             Command::SetEx {
-                key: Vec::new(),
+                key: Bytes::new(),
                 seconds: 1,
-                value: Vec::new(),
+                value: Bytes::new(),
             },
             Command::SetNx {
-                key: Vec::new(),
-                value: Vec::new(),
+                key: Bytes::new(),
+                value: Bytes::new(),
             },
             Command::PSetEx {
-                key: Vec::new(),
+                key: Bytes::new(),
                 millis: 1,
-                value: Vec::new(),
+                value: Bytes::new(),
             },
-            Command::PTtl { key: Vec::new() },
+            Command::PTtl { key: Bytes::new() },
             Command::ExpireAt {
-                key: Vec::new(),
+                key: Bytes::new(),
                 millis: 1,
             },
             Command::PExpireAt {
-                key: Vec::new(),
+                key: Bytes::new(),
                 millis: 1,
             },
         ];
@@ -579,34 +581,50 @@ mod tests {
     #[test]
     fn every_command_declares_how_it_is_routed() {
         let keyed: [Command; 15] = [
-            Command::Get { key: b"k".to_vec() },
+            Command::Get {
+                key: Bytes::from_static(b"k"),
+            },
             set(b"k", b"v"),
-            Command::Del { key: b"k".to_vec() },
+            Command::Del {
+                key: Bytes::from_static(b"k"),
+            },
             Command::IncrBy {
-                key: b"k".to_vec(),
+                key: Bytes::from_static(b"k"),
                 delta: 1,
             },
             Command::Expire {
-                key: b"k".to_vec(),
+                key: Bytes::from_static(b"k"),
                 seconds: 1,
             },
             Command::PExpire {
-                key: b"k".to_vec(),
+                key: Bytes::from_static(b"k"),
                 millis: 1,
             },
-            Command::Ttl { key: b"k".to_vec() },
-            Command::Persist { key: b"k".to_vec() },
-            Command::Exists { key: b"k".to_vec() },
-            Command::Type { key: b"k".to_vec() },
-            Command::StrLen { key: b"k".to_vec() },
+            Command::Ttl {
+                key: Bytes::from_static(b"k"),
+            },
+            Command::Persist {
+                key: Bytes::from_static(b"k"),
+            },
+            Command::Exists {
+                key: Bytes::from_static(b"k"),
+            },
+            Command::Type {
+                key: Bytes::from_static(b"k"),
+            },
+            Command::StrLen {
+                key: Bytes::from_static(b"k"),
+            },
             setex(b"k", 1, b"v"),
-            Command::PTtl { key: b"k".to_vec() },
+            Command::PTtl {
+                key: Bytes::from_static(b"k"),
+            },
             Command::ExpireAt {
-                key: b"k".to_vec(),
+                key: Bytes::from_static(b"k"),
                 millis: 1,
             },
             Command::PExpireAt {
-                key: b"k".to_vec(),
+                key: Bytes::from_static(b"k"),
                 millis: 1,
             },
         ];

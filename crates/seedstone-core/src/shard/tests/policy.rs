@@ -6,6 +6,7 @@ use crate::dict::{DictSeed, WalkOrder};
 use crate::shard::{
     Deadlines, EvictionPolicy, ExpiryPolicy, HOUSEKEEPING_TICK, NoTrace, Reply, Router, ShardPool,
 };
+use bytes::Bytes;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -58,7 +59,7 @@ async fn a_pool_spawned_with_a_policy_expires_by_that_policy() {
 
     assert_eq!(
         pool.dispatch(get(b"k")).await,
-        Reply::Bulk(Some(b"v".to_vec())),
+        Reply::Bulk(Some(Bytes::from_static(b"v"))),
         "the policy said nothing was due, so the key must still answer"
     );
 }
@@ -122,7 +123,7 @@ async fn the_eviction_decision_is_the_policys() {
     assert_eq!(honest.dispatch(set(b"b", b"v")).await, Reply::Ok);
     assert_eq!(
         honest.dispatch(get(b"a")).await,
-        Reply::Bulk(Some(b"v".to_vec())),
+        Reply::Bulk(Some(Bytes::from_static(b"v"))),
         "the honest policy under no ceiling reclaims nothing"
     );
 }

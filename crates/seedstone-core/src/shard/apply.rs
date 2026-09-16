@@ -2,6 +2,8 @@
 //! and the replication record it appends when it changed something. Expiry
 //! is resolved lazily here and by the sweep in [`crate::shard::executor`].
 
+use bytes::Bytes;
+
 use crate::dict::{Dict, Entry};
 use crate::glob;
 use crate::log::{Record, ReplicationLog};
@@ -27,7 +29,8 @@ use tokio::time::Instant;
 /// write path that is the difference between one copy of a payload and two, and
 /// the payload is the largest thing a peer can send. The key cannot be treated
 /// that way: [`TraceSink`] observes the command after this call and folds its
-/// key, so the key is cloned and the command's own copy is left intact. What a
+/// key, so the key is cloned — a reference count, not a copy of its bytes —
+/// and the command's own is left intact. What a
 /// handler may take is exactly what the trace does not read.
 ///
 /// `now` is the instant the whole envelope is being served at, supplied by the
@@ -102,6 +105,8 @@ pub fn apply<L: ReplicationLog, P: ShardPolicy>(
         // whole working set up for eviction.
         Command::Get { key } => {
             dict.touch(key);
+            // The clone is a reference count; the connection drops it once
+            // the reply is encoded.
             Reply::Bulk(dict.get(key).map(|entry| entry.value.clone()))
         }
 
@@ -235,9 +240,9 @@ pub fn apply<L: ReplicationLog, P: ShardPolicy>(
 /// value mutably, so the handler can take the bytes rather than copy them.
 struct SetArgs<'a> {
     /// The key to write.
-    key: &'a Vec<u8>,
+    key: &'a Bytes,
     /// The bytes to store, taken by the write that stores them.
-    value: &'a mut Vec<u8>,
+    value: &'a mut Bytes,
     /// How long the key should live.
     expiry: Option<Expiry>,
     /// The condition the write is subject to.
@@ -258,7 +263,7 @@ impl<'a> SetArgs<'a> {
     /// six fields of it read as a decision at each one when only the deadline
     /// is a decision at all. Naming the four that are off here says once, in
     /// the place that owns the type, that `SETEX` has no options.
-    const fn set_ex(key: &'a Vec<u8>, value: &'a mut Vec<u8>, seconds: u64) -> Self {
+    const fn set_ex(key: &'a Bytes, value: &'a mut Bytes, seconds: u64) -> Self {
         Self {
             key,
             value,
@@ -272,7 +277,7 @@ impl<'a> SetArgs<'a> {
     /// The four fields `SETNX` does not have. Named here for
     /// [`set_ex`](Self::set_ex)'s reason: the type carries six fields and
     /// only the condition is a decision this command makes.
-    const fn set_nx(key: &'a Vec<u8>, value: &'a mut Vec<u8>) -> Self {
+    const fn set_nx(key: &'a Bytes, value: &'a mut Bytes) -> Self {
         Self {
             key,
             value,
@@ -286,7 +291,7 @@ impl<'a> SetArgs<'a> {
     /// [`set_ex`](Self::set_ex)'s shape with the span in milliseconds. The
     /// four fields named off here say once that `PSETEX` has no options
     /// either.
-    const fn pset_ex(key: &'a Vec<u8>, value: &'a mut Vec<u8>, millis: u64) -> Self {
+    const fn pset_ex(key: &'a Bytes, value: &'a mut Bytes, millis: u64) -> Self {
         Self {
             key,
             value,
@@ -329,6 +334,7 @@ fn set<L: ReplicationLog>(
     //
     // The value is cloned only for a `GET`, since that reply is the one thing
     // that still wants the old bytes after the write has taken their place.
+    // The clone is a reference count, as on the read path.
     let found = dict.get(key);
     let existed = found.is_some();
     let old = found.filter(|_| get).map(|entry| entry.value.clone());
@@ -392,8 +398,8 @@ fn set_nx<L: ReplicationLog>(
     seq: &mut u64,
     shard: u16,
     now: Instant,
-    key: &Vec<u8>,
-    value: &mut Vec<u8>,
+    key: &Bytes,
+    value: &mut Bytes,
 ) -> Reply {
     // `set` answers `Ok` or `Bulk(None)` for the `NX` condition; this spelling
     // reports the same decision as an integer (6.2.24, 8.10.1).
@@ -438,7 +444,7 @@ fn incr_by<L: ReplicationLog>(
     log: &mut L,
     seq: &mut u64,
     shard: u16,
-    key: &[u8],
+    key: &Bytes,
     delta: i64,
 ) -> Reply {
     let (current, expires_at) = match dict.get(key) {
@@ -457,9 +463,11 @@ fn incr_by<L: ReplicationLog>(
     // The deadline rides along, as it does in Redis: an increment changes what
     // a counter holds, not how long it lives.
     dict.insert(
-        key.to_vec(),
+        key.clone(),
         Entry {
-            value: next.to_string().into_bytes(),
+            // The one copy on this path: the counter's new text is built
+            // fresh, as it always was.
+            value: Bytes::from(next.to_string()),
             expires_at,
             touched: 0,
         },
