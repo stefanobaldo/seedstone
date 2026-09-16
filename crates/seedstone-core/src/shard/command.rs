@@ -263,7 +263,7 @@ pub enum Command {
         count: usize,
         /// Return only keys matching this glob, filtered here rather than at
         /// the edge so the channel does not carry a keyspace to discard it.
-        pattern: Option<Vec<u8>>,
+        pattern: Option<Bytes>,
     },
     /// Report what this shard has counted since it started.
     ///

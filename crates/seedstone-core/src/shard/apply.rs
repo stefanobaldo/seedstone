@@ -619,7 +619,7 @@ pub fn scan_step<P: ShardPolicy>(
                 return;
             }
             if pattern.is_none_or(|p| glob::matches(p, key)) {
-                keys.push(key.to_vec());
+                keys.push(key.clone());
             }
         });
         if next == 0 {

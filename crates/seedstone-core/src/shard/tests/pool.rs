@@ -210,6 +210,35 @@ async fn a_broadcast_is_answered_once_per_shard_in_shard_order() {
     );
 }
 
+/// A scan step hands back the keys it matched by reference count: the
+/// bytes a reply carries are the bytes the dict holds, not a copy of them.
+#[test]
+fn a_scan_step_returns_the_dicts_own_key_bytes() {
+    let mut dict = Dict::with_seed(DictSeed { k0: 1, k1: 2 });
+    let key = Bytes::from_static(b"shared:key");
+    dict.insert(
+        key.clone(),
+        Entry {
+            value: Bytes::from_static(b"v"),
+            expires_at: None,
+            touched: 0,
+        },
+    );
+    let reply = scan_step(
+        &dict,
+        0,
+        1024,
+        Some(b"shared:*"),
+        Instant::now(),
+        &Deadlines,
+    );
+    let Reply::Scan { keys, .. } = reply else {
+        panic!("{reply:?}")
+    };
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].as_ptr(), key.as_ptr(), "the key was copied");
+}
+
 /// The budget the edge accounts a crossing call by: how many buckets one
 /// step actually walked, which is not the count it was asked for whenever
 /// the step finished the cycle first.
@@ -259,7 +288,7 @@ async fn a_scan_step_returns_at_most_a_countful_and_a_resumable_cursor() {
         pool.dispatch(set(format!("k{i}").as_bytes(), b"v")).await;
     }
 
-    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut seen: Vec<Bytes> = Vec::new();
     let mut cursor = 0u64;
     let mut calls = 0;
     loop {
@@ -305,7 +334,7 @@ async fn a_scan_step_filters_by_pattern_inside_the_shard() {
     for name in ["alpha", "album", "beta"] {
         pool.dispatch(set(name.as_bytes(), b"v")).await;
     }
-    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut seen: Vec<Bytes> = Vec::new();
     let mut cursor = 0u64;
     loop {
         let Reply::Scan {
@@ -316,7 +345,7 @@ async fn a_scan_step_filters_by_pattern_inside_the_shard() {
                 Command::ScanStep {
                     cursor,
                     count: 100,
-                    pattern: Some(b"al*".to_vec()),
+                    pattern: Some(Bytes::from_static(b"al*")),
                 },
             )
             .await
@@ -330,7 +359,10 @@ async fn a_scan_step_filters_by_pattern_inside_the_shard() {
         }
     }
     seen.sort();
-    assert_eq!(seen, vec![b"album".to_vec(), b"alpha".to_vec()]);
+    assert_eq!(
+        seen,
+        vec![Bytes::from_static(b"album"), Bytes::from_static(b"alpha")]
+    );
 }
 
 #[tokio::test]
