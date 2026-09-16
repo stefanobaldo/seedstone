@@ -7,6 +7,7 @@ use crate::dict::{Dict, DictSeed, Entry};
 use crate::shard::apply::scan_step;
 use crate::shard::{Command, Deadlines, NoTrace, Reply, Route, Router, ShardPool};
 use crate::slot::{executor_of, shard_of};
+use bytes::Bytes;
 use tokio::time::Instant;
 
 /// The counters `INFO` reports, gathered the way `INFO` gathers them.
@@ -28,36 +29,36 @@ async fn a_shard_counts_the_lookups_and_the_calls_info_reports() {
     pool.dispatch(get(b"present")).await;
     pool.dispatch(get(b"absent")).await;
     pool.dispatch(Command::Exists {
-        key: b"present".to_vec(),
+        key: Bytes::from_static(b"present"),
     })
     .await;
     pool.dispatch(Command::Exists {
-        key: b"absent".to_vec(),
+        key: Bytes::from_static(b"absent"),
     })
     .await;
     // And one of each from the three that do not.
     pool.dispatch(Command::Ttl {
-        key: b"present".to_vec(),
+        key: Bytes::from_static(b"present"),
     })
     .await;
     pool.dispatch(Command::Ttl {
-        key: b"absent".to_vec(),
+        key: Bytes::from_static(b"absent"),
     })
     .await;
     pool.dispatch(Command::Type {
-        key: b"present".to_vec(),
+        key: Bytes::from_static(b"present"),
     })
     .await;
     pool.dispatch(Command::Type {
-        key: b"absent".to_vec(),
+        key: Bytes::from_static(b"absent"),
     })
     .await;
     pool.dispatch(Command::StrLen {
-        key: b"empty".to_vec(),
+        key: Bytes::from_static(b"empty"),
     })
     .await;
     pool.dispatch(Command::StrLen {
-        key: b"absent".to_vec(),
+        key: Bytes::from_static(b"absent"),
     })
     .await;
     // A broadcast, which no shard may count.
@@ -69,7 +70,7 @@ async fn a_shard_counts_the_lookups_and_the_calls_info_reports() {
     assert_eq!(stats.keys, 2);
     assert_eq!(stats.expires, 0);
     assert_eq!(
-        stats.calls[usize::from(Command::Get { key: Vec::new() }.kind())],
+        stats.calls[usize::from(Command::Get { key: Bytes::new() }.kind())],
         2
     );
     assert_eq!(
@@ -101,8 +102,11 @@ async fn keys_spread_over_shards_and_every_one_survives_growth() {
     }
     for (i, key) in keys.iter().enumerate() {
         assert_eq!(
-            pool.dispatch(Command::Get { key: key.clone() }).await,
-            Reply::Bulk(Some(i.to_string().into_bytes())),
+            pool.dispatch(Command::Get {
+                key: Bytes::from(key.clone())
+            })
+            .await,
+            Reply::Bulk(Some(Bytes::from(i.to_string()))),
             "key {key:?} lost across a rehash"
         );
     }
@@ -141,13 +145,15 @@ async fn a_batch_is_answered_in_request_order_across_executors() {
 
     let gets: Vec<Command> = keys
         .iter()
-        .map(|key| Command::Get { key: key.clone() })
+        .map(|key| Command::Get {
+            key: Bytes::from(key.clone()),
+        })
         .collect();
     let replies = pool.dispatch_many(gets).await;
     for (i, reply) in replies.iter().enumerate() {
         assert_eq!(
             *reply,
-            Reply::Bulk(Some(i.to_string().into_bytes())),
+            Reply::Bulk(Some(Bytes::from(i.to_string()))),
             "reply {i} out of order or wrong"
         );
     }
@@ -186,8 +192,8 @@ async fn a_broadcast_is_answered_once_per_shard_in_shard_order() {
     for i in 0..8u16 {
         for key in keys_landing_on(i, 8, usize::from(i) + 1) {
             pool.dispatch(Command::Set {
-                key,
-                value: b"v".to_vec(),
+                key: Bytes::from(key),
+                value: Bytes::from_static(b"v"),
                 expiry: None,
                 cond: None,
                 keep_ttl: false,
@@ -214,9 +220,9 @@ fn a_scan_step_reports_how_many_buckets_it_visited() {
     // nothing has grown and the cycle is exactly eight steps long.
     for i in 0..4u8 {
         dict.insert(
-            vec![i],
+            Bytes::from(vec![i]),
             Entry {
-                value: Vec::new(),
+                value: Bytes::new(),
                 expires_at: None,
                 touched: 0,
             },
@@ -342,7 +348,7 @@ async fn the_default_dispatch_many_loops_dispatch_in_order() {
     impl Router for Echo {
         async fn dispatch(&self, cmd: Command) -> Reply {
             match cmd.route() {
-                Route::Key(key) => Reply::Bulk(Some(key.to_vec())),
+                Route::Key(key) => Reply::Bulk(Some(Bytes::copy_from_slice(key))),
                 Route::Shard(_) | Route::Every | Route::Unaddressed => Reply::Ok,
             }
         }
@@ -363,15 +369,19 @@ async fn the_default_dispatch_many_loops_dispatch_in_order() {
     }
     let replies = Echo
         .dispatch_many(vec![
-            Command::Get { key: b"a".to_vec() },
-            Command::Get { key: b"b".to_vec() },
+            Command::Get {
+                key: Bytes::from_static(b"a"),
+            },
+            Command::Get {
+                key: Bytes::from_static(b"b"),
+            },
         ])
         .await;
     assert_eq!(
         replies,
         vec![
-            Reply::Bulk(Some(b"a".to_vec())),
-            Reply::Bulk(Some(b"b".to_vec()))
+            Reply::Bulk(Some(Bytes::from_static(b"a"))),
+            Reply::Bulk(Some(Bytes::from_static(b"b")))
         ]
     );
 }

@@ -9,6 +9,7 @@ use crate::shard::executor::ShardState;
 use crate::shard::{
     Command, Deadlines, HOUSEKEEPING_TICK, NoTrace, Reply, ReplyError, Router, ShardPool,
 };
+use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -21,7 +22,7 @@ async fn set_with_ex_expires_lazily() {
     tokio::time::advance(Duration::from_secs(29)).await;
     assert_eq!(
         shard.run(get(b"k"), Instant::now()),
-        Reply::Bulk(Some(b"v".to_vec())),
+        Reply::Bulk(Some(Bytes::from_static(b"v"))),
         "a key one second short of its deadline is still a key"
     );
 
@@ -47,7 +48,7 @@ async fn setex_writes_the_value_and_the_deadline() {
     tokio::time::advance(Duration::from_secs(29)).await;
     assert_eq!(
         shard.run(get(b"k"), Instant::now()),
-        Reply::Bulk(Some(b"v".to_vec())),
+        Reply::Bulk(Some(Bytes::from_static(b"v"))),
         "a key one second short of its deadline is still a key"
     );
 
@@ -57,7 +58,9 @@ async fn setex_writes_the_value_and_the_deadline() {
 }
 
 fn pttl(key: &[u8]) -> Command {
-    Command::PTtl { key: key.to_vec() }
+    Command::PTtl {
+        key: Bytes::copy_from_slice(key),
+    }
 }
 
 /// `PTTL` is `TTL` in milliseconds: `-2` for a key that is not there,
@@ -74,7 +77,7 @@ async fn pttl_answers_in_milliseconds() {
     assert_eq!(
         shard.run(
             Command::PExpire {
-                key: b"k".to_vec(),
+                key: Bytes::from_static(b"k"),
                 millis: 1500
             },
             Instant::now()
@@ -84,7 +87,12 @@ async fn pttl_answers_in_milliseconds() {
     tokio::time::advance(Duration::from_millis(400)).await;
     assert_eq!(shard.run(pttl(b"k"), Instant::now()), Reply::Integer(1100));
     assert_eq!(
-        shard.run(Command::Ttl { key: b"k".to_vec() }, Instant::now()),
+        shard.run(
+            Command::Ttl {
+                key: Bytes::from_static(b"k")
+            },
+            Instant::now()
+        ),
         Reply::Integer(1),
         "TTL rounds the same deadline to the nearest second"
     );
@@ -102,7 +110,7 @@ async fn expireat_is_pexpire_on_a_span_the_edge_resolved() {
     assert_eq!(
         shard.run(
             Command::ExpireAt {
-                key: b"k".to_vec(),
+                key: Bytes::from_static(b"k"),
                 millis: 30_000
             },
             Instant::now()
@@ -116,7 +124,7 @@ async fn expireat_is_pexpire_on_a_span_the_edge_resolved() {
     assert_eq!(
         shard.run(
             Command::PExpireAt {
-                key: b"k".to_vec(),
+                key: Bytes::from_static(b"k"),
                 millis: 0
             },
             Instant::now()
@@ -129,7 +137,7 @@ async fn expireat_is_pexpire_on_a_span_the_edge_resolved() {
     assert_eq!(
         shard.run(
             Command::ExpireAt {
-                key: b"missing".to_vec(),
+                key: Bytes::from_static(b"missing"),
                 millis: 30_000
             },
             Instant::now()
@@ -153,12 +161,12 @@ async fn setex_overwrites_value_and_deadline_alike() {
     );
     assert_eq!(
         shard.run(get(b"pre"), Instant::now()),
-        Reply::Bulk(Some(b"replaced".to_vec()))
+        Reply::Bulk(Some(Bytes::from_static(b"replaced")))
     );
     assert_eq!(
         shard.run(
             Command::Ttl {
-                key: b"pre".to_vec()
+                key: Bytes::from_static(b"pre")
             },
             Instant::now()
         ),
@@ -169,9 +177,11 @@ async fn setex_overwrites_value_and_deadline_alike() {
 #[tokio::test(start_paused = true)]
 async fn expire_and_ttl() {
     let mut shard = Shard::for_tests();
-    let ttl = |key: &[u8]| Command::Ttl { key: key.to_vec() };
+    let ttl = |key: &[u8]| Command::Ttl {
+        key: Bytes::copy_from_slice(key),
+    };
     let expire = |key: &[u8], seconds: i64| Command::Expire {
-        key: key.to_vec(),
+        key: Bytes::copy_from_slice(key),
         seconds,
     };
 
@@ -216,7 +226,7 @@ async fn expire_and_ttl() {
     assert_eq!(shard.run(ttl(b"k"), Instant::now()), Reply::Integer(0));
     assert_eq!(
         shard.run(get(b"k"), Instant::now()),
-        Reply::Bulk(Some(b"v".to_vec())),
+        Reply::Bulk(Some(Bytes::from_static(b"v"))),
         "a key reading TTL 0 is still alive"
     );
 
@@ -256,7 +266,7 @@ async fn expired_keys_are_dead_to_every_command() {
     assert_eq!(
         shard.run(
             Command::Exists {
-                key: b"exists".to_vec()
+                key: Bytes::from_static(b"exists")
             },
             now
         ),
@@ -265,7 +275,7 @@ async fn expired_keys_are_dead_to_every_command() {
     assert_eq!(
         shard.run(
             Command::Ttl {
-                key: b"ttl".to_vec()
+                key: Bytes::from_static(b"ttl")
             },
             now
         ),
@@ -278,7 +288,7 @@ async fn expired_keys_are_dead_to_every_command() {
     assert_eq!(
         shard.run(
             Command::Persist {
-                key: b"persist".to_vec()
+                key: Bytes::from_static(b"persist")
             },
             now
         ),
@@ -287,7 +297,7 @@ async fn expired_keys_are_dead_to_every_command() {
     assert_eq!(
         shard.run(
             Command::PExpire {
-                key: b"pexpire".to_vec(),
+                key: Bytes::from_static(b"pexpire"),
                 millis: 10_000
             },
             now
@@ -297,7 +307,7 @@ async fn expired_keys_are_dead_to_every_command() {
     assert_eq!(
         shard.run(
             Command::Del {
-                key: b"del".to_vec()
+                key: Bytes::from_static(b"del")
             },
             now
         ),
@@ -306,7 +316,7 @@ async fn expired_keys_are_dead_to_every_command() {
     assert_eq!(
         shard.run(
             Command::IncrBy {
-                key: b"incrby".to_vec(),
+                key: Bytes::from_static(b"incrby"),
                 delta: 7
             },
             now
@@ -321,7 +331,7 @@ async fn expired_keys_are_dead_to_every_command() {
     assert_eq!(
         shard.run(
             Command::Type {
-                key: b"type".to_vec()
+                key: Bytes::from_static(b"type")
             },
             now
         ),
@@ -330,7 +340,7 @@ async fn expired_keys_are_dead_to_every_command() {
     assert_eq!(
         shard.run(
             Command::StrLen {
-                key: b"strlen".to_vec()
+                key: Bytes::from_static(b"strlen")
             },
             now
         ),
@@ -400,10 +410,14 @@ async fn an_expiry_is_logged_exactly_as_a_delete_is() {
 #[tokio::test(start_paused = true)]
 async fn pexpire_and_persist_reach_the_log_only_when_they_change_something() {
     let mut shard = Shard::for_tests();
-    let ttl = |key: &[u8]| Command::Ttl { key: key.to_vec() };
-    let persist = |key: &[u8]| Command::Persist { key: key.to_vec() };
+    let ttl = |key: &[u8]| Command::Ttl {
+        key: Bytes::copy_from_slice(key),
+    };
+    let persist = |key: &[u8]| Command::Persist {
+        key: Bytes::copy_from_slice(key),
+    };
     let pexpire = |key: &[u8], millis: i64| Command::PExpire {
-        key: key.to_vec(),
+        key: Bytes::copy_from_slice(key),
         millis,
     };
 

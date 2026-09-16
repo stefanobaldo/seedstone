@@ -9,6 +9,7 @@ use crate::shard::executor::ShardState;
 use crate::shard::{
     Command, Cond, Deadlines, NoTrace, Reply, ReplyError, Route, Router, ShardPool,
 };
+use bytes::Bytes;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -16,8 +17,8 @@ use tokio::time::Instant;
 async fn set_nx_xx_algebra() {
     let mut shard = Shard::for_tests();
     let conditional = |value: &[u8], cond: Cond| Command::Set {
-        key: b"k".to_vec(),
-        value: value.to_vec(),
+        key: Bytes::from_static(b"k"),
+        value: Bytes::copy_from_slice(value),
         expiry: None,
         cond: Some(cond),
         keep_ttl: false,
@@ -38,7 +39,7 @@ async fn set_nx_xx_algebra() {
     );
     assert_eq!(
         shard.run(get(b"k"), Instant::now()),
-        Reply::Bulk(Some(b"first".to_vec()))
+        Reply::Bulk(Some(Bytes::from_static(b"first")))
     );
 
     // NX on a present key refuses, and leaves the value it found alone.
@@ -48,7 +49,7 @@ async fn set_nx_xx_algebra() {
     );
     assert_eq!(
         shard.run(get(b"k"), Instant::now()),
-        Reply::Bulk(Some(b"first".to_vec())),
+        Reply::Bulk(Some(Bytes::from_static(b"first"))),
         "a refused NX overwrote the value anyway"
     );
 
@@ -59,7 +60,7 @@ async fn set_nx_xx_algebra() {
     );
     assert_eq!(
         shard.run(get(b"k"), Instant::now()),
-        Reply::Bulk(Some(b"second".to_vec()))
+        Reply::Bulk(Some(Bytes::from_static(b"second")))
     );
 
     // And a plain SET clears the deadline the key it overwrote carried —
@@ -71,7 +72,7 @@ async fn set_nx_xx_algebra() {
     tokio::time::advance(Duration::from_hours(1)).await;
     assert_eq!(
         shard.run(get(b"t"), Instant::now()),
-        Reply::Bulk(Some(b"w".to_vec())),
+        Reply::Bulk(Some(Bytes::from_static(b"w"))),
         "a plain SET left the old deadline in place"
     );
 }
@@ -81,12 +82,15 @@ async fn commands_round_trip_through_the_pool() {
     let pool = ShardPool::spawn(16, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
     assert_eq!(pool.dispatch(set(b"k", b"v")).await, Reply::Ok);
     assert_eq!(
-        pool.dispatch(Command::Get { key: b"k".to_vec() }).await,
-        Reply::Bulk(Some(b"v".to_vec()))
+        pool.dispatch(Command::Get {
+            key: Bytes::from_static(b"k")
+        })
+        .await,
+        Reply::Bulk(Some(Bytes::from_static(b"v")))
     );
     assert_eq!(
         pool.dispatch(Command::IncrBy {
-            key: b"n".to_vec(),
+            key: Bytes::from_static(b"n"),
             delta: 5
         })
         .await,
@@ -94,7 +98,7 @@ async fn commands_round_trip_through_the_pool() {
     );
     assert_eq!(
         pool.dispatch(Command::IncrBy {
-            key: b"n".to_vec(),
+            key: Bytes::from_static(b"n"),
             delta: -2
         })
         .await,
@@ -102,22 +106,31 @@ async fn commands_round_trip_through_the_pool() {
     );
     assert_eq!(
         pool.dispatch(Command::IncrBy {
-            key: b"k".to_vec(),
+            key: Bytes::from_static(b"k"),
             delta: 1
         })
         .await,
         Reply::Error(ReplyError::NotAnInteger)
     );
     assert_eq!(
-        pool.dispatch(Command::Del { key: b"k".to_vec() }).await,
+        pool.dispatch(Command::Del {
+            key: Bytes::from_static(b"k")
+        })
+        .await,
         Reply::Removed(true)
     );
     assert_eq!(
-        pool.dispatch(Command::Del { key: b"k".to_vec() }).await,
+        pool.dispatch(Command::Del {
+            key: Bytes::from_static(b"k")
+        })
+        .await,
         Reply::Removed(false)
     );
     assert_eq!(
-        pool.dispatch(Command::Get { key: b"k".to_vec() }).await,
+        pool.dispatch(Command::Get {
+            key: Bytes::from_static(b"k")
+        })
+        .await,
         Reply::Bulk(None)
     );
 }
@@ -139,7 +152,7 @@ fn a_handler_runs_to_completion_without_a_runtime() {
     assert_eq!(stored, Reply::Ok);
     assert_eq!(
         apply(&mut state, 0, &mut get(b"k"), now, &Deadlines),
-        Reply::Bulk(Some(b"v".to_vec()))
+        Reply::Bulk(Some(Bytes::from_static(b"v")))
     );
 }
 
@@ -169,7 +182,7 @@ fn a_handler_takes_the_value_and_leaves_what_the_trace_reads() {
     assert_eq!(cmd.kind(), set(b"k", b"v").kind());
     assert_eq!(
         state.dict.get(b"k").map(|entry| entry.value.clone()),
-        Some(b"v".to_vec())
+        Some(Bytes::from_static(b"v"))
     );
     // The other half of the same fact: the dict holds the only copy of the
     // value, because the command no longer has one. A `SET` that copied it
@@ -189,7 +202,12 @@ fn seq_advances_only_for_commands_that_change_something() {
     };
 
     // A read moves nothing.
-    run(&mut state, Command::Get { key: b"a".to_vec() });
+    run(
+        &mut state,
+        Command::Get {
+            key: Bytes::from_static(b"a"),
+        },
+    );
     assert_eq!(state.seq, 0);
 
     // A write does.
@@ -201,7 +219,7 @@ fn seq_advances_only_for_commands_that_change_something() {
     run(
         &mut state,
         Command::Del {
-            key: b"absent".to_vec(),
+            key: Bytes::from_static(b"absent"),
         },
     );
     assert_eq!(state.seq, 1);
@@ -210,7 +228,7 @@ fn seq_advances_only_for_commands_that_change_something() {
     run(
         &mut state,
         Command::IncrBy {
-            key: b"a".to_vec(),
+            key: Bytes::from_static(b"a"),
             delta: 1,
         },
     );
@@ -224,7 +242,7 @@ fn seq_advances_only_for_commands_that_change_something() {
     run(
         &mut state,
         Command::IncrBy {
-            key: b"txt".to_vec(),
+            key: Bytes::from_static(b"txt"),
             delta: 1,
         },
     );
@@ -234,7 +252,12 @@ fn seq_advances_only_for_commands_that_change_something() {
     );
 
     // And a delete that does remove something.
-    run(&mut state, Command::Del { key: b"a".to_vec() });
+    run(
+        &mut state,
+        Command::Del {
+            key: Bytes::from_static(b"a"),
+        },
+    );
     assert_eq!(state.seq, 4);
 }
 
@@ -248,7 +271,7 @@ async fn incr_by_reports_overflow_instead_of_panicking() {
     );
     assert_eq!(
         pool.dispatch(Command::IncrBy {
-            key: b"c".to_vec(),
+            key: Bytes::from_static(b"c"),
             delta: 1
         })
         .await,
@@ -256,8 +279,11 @@ async fn incr_by_reports_overflow_instead_of_panicking() {
     );
     // The value is untouched.
     assert_eq!(
-        pool.dispatch(Command::Get { key: b"c".to_vec() }).await,
-        Reply::Bulk(Some(i64::MAX.to_string().into_bytes()))
+        pool.dispatch(Command::Get {
+            key: Bytes::from_static(b"c")
+        })
+        .await,
+        Reply::Bulk(Some(Bytes::from(i64::MAX.to_string())))
     );
 }
 
@@ -266,7 +292,7 @@ async fn a_missing_counter_starts_at_zero_and_set_overwrites() {
     let pool = ShardPool::spawn(8, 4, DictSeed { k0: 5, k1: 6 }, NoTrace);
     assert_eq!(
         pool.dispatch(Command::IncrBy {
-            key: b"fresh".to_vec(),
+            key: Bytes::from_static(b"fresh"),
             delta: -3
         })
         .await,
@@ -275,7 +301,7 @@ async fn a_missing_counter_starts_at_zero_and_set_overwrites() {
     assert_eq!(pool.dispatch(set(b"fresh", b"100")).await, Reply::Ok);
     assert_eq!(
         pool.dispatch(Command::IncrBy {
-            key: b"fresh".to_vec(),
+            key: Bytes::from_static(b"fresh"),
             delta: 1
         })
         .await,

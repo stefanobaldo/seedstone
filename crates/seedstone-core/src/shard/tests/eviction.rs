@@ -7,6 +7,7 @@ use crate::log::NoopLog;
 use crate::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use crate::shard::executor::{Memory, ShardState, evict_until_fits};
 use crate::shard::{Command, Deadlines, NoTrace, Reply, ReplyError, Router, ShardPool};
+use bytes::Bytes;
 
 /// `SETEX` carries Redis's `denyoom` flag (`COMMAND INFO SETEX` on
 /// 6.2.24 and 8.10.1), so under `noeviction` a full shard refuses it as
@@ -44,7 +45,10 @@ async fn the_pool_gauge_follows_what_its_dicts_account() {
         empty + crate::dict::entry_bytes(b"k", &[0u8; 100])
     );
     assert_eq!(
-        pool.dispatch(Command::Del { key: b"k".to_vec() }).await,
+        pool.dispatch(Command::Del {
+            key: Bytes::from_static(b"k")
+        })
+        .await,
         Reply::Removed(true)
     );
     assert_eq!(gauge.used(), empty);
@@ -83,7 +87,7 @@ async fn allkeys_lru_evicts_until_the_write_fits() {
     assert_eq!(evicted(&pool).await, 1);
     assert_eq!(
         pool.dispatch(get(b"k9")).await,
-        Reply::Bulk(Some(vec![0u8; 64])),
+        Reply::Bulk(Some(vec![0u8; 64].into())),
         "the write that evicted is itself kept"
     );
 }
@@ -108,11 +112,11 @@ async fn noeviction_refuses_a_write_over_the_ceiling_and_keeps_reads() {
     );
     assert_eq!(
         pool.dispatch(get(b"k0")).await,
-        Reply::Bulk(Some(vec![0u8; 64]))
+        Reply::Bulk(Some(vec![0u8; 64].into()))
     );
     assert_eq!(
         pool.dispatch(Command::Del {
-            key: b"k0".to_vec()
+            key: Bytes::from_static(b"k0")
         })
         .await,
         Reply::Removed(true),
@@ -147,9 +151,9 @@ fn a_command_that_does_not_stamp_still_evicts_past_the_ceiling() {
     // `EVICTION_SAMPLES` — offers it first.
     for key in [b"spared".as_slice(), b"middle", b"newest"] {
         state.dict.insert(
-            key.to_vec(),
+            Bytes::copy_from_slice(key),
             Entry {
-                value: vec![0u8; 64],
+                value: vec![0u8; 64].into(),
                 expires_at: None,
                 touched: 0,
             },
@@ -198,6 +202,6 @@ async fn a_value_larger_than_the_ceiling_empties_the_shard_and_stops() {
     assert_eq!(pool.dispatch(set(b"big", &[0u8; 1024])).await, Reply::Ok);
     assert_eq!(
         pool.dispatch(get(b"big")).await,
-        Reply::Bulk(Some(vec![0u8; 1024]))
+        Reply::Bulk(Some(vec![0u8; 1024].into()))
     );
 }

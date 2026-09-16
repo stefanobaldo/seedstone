@@ -13,7 +13,7 @@ fn seed() -> DictSeed {
 /// what a deadline means is the shard's, and is tested there.
 fn entry(value: &[u8]) -> Entry {
     Entry {
-        value: value.to_vec(),
+        value: Bytes::copy_from_slice(value),
         expires_at: None,
         touched: 0,
     }
@@ -21,7 +21,7 @@ fn entry(value: &[u8]) -> Entry {
 
 /// The value stored under `key`, or `None` if the key is absent.
 fn value<'a>(d: &'a Dict, key: &[u8]) -> Option<&'a [u8]> {
-    d.get(key).map(|entry| entry.value.as_slice())
+    d.get(key).map(|entry| &entry.value[..])
 }
 
 /// Inserts ascending numeric keys until a rehash is in flight, and returns
@@ -31,7 +31,7 @@ fn fill_until_rehashing(d: &mut Dict) -> usize {
     let mut count = 0usize;
     while !d.is_rehashing() {
         d.insert(
-            count.to_string().into_bytes(),
+            Bytes::from(count.to_string()),
             entry(count.to_string().as_bytes()),
         );
         count += 1;
@@ -113,15 +113,15 @@ async fn a_dict_knows_when_no_entry_can_be_carrying_a_deadline() {
 
     // Entries without deadlines leave it alone: this is the state nearly
     // every keyspace stays in, and the one the fast path is for.
-    d.insert(b"plain".to_vec(), entry(b"v"));
-    d.insert(b"other".to_vec(), entry(b"v"));
+    d.insert(Bytes::from_static(b"plain"), entry(b"v"));
+    d.insert(Bytes::from_static(b"other"), entry(b"v"));
     assert!(!d.may_hold_deadlines());
 
     // Way in the first: an inserted entry that carries one.
     d.insert(
-        b"dated".to_vec(),
+        Bytes::from_static(b"dated"),
         Entry {
-            value: b"v".to_vec(),
+            value: Bytes::from_static(b"v"),
             expires_at: Some(Instant::now()),
             touched: 0,
         },
@@ -140,7 +140,7 @@ async fn a_dict_knows_when_no_entry_can_be_carrying_a_deadline() {
     assert!(!d.may_hold_deadlines());
 
     // Way in the second: a deadline put on a key already stored.
-    d.insert(b"plain".to_vec(), entry(b"v"));
+    d.insert(Bytes::from_static(b"plain"), entry(b"v"));
     assert!(!d.may_hold_deadlines());
     assert!(d.set_deadline(b"plain", Some(Instant::now())));
     assert!(d.may_hold_deadlines());
@@ -186,11 +186,14 @@ async fn set_deadline_finds_a_key_in_either_table() {
 #[test]
 fn insert_get_remove_round_trip() {
     let mut d = Dict::with_seed(seed());
-    d.insert(b"a".to_vec(), entry(b"1"));
+    d.insert(Bytes::from_static(b"a"), entry(b"1"));
     assert_eq!(value(&d, b"a"), Some(&b"1"[..]));
-    d.insert(b"a".to_vec(), entry(b"2")); // overwrite, len stays 1
+    d.insert(Bytes::from_static(b"a"), entry(b"2")); // overwrite, len stays 1
     assert_eq!((d.len(), value(&d, b"a")), (1, Some(&b"2"[..])));
-    assert_eq!(d.remove(b"a").map(|e| e.value), Some(b"2".to_vec()));
+    assert_eq!(
+        d.remove(b"a").map(|e| e.value),
+        Some(Bytes::from_static(b"2"))
+    );
     assert_eq!((d.len(), value(&d, b"a")), (0, None));
 }
 
@@ -198,7 +201,7 @@ fn insert_get_remove_round_trip() {
 fn survives_growth_through_many_inserts() {
     let mut d = Dict::with_seed(seed());
     for i in 0..10_000u32 {
-        d.insert(i.to_string().into_bytes(), entry(i.to_string().as_bytes()));
+        d.insert(Bytes::from(i.to_string()), entry(i.to_string().as_bytes()));
     }
     while d.is_rehashing() {
         d.rehash_step(16);
@@ -224,7 +227,7 @@ fn a_fresh_dict_is_empty_and_not_rehashing() {
 #[test]
 fn removing_an_absent_key_reports_it_and_leaves_len_alone() {
     let mut d = Dict::with_seed(seed());
-    d.insert(b"present".to_vec(), entry(b"v"));
+    d.insert(Bytes::from_static(b"present"), entry(b"v"));
     assert!(d.remove(b"absent").is_none());
     assert_eq!(d.len(), 1);
 }
@@ -255,7 +258,10 @@ fn removes_reach_into_the_old_table_while_rehashing() {
     let inserted = fill_until_rehashing(&mut d);
 
     // Key 0 predates the growth, so it can only be in the old table.
-    assert_eq!(d.remove(b"0").map(|e| e.value), Some(b"0".to_vec()));
+    assert_eq!(
+        d.remove(b"0").map(|e| e.value),
+        Some(Bytes::from_static(b"0"))
+    );
     assert_eq!(value(&d, b"0"), None);
     assert_eq!(d.len(), inserted - 1);
 
@@ -273,7 +279,7 @@ fn overwriting_during_a_rehash_does_not_duplicate_the_entry() {
 
     // Key 0 lives in the old table; the overwrite must update it in place
     // rather than leave a second copy in the new one.
-    d.insert(b"0".to_vec(), entry(b"overwritten"));
+    d.insert(Bytes::from_static(b"0"), entry(b"overwritten"));
     assert_eq!(d.len(), inserted);
     assert_eq!(value(&d, b"0"), Some(&b"overwritten"[..]));
 
@@ -283,7 +289,7 @@ fn overwriting_during_a_rehash_does_not_duplicate_the_entry() {
     // A duplicate would survive the first removal and still answer reads.
     assert_eq!(
         d.remove(b"0").map(|e| e.value),
-        Some(b"overwritten".to_vec())
+        Some(Bytes::from_static(b"overwritten"))
     );
     assert_eq!(value(&d, b"0"), None);
 }
@@ -353,11 +359,11 @@ fn contents_do_not_depend_on_insertion_order() {
     let mut a = Dict::with_seed(seed());
     let mut b = Dict::with_seed(seed());
     for i in 0..200u32 {
-        a.insert(i.to_string().into_bytes(), entry(i.to_string().as_bytes()));
+        a.insert(Bytes::from(i.to_string()), entry(i.to_string().as_bytes()));
     }
     for i in (0..200u32).rev() {
-        b.insert(i.to_string().into_bytes(), entry(b"stale"));
-        b.insert(i.to_string().into_bytes(), entry(i.to_string().as_bytes()));
+        b.insert(Bytes::from(i.to_string()), entry(b"stale"));
+        b.insert(Bytes::from(i.to_string()), entry(i.to_string().as_bytes()));
     }
     assert_eq!(a.len(), b.len());
     for i in 0..200u32 {
@@ -377,7 +383,7 @@ fn interleaved_inserts_and_removes_keep_len_and_contents_consistent() {
     let mut expected = BTreeSet::new();
     for i in 0..2_000u32 {
         let key = i.to_string().into_bytes();
-        d.insert(key.clone(), entry(i.to_string().as_bytes()));
+        d.insert(Bytes::from(key.clone()), entry(i.to_string().as_bytes()));
         expected.insert(key);
         // Remove an older key every third insert, so the table shrinks and
         // grows while rehashes are in flight.
@@ -418,7 +424,7 @@ fn interleaved_inserts_and_removes_keep_len_and_contents_consistent() {
 fn scan_visits_every_key_when_static() {
     let mut d = Dict::with_seed(seed());
     for i in 0..500u32 {
-        d.insert(i.to_string().into_bytes(), entry(b""));
+        d.insert(Bytes::from(i.to_string()), entry(b""));
     }
     let mut seen = std::collections::BTreeSet::new();
     let mut c = 0;
@@ -446,7 +452,7 @@ fn scan_sees_every_stable_key_across_growth() {
     // at least once even though the table grows (and rehashes) mid-scan.
     let mut d = Dict::with_seed(seed());
     for i in 0..64u32 {
-        d.insert(format!("stable-{i}").into_bytes(), entry(b""));
+        d.insert(Bytes::from(format!("stable-{i}")), entry(b""));
     }
     let mut seen = std::collections::BTreeSet::new();
     let mut c = 0;
@@ -465,7 +471,7 @@ fn scan_sees_every_stable_key_across_growth() {
         assert!(steps < 10_000, "the cursor never returned to 0");
 
         for _ in 0..8 {
-            d.insert(format!("noise-{extra}").into_bytes(), entry(b""));
+            d.insert(Bytes::from(format!("noise-{extra}")), entry(b""));
             extra += 1;
         }
         d.rehash_step(1);
@@ -520,7 +526,7 @@ fn an_upward_cursor_is_outrun_by_a_table_growing_under_it() {
     // hung is more than generous enough to call this one outrun.
     let mut d = Dict::with_seed(seed());
     for i in 0..64u32 {
-        d.insert(format!("stable-{i}").into_bytes(), entry(b""));
+        d.insert(Bytes::from(format!("stable-{i}")), entry(b""));
     }
     let mut c = 0;
     let mut extra = 0u32;
@@ -531,7 +537,7 @@ fn an_upward_cursor_is_outrun_by_a_table_growing_under_it() {
             "an upward cursor finished a cycle over a table growing under it"
         );
         for _ in 0..8 {
-            d.insert(format!("noise-{extra}").into_bytes(), entry(b""));
+            d.insert(Bytes::from(format!("noise-{extra}")), entry(b""));
             extra += 1;
         }
         d.rehash_step(1);
@@ -556,7 +562,7 @@ fn a_full_cycle_at_rest_visits_every_bucket_exactly_once() {
 
     let mut d = Dict::with_seed(seed());
     for i in 0..100u32 {
-        d.insert(i.to_string().into_bytes(), entry(b""));
+        d.insert(Bytes::from(i.to_string()), entry(b""));
     }
     drain_rehash(&mut d);
 
@@ -679,7 +685,7 @@ fn the_growth_guarantee_holds_wherever_in_the_cycle_the_growth_starts() {
     // start doubling and demand the guarantee at each one.
     let mut d = Dict::with_seed(seed());
     for i in 0..100u32 {
-        d.insert(format!("stable-{i}").into_bytes(), entry(b""));
+        d.insert(Bytes::from(format!("stable-{i}")), entry(b""));
     }
     drain_rehash(&mut d);
     let cycle = d.old.len();
@@ -687,7 +693,7 @@ fn the_growth_guarantee_holds_wherever_in_the_cycle_the_growth_starts() {
     for grow_at in 0..cycle {
         let mut d = Dict::with_seed(seed());
         for i in 0..100u32 {
-            d.insert(format!("stable-{i}").into_bytes(), entry(b""));
+            d.insert(Bytes::from(format!("stable-{i}")), entry(b""));
         }
         drain_rehash(&mut d);
         assert_eq!(d.old.len(), cycle);
@@ -700,7 +706,7 @@ fn the_growth_guarantee_holds_wherever_in_the_cycle_the_growth_starts() {
             if step == grow_at {
                 // Write until the table starts doubling, exactly here.
                 while !d.is_rehashing() {
-                    d.insert(format!("noise-{noise}").into_bytes(), entry(b""));
+                    d.insert(Bytes::from(format!("noise-{noise}")), entry(b""));
                     noise += 1;
                 }
             }
@@ -749,7 +755,7 @@ fn a_cycle_under_continuous_growth_converges_instead_of_chasing_the_table() {
     // in any other order fails on the second call instead of hanging.
     let mut d = Dict::with_seed(seed());
     for i in 0..64u32 {
-        d.insert(format!("stable-{i}").into_bytes(), entry(b""));
+        d.insert(Bytes::from(format!("stable-{i}")), entry(b""));
     }
     let started_over = d.new.as_ref().map_or(d.old.len(), Vec::len);
 
@@ -779,7 +785,7 @@ fn a_cycle_under_continuous_growth_converges_instead_of_chasing_the_table() {
         assert!(steps < 10_000, "the cycle never came back to cursor 0");
 
         for _ in 0..8 {
-            d.insert(format!("noise-{noise}").into_bytes(), entry(b""));
+            d.insert(Bytes::from(format!("noise-{noise}")), entry(b""));
             noise += 1;
         }
         d.rehash_step(1);
@@ -800,7 +806,7 @@ fn a_cycle_under_continuous_growth_converges_instead_of_chasing_the_table() {
 /// An entry whose deadline is `expires_at`.
 fn dated(value: &[u8], expires_at: Instant) -> Entry {
     Entry {
-        value: value.to_vec(),
+        value: Bytes::copy_from_slice(value),
         expires_at: Some(expires_at),
         touched: 0,
     }
@@ -809,7 +815,7 @@ fn dated(value: &[u8], expires_at: Instant) -> Entry {
 /// Sweeps from `cursor` to the end of the cycle at `budget` buckets a call
 /// and returns every key reported dead, in the order the cursor reached
 /// them.
-fn sweep_from(d: &Dict, cursor: u64, budget: usize, now: Instant) -> Vec<Vec<u8>> {
+fn sweep_from(d: &Dict, cursor: u64, budget: usize, now: Instant) -> Vec<Bytes> {
     let mut dead = Vec::new();
     let mut cursor = cursor;
     let mut steps = 0;
@@ -848,7 +854,7 @@ fn the_sweep_never_eats_the_living() {
     let mut expired = BTreeSet::new();
     let mut alive = BTreeSet::new();
     for i in 0..200u32 {
-        let key = format!("k{i}").into_bytes();
+        let key = Bytes::from(format!("k{i}"));
         match i % 4 {
             0 | 1 => {
                 d.insert(key.clone(), dated(b"v", past));
@@ -900,7 +906,7 @@ fn a_dict_that_holds_no_deadline_is_not_walked_at_all() {
     let now = Instant::now();
     let mut d = Dict::with_seed(seed());
     for i in 0..100u32 {
-        d.insert(format!("k{i}").into_bytes(), entry(b"v"));
+        d.insert(Bytes::from(format!("k{i}")), entry(b"v"));
     }
 
     // A walked cursor cannot come back where it started: a step always
@@ -914,7 +920,7 @@ fn a_dict_that_holds_no_deadline_is_not_walked_at_all() {
 
     // And it is skipped work, not lost work: one dated entry and the walk
     // happens again.
-    d.insert(b"dated".to_vec(), dated(b"v", now));
+    d.insert(Bytes::from_static(b"dated"), dated(b"v", now));
     assert_ne!(
         d.expire_step(0, 4, now, &Deadlines).0,
         0,
@@ -933,7 +939,7 @@ fn the_sweep_respects_its_budget() {
     let now = past + Duration::from_secs(1);
     let mut d = Dict::with_seed(seed());
     for i in 0..50u32 {
-        d.insert(format!("k{i}").into_bytes(), dated(b"v", past));
+        d.insert(Bytes::from(format!("k{i}")), dated(b"v", past));
     }
     drain_rehash(&mut d);
     assert_eq!(d.old.len(), 64, "the table is not the size this test wants");
@@ -944,7 +950,7 @@ fn the_sweep_respects_its_budget() {
     let mut expected_dead = BTreeSet::new();
     for _ in 0..4 {
         expected_cursor = d.scan(expected_cursor, |key, _| {
-            expected_dead.insert(key.to_vec());
+            expected_dead.insert(key.clone());
         });
     }
 
@@ -960,7 +966,7 @@ fn the_sweep_respects_its_budget() {
     // The rest is left for later rather than skipped: resuming from the
     // cursor the budgeted call handed back reports every key it did not,
     // and between them they cover the keyspace exactly once.
-    let mut covered: BTreeSet<Vec<u8>> = dead.iter().cloned().collect();
+    let mut covered: BTreeSet<Bytes> = dead.iter().cloned().collect();
     for key in sweep_from(&d, cursor, 4, now) {
         assert!(
             covered.insert(key.clone()),
@@ -981,7 +987,7 @@ fn scan_hands_over_the_value_stored_under_each_key() {
     let mut d = Dict::with_seed(seed());
     for i in 0..50u32 {
         d.insert(
-            i.to_string().into_bytes(),
+            Bytes::from(i.to_string()),
             entry(format!("v{i}").as_bytes()),
         );
     }
@@ -1000,7 +1006,8 @@ fn scan_hands_over_the_value_stored_under_each_key() {
     assert_eq!(seen.len(), 50);
     for i in 0..50u32 {
         assert_eq!(
-            seen.get(i.to_string().as_bytes()).map(Vec::as_slice),
+            seen.get(i.to_string().as_bytes())
+                .map(|value: &Bytes| &value[..]),
             Some(format!("v{i}").as_bytes()),
             "key {i} came back with the wrong value"
         );
@@ -1032,9 +1039,9 @@ fn used_bytes_tracks_every_mutation_including_growth_and_clear() {
     );
     for i in 0..200u32 {
         dict.insert(
-            format!("k{i}").into_bytes(),
+            Bytes::from(format!("k{i}")),
             Entry {
-                value: vec![b'v'; (i % 17) as usize],
+                value: vec![b'v'; (i % 17) as usize].into(),
                 expires_at: None,
                 touched: 0,
             },
@@ -1043,18 +1050,18 @@ fn used_bytes_tracks_every_mutation_including_growth_and_clear() {
     }
     // Overwrite with a longer and then a shorter value.
     dict.insert(
-        b"k3".to_vec(),
+        Bytes::from_static(b"k3"),
         Entry {
-            value: vec![0; 1000],
+            value: vec![0; 1000].into(),
             expires_at: None,
             touched: 0,
         },
     );
     assert_eq!(dict.used_bytes(), recount(&dict));
     dict.insert(
-        b"k3".to_vec(),
+        Bytes::from_static(b"k3"),
         Entry {
-            value: vec![0; 1],
+            value: vec![0; 1].into(),
             expires_at: None,
             touched: 0,
         },
@@ -1100,22 +1107,22 @@ fn with_deadline_counts_the_dated_entries_through_every_mutation() {
     let later = now + Duration::from_mins(1);
     let mut dict = Dict::with_seed(DictSeed { k0: 3, k1: 4 });
     let dated = |at: Option<Instant>| Entry {
-        value: b"v".to_vec(),
+        value: Bytes::from_static(b"v"),
         expires_at: at,
         touched: 0,
     };
     assert_eq!(dict.with_deadline(), 0);
 
-    dict.insert(b"a".to_vec(), dated(Some(later)));
-    dict.insert(b"b".to_vec(), dated(None));
+    dict.insert(Bytes::from_static(b"a"), dated(Some(later)));
+    dict.insert(Bytes::from_static(b"b"), dated(None));
     assert_eq!(dict.with_deadline(), 1, "one of the two carries a deadline");
     assert_eq!(dict.with_deadline(), recount_deadlines(&dict));
 
     // Overwrite in both directions: the count follows the entry that is
     // there now, not the one that was.
-    dict.insert(b"a".to_vec(), dated(None));
+    dict.insert(Bytes::from_static(b"a"), dated(None));
     assert_eq!(dict.with_deadline(), 0);
-    dict.insert(b"b".to_vec(), dated(Some(later)));
+    dict.insert(Bytes::from_static(b"b"), dated(Some(later)));
     assert_eq!(dict.with_deadline(), 1);
 
     // `set_deadline` is the other way a deadline enters or leaves.
@@ -1137,7 +1144,7 @@ fn with_deadline_counts_the_dated_entries_through_every_mutation() {
     // And across a rehash, where entries live in two tables at once.
     for i in 0..200u32 {
         dict.insert(
-            format!("k{i}").into_bytes(),
+            Bytes::from(format!("k{i}")),
             dated((i % 3 == 0).then_some(later)),
         );
         assert_eq!(
@@ -1184,9 +1191,9 @@ fn used_bytes_agrees_with_a_recount_over_every_short_sequence() {
                     for op in [a, b, c, d] {
                         match op {
                             Op::Put(k, len) => dict.insert(
-                                vec![k],
+                                Bytes::from(vec![k]),
                                 Entry {
-                                    value: vec![1; len],
+                                    value: vec![1; len].into(),
                                     expires_at: None,
                                     touched: 0,
                                 },
@@ -1211,9 +1218,9 @@ fn touching_a_key_stamps_it_later_than_every_key_touched_before() {
     let mut dict = Dict::with_seed(DictSeed { k0: 1, k1: 2 });
     for k in 0..10u8 {
         dict.insert(
-            vec![k],
+            Bytes::from(vec![k]),
             Entry {
-                value: vec![],
+                value: vec![].into(),
                 expires_at: None,
                 touched: 0,
             },
@@ -1240,9 +1247,9 @@ fn sampled_eviction_rarely_takes_a_recently_touched_key() {
     let mut dict = Dict::with_seed(DictSeed { k0: 7, k1: 11 });
     for i in 0..1000u32 {
         dict.insert(
-            format!("k{i}").into_bytes(),
+            Bytes::from(format!("k{i}")),
             Entry {
-                value: vec![],
+                value: vec![].into(),
                 expires_at: None,
                 touched: 0,
             },
@@ -1278,7 +1285,7 @@ fn sampled_eviction_rarely_takes_a_recently_touched_key() {
 #[cfg(target_pointer_width = "64")]
 fn the_slot_layout_is_what_entry_overhead_prices() {
     assert_eq!(
-        size_of::<(u64, Vec<u8>, Entry)>(),
+        size_of::<(u64, Bytes, Entry)>(),
         usize::try_from(ENTRY_OVERHEAD).expect("a small constant"),
     );
 }

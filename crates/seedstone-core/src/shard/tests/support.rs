@@ -10,6 +10,7 @@ use crate::shard::{
     Command, Deadlines, EvictionPolicy, Expiry, ExpiryPolicy, Reply, Router, ShardPool, ShardStats,
     TraceSink,
 };
+use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
 
@@ -37,8 +38,8 @@ impl Shard {
 /// `SET key value`, with no options.
 pub fn set(key: &[u8], value: &[u8]) -> Command {
     Command::Set {
-        key: key.to_vec(),
-        value: value.to_vec(),
+        key: Bytes::copy_from_slice(key),
+        value: Bytes::copy_from_slice(value),
         expiry: None,
         cond: None,
         keep_ttl: false,
@@ -49,8 +50,8 @@ pub fn set(key: &[u8], value: &[u8]) -> Command {
 /// `SET key value EX seconds`.
 pub fn set_ex(key: &[u8], value: &[u8], seconds: u64) -> Command {
     Command::Set {
-        key: key.to_vec(),
-        value: value.to_vec(),
+        key: Bytes::copy_from_slice(key),
+        value: Bytes::copy_from_slice(value),
         expiry: Some(Expiry::Ex(seconds)),
         cond: None,
         keep_ttl: false,
@@ -61,14 +62,16 @@ pub fn set_ex(key: &[u8], value: &[u8], seconds: u64) -> Command {
 /// `SETEX key seconds value`.
 pub fn setex(key: &[u8], seconds: u64, value: &[u8]) -> Command {
     Command::SetEx {
-        key: key.to_vec(),
+        key: Bytes::copy_from_slice(key),
         seconds,
-        value: value.to_vec(),
+        value: Bytes::copy_from_slice(value),
     }
 }
 
 pub fn get(key: &[u8]) -> Command {
-    Command::Get { key: key.to_vec() }
+    Command::Get {
+        key: Bytes::copy_from_slice(key),
+    }
 }
 
 /// Every shard's counters, summed the way `INFO` sums them.

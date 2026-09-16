@@ -17,6 +17,8 @@
 
 use std::hash::Hasher;
 
+use bytes::Bytes;
+
 use crate::shard::ExpiryPolicy;
 use siphasher::sip::SipHasher13;
 use tokio::time::Instant;
@@ -56,12 +58,14 @@ pub struct DictSeed {
 /// The deadline is stored inline on every entry, whether or not that entry has
 /// one, and an `Option<Instant>` is 16 bytes — `Instant` is 16 and the niche
 /// absorbs the discriminant, so `None` is not cheaper. A bucket slot,
-/// `(u64, Vec<u8>, Entry)` — see `Bucket` — is therefore 80 bytes against
-/// the 48 a plain `(Vec<u8>, Vec<u8>)` would take: 8 for the stored hash,
+/// `(u64, Bytes, Entry)` — see `Bucket` — is therefore 96 bytes against
+/// the 64 a plain `(Bytes, Bytes)` would take: 8 for the stored hash,
 /// which is a deliberate trade of space for a cheaper chain scan, 16 for this
 /// field, which the great majority of keys in a real keyspace never use, and
 /// 8 more for the four-byte [`touched`](Self::touched) stamp and the padding
-/// that rounds it up. `the_slot_layout_is_what_entry_overhead_prices` holds
+/// that rounds it up. Key and value are `Bytes` rather than `Vec<u8>` — 32
+/// bytes of header each where a `Vec` takes 24 — so that a read hands the
+/// stored bytes back by reference count instead of by copy. `the_slot_layout_is_what_entry_overhead_prices` holds
 /// that figure to what the compiler actually lays out.
 ///
 /// Stated here so nobody has to derive it from the layout. Whether it is the
@@ -69,8 +73,9 @@ pub struct DictSeed {
 /// — is a design question, and this doc is not where it gets settled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    /// The bytes stored under the key, kept verbatim.
-    pub value: Vec<u8>,
+    /// The bytes stored under the key, kept verbatim, shared by reference
+    /// count with any reply that carries them.
+    pub value: Bytes,
     /// When the entry expires, or `None` if it never does.
     pub expires_at: Option<Instant>,
     /// When the entry was last touched, on the dict's own command counter.
@@ -94,7 +99,7 @@ pub struct Entry {
 /// migrates an entry without a second pass through SipHash. It moves
 /// nothing — the hash stored is the hash placement already used, so every key
 /// lands where it always did.
-type Bucket = Vec<(u64, Vec<u8>, Entry)>;
+type Bucket = Vec<(u64, Bytes, Entry)>;
 
 /// A table of buckets. Its length is always a power of two.
 ///
@@ -113,14 +118,14 @@ const INITIAL_BUCKETS: usize = 8;
 
 /// What one entry costs beyond its key and value bytes.
 ///
-/// A bucket slot is `(u64, Vec<u8>, Entry)` — 8 for the stored hash, 24 for
-/// the key's `Vec` header, and `Entry` at 48 (a 24-byte `Vec` header for the
-/// value, a 16-byte `Option<Instant>`, and the 4-byte LRU stamp padded to 8)
-/// — 80 bytes, as the [`Entry`] doc derives.
+/// A bucket slot is `(u64, Bytes, Entry)` — 8 for the stored hash, 32 for
+/// the key's `Bytes` header, and `Entry` at 56 (a 32-byte `Bytes` header for
+/// the value, a 16-byte `Option<Instant>`, and the 4-byte LRU stamp padded to
+/// 8) — 96 bytes, as the [`Entry`] doc derives.
 /// The two heap allocations the headers point at are counted through their
 /// lengths by [`entry_bytes`]; their allocator rounding is not, and that is
 /// deliberate: this is a formula the simulator can replay, not a reading.
-pub const ENTRY_OVERHEAD: u64 = 80;
+pub const ENTRY_OVERHEAD: u64 = 96;
 
 /// What one bucket costs when empty: its `Vec` header. A chain's slots are
 /// counted per entry above.
@@ -337,11 +342,11 @@ impl Dict {
         cursor: &mut u64,
         samples: usize,
         spared: Option<&[u8]>,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<Bytes> {
         if self.is_empty() {
             return None;
         }
-        let mut oldest: Option<(u32, Vec<u8>)> = None;
+        let mut oldest: Option<(u32, Bytes)> = None;
         let mut seen = 0usize;
         let mut steps = 0usize;
         // One full cycle of the walk, in the widest table there is: the bound
@@ -355,18 +360,20 @@ impl Dict {
                 // nothing to give". It is not counted against `samples`
                 // either: a sample that met only the spared key met nothing,
                 // and charging it would shrink the real sample by one.
-                if spared == Some(key) {
+                if spared == Some(&key[..]) {
                     return;
                 }
                 seen += 1;
                 // The key is cloned only when it becomes the candidate, not
-                // once per entry met: a sample of five over a chained bucket
-                // would otherwise allocate for every entry it discards.
+                // once per entry met. The clone is a reference count, so the
+                // guard no longer saves an allocation per entry discarded; it
+                // still saves the count's increment and decrement, which a
+                // shared count makes atomic.
                 if oldest
                     .as_ref()
                     .is_none_or(|(stamp, _)| entry.touched < *stamp)
                 {
-                    oldest = Some((entry.touched, key.to_vec()));
+                    oldest = Some((entry.touched, key.clone()));
                 }
             });
             steps += 1;
@@ -380,7 +387,7 @@ impl Dict {
     /// old table mid-rehash, from where it will migrate like any other entry.
     /// Moving it would risk leaving a stale copy behind, and the entry is
     /// reachable either way.
-    pub fn insert(&mut self, key: Vec<u8>, entry: Entry) {
+    pub fn insert(&mut self, key: Bytes, entry: Entry) {
         // A write pays for one bucket of the migration it is competing with,
         // which is what keeps the two tables from coexisting indefinitely.
         //
@@ -621,7 +628,7 @@ impl Dict {
     /// and then every bucket of the larger table that bucket expands into,
     /// which is exactly the cursors sharing its low bits. The loop ends when
     /// the increment carries back into the bits the smaller mask covers.
-    pub fn scan<F: FnMut(&[u8], &Entry)>(&self, cursor: u64, visit: F) -> u64 {
+    pub fn scan<F: FnMut(&Bytes, &Entry)>(&self, cursor: u64, visit: F) -> u64 {
         self.scan_in_order(cursor, &ReverseBinary, visit)
     }
 
@@ -631,7 +638,7 @@ impl Dict {
     /// [`scan`](Dict::scan) passes and the only order this crate ships. See
     /// [`WalkOrder`] for why the parameter exists at all; a caller that wants
     /// the guarantees wants [`scan`](Dict::scan).
-    pub fn scan_in_order<O: WalkOrder, F: FnMut(&[u8], &Entry)>(
+    pub fn scan_in_order<O: WalkOrder, F: FnMut(&Bytes, &Entry)>(
         &self,
         cursor: u64,
         order: &O,
@@ -731,7 +738,7 @@ impl Dict {
         budget_buckets: usize,
         now: Instant,
         expiry: &impl ExpiryPolicy,
-    ) -> (u64, Vec<Vec<u8>>) {
+    ) -> (u64, Vec<Bytes>) {
         if !self.may_hold_deadlines && !expiry.takes_undated() {
             return (cursor, Vec::new());
         }
@@ -743,7 +750,7 @@ impl Dict {
             // they cover are disjoint and no key can be reported twice.
             next = self.scan(next, |key, entry| {
                 if expiry.due_on_sweep(entry.expires_at, now) {
-                    dead.push(key.to_vec());
+                    dead.push(key.clone());
                 }
             });
             if next == 0 {
@@ -816,7 +823,7 @@ fn mask_of(table: &Table) -> u64 {
 }
 
 /// Hands every entry of the bucket `cursor` selects in `table` to `visit`.
-fn visit_bucket<F: FnMut(&[u8], &Entry)>(table: &Table, cursor: u64, visit: &mut F) {
+fn visit_bucket<F: FnMut(&Bytes, &Entry)>(table: &Table, cursor: u64, visit: &mut F) {
     let index = usize::try_from(cursor & mask_of(table))
         .expect("a masked cursor is below the bucket count, which is a usize");
     for (_, key, entry) in &table[index] {
@@ -895,8 +902,8 @@ impl WalkOrder for ReverseBinary {
 /// only the entry that could be a match pays for a key comparison. The key
 /// comparison behind it is not redundant: it is what makes a hash collision a
 /// miss rather than a wrong answer.
-fn matches(slot: &(u64, Vec<u8>, Entry), hash: u64, key: &[u8]) -> bool {
-    slot.0 == hash && slot.1.as_slice() == key
+fn matches(slot: &(u64, Bytes, Entry), hash: u64, key: &[u8]) -> bool {
+    slot.0 == hash && &slot.1[..] == key
 }
 
 fn find<'a>(table: &'a Table, hash: u64, key: &[u8]) -> Option<&'a Entry> {
