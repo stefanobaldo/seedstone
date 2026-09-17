@@ -163,7 +163,16 @@ fn the_trace_hash_is_pinned_across_processes_and_builds() {
     // move. It is drawn short, so `dead_checks` rises where `SETEX` had
     // raised `alive_checks` — the two positional spellings now reach one
     // half of the expiration invariant each.
-    const MINI_1_42: u64 = 0x959f_0105_262d_501d;
+    //
+    // And then a change to *when the server dispatches*, with no change to
+    // the workload or to any reply: an `MGET` of a few keys stopped closing
+    // the connection's batch in front of it and began travelling inside it,
+    // so the shards see its `GET`s in the same envelope as the commands
+    // pipelined around it rather than in one of their own. The trace
+    // records the order shards saw commands in, so this moved; the workload
+    // did not, and `expected_sum` held still. One check count moved with
+    // it, for a reason of the schedule's own — see beside the counts.
+    const MINI_1_42: u64 = 0x9734_f771_1820_8525;
 
     let outcome = run_sim(&SimConfig::mini(1, 42));
     assert_eq!(
@@ -197,7 +206,17 @@ fn the_trace_hash_is_pinned_across_processes_and_builds() {
         // where two of seven did. `plain_checks` and `walk_checks` held
         // still through both, which is what says a deadline was added and
         // nothing else moved.
-        (51, 32, 149, 32),
+        //
+        // The batched `MGET` moved `alive_checks` alone, by one, and not
+        // because anything was drawn differently: whether a volatile read
+        // is decided at all depends on the simulated instants its request
+        // left and its reply arrived, measured against a deadline taken
+        // from an earlier write's own, and every one of those instants
+        // moves when a burst no longer stops for an `MGET` of its own. One
+        // read that used to fall inside the live band now falls clear of
+        // it and is decided. `dead_checks`,
+        // `plain_checks`, `walk_checks` and `expected_sum` held still.
+        (51, 33, 149, 32),
         "the recorded workload decides a different number of checks"
     );
 }

@@ -472,6 +472,10 @@ pub async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
 /// whatever order the executors answered in, and the slices are appended in
 /// the order they were cut. A key named twice is two commands and therefore
 /// two entries — nothing here deduplicates.
+///
+/// A [`Fold::Array`] request of at most [`CHUNK_COMMANDS`] keys does not reach
+/// here from the connection: the drain spans it into its batch instead — see
+/// `connection::Slot::Spanned`. This arm serves the larger ones.
 pub async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>, fold: Fold) -> Frame {
     match fold {
         Fold::Sum => {
@@ -496,42 +500,57 @@ pub async fn fan_out<R: Router>(router: &R, cmds: Vec<Command>, fold: Fold) -> F
                 if slice.is_empty() {
                     break;
                 }
-                // One reply per command, or this is not an answer to the
-                // request that was asked. A router that returned fewer would
-                // shorten the array with nothing on the wire to say so, and a
-                // client zipping its keys against the values it got back reads
-                // the missing tail as cache misses it cannot tell from real
-                // ones.
+                // The first error in reply order wins over everything behind
+                // it in its slice: that slice has already run, so this is a
+                // choice of which answer to give rather than a point the work
+                // stopped at. The slices behind it are the exception, and
+                // they are genuinely not dispatched.
                 let expected = slice.len();
-                let replies = router.dispatch_many(slice).await;
-                if replies.len() != expected {
-                    return Frame::Error(UNRENDERABLE_REPLY.into());
-                }
-                for reply in replies {
-                    match reply {
-                        // A key that is not there is an entry all the same — the
-                        // array's null, in its own slot, never a shorter array.
-                        reply @ Reply::Bulk(_) => entries.push(reply_to_frame(reply)),
-                        // First error in reply order wins, and it wins over
-                        // everything behind it in its slice: that slice has
-                        // already run, so this is a choice of which answer to
-                        // give rather than a point the work stopped at. The
-                        // slices behind it are the exception, and they are
-                        // genuinely not dispatched.
-                        error @ Reply::Error(_) => return reply_to_frame(error),
-                        // Anything else is a reply of a shape this fold cannot
-                        // put in an array — a command wired to [`Fold::Array`]
-                        // whose shard answers with a count, say. Refused rather
-                        // than rendered: a `:5` where an array of one was due
-                        // is read happily and wrongly, and the peer has no way
-                        // to tell.
-                        _ => return Frame::Error(UNRENDERABLE_REPLY.into()),
-                    }
+                match fold_array(router.dispatch_many(slice).await, expected) {
+                    Ok(part) => entries.extend(part),
+                    Err(frame) => return frame,
                 }
             }
             Frame::Array(entries)
         }
     }
+}
+
+/// Folds the replies of a [`Fold::Array`] request into the array's entries,
+/// or into the one frame that answers instead.
+///
+/// One entry per reply, or this is not an answer to the request that was
+/// asked. A router that returned fewer would shorten the array with nothing
+/// on the wire to say so, and a client zipping its keys against the values
+/// it got back reads the missing tail as cache misses it cannot tell from
+/// real ones.
+///
+/// A key that is not there is an entry all the same — the array's null, in
+/// its own slot, never a shorter array. The first error in reply order wins
+/// over everything behind it. Anything else is a reply of a shape this fold
+/// cannot put in an array — a command wired to [`Fold::Array`] whose shard
+/// answers with a count, say — and is refused rather than rendered: a `:5`
+/// where an array of one was due is read happily and wrongly, and the peer
+/// has no way to tell.
+///
+/// Shared by [`fan_out`] and by the connection's chunk, which spans a
+/// bounded `MGET` into its batch and folds the span's replies here.
+pub fn fold_array<I: IntoIterator<Item = Reply>>(
+    replies: I,
+    expected: usize,
+) -> Result<Vec<Frame>, Frame> {
+    let mut entries = Vec::with_capacity(expected);
+    for reply in replies {
+        match reply {
+            reply @ Reply::Bulk(_) => entries.push(reply_to_frame(reply)),
+            error @ Reply::Error(_) => return Err(reply_to_frame(error)),
+            _ => return Err(Frame::Error(UNRENDERABLE_REPLY.into())),
+        }
+    }
+    if entries.len() != expected {
+        return Err(Frame::Error(UNRENDERABLE_REPLY.into()));
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]

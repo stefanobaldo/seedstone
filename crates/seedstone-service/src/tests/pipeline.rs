@@ -3,7 +3,9 @@
 
 use super::support::{FlushCounting, connected, read_frames, req};
 use crate::auth::AUTH_NOT_CONFIGURED;
-use crate::connection::{CHUNK_COMMANDS, READ_CEILING, REPLY_HIGH_WATER, serve_connection};
+use crate::connection::{
+    CHUNK_COMMANDS, READ_CEILING, READ_FLOOR, REPLY_HIGH_WATER, serve_connection,
+};
 use crate::hello::NOPROTO;
 use crate::node::NodeInfo;
 use crate::reply::UNRENDERABLE_REPLY;
@@ -298,6 +300,131 @@ async fn a_long_mget_is_dispatched_in_bounded_slices() {
         vec![CHUNK_COMMANDS, CHUNK_COMMANDS, KEYS - 2 * CHUNK_COMMANDS],
         "the fan-out must reach the router in slices of at most {CHUNK_COMMANDS}"
     );
+}
+
+/// An `MGET` of at most a chunk's worth of keys travels in the drain's
+/// batch with the commands pipelined around it: one message to the
+/// executors for the whole drain, not one for the commands before the
+/// `MGET`, one for the `MGET`, and one for the commands after it.
+#[tokio::test]
+async fn an_mget_travels_in_the_drains_batch() {
+    let sizes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = BatchSizes {
+        sizes: std::sync::Arc::clone(&sizes),
+        inner: ShardPool::spawn(16, 4, DictSeed { k0: 8, k1: 8 }, NoTrace),
+    };
+    let (client, server) = tokio::io::duplex(1 << 20);
+    tokio::spawn(serve_connection(server, router, NodeInfo::for_tests()));
+    let (mut r, mut w) = tokio::io::split(client);
+
+    let mut out = Vec::new();
+    for parts in [
+        &["SET", "a", "1"][..],
+        &["SET", "b", "2"],
+        &["MGET", "a", "missing", "b"],
+        &["GET", "a"],
+        &["MGET", "b"],
+    ] {
+        encode(&req(parts), &mut out);
+    }
+    w.write_all(&out).await.unwrap();
+    w.flush().await.unwrap();
+
+    let frames = read_frames(&mut r, 5).await;
+    assert_eq!(frames[0], Frame::Simple("OK".into()));
+    assert_eq!(frames[1], Frame::Simple("OK".into()));
+    assert_eq!(
+        frames[2],
+        Frame::Array(vec![
+            Frame::Bulk("1".into()),
+            Frame::Null,
+            Frame::Bulk("2".into())
+        ])
+    );
+    assert_eq!(frames[3], Frame::Bulk("1".into()));
+    assert_eq!(frames[4], Frame::Array(vec![Frame::Bulk("2".into())]));
+    assert_eq!(
+        *sizes.lock().expect("sizes mutex"),
+        vec![7],
+        "two SETs, three GETs of the first MGET, one GET, one GET of the second: one batch"
+    );
+}
+
+/// An `MGET` that would carry the batch past the mark closes the chunk in
+/// front of it first, so no message to an executor exceeds the mark and
+/// the replies still come back in request order.
+///
+/// The batch is filled by a spanned `MGET` rather than by a pipeline of
+/// one-key commands, so that the whole pipeline is a single read and a
+/// single drain: a chunk's worth of `SET`s is more bytes than the
+/// connection's first read takes, and a drain that ends mid-pipeline
+/// closes the chunk for its own reason, which is not the one under test.
+#[tokio::test]
+async fn an_mget_that_would_overflow_the_chunk_closes_it_first() {
+    /// One key short of what fills the batch behind the `SET`, so the
+    /// three-key `MGET` after it is the request that would cross the mark.
+    const KEYS: usize = CHUNK_COMMANDS - 3;
+
+    let sizes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = BatchSizes {
+        sizes: std::sync::Arc::clone(&sizes),
+        inner: ShardPool::spawn(16, 4, DictSeed { k0: 8, k1: 8 }, NoTrace),
+    };
+    let (client, server) = tokio::io::duplex(1 << 20);
+    tokio::spawn(serve_connection(server, router, NodeInfo::for_tests()));
+    let (mut r, mut w) = tokio::io::split(client);
+
+    let mut parts = vec!["MGET".to_owned()];
+    parts.extend((0..KEYS).map(|i| format!("k{i}")));
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+    let mut out = Vec::new();
+    encode(&req(&["SET", "k0", "0"]), &mut out);
+    encode(&req(&parts), &mut out);
+    encode(&req(&["MGET", "k0", "k1", "k2"]), &mut out);
+    assert!(
+        out.len() <= READ_FLOOR,
+        "the pipeline must fit the first read to be one drain"
+    );
+    w.write_all(&out).await.unwrap();
+    w.flush().await.unwrap();
+
+    let frames = read_frames(&mut r, 3).await;
+    assert_eq!(frames[0], Frame::Simple("OK".into()));
+    let mut long = vec![Frame::Null; KEYS];
+    long[0] = Frame::Bulk("0".into());
+    assert_eq!(frames[1], Frame::Array(long));
+    assert_eq!(
+        frames[2],
+        Frame::Array(vec![Frame::Bulk("0".into()), Frame::Null, Frame::Null])
+    );
+    assert_eq!(
+        *sizes.lock().expect("sizes mutex"),
+        vec![1 + KEYS, 3],
+        "the chunk closed before the span, and the span was its own batch"
+    );
+}
+
+/// A spanned `MGET` still reads what the commands pipelined in front of it
+/// wrote: on one key the batch is applied in order by one executor.
+#[tokio::test]
+async fn a_spanned_mget_reads_behind_the_writes_pipelined_before_it() {
+    let (mut r, mut w, _pool) = connected(16);
+    let mut out = Vec::new();
+    for parts in [
+        &["SET", "k", "old"][..],
+        &["SET", "k", "new"],
+        &["MGET", "k"],
+        &["DEL", "k"],
+        &["MGET", "k"],
+    ] {
+        encode(&req(parts), &mut out);
+    }
+    w.write_all(&out).await.unwrap();
+    w.flush().await.unwrap();
+    let frames = read_frames(&mut r, 5).await;
+    assert_eq!(frames[2], Frame::Array(vec![Frame::Bulk("new".into())]));
+    assert_eq!(frames[3], Frame::Integer(1));
+    assert_eq!(frames[4], Frame::Array(vec![Frame::Null]));
 }
 
 /// A router that hands back fewer replies than commands is refused, not

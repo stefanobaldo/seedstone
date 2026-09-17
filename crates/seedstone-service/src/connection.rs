@@ -14,10 +14,12 @@
 //! only a clock can report — so there are two signals and one shed
 //! ([`IDLE_SHED_AFTER`]).
 
-use crate::dispatch::{Action, frame_to_action, gated, settle_auth};
-use crate::node::NodeInfo;
+use crate::dispatch::{Action, Fold, Unbatched, frame_to_action, gated, settle_auth};
+use crate::fan_out::fold_array;
+use crate::node::{NodeInfo, edge_slot, micros_since};
 use crate::reply::{
-    CommandLabel, count_error_reply, log_error_reply, protocol_error, reply_to_frame, safe_error,
+    CommandLabel, UNRENDERABLE_REPLY, count_error_reply, log_error_reply, protocol_error,
+    reply_to_frame, safe_error,
 };
 use seedstone_core::shard::{Command, Reply, ReplyError, Router};
 use seedstone_resp::{Decoder, DecoderLimits, Frame, encode};
@@ -226,6 +228,21 @@ pub enum Slot {
     Ready(Frame, CommandLabel),
     /// Answered by the router; the index is into the chunk's batch.
     Pending(usize, CommandLabel),
+    /// Answered by the router as a run of `len` consecutive batch entries
+    /// starting at `first`, folded into one array — a multi-key read of at
+    /// most [`CHUNK_COMMANDS`] keys, spanned into the batch instead of
+    /// closing it. `edge` is the request's slot in the edge's counters,
+    /// where its wait is added once the chunk is answered.
+    Spanned {
+        /// Where the run starts in the chunk's batch.
+        first: usize,
+        /// How many commands the run is, one per key the peer named.
+        len: usize,
+        /// What the request is logged as if its answer is an error.
+        label: CommandLabel,
+        /// The request's [`edge_slot`], if the edge times it.
+        edge: Option<usize>,
+    },
 }
 
 /// Serves one connection until the peer disconnects or sends something that
@@ -250,9 +267,12 @@ pub enum Slot {
 /// owns its keys in one message per owner instead of one per command — and
 /// request order is restored by the slots rather than by the awaiting. A chunk
 /// closes when the decoder runs dry, when the batch reaches
-/// `CHUNK_COMMANDS`, before a multi-key request fans out — see `fan_out::fan_out`,
-/// which has to run *after* what the peer wrote in front of it — and at `QUIT`
-/// or a protocol error.
+/// `CHUNK_COMMANDS`, before a request that is answered on its own — see
+/// `dispatch::Unbatched`, every one of which has to run *after* what the peer
+/// wrote in front of it — and at `QUIT` or a protocol error. An `MGET` of at
+/// most `CHUNK_COMMANDS` keys is the exception among those requests: it does
+/// not close the chunk but joins its batch as a run of one-key reads, a
+/// `Slot::Spanned`.
 ///
 /// Accumulation is bounded rather than open-ended, on both axes: a drain that
 /// reaches `REPLY_HIGH_WATER` writes there and carries on into the same
@@ -493,7 +513,8 @@ pub fn shed_connection_buffers(read_buf: &mut Vec<u8>, decoder: &mut Decoder, ou
 /// still to be run for the ones that are waiting on a shard.
 ///
 /// One type rather than two vectors passed side by side, because they are one
-/// thing with one invariant — every [`Slot::Pending`] indexes this batch — and
+/// thing with one invariant — every [`Slot::Pending`] and [`Slot::Spanned`]
+/// indexes this batch — and
 /// a pair of parameters is a pair that can be handed to a call in the wrong
 /// order or reset one at a time.
 #[derive(Default)]
@@ -503,6 +524,9 @@ pub struct Chunk {
     slots: Vec<Slot>,
     /// The commands the pending slots are waiting on, in dispatch order.
     batch: Vec<Command>,
+    /// How many of `slots` are spanned, so that a chunk with none reads no
+    /// clock in [`emit_chunk`].
+    spanned: usize,
 }
 
 /// Why a pass over the decoder stopped.
@@ -560,6 +584,40 @@ where
                             return Drained::Over;
                         }
                     }
+                    Action::Unbatched(Unbatched::FanOut {
+                        cmds,
+                        name,
+                        fold: Fold::Array,
+                    }) if cmds.len() <= CHUNK_COMMANDS => {
+                        // A bounded multi-key read joins the batch instead of
+                        // closing it: its one-key commands are ordered against
+                        // the commands around them exactly as a run of `GET`s
+                        // would be — on one key, one shard, one executor, in
+                        // batch order — which is the guarantee the fan-out
+                        // path gave it. What bounds it is the mark: a span
+                        // never carries the batch past `CHUNK_COMMANDS`, so no
+                        // executor holds an envelope longer than the mark
+                        // allows, and a request above the mark takes the
+                        // fan-out path below with its own slicing.
+                        if chunk.batch.len() + cmds.len() > CHUNK_COMMANDS
+                            && !emit_chunk(stream, out, router, chunk, node).await
+                        {
+                            return Drained::Over;
+                        }
+                        chunk.slots.push(Slot::Spanned {
+                            first: chunk.batch.len(),
+                            len: cmds.len(),
+                            label,
+                            edge: edge_slot(name.as_bytes()),
+                        });
+                        chunk.spanned += 1;
+                        chunk.batch.extend(cmds);
+                        if chunk.batch.len() >= CHUNK_COMMANDS
+                            && !emit_chunk(stream, out, router, chunk, node).await
+                        {
+                            return Drained::Over;
+                        }
+                    }
                     Action::Unbatched(request) => {
                         // The chunk closes *before* the request runs, and that is
                         // an ordering requirement rather than tidiness: the
@@ -568,7 +626,8 @@ where
                         // run a `DEL k` before the `SET k v` the peer pipelined in
                         // front of it, empty the keyspace in front of the writes
                         // that filled it, or answer a `KEYS` without the key a
-                        // `SET` just wrote.
+                        // `SET` just wrote. A bounded `MGET` never reaches here:
+                        // the arm above spans it.
                         if !emit_chunk(stream, out, router, chunk, node).await {
                             return Drained::Over;
                         }
@@ -649,6 +708,7 @@ where
     if chunk.slots.is_empty() {
         return true;
     }
+    let started = (chunk.spanned > 0).then(Instant::now);
     let mut replies: Vec<Option<Reply>> = if chunk.batch.is_empty() {
         Vec::new()
     } else {
@@ -662,6 +722,11 @@ where
             .map(Some)
             .collect()
     };
+    // The chunk's wait is what a spanned request waited for; it is added to
+    // the request's edge slot below, once per span. `action_for` already
+    // counted the call, as it counts every request answered at the edge.
+    let waited = started.map(micros_since);
+    chunk.spanned = 0;
     for slot in chunk.slots.drain(..) {
         let (frame, label) = match slot {
             Slot::Ready(frame, label) => (frame, label),
@@ -674,6 +739,32 @@ where
                 ),
                 label,
             ),
+            Slot::Spanned {
+                first,
+                len,
+                label,
+                edge,
+            } => {
+                let run = replies.get_mut(first..first + len).map(|run| {
+                    run.iter_mut().map(|reply| {
+                        reply
+                            .take()
+                            .unwrap_or(Reply::Error(ReplyError::ShardUnavailable))
+                    })
+                });
+                let frame = match run.map(|run| fold_array(run, len)) {
+                    Some(Ok(entries)) => Frame::Array(entries),
+                    Some(Err(frame)) => frame,
+                    // A batch shorter than the span claims: refused, as the
+                    // fan-out refuses a short reply vector, rather than folded
+                    // into a shorter array.
+                    None => Frame::Error(UNRENDERABLE_REPLY.into()),
+                };
+                if let (Some(index), Some(waited)) = (edge, waited) {
+                    node.edge_usec[index].fetch_add(waited, Ordering::Relaxed);
+                }
+                (frame, label)
+            }
         };
         if let Frame::Error(text) = &frame {
             count_error_reply(node, text);
