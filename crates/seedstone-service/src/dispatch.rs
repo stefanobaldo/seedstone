@@ -138,6 +138,10 @@ pub enum Unbatched {
     /// Usually several keys, but not only: a fold that changes the shape of a
     /// lone reply sends a one-key request through here too — see
     /// [`Fold::is_identity_on_one`].
+    ///
+    /// A [`Fold::Array`] request of at most `CHUNK_COMMANDS` keys is spanned
+    /// into the connection's batch by the drain and never reaches
+    /// [`fan_out`]; see `connection::Slot::Spanned`.
     FanOut {
         /// The commands, in the order the peer named their keys.
         cmds: Vec<Command>,
