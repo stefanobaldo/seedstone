@@ -72,6 +72,9 @@ SemVer and are `0.x` until the server persists data;
   pipelined around it, instead of waiting for that batch to close and then
   making a round trip of its own. A pipeline of `MGET`s costs the server one
   message to its executors per drain rather than one per request.
+- A batch of pipelined commands wakes its connection once, when every
+  executor it reached has answered, rather than up to once per executor; the
+  replies come back in one shared cell instead of a channel per executor.
 
 ### Removed
 
