@@ -8,7 +8,7 @@ use crate::log::ReplicationLog;
 use crate::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use crate::shard::apply::{append, apply};
 use crate::shard::{
-    Command, Envelope, EvictionPolicy, ExpiryPolicy, KIND_SLOTS, Reply, ReplyError, Route,
+    Command, Envelope, EvictionPolicy, ExpiryPolicy, KIND_SLOTS, Reply, ReplyError, ReplyTo, Route,
     ShardPolicy, ShardStats, TraceSink,
 };
 use std::time::Duration;
@@ -301,8 +301,13 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                     trace.record(*shard, at, cmd, &answer);
                     replies.push(answer);
                 }
-                // The caller may have gone away; its replies are simply dropped.
-                let _ = reply.send(replies);
+                match reply {
+                    // The caller may have gone away; its replies are simply dropped.
+                    ReplyTo::Once(tx) => {
+                        let _ = tx.send(replies);
+                    }
+                    ReplyTo::Share(share) => share.deliver(replies),
+                }
             }
             // One ticker per executor rather than one per shard, advancing
             // every owned dict by the same budget: the same per-dict drain
