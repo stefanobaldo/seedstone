@@ -68,6 +68,10 @@ SemVer and are `0.x` until the server persists data;
   on its schedule rather than glibc's, and the `MIMALLOC_*` environment
   variables reach it; `used_memory` is unaffected, being an accounting
   formula over the keyspace.
+- `MGET` of up to 128 keys travels in the same batch as the commands
+  pipelined around it, instead of waiting for that batch to close and then
+  making a round trip of its own. A pipeline of `MGET`s costs the server one
+  message to its executors per drain rather than one per request.
 
 ### Removed
 
