@@ -80,56 +80,63 @@ pub struct ShardStats {
 /// A channel per executor would cost, per executor the chunk touched, an
 /// allocation made by the connection and shared with that executor's thread,
 /// and a wake of the connection task for each channel that completed while
-/// it was parked. The cell costs one allocation and one wake: each executor
-/// writes its replies into their positions and counts down, and the one that
-/// brings the count to zero notifies.
+/// it was parked. The cell costs the same few allocations however many
+/// executors the chunk reached, and one wake: each executor puts its replies
+/// in its own slot and counts down, and the one that brings the count to zero
+/// notifies.
 ///
-/// The positions are fixed at scatter time, so the order the executors
-/// finish in is unobservable — the same property gathering in
-/// executor-index order had.
+/// A slot per executor rather than per command, so that nothing about a
+/// share is allocated per executor: a share is the cell and an index, and
+/// where each command's reply sits among its executor's replies is recorded
+/// once, at scatter time, by the caller — see [`gather`](Self::gather). The
+/// order the executors finish in is therefore unobservable, the same
+/// property gathering in executor-index order had.
 pub struct ChunkReply {
-    /// One slot per command of the chunk, in command order. A slot still
-    /// `None` when the count reaches zero belonged to a command nothing
-    /// answered — no shard for it, an executor that would not take its
-    /// envelope, or a share dropped mid-flight — and reads
-    /// `ShardUnavailable`.
-    slots: Mutex<Vec<Option<Reply>>>,
+    /// One slot per executor, indexed by executor. A slot still `None` when
+    /// the count reaches zero belonged to an executor that answered nothing —
+    /// one that would not take its envelope, or dropped its share mid-flight
+    /// — or to one the chunk never reached.
+    answers: Mutex<Vec<Option<Vec<Reply>>>>,
     /// Shares outstanding. Zero means every share was delivered or dropped.
     remaining: AtomicUsize,
-    /// Notified once, by the share that brought `remaining` to zero. A
-    /// `Notify` stores the permit if nobody is waiting yet, so the notify
-    /// cannot be lost to a connection that has not reached its `await`.
+    /// Notified by the share that brought `remaining` to zero. A `Notify`
+    /// stores the permit if nobody is waiting yet, so the notify cannot be
+    /// lost to a connection that has not reached its `await`.
     done: Notify,
 }
 
 impl ChunkReply {
-    /// A cell for `commands` replies, with no shares yet.
+    /// A cell with a slot for each of `executors`, and no shares yet.
     #[must_use]
-    pub fn new(commands: usize) -> Arc<Self> {
+    pub fn new(executors: usize) -> Arc<Self> {
         Arc::new(Self {
-            slots: Mutex::new(std::iter::repeat_with(|| None).take(commands).collect()),
+            answers: Mutex::new(std::iter::repeat_with(|| None).take(executors).collect()),
             remaining: AtomicUsize::new(0),
             done: Notify::new(),
         })
     }
 
-    /// One executor's share: the positions its envelope's replies go to, in
-    /// the envelope's order. Counts itself in on creation and out on
-    /// delivery or drop.
+    /// `executor`'s share of the cell. Counts itself in on creation and out
+    /// on delivery or drop.
     #[must_use]
-    pub fn share(self: &Arc<Self>, positions: Vec<usize>) -> Share {
+    pub fn share(self: &Arc<Self>, executor: usize) -> Share {
         self.remaining.fetch_add(1, Ordering::AcqRel);
         Share {
             cell: Arc::clone(self),
-            positions,
+            executor,
         }
     }
 
-    /// Resolves once every share is in, to the replies in command order.
+    /// Resolves once every share is in, to one reply per entry of
+    /// `positions`, in that order.
     ///
-    /// The slots are taken, not copied: a second call after the first has
-    /// completed answers an empty vector.
-    pub async fn gather(&self) -> Vec<Reply> {
+    /// `positions` is the chunk as it was scattered: for each command, the
+    /// executor it went to and its offset among that executor's commands, or
+    /// `None` for a command sent nowhere. A command whose executor answered
+    /// nothing, or answered short, reads `ShardUnavailable`. The slots are
+    /// taken, not copied, so a second call after the first has completed
+    /// reads `ShardUnavailable` throughout.
+    pub async fn gather(&self, positions: Vec<Option<(usize, usize)>>) -> Vec<Reply> {
         // Checked before every wait, not only once. A count already at zero
         // must not wait for a notify that was stored — or never stored, if
         // there were no shares at all. And a stored permit does not mean the
@@ -140,12 +147,28 @@ impl ChunkReply {
         while self.remaining.load(Ordering::Acquire) != 0 {
             self.done.notified().await;
         }
-        // A poisoned lock still holds whole replies: nothing panics while it
-        // is held, and a slot is either written or not.
-        let slots = std::mem::take(&mut *self.slots.lock().unwrap_or_else(PoisonError::into_inner));
-        slots
+        // A poisoned lock still holds whole answers: nothing panics while it
+        // is held, and a slot is either filled or not.
+        let answers =
+            std::mem::take(&mut *self.answers.lock().unwrap_or_else(PoisonError::into_inner));
+        let mut answered: Vec<Vec<Option<Reply>>> = answers
             .into_iter()
-            .map(|slot| slot.unwrap_or(Reply::Error(ReplyError::ShardUnavailable)))
+            .map(|answer| {
+                answer.map_or_else(Vec::new, |replies| replies.into_iter().map(Some).collect())
+            })
+            .collect();
+        positions
+            .into_iter()
+            .map(|position| {
+                position
+                    .and_then(|(executor, offset)| {
+                        answered
+                            .get_mut(executor)
+                            .and_then(|replies| replies.get_mut(offset))
+                            .and_then(Option::take)
+                    })
+                    .unwrap_or(Reply::Error(ReplyError::ShardUnavailable))
+            })
             .collect()
     }
 }
@@ -158,27 +181,25 @@ impl ChunkReply {
 /// [`ReplyTo::Once`] sender gives.
 pub struct Share {
     cell: Arc<ChunkReply>,
-    positions: Vec<usize>,
+    executor: usize,
 }
 
 impl Share {
-    /// Writes `replies` into this share's positions, in order, and counts
-    /// out. Fewer replies than positions leaves the rest `None`.
+    /// Puts `replies` — one per command of this executor's envelope, in the
+    /// envelope's order — in this share's slot, and counts out.
     pub fn deliver(self, replies: Vec<Reply>) {
-        let mut slots = self
+        let mut answers = self
             .cell
-            .slots
+            .answers
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        for (position, reply) in self.positions.iter().zip(replies) {
-            if let Some(slot) = slots.get_mut(*position) {
-                *slot = Some(reply);
-            }
+        if let Some(slot) = answers.get_mut(self.executor) {
+            *slot = Some(replies);
         }
         // Released before `self` drops: the count-out is `Drop`'s, so
         // delivering and dropping are one path, and the connection it may
         // wake must find the lock free.
-        drop(slots);
+        drop(answers);
     }
 }
 
@@ -189,10 +210,6 @@ impl Drop for Share {
         }
     }
 }
-
-/// One executor's part of a chunk in [`Router::dispatch_many`]: its
-/// `(shard, command)` pairs, and the position each holds in the chunk.
-type Bucket = (Vec<(u16, Command)>, Vec<usize>);
 
 /// One unit of work for an executor: a batch of commands and where its
 /// replies go.
@@ -728,41 +745,42 @@ impl Router for ShardPool {
 
     fn dispatch_many(&self, cmds: Vec<Command>) -> impl Future<Output = Vec<Reply>> + Send {
         let executors = usize::from(self.executors);
-        let cell = ChunkReply::new(cmds.len());
         // Index-addressed buckets: iteration order is the executor order by
         // construction, which is what keeps this path free of any map
         // iteration — and so free of an iteration order that could differ
-        // between two runs of the same seed. Each bucket carries the
-        // positions its commands hold in the chunk, so the executor writes
-        // straight into the cell.
-        let mut buckets: Vec<Bucket> = Vec::new();
-        buckets.resize_with(executors, || (Vec::new(), Vec::new()));
-        for (position, cmd) in cmds.into_iter().enumerate() {
-            // A command this pool has no shard for keeps its position and is
-            // sent nowhere; its slot stays empty and reads `ShardUnavailable`.
+        // between two runs of the same seed.
+        let mut buckets: Vec<Vec<(u16, Command)>> = Vec::new();
+        buckets.resize_with(executors, Vec::new);
+        // Where each command's reply will be found once the executors answer,
+        // or `None` for a command this pool has no shard for — which keeps its
+        // place in the batch and is answered without anything being sent.
+        let mut positions: Vec<Option<(usize, usize)>> = Vec::with_capacity(cmds.len());
+        for cmd in cmds {
             let Some(shard) = self.shard_for(&cmd) else {
+                positions.push(None);
                 continue;
             };
             let executor = usize::from(executor_of(shard, self.shards, self.executors));
-            buckets[executor].0.push((shard, cmd));
-            buckets[executor].1.push(position);
+            positions.push(Some((executor, buckets[executor].len())));
+            buckets[executor].push((shard, cmd));
         }
 
         // Scattered at call time, exactly as `dispatch` sends at call time: an
         // executor starts on its bucket while the others are still being sent.
         // A share the inbox refuses comes back inside the error and is dropped
-        // with it, which counts it out with its slots empty.
-        for (executor, (cmds, positions)) in buckets.into_iter().enumerate() {
+        // with it, which counts it out with its slot empty.
+        let cell = ChunkReply::new(executors);
+        for (executor, cmds) in buckets.into_iter().enumerate() {
             if cmds.is_empty() {
                 continue;
             }
             let _ = self.inboxes[executor].send(Envelope {
                 cmds,
-                reply: ReplyTo::Share(cell.share(positions)),
+                reply: ReplyTo::Share(cell.share(executor)),
             });
         }
 
-        async move { cell.gather().await }
+        async move { cell.gather(positions).await }
     }
 
     fn dispatch_every(&self, cmd: Command) -> impl Future<Output = Vec<Reply>> + Send {
