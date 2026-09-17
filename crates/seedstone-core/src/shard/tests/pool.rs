@@ -373,17 +373,22 @@ async fn a_scan_step_filters_by_pattern_inside_the_shard() {
 /// positions and still lets the chunk complete.
 #[tokio::test]
 async fn a_chunk_reply_cell_gathers_in_order_and_survives_a_dropped_share() {
-    let cell = ChunkReply::new(5);
-    let (a, b, c) = (
-        cell.share(vec![0, 3]),
-        cell.share(vec![1]),
-        cell.share(vec![2, 4]),
-    );
+    let cell = ChunkReply::new(3);
+    let (a, b, c) = (cell.share(0), cell.share(1), cell.share(2));
+    // Five commands: executor 0 took the first and the fourth, executor 1 the
+    // second, executor 2 the third and the fifth.
+    let positions = vec![
+        Some((0, 0)),
+        Some((1, 0)),
+        Some((2, 0)),
+        Some((0, 1)),
+        Some((2, 1)),
+    ];
     // Delivered out of executor order, on purpose.
     c.deliver(vec![Reply::Integer(2), Reply::Integer(4)]);
     a.deliver(vec![Reply::Integer(0), Reply::Integer(3)]);
     drop(b);
-    let replies = cell.gather().await;
+    let replies = cell.gather(positions).await;
     assert_eq!(
         replies,
         vec![
@@ -402,12 +407,17 @@ async fn a_chunk_reply_cell_gathers_in_order_and_survives_a_dropped_share() {
 #[tokio::test]
 async fn a_chunk_reply_cell_completes_on_the_last_share() {
     let cell = ChunkReply::new(2);
-    let (a, b) = (cell.share(vec![0]), cell.share(vec![1]));
+    let (a, b) = (cell.share(0), cell.share(1));
+    let positions = vec![Some((0, 0)), Some((1, 0))];
     a.deliver(vec![Reply::Ok]);
-    let pending = tokio::time::timeout(std::time::Duration::from_millis(20), cell.gather()).await;
+    let pending = tokio::time::timeout(
+        std::time::Duration::from_millis(20),
+        cell.gather(positions.clone()),
+    )
+    .await;
     assert!(pending.is_err(), "gathered with a share outstanding");
     b.deliver(vec![Reply::Ok]);
-    assert_eq!(cell.gather().await, vec![Reply::Ok, Reply::Ok]);
+    assert_eq!(cell.gather(positions).await, vec![Reply::Ok, Reply::Ok]);
 }
 
 #[tokio::test]
