@@ -5,10 +5,11 @@
 //! replication position, and its log. It is the unit of *keyspace ownership*, not of
 //! scheduling: an executor task owns a contiguous range of shards and is the
 //! only thing that touches their state. Work arrives as an [`Envelope`] — a
-//! batch of `(shard, command)` pairs plus the one-shot channel its replies go
-//! back on — and an executor answers envelopes one at a time, in arrival
-//! order, applying each batch's commands in order. Nothing is shared, so
-//! nothing is locked.
+//! batch of `(shard, command)` pairs plus where its replies go — and an
+//! executor answers envelopes one at a time, in arrival order, applying each
+//! batch's commands in order. No shard's state is shared, so none of it is
+//! locked; the one lock on this path guards a chunk's reply slots, never a
+//! keyspace.
 //!
 //! Splitting the two lets the shard count stay a placement decision, fixed by
 //! the deployment format, while the executor count follows the machine. A key
@@ -58,7 +59,7 @@ pub use apply::parse_i64;
 pub use command::{Command, Cond, Expiry, KIND_SLOTS, Route};
 pub use executor::{EVICTION_SAMPLES, HOUSEKEEPING_TICK};
 pub use policy::{Deadlines, EvictionPolicy, ExpiryPolicy, NoTrace, ShardPolicy, TraceSink};
-pub use pool::{Envelope, Router, ShardPool, ShardStats};
+pub use pool::{ChunkReply, Envelope, ReplyTo, Router, ShardPool, ShardStats, Share};
 pub use reply::{Reply, ReplyError};
 
 #[cfg(test)]

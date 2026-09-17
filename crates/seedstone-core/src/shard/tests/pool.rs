@@ -5,7 +5,9 @@
 use super::support::{gathered, get, set};
 use crate::dict::{Dict, DictSeed, Entry};
 use crate::shard::apply::scan_step;
-use crate::shard::{Command, Deadlines, NoTrace, Reply, Route, Router, ShardPool};
+use crate::shard::{
+    ChunkReply, Command, Deadlines, NoTrace, Reply, ReplyError, Route, Router, ShardPool,
+};
 use crate::slot::{executor_of, shard_of};
 use bytes::Bytes;
 use tokio::time::Instant;
@@ -363,6 +365,49 @@ async fn a_scan_step_filters_by_pattern_inside_the_shard() {
         seen,
         vec![Bytes::from_static(b"album"), Bytes::from_static(b"alpha")]
     );
+}
+
+/// A chunk's replies come back in command order whatever order the
+/// executors finish in, and a share that is dropped without delivering —
+/// an executor gone mid-flight — leaves `ShardUnavailable` in exactly its
+/// positions and still lets the chunk complete.
+#[tokio::test]
+async fn a_chunk_reply_cell_gathers_in_order_and_survives_a_dropped_share() {
+    let cell = ChunkReply::new(5);
+    let (a, b, c) = (
+        cell.share(vec![0, 3]),
+        cell.share(vec![1]),
+        cell.share(vec![2, 4]),
+    );
+    // Delivered out of executor order, on purpose.
+    c.deliver(vec![Reply::Integer(2), Reply::Integer(4)]);
+    a.deliver(vec![Reply::Integer(0), Reply::Integer(3)]);
+    drop(b);
+    let replies = cell.gather().await;
+    assert_eq!(
+        replies,
+        vec![
+            Reply::Integer(0),
+            Reply::Error(ReplyError::ShardUnavailable),
+            Reply::Integer(2),
+            Reply::Integer(3),
+            Reply::Integer(4),
+        ]
+    );
+}
+
+/// The connection is woken once, by the last share: `gather` completes only
+/// after every share is delivered or dropped, and a cell with one share
+/// outstanding is still pending.
+#[tokio::test]
+async fn a_chunk_reply_cell_completes_on_the_last_share() {
+    let cell = ChunkReply::new(2);
+    let (a, b) = (cell.share(vec![0]), cell.share(vec![1]));
+    a.deliver(vec![Reply::Ok]);
+    let pending = tokio::time::timeout(std::time::Duration::from_millis(20), cell.gather()).await;
+    assert!(pending.is_err(), "gathered with a share outstanding");
+    b.deliver(vec![Reply::Ok]);
+    assert_eq!(cell.gather().await, vec![Reply::Ok, Reply::Ok]);
 }
 
 #[tokio::test]
