@@ -55,6 +55,17 @@ step 3 below insists on the candidate suffix.
    the destination is `[Unreleased]` and the question cannot yet be asked, so
    the assembled document is first read as a whole here.
 
+   **Rewrite the section for someone running the server, before the first
+   candidate.** Entries are written one change at a time, each by the change
+   that earns it, and read together they carry mechanism a reader cannot act
+   on and detail the documentation already holds. Fold what changes nothing
+   for that reader into one line — a performance line, a line of edge cases
+   now answering as Redis does — and keep every entry that asks something of
+   them or breaks something they rely on: a format, a refusal at startup, an
+   accounting change, a removed field. Do it before `rc.1` rather than at the
+   final: a candidate's release notes are `[Unreleased]` as it stands, so the
+   first candidate already publishes whatever the section says.
+
 2. `CHANGELOG.md`'s link footer: point `[Unreleased]` at the new version and
    give the new version its own definition. A final gets a compare against the
    version before it; the first release of all has nothing to compare against
