@@ -9,101 +9,46 @@ SemVer and are `0.x` until the server persists data;
 
 ### Added
 
-- `PTTL key` — the deadline a key carries, in milliseconds, which is the unit
-  this server keeps it in. `TTL` rounds the same deadline to a second; a
-  client that set a span with `PX` or `PSETEX` can now read it back without
-  the rounding. Its own `cmdstat_pttl` line in `INFO commandstats`.
-- `EXPIREAT key unix-seconds` and `PEXPIREAT key unix-milliseconds` — a
-  deadline named as a moment rather than as a span, the command spellings of
-  `SET … EXAT` and `SET … PXAT`. A moment already passed deletes the key and
-  answers `1`, as Redis 6.2.24 and 8.10.1 do; a moment whose multiplication by
-  its unit leaves a signed 64-bit millisecond clock is refused as an invalid
-  expire time, which bounds `EXPIREAT` at both ends and leaves `PEXPIREAT` the
-  whole range — the same asymmetry those two versions have. Each gets its own
-  `cmdstat_` line.
+- `PTTL`, `EXPIREAT` and `PEXPIREAT`. Their forms and how they compare with
+  Redis are in [docs/compatibility.md](docs/compatibility.md).
 - [docs/compatibility.md](docs/compatibility.md) — every command this server
-  answers with the forms it takes and how it differs from Redis 6.2.24 and
-  8.10.1, every command its clients emit that it refuses with the exact reply,
-  and the deliberate differences that are not commands. A test holds the page
-  and `COMMAND` together, so a command cannot be added or removed without it.
-- One format for everything the server writes about itself: a JSON object per
-  line on stderr with `ts`, `level` (`info`, `warn` or `error`) and `evt`,
-  then the event's fields. Four events — `listening`, `bind_failed`,
-  `error_reply`, `stopping` — documented with their fields in
-  [docs/operations.md](docs/operations.md), which a test holds to the code;
-  the field set is promised additively there. A collector no longer has to be
-  told that this server's stderr is not all errors.
-- `--requirepass-file` may hold two passwords, one per line, and either
-  authenticates. With `SIGHUP` re-reading the file, a rotation is three
-  steps and no server restart: add the new password as a second line and
-  send `SIGHUP`; restart the clients with the new password; remove the old
-  line and send `SIGHUP`. The result of every reload is one line —
-  `password_reloaded`, `password_reload_failed` or
-  `password_reload_skipped` — and the procedure is in
-  [docs/operations.md](docs/operations.md). `SEEDSTONE_REQUIREPASS` still
-  holds one password and is read once: an environment is not re-read.
+  answers, how each differs from Redis 6.2.24 and 8.10.1, and what it refuses
+  with which reply. A test keeps it in step with `COMMAND`.
+- Log lines are JSON objects with `ts`, `level` and `evt`, one per line on
+  stderr. The events and their fields are in
+  [docs/operations.md](docs/operations.md).
+- Password rotation without a restart: `--requirepass-file` may hold two
+  passwords, either of which authenticates, and `SIGHUP` re-reads it. The
+  procedure is in [docs/operations.md](docs/operations.md).
 
 ### Changed
 
-- The startup line `seedstone <version> listening on <addr>` and the
-  bind-failure line `bind failed: <error>` are now JSON lines with a level
-  (`listening` at `info`, `bind_failed` at `error`). Anything matching the
-  old text should select on `"evt":"listening"` instead.
-- The error-reply line carries `"level":"warn"` after `ts`; its other fields
-  (`evt`, `code`, `cmd`, `msg`) are unchanged.
-- A password file with an empty line, a whitespace-only line or more than
-  two lines is refused at startup, naming the rule. Before, a file ending in
-  two newlines was accepted with the second newline as part of the password.
-- A command's name is matched against the table without being copied, and
-  its arguments are read in place; a request no longer costs two
-  allocations before its handler runs.
-- `GET` hands back the stored value without copying it, and `SET` stores the
-  bytes it received without copying them: key and value are kept as
-  reference-counted byte strings. The fixed cost per key in `used_memory`'s
-  accounting is 96 bytes where it was 80, so the same `--maxmemory` holds
-  somewhat fewer keys before evicting.
-- `KEYS` and `SCAN` return key names without copying them, and the pattern
-  is shared across the steps of a walk rather than copied per step.
-- The binary's allocator is mimalloc. Resident memory grows and is released
-  on its schedule rather than glibc's, and the `MIMALLOC_*` environment
-  variables reach it; `used_memory` is unaffected, being an accounting
-  formula over the keyspace.
-- `MGET` of up to 128 keys travels in the same batch as the commands
-  pipelined around it, instead of waiting for that batch to close and then
-  making a round trip of its own. A pipeline of `MGET`s costs the server one
-  message to its executors per drain rather than one per request.
-- A batch of pipelined commands wakes its connection once, when every
-  executor it reached has answered, rather than up to once per executor; the
-  replies come back in one shared cell instead of a channel per executor.
+- The startup and bind-failure lines are JSON. Anything matching the old
+  text should select on `"evt":"listening"` or `"evt":"bind_failed"`.
+- A password file with an empty or whitespace-only line, or more than two
+  lines, is refused at startup, naming the rule.
+- Lower CPU per request: fewer allocations and copies per command, pipelined
+  `MGET`s travel with the commands around them instead of making a round trip
+  of their own, and a pipeline wakes its connection once. The measurements
+  are in [docs/benchmarks.md](docs/benchmarks.md).
+- Each key costs 96 bytes of fixed overhead in `used_memory`, up from 80, so
+  the same `--maxmemory` holds somewhat fewer keys before evicting.
+- The allocator is mimalloc: resident memory grows and is released on its
+  schedule rather than glibc's, and `MIMALLOC_*` environment variables reach
+  it. `used_memory` is unaffected.
 
 ### Removed
 
-- `INFO memory` no longer reports `mem_fragmentation_ratio`. The value was a
-  constant `1.00`, not a measurement: this server does not read its resident
-  set size, so it has no `used_memory_rss` to divide by, and a field that is
-  always `1.00` reads as a healthy measurement when it is not one. A consumer
-  that finds the field absent is correctly informed.
+- `mem_fragmentation_ratio` from `INFO memory`. It was a constant `1.00`, not
+  a measurement.
 
 ### Fixed
 
-- An empty line between pipelined commands is ignored, as Redis ignores it.
-  `redis-cli --pipe` writes one at the end of every transfer, and a transfer
-  that ended in a protocol error and a closed connection now completes.
-- The largest expiry span a command accepts is now Redis's: `now` plus the span
-  must fit a signed 64-bit millisecond clock, so the ceiling is clock-relative
-  and moves by one every second. `SET … EX`, `SETEX`, `EXPIRE` and their
-  millisecond spellings refuse exactly the spans Redis 6.2.24 and 8.10.1
-  refuse, where they previously accepted a band of about fifty-six years above
-  Redis's boundary. Ordinary spans never read the clock for this check.
-- A `HELLO` that names a protocol version this server does not speak, or an
-  option it does not take, is refused with its own error — `NOPROTO`, or the
-  syntax error — before the connection's authentication is considered, which
-  is the order Redis 6.2.24 and 8.10.1 decide it in. Previously an
-  unauthenticated client was told `NOAUTH` for every such request, so a client
-  probing for RESP3 support could not tell a refused version from a missing
-  password. One consequence for an operator: such a handshake is now counted
-  in `INFO commandstats` as a `cmdstat_hello` call, where before it was
-  counted nowhere.
+- `redis-cli --pipe` transfers complete: an empty line between pipelined
+  commands is ignored, as Redis ignores it.
+- Edge cases answer as Redis 6.2.24 and 8.10.1 do: the largest expiry span a
+  command accepts, and the error a `HELLO` naming an unsupported protocol
+  version gets before authentication is considered.
 
 ## [0.1.1] - 2026-09-08
 
