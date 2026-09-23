@@ -68,14 +68,16 @@ along with RESP3, replication, clustering, and every data type except strings.
 one and four I/O threads, and against Dragonfly and Garnet. On pipelined reads
 of small values at depth 64 this server is ahead of Redis and ahead of Valkey,
 at both of their I/O-thread settings; the word changes with the depth — at
-depth 4 it is behind each of them at one of their two settings and
-indistinguishable at the other — and the tables carry all four depths. On
-unpipelined reads, the shape a cache client actually runs, it is ahead of Redis
-and ahead of Valkey. On 10 KB writes under a memory ceiling with eviction it is
-ahead of Redis and of Valkey at one I/O thread, behind Redis at four and
-indistinguishable from Valkey at four. On multi-key reads of four and sixteen
-keys it is behind Redis, and behind every other engine measured; and it is more
-expensive per operation than Redis at pipeline depths above one. Every figure,
+depth 4 it is behind Redis at one I/O thread and ahead of it at four, and
+behind Valkey at both — and the tables carry all four depths. On unpipelined
+reads, the shape a cache client actually runs, it is ahead of Redis at both
+settings, ahead of Valkey at one I/O thread and indistinguishable from it at
+four. On 10 KB writes under a memory ceiling with eviction it is ahead of Redis
+and of Valkey at one I/O thread and indistinguishable from both at four. On
+multi-key reads of four and sixteen keys it is ahead of Redis and of Valkey at
+both settings, and ahead of or indistinguishable from the other two engines;
+and on every cell measured it spends more CPU per operation than Redis at one
+I/O thread. Every figure,
 the method that produced it, the raw logs and what the numbers do not say are in
 [docs/benchmarks.md](docs/benchmarks.md). No figure appears here, because a
 figure without its method beside it is a marketing number.
@@ -97,7 +99,7 @@ purpose — is [docs/compatibility.md](docs/compatibility.md).
 and its `sha256`, and a container image,
 `ghcr.io/stefanobaldo/seedstone:<tag>`. [CHANGELOG.md](CHANGELOG.md) is what
 changed; [docs/RELEASING.md](docs/RELEASING.md) is how a version is cut. The
-current release is `v0.1.0`.
+current release is `v0.2.0`.
 
 ## How it is built
 
