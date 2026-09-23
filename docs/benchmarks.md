@@ -10,8 +10,10 @@ The method below was committed before the run; the tables were added after
 it. The raw logs the tables are computed from are in
 [`bench/results/v0.2.0/`](../bench/results/v0.2.0/), and
 `python3 bench/report.py bench/results/v0.2.0/0[3-7]-*.log` regenerates every
-table and every reading on this page. A number here without its method beside it
-would be a marketing number, so the method comes first.
+table and every pair line on this page. The only readings it does not produce
+are the `v0.1.0` ones quoted under the pairs whose word changed; the same
+command over that run's logs produces those. A number here without its method
+beside it would be a marketing number, so the method comes first.
 
 **The run these tables replace is still here.** The `v0.1.0` run's raw logs stay
 under [`bench/results/v0.1.0/`](../bench/results/v0.1.0/), the same command over
@@ -31,9 +33,10 @@ two talk over loopback. Nothing else runs on the machine.
 **The load generator.** `redis-benchmark`, from the Redis release measured
 (8.10.0), is the only client. Its own CPU is on every row of every table, so a
 row where the client and not the server was the bottleneck can be seen rather
-than suspected. Its highest reading across the 225 kept runs in the tables below
-is 1.01 cores, and no row reaches higher; if a re-run shows more, that row is
-about the client.
+than suspected. Its highest reading across the 225 kept runs behind the tables
+below is 1.02 cores, on one of them; no row of any table, each being a median of
+three, reaches above 1.01. If a re-run shows more, that row is about the
+client.
 
 **The engines, and how each was configured.** Each engine receives the
 configuration that matches the hardware it is given, where it has a knob for
@@ -253,8 +256,8 @@ the same runs.
 Against `redis-iot1`, `valkey-iot1` and `valkey-iot4` on this row the two
 quantities agree rather than disagree — behind on throughput and more expensive
 per operation is one direction, and this row is not a trade against any of the
-three. It is the row this server reads worst against Redis and Valkey, and it
-was the same row in `v0.1.0`.
+three. It is the only row on this page carrying more than one *behind* against
+the four Redis and Valkey arms.
 
 **Since `v0.1.0`.** The pairs on this row whose word changed, and what
 they read then:
@@ -440,11 +443,12 @@ held: between 0.61 and 0.68 keys evicted per operation, in every arm.
 is in `05-eviction.log`.
 
 **Two engines are absent from this table, and each absence is that engine's
-property, not this cell's.** Garnet bounds memory by a log size with tail
+property, not this cell's.** Garnet 2.1.5 bounds memory by a log size with tail
 reclamation rather than by a ceiling with LRU eviction, so the comparable cell
-does not exist for it. Dragonfly requires 256 MiB of `maxmemory` per proactor
-thread and refuses to start below that: at the ten proactor threads this
-hardware gives it, the smallest ceiling it accepts is 2.50 GiB, which is above
+does not exist for it. Dragonfly `df-v1.40.2` requires 256 MiB of `maxmemory`
+per proactor thread and refuses to start below that: at the ten proactor
+threads this hardware gives it, the smallest ceiling it accepts is 2.50 GiB,
+which is above
 the roughly 0.95 GiB this cell's keyspace can hold — so it would have evicted
 nothing, and raising the ceiling to admit it would have stopped every other arm
 evicting too, while the cell still looked like an eviction cell. The ceiling was
@@ -616,7 +620,7 @@ key. The keyspace is written by `bench/keys-load.sh` rather than by
 `redis-benchmark`, and key `i` is a function of `i` alone, so every arm and
 every run walks the identical 7 000 keys; each arm's `dbsize` is read back and
 printed in `07-keys.log`. One fixed prefix of the 64 is matched per call, so
-every call answers the same ~109 keys. Depth 1 because the deployment these
+every call answers the same 110 keys. Depth 1 because the deployment these
 shapes are sized from does not pipeline a `KEYS` call. `W` = 3 discarded runs
 per arm, then three kept.
 
@@ -688,14 +692,15 @@ as every other arm's. It is stated here rather than left in the log.
 - Two payloads (64 B, 10 240 B) and two key distributions: 100 000 spread keys
   everywhere except the `KEYS` cell, which walks 7 000 keys under 64 prefixes.
   Pipeline depth at most 64, 50 connections throughout.
-- The `KEYS` cell matches one prefix that answers about 109 of 7 000 keys. A
+- The `KEYS` cell matches one prefix that answers 110 of 7 000 keys. A
   glob that matches nothing, a glob that matches everything, a keyspace an
   order of magnitude larger, and a `KEYS` call concurrent with write traffic
   are four different cells, and none of them was run.
 - Garnet and Dragonfly are both absent from the eviction table, each for the
-  reason stated there: Garnet bounds memory by a log size with tail
-  reclamation rather than a ceiling with LRU, and Dragonfly refuses to start
-  below 256 MiB of `maxmemory` per proactor thread, which at ten threads puts
+  reason stated there: Garnet 2.1.5 bounds memory by a log size with tail
+  reclamation rather than a ceiling with LRU, and Dragonfly `df-v1.40.2`
+  refuses to start below 256 MiB of `maxmemory` per proactor thread, which at
+  ten threads puts
   the smallest ceiling it accepts above everything this cell's keyspace can
   hold. The ceiling was declared before the run and was not moved to
   accommodate an engine.
