@@ -43,7 +43,7 @@ approximately.
 | `AUTH [username] password` | one password for the `default` user; no ACL users |
 | `HELLO [protover [AUTH username password]]` | RESP2 only: `HELLO 3` is `NOPROTO unsupported protocol version`. `SETNAME` is refused, where 6.2.24 and 8.10.1 accept it, because there is no client name to set here. A refused version or option is answered before the connection's authentication is considered — the order 6.2.24 and 8.10.1 decide it in — so an unauthenticated client is told which of the two it got wrong |
 | `QUIT` | — |
-| `CLIENT SETNAME \| SETINFO` | both answered `OK` and both ignored: there is no `CLIENT LIST` here to show a name in. redis-py 8.1.0 and go-redis 9.7.3 send `SETINFO` while establishing a connection |
+| `CLIENT SETNAME \| SETINFO` | both answered `OK` and both ignored: there is no `CLIENT LIST` here to show a name in. redis-py 8.1.0 and go-redis 9.22.0 send `SETINFO` while establishing a connection |
 | `INFO [section]` | sections `server`, `clients`, `memory`, `stats`, `keyspace` and `commandstats`, each carrying only the fields this node can state truthfully. `memory` is `used_memory`, `used_memory_human`, `maxmemory`, `maxmemory_human` and `maxmemory_policy`, and no resident-set family — see below |
 | `CONFIG GET parameter [parameter …]` | a fixed table of the parameters that describe how the node was started, matched without regard to case; `CONFIG SET` is refused. See below for which spelling comes back |
 | `SLOWLOG GET \| LEN \| RESET` | answers as a monitor that is switched off: an empty list, `0`, `OK` |
@@ -76,7 +76,7 @@ page was written. One shape covers all of them — `ERR unknown command
 
 - **RESP2 only.** `HELLO 3` is answered `NOPROTO unsupported protocol version`.
   redis-py 8.1.0 opens every connection with `HELLO 3` and does not fall back,
-  so configure it with `protocol=2`; go-redis 9.7.3 sends the same handshake
+  so configure it with `protocol=2`; go-redis 9.22.0 sends the same handshake
   and falls back on its own when it is refused. redis-py 5.0.8 and earlier
   default to RESP2 and send no `HELLO` at all.
 
