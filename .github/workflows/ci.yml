@@ -189,7 +189,12 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         with:
-          go-version: '1.23'
+          # The `go` directive in `e2e/go/go.mod`, and not a version above it:
+          # `setup-go` pins `GOTOOLCHAIN=local`, so a runner below the
+          # directive fails the lane rather than quietly downloading what the
+          # module asked for — which is how a go-redis bump that raised the
+          # directive to 1.24 arrived here red. Raise the two together.
+          go-version: '1.24'
           cache-dependency-path: e2e/go/go.sum
       - name: build the server
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
