@@ -24,7 +24,17 @@ KEYS = ("k", "k2", "n", "fresh", "brief", "missing")
 
 @pytest.fixture(scope="module")
 def r():
-    client = redis.Redis(port=PORT, password=PASSWORD, decode_responses=True)
+    # `protocol=2` is not a preference: redis-py 8 defaults to RESP3 and opens
+    # every connection with `HELLO 3`, which this server refuses because it
+    # speaks RESP2 and only RESP2. Unlike go-redis, redis-py does not downgrade
+    # on the refusal — it raises, and nothing below runs. Measured on redis-py
+    # 8.1.0 against seedstone 0.2.0: bare, the fixture dies in the handshake
+    # with `NOPROTO unsupported protocol version`; with this parameter, every
+    # test in this file passes. The django lane's `current` pair names it the
+    # same way and for the same reason.
+    client = redis.Redis(
+        port=PORT, password=PASSWORD, decode_responses=True, protocol=2
+    )
     # The server has no FLUSHALL and this gate does not need one, but a
     # counter that survives a re-run against a server someone left up would
     # fail the second run and pass the first. Clearing what these tests own is
@@ -85,7 +95,7 @@ def test_hello_without_credentials_is_refused():
     given it, and the refusal names the form that would have worked.
 
     A socket rather than the library, which is the exception in this file and
-    is why: redis-py 5 sends `CLIENT SETINFO` inside `connect()`, is refused
+    is why: redis-py 8 sends `CLIENT SETINFO` inside `connect()`, is refused
     for want of a password and raises there, so a credential-less `HELLO` is
     unreachable through its API. The bytes are what the server is being held
     to here, and they are the bytes any client would read.
