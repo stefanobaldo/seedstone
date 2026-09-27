@@ -259,6 +259,12 @@ per operation is one direction, and this row is not a trade against any of the
 three. It is the only row on this page carrying more than one *behind* against
 the four Redis and Valkey arms.
 
+The gap is the cost of handing each request to executor threads that sleep
+between requests. Keeping them awake after each request narrows it only at a
+much higher CPU per operation, and does not close it against `valkey-iot4`;
+[#32](https://github.com/stefanobaldo/seedstone/issues/32) has the
+measurement and why that trade was declined.
+
 **Since `v0.1.0`.** The pairs on this row whose word changed, and what
 they read then:
 
