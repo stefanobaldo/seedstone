@@ -124,12 +124,17 @@ use seedstone_core::dict::DictSeed;
 // indistinguishable from the honest one except in its atomicity, and these
 // strings enter the trace hash — a private copy that drifted would make a
 // planted trace differ for a reason unrelated to the race.
+use seedstone_core::log::disk::Disk;
+use seedstone_core::log::file::{FileLog, SharedSegment, next_generation, open_segments};
+use seedstone_core::log::recovery::{ReaderMode, Recovery, ShardRecords, recover};
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
-use seedstone_core::shard::{ShardPool, parse_i64};
+use seedstone_core::shard::{Deadlines, PoolSpec, ShardPolicy, ShardPool, parse_i64};
+use seedstone_core::slot::executor_of;
 use seedstone_resp::Frame;
 use seedstone_service::{NodeInfo, serve_connection};
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -159,6 +164,8 @@ pub use routers::{PlantedRouter, SkippingRouter};
 pub use sweep::{SweepReport, sweep};
 pub use trace::mix;
 
+use disk::SimFile;
+use durability::Observed;
 use model::Model;
 use outcome::{Shared, lock};
 use plant::{EvictsBelowCeiling, IgnoresCeiling, ScanMissesRehash, ServeExpired, SweepEatsAll};
@@ -324,7 +331,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         .build();
 
     let trace = Arc::new(Mutex::new(TRACE_INIT));
-    let shared = Shared::default();
+    let shared = Shared::new(cfg.shards);
 
     // The dict seed is derived from the simulator seed so two seeds do not
     // share a bucket layout: a hash collision that only shows up under one
@@ -333,7 +340,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         k0: mix(TRACE_INIT, cfg.sim_seed),
         k1: mix(GOLDEN, cfg.sim_seed),
     };
-    let sink = HashSink(Arc::clone(&trace));
+    let sink = HashSink::new(Arc::clone(&trace), shared.clone());
     let shards = cfg.shards;
     let executors = cfg.executors;
     let planted = cfg.planted;
@@ -342,12 +349,21 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         mode: EvictionMode::AllKeysLru,
     };
 
+    let host_shared = shared.clone();
     sim.host(SERVER, move || {
         // Cloned per invocation: turmoil may restart a host, and each start
         // needs its own future. The sink is shared on purpose — a restart
         // continues the same trace.
         let sink = sink.clone();
-        server(shards, executors, dict_seed, sink, planted, limit)
+        server(
+            shards,
+            executors,
+            dict_seed,
+            sink,
+            planted,
+            limit,
+            host_shared.clone(),
+        )
     });
 
     for id in 0..cfg.clients {
@@ -381,6 +397,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         ceiling_checks: tally.ceiling_checks,
         evictable: cfg.maxmemory.is_some(),
         forms_emitted: lock(&shared.forms).clone(),
+        recoveries: tally.recoveries,
     }
 }
 
@@ -397,53 +414,68 @@ async fn server(
     sink: HashSink,
     planted: Option<Plant>,
     limit: MemoryLimit,
+    shared: Shared,
 ) -> turmoil::Result {
+    // Recovery and the segments, retried until they succeed: under a disk
+    // that fails I/O a start can fail on the header write of a segment, and
+    // a node that gave up there would end the run with a harness error
+    // rather than a finding.
+    let (recovery, segments) = loop {
+        if let Ok(started) = start_log(shards, executors, planted) {
+            break started;
+        }
+        lock(&shared.tally).start_failures += 1;
+        tokio::time::sleep(START_RETRY).await;
+    };
     // Every arm is spawned with the limit, the honest one included: the
     // ceiling is the shape's, not the plant's, and a run whose honest node
     // had no ceiling would be measuring a different server from the one its
     // planted twin runs.
+    let parts = PoolParts {
+        shards,
+        executors,
+        seed,
+        sink,
+        limit,
+        recovered: recovery.shards,
+        make_log: {
+            let shared = shared.clone();
+            let drops = planted == Some(Plant::DropsFailedWrite);
+            move |shard: u16| {
+                let executor = usize::from(executor_of(shard, shards, executors));
+                Observed::new(
+                    shard,
+                    FileLog::new(shard, Arc::clone(&segments[executor])),
+                    drops,
+                    shared.clone(),
+                )
+            }
+        },
+    };
     let pool = match planted {
-        Some(Plant::ServeExpired) => {
-            ShardPool::spawn_with_policy_limited(shards, executors, seed, sink, ServeExpired, limit)
-        }
-        Some(Plant::SweepEatsAll) => {
-            ShardPool::spawn_with_policy_limited(shards, executors, seed, sink, SweepEatsAll, limit)
-        }
-        Some(Plant::ScanMissesRehash) => ShardPool::spawn_with_policy_limited(
-            shards,
-            executors,
-            seed,
-            sink,
-            ScanMissesRehash,
-            limit,
-        ),
-        Some(Plant::IgnoresCeiling) => ShardPool::spawn_with_policy_limited(
-            shards,
-            executors,
-            seed,
-            sink,
-            IgnoresCeiling,
-            limit,
-        ),
-        Some(Plant::EvictsBelowCeiling) => ShardPool::spawn_with_policy_limited(
-            shards,
-            executors,
-            seed,
-            sink,
-            EvictsBelowCeiling,
-            limit,
-        ),
-        // The honest pool, and the two router plants' too: both of those
-        // defects live above the shard, where a real one would.
-        None | Some(Plant::LostUpdate | Plant::CrossingSkipsShard) => {
-            ShardPool::spawn_limited(shards, executors, seed, sink, limit)
-        }
+        Some(Plant::ServeExpired) => parts.spawn(ServeExpired),
+        Some(Plant::SweepEatsAll) => parts.spawn(SweepEatsAll),
+        Some(Plant::ScanMissesRehash) => parts.spawn(ScanMissesRehash),
+        Some(Plant::IgnoresCeiling) => parts.spawn(IgnoresCeiling),
+        Some(Plant::EvictsBelowCeiling) => parts.spawn(EvictsBelowCeiling),
+        // The honest pool; the router plants and the recovery plants live
+        // elsewhere — above the shard, or in the log the factory built.
+        None
+        | Some(
+            Plant::LostUpdate
+            | Plant::CrossingSkipsShard
+            | Plant::PrefixScanRecovery
+            | Plant::DropsFailedWrite,
+        ) => parts.spawn(Deadlines),
     };
     let listener = turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await?;
     // One per host, as it is in production: it describes the node, not the
     // connection. No workload here asks a host about itself, so nothing reads
     // it — it is here because the connection code takes one.
     let mut node = NodeInfo::for_tests();
+    // The clock the log's deadlines are written against, so a deadline
+    // replayed after a crash means what it meant when it was written.
+    node.now_unix_millis = sim_wall_clock;
     // Short enough that a client's nap can cross it: see [`SIM_IDLE_SHED`].
     node.idle_shed_after = SIM_IDLE_SHED;
     // The simulated node's `INFO` reads the same word its executors keep, for
@@ -479,6 +511,65 @@ async fn server(
                 tokio::spawn(serve_connection(stream, pool.clone(), node.clone()));
             }
         }
+    }
+}
+
+/// How long a failed start waits before trying again.
+const START_RETRY: Duration = Duration::from_millis(10);
+
+/// Where the simulated node keeps its log, on its host's own filesystem.
+const DATA_DIR: &str = "/data";
+
+/// Reads the log and opens this generation's segments.
+///
+/// Inside the host, never around [`run_sim`]: turmoil's filesystem belongs
+/// to the host that is running, and there is none outside one.
+fn start_log(
+    shards: u16,
+    executors: u16,
+    planted: Option<Plant>,
+) -> std::io::Result<(Recovery, Vec<SharedSegment<SimFile>>)> {
+    let disk = SimDisk;
+    let wal = Path::new(DATA_DIR).join("wal");
+    disk.create_dir_all(&wal)?;
+    let mode = if planted == Some(Plant::PrefixScanRecovery) {
+        ReaderMode::PrefixScan
+    } else {
+        ReaderMode::Resynchronising
+    };
+    let recovery = recover(&disk, &wal, shards, mode)?;
+    let generation = next_generation(&disk, &wal)?;
+    let segments = open_segments(&disk, &wal, generation, executors)?;
+    Ok((recovery, segments))
+}
+
+/// What every arm of the plant match spawns from: the spec minus its policy.
+struct PoolParts<F> {
+    shards: u16,
+    executors: u16,
+    seed: DictSeed,
+    sink: HashSink,
+    limit: MemoryLimit,
+    recovered: Vec<ShardRecords>,
+    make_log: F,
+}
+
+impl<F> PoolParts<F>
+where
+    F: Fn(u16) -> Observed<SimFile>,
+{
+    fn spawn<P: ShardPolicy>(self, policy: P) -> ShardPool {
+        ShardPool::spawn_spec(PoolSpec {
+            shards: self.shards,
+            executors: self.executors,
+            seed: self.seed,
+            trace: self.sink,
+            make_log: self.make_log,
+            policy,
+            limit: self.limit,
+            clock: sim_wall_clock,
+            recovered: self.recovered,
+        })
     }
 }
 
