@@ -362,6 +362,32 @@ pub struct ShardPool {
     limit: MemoryLimit,
 }
 
+/// Everything a pool is built from, with every seam exposed.
+///
+/// A struct rather than a parameter list: the constructor had reached the
+/// argument count where the next one is a list nobody reads, and a caller
+/// that names its fields cannot swap two clocks or two counts by position.
+/// The public constructors on [`ShardPool`] are this with defaults filled
+/// in; [`ShardPool::spawn_spec`] takes it whole.
+pub struct PoolSpec<T, F, P> {
+    /// How many virtual shards the node runs.
+    pub shards: u16,
+    /// How many executor tasks host them.
+    pub executors: u16,
+    /// What the keyspace dicts hash under.
+    pub seed: DictSeed,
+    /// Where every completed command is reported.
+    pub trace: T,
+    /// Builds each shard's log, called once per shard with its index.
+    pub make_log: F,
+    /// The executor's own decisions — deadlines, eviction, walk order.
+    pub policy: P,
+    /// The memory ceiling, and what happens at it.
+    pub limit: MemoryLimit,
+    /// The wall clock, injected. See [`Now`](crate::shard::Now).
+    pub clock: fn() -> u64,
+}
+
 impl ShardPool {
     /// Spawns `executors` executor tasks on the current tokio runtime,
     /// hosting `shards` virtual shards between them.
@@ -379,16 +405,16 @@ impl ShardPool {
     /// If `shards` is zero — there would be nowhere to route a key — or if
     /// `executors` is not in `1..=shards`.
     pub fn spawn<T: TraceSink>(shards: u16, executors: u16, seed: DictSeed, trace: T) -> Self {
-        Self::spawn_full(
+        Self::spawn_spec(PoolSpec {
             shards,
             executors,
             seed,
             trace,
-            |_shard| NoopLog,
-            Deadlines,
-            MemoryLimit::default(),
-            frozen_clock,
-        )
+            make_log: |_shard| NoopLog,
+            policy: Deadlines,
+            limit: MemoryLimit::default(),
+            clock: frozen_clock,
+        })
     }
 
     /// [`spawn`](ShardPool::spawn) with a ceiling on what the node's keyspace
@@ -411,16 +437,16 @@ impl ShardPool {
         trace: T,
         limit: MemoryLimit,
     ) -> Self {
-        Self::spawn_full(
+        Self::spawn_spec(PoolSpec {
             shards,
             executors,
             seed,
             trace,
-            |_shard| NoopLog,
-            Deadlines,
+            make_log: |_shard| NoopLog,
+            policy: Deadlines,
             limit,
-            frozen_clock,
-        )
+            clock: frozen_clock,
+        })
     }
 
     /// [`spawn`](ShardPool::spawn) with the replication log supplied per shard.
@@ -453,16 +479,16 @@ impl ShardPool {
         L: ReplicationLog,
         F: Fn(u16) -> L,
     {
-        Self::spawn_full(
+        Self::spawn_spec(PoolSpec {
             shards,
             executors,
             seed,
             trace,
             make_log,
-            Deadlines,
-            MemoryLimit::default(),
-            frozen_clock,
-        )
+            policy: Deadlines,
+            limit: MemoryLimit::default(),
+            clock: frozen_clock,
+        })
     }
 
     /// [`spawn`](ShardPool::spawn) with the executor's own decisions supplied.
@@ -485,16 +511,16 @@ impl ShardPool {
         T: TraceSink,
         P: ShardPolicy,
     {
-        Self::spawn_full(
+        Self::spawn_spec(PoolSpec {
             shards,
             executors,
             seed,
             trace,
-            |_shard| NoopLog,
+            make_log: |_shard| NoopLog,
             policy,
-            MemoryLimit::default(),
-            frozen_clock,
-        )
+            limit: MemoryLimit::default(),
+            clock: frozen_clock,
+        })
     }
 
     /// [`spawn_with_policy`](ShardPool::spawn_with_policy) with a ceiling as
@@ -521,24 +547,25 @@ impl ShardPool {
         T: TraceSink,
         P: ShardPolicy,
     {
-        Self::spawn_full(
+        Self::spawn_spec(PoolSpec {
             shards,
             executors,
             seed,
             trace,
-            |_shard| NoopLog,
+            make_log: |_shard| NoopLog,
             policy,
             limit,
-            frozen_clock,
-        )
+            clock: frozen_clock,
+        })
     }
 
     /// The one constructor with every seam exposed; the public ones above are
     /// its defaults.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one parameter per seam; the next change gathers them into one struct"
-    )]
+    ///
+    /// # Panics
+    ///
+    /// As [`spawn`](ShardPool::spawn): if `shards` is zero, or if `executors`
+    /// is not in `1..=shards`.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "every executor gets a clone of the sink and of the policy and the \
@@ -546,22 +573,23 @@ impl ShardPool {
                   is what lets a caller move them in rather than keep them alive \
                   alongside the pool"
     )]
-    fn spawn_full<T, L, F, P>(
-        shards: u16,
-        executors: u16,
-        seed: DictSeed,
-        trace: T,
-        make_log: F,
-        policy: P,
-        limit: MemoryLimit,
-        clock: fn() -> u64,
-    ) -> Self
+    pub fn spawn_spec<T, L, F, P>(spec: PoolSpec<T, F, P>) -> Self
     where
         T: TraceSink,
         L: ReplicationLog,
         F: Fn(u16) -> L,
         P: ShardPolicy,
     {
+        let PoolSpec {
+            shards,
+            executors,
+            seed,
+            trace,
+            make_log,
+            policy,
+            limit,
+            clock,
+        } = spec;
         assert!(
             shards > 0,
             "ShardPool::spawn: shards must be greater than zero"

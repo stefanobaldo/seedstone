@@ -335,3 +335,72 @@ async fn every_mutation_logs_its_effect_with_an_absolute_deadline() {
         ]
     );
 }
+
+/// The tick flushes every shard's log, then syncs it, and a failure of
+/// either reaches the trace sink as a fault rather than vanishing.
+#[tokio::test(start_paused = true)]
+async fn the_tick_flushes_then_syncs_and_reports_a_failure() {
+    use crate::shard::{HOUSEKEEPING_TICK, LogFault, PoolSpec, TraceSink};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Clone, Default)]
+    struct Journal(Arc<Mutex<Vec<&'static str>>>);
+
+    impl ReplicationLog for Journal {
+        fn append(&mut self, _rec: Record<'_>) -> std::io::Result<()> {
+            self.0.lock().expect("journal").push("append");
+            Ok(())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.lock().expect("journal").push("flush");
+            Err(std::io::Error::other("the disk went away"))
+        }
+        fn sync(&mut self) -> std::io::Result<Option<u64>> {
+            self.0.lock().expect("journal").push("sync");
+            Ok(None)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Faults(Arc<AtomicU64>);
+
+    impl TraceSink for Faults {
+        fn record(&self, _shard: u16, _seq: u64, _cmd: &Command, _reply: &Reply) {}
+        fn fault(&self, shard: u16, fault: LogFault, error: &std::io::Error) {
+            assert_eq!(shard, 0);
+            assert_eq!(fault, LogFault::Write);
+            assert_eq!(error.to_string(), "the disk went away");
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let journal = Journal::default();
+    let faults = Faults::default();
+    let pool = ShardPool::spawn_spec(PoolSpec {
+        shards: 1,
+        executors: 1,
+        seed: DictSeed { k0: 1, k1: 2 },
+        trace: faults.clone(),
+        make_log: {
+            let journal = journal.clone();
+            move |_shard| journal.clone()
+        },
+        policy: crate::shard::Deadlines,
+        limit: crate::memory::MemoryLimit::default(),
+        clock: crate::shard::frozen_clock,
+    });
+    pool.dispatch(set(b"k", b"v")).await;
+    tokio::time::advance(HOUSEKEEPING_TICK + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+
+    let seen = journal.0.lock().expect("journal").clone();
+    assert!(
+        seen.starts_with(&["append", "flush", "sync"]),
+        "flush precedes sync on the tick, and the failed flush does not stop the sync: {seen:?}"
+    );
+    assert_eq!(
+        faults.0.load(Ordering::SeqCst),
+        1,
+        "one flush failed, one fault reported"
+    );
+}

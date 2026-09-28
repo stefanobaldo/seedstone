@@ -58,8 +58,10 @@ mod reply;
 pub use apply::parse_i64;
 pub use command::{Command, Cond, Expiry, KIND_SLOTS, Route};
 pub use executor::{EVICTION_SAMPLES, HOUSEKEEPING_TICK, Now, Replayed, frozen_clock};
-pub use policy::{Deadlines, EvictionPolicy, ExpiryPolicy, NoTrace, ShardPolicy, TraceSink};
-pub use pool::{ChunkReply, Envelope, ReplyTo, Router, ShardPool, ShardStats, Share};
+pub use policy::{
+    Deadlines, EvictionPolicy, ExpiryPolicy, LogFault, NoTrace, ShardPolicy, TraceSink,
+};
+pub use pool::{ChunkReply, Envelope, PoolSpec, ReplyTo, Router, ShardPool, ShardStats, Share};
 pub use reply::{Reply, ReplyError};
 
 #[cfg(test)]

@@ -360,33 +360,48 @@ pub fn decode_record(buf: &[u8]) -> Decoded<'_> {
 pub trait ReplicationLog: Send + 'static {
     /// Records `rec`, before the command it describes is applied.
     ///
-    /// Returning `Ok` means the record is accepted, not that it is durable.
-    /// Durability is [`sync`](ReplicationLog::sync)'s job, and the two are
-    /// separate because syncing every append is what makes torn writes
-    /// unobservable — precisely the fault this format is built to survive.
+    /// Returning `Ok` means the record is accepted, not that it is durable
+    /// — not even that it is written. An implementation buffers here,
+    /// because this runs inside a shard's command handler, which is a plain
+    /// `fn` that cannot `await` and must stay cheap.
     ///
     /// # Errors
     ///
-    /// Whatever the underlying store reports. The mutation the record
-    /// describes must not proceed: a change applied without its record is the
-    /// one divergence recovery cannot detect.
+    /// Whatever the implementation reports. The mutation the record
+    /// describes must not proceed: a change applied without its record is
+    /// the one divergence recovery cannot detect.
     fn append(&mut self, rec: Record<'_>) -> std::io::Result<()>;
 
     /// Writes everything appended so far to the store, without making it
     /// durable.
     ///
+    /// Called from the housekeeping tick, once per shard, before any
+    /// [`sync`](ReplicationLog::sync). A write that fails **keeps** what it
+    /// could not write, so the next tick retries it: a record whose command
+    /// was acknowledged is never dropped by the server, because a dropped
+    /// record followed by a later successful write is a hole inside the
+    /// durable region — the one damage recovery cannot repair.
+    ///
     /// # Errors
     ///
-    /// Whatever the underlying store reports.
+    /// Whatever the store reports. Nothing is lost; the caller reports the
+    /// fault and moves on.
     fn flush(&mut self) -> std::io::Result<()>;
 
-    /// Makes everything flushed so far durable and reports the highest
-    /// sequence that is now durable for this shard, if any.
+    /// Makes everything flushed so far durable.
+    ///
+    /// Called from the tick after every shard's `flush`. Separate from
+    /// `append` because syncing every append is what makes torn writes
+    /// unobservable — precisely the fault the record format is built to
+    /// survive.
+    ///
+    /// Returns the highest sequence of this shard that is now durable, or
+    /// `None` if nothing of this shard has ever been made durable.
     ///
     /// # Errors
     ///
-    /// Whatever the underlying store reports. Nothing appended since the last
-    /// successful sync may be assumed durable afterwards.
+    /// Whatever the store reports. Nothing flushed since the last successful
+    /// sync may be assumed durable afterwards; the next tick syncs again.
     fn sync(&mut self) -> std::io::Result<Option<u64>>;
 }
 

@@ -7,6 +7,15 @@ use crate::dict::WalkOrder;
 use crate::shard::{Command, Reply};
 use tokio::time::Instant;
 
+/// Which half of the tick's durability work failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFault {
+    /// `flush` failed: the records stay buffered and are retried.
+    Write,
+    /// `sync` failed: what was flushed is on disk but not durable yet.
+    Sync,
+}
+
 /// An observer of every command a shard completes.
 ///
 /// The simulator folds these calls into a trace hash. Calls arrive in each
@@ -29,6 +38,22 @@ pub trait TraceSink: Clone + Send + 'static {
     /// is what makes a schedule that reordered two commands visible; reading
     /// it as an index into the log would be wrong.
     fn record(&self, shard: u16, seq: u64, cmd: &Command, reply: &Reply);
+
+    /// Called once per shard when the node starts, after that shard's log
+    /// has been replayed: `next_seq` is the position the shard resumes at,
+    /// and `lossy` says whether recovery had to discard records of this
+    /// shard — a gap in its sequence, or a segment it could not read at all.
+    ///
+    /// A default that does nothing, so a sink that folds commands need not
+    /// know a restart exists. The simulator's does: two runs that recovered
+    /// different prefixes are different runs.
+    fn recovered(&self, _shard: u16, _next_seq: u64, _lossy: bool) {}
+
+    /// Called when a shard's log could not be written or synced on a tick.
+    ///
+    /// A default that does nothing: the tick has nowhere else to report to,
+    /// and a sink that wants the line — the binary's — implements this.
+    fn fault(&self, _shard: u16, _fault: LogFault, _error: &std::io::Error) {}
 }
 
 /// A [`TraceSink`] that observes nothing. Production's sink.
