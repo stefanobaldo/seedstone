@@ -139,6 +139,8 @@ use tokio::time::Instant;
 pub mod contract;
 
 mod config;
+mod disk;
+mod durability;
 mod model;
 mod outcome;
 mod plant;
@@ -149,6 +151,8 @@ mod verify;
 mod workload;
 
 pub use config::SimConfig;
+pub use disk::SimDisk;
+pub use durability::{sim_wall_clock, world_now};
 pub use outcome::SimOutcome;
 pub use plant::Plant;
 pub use routers::{PlantedRouter, SkippingRouter};
