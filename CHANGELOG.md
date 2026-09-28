@@ -7,6 +7,14 @@ SemVer and are `0.x` until the server persists data;
 
 ## [Unreleased]
 
+### Added
+
+- `--data-dir PATH`: the node keeps a write-ahead log under `PATH/wal/`,
+  synced on its housekeeping tick, and replays it on the next start. A
+  shard whose log has a gap is replayed up to the gap and reported. The log
+  only grows for now. Four new log events: `recovery`, `recovery_truncated`,
+  `recovery_failed`, `log_fault` — see `docs/operations.md`.
+
 ## [0.2.0] - 2026-09-22
 
 ### Added

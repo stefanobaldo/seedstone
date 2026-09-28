@@ -61,8 +61,14 @@ pass. What the server itself writes while it runs — one JSON line per event,
 with a level — and how it is operated are in
 [docs/operations.md](docs/operations.md).
 
-**What it does not have yet:** persistence — a restart is an empty keyspace —
-along with RESP3, replication, clustering, and every data type except strings.
+**Persistence, first cut:** with `--data-dir PATH` every write is appended to a
+log and replayed on the next start; a write acknowledged before the log's
+last sync survives a crash. The log only grows for now — snapshots and
+compaction come next — so the flag is off by default. See
+[docs/operations.md](docs/operations.md).
+
+**What it does not have yet:** snapshots and compaction, RESP3, replication,
+clustering, and every data type except strings.
 
 **Performance:** measured on a 16-core ARM instance against Redis and Valkey at
 one and four I/O threads, and against Dragonfly and Garnet. On pipelined reads
