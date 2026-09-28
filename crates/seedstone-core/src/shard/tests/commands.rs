@@ -4,6 +4,7 @@
 use super::support::{Shard, get, set, set_ex};
 use crate::dict::{Dict, DictSeed};
 use crate::log::NoopLog;
+use crate::shard::Now;
 use crate::shard::apply::apply;
 use crate::shard::executor::ShardState;
 use crate::shard::{
@@ -148,10 +149,16 @@ fn a_handler_runs_to_completion_without_a_runtime() {
     let mut state = ShardState::new(Dict::with_seed(DictSeed { k0: 7, k1: 9 }), NoopLog);
     let now = Instant::now();
 
-    let stored = apply(&mut state, 0, &mut set(b"k", b"v"), now, &Deadlines);
+    let stored = apply(
+        &mut state,
+        0,
+        &mut set(b"k", b"v"),
+        Now::at(now),
+        &Deadlines,
+    );
     assert_eq!(stored, Reply::Ok);
     assert_eq!(
-        apply(&mut state, 0, &mut get(b"k"), now, &Deadlines),
+        apply(&mut state, 0, &mut get(b"k"), Now::at(now), &Deadlines),
         Reply::Bulk(Some(Bytes::from_static(b"v")))
     );
 }
@@ -171,7 +178,7 @@ fn a_handler_takes_the_value_and_leaves_what_the_trace_reads() {
     let mut cmd = set(b"k", b"v");
 
     assert_eq!(
-        apply(&mut state, 0, &mut cmd, Instant::now(), &Deadlines),
+        apply(&mut state, 0, &mut cmd, Now::at(Instant::now()), &Deadlines),
         Reply::Ok
     );
     assert_eq!(
@@ -198,7 +205,7 @@ fn seq_advances_only_for_commands_that_change_something() {
     let mut state = ShardState::new(Dict::with_seed(DictSeed { k0: 1, k1: 1 }), NoopLog);
     let now = Instant::now();
     let run = |state: &mut ShardState<NoopLog>, mut cmd: Command| {
-        apply(state, 3, &mut cmd, now, &Deadlines)
+        apply(state, 3, &mut cmd, Now::at(now), &Deadlines)
     };
 
     // A read moves nothing.

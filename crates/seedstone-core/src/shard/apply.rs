@@ -6,8 +6,9 @@ use bytes::Bytes;
 
 use crate::dict::{Dict, Entry};
 use crate::glob;
+use crate::log::effect::Effect;
 use crate::log::{Record, ReplicationLog};
-use crate::shard::executor::{ShardState, keyspace_stats};
+use crate::shard::executor::{Now, ShardState, keyspace_stats};
 use crate::shard::{Command, Cond, Expiry, ExpiryPolicy, Reply, ReplyError, Route, ShardPolicy};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -33,13 +34,15 @@ use tokio::time::Instant;
 /// and the command's own is left intact. What a
 /// handler may take is exactly what the trace does not read.
 ///
-/// `now` is the instant the whole envelope is being served at, supplied by the
-/// executor: a handler must not read a clock of its own, or two commands of
-/// one batch could disagree about which keys are still alive.
+/// `now` is the instant the whole envelope is being served at, and the wall
+/// clock beside it, both supplied by the executor: a handler must not read a
+/// clock of its own, or two commands of one batch could disagree about which
+/// keys are still alive. The wall clock is read only to make a logged
+/// deadline absolute — see [`Now`].
 ///
 /// **An arm whose logic is extracted gets a named free function directly
 /// below, in match order.** Plenty of arms are not extracted and carry real
-/// decisions anyway — `Del`, `Ttl` and `Persist` all do — because a handler
+/// decisions anyway — `Get` does, stamping the key it reads — because a handler
 /// that says no more than the arm already says buys a name and a signature
 /// for nothing. What earns an extraction is one of three things: logic two
 /// arms share, as `Expire` and `PExpire` share [`set_expiry`]; an argument
@@ -64,7 +67,7 @@ pub fn apply<L: ReplicationLog, P: ShardPolicy>(
     state: &mut ShardState<L>,
     shard: u16,
     cmd: &mut Command,
-    now: Instant,
+    now: Now,
     policy: &P,
 ) -> Reply {
     // The three the handlers work on, plus the one counter a handler can
@@ -90,7 +93,7 @@ pub fn apply<L: ReplicationLog, P: ShardPolicy>(
     // rather than an entry, so there is no single key whose deadline it could
     // be meeting.
     if let Route::Key(key) = cmd.route() {
-        match evict_if_expired(dict, log, seq, shard, key, now, policy) {
+        match evict_if_expired(dict, log, seq, shard, key, now.instant, policy) {
             Err(failed) => return failed,
             // The lazy half of `expired_keys`. The active half is
             // [`sweep_expired`]'s, and Redis counts both under the one field.
@@ -151,11 +154,11 @@ pub fn apply<L: ReplicationLog, P: ShardPolicy>(
 
         Command::Del { key } => del(dict, log, seq, shard, key),
 
-        Command::IncrBy { key, delta } => incr_by(dict, log, seq, shard, key, *delta),
+        Command::IncrBy { key, delta } => incr_by(dict, log, seq, shard, now, key, *delta),
 
         Command::Expire { key, seconds } => {
-            let at = span_deadline(now, *seconds, Expiry::Ex);
-            set_expiry(dict, log, seq, shard, key, at)
+            let at = span_deadline(now.instant, *seconds, Expiry::Ex);
+            set_expiry(dict, log, seq, shard, now, key, at)
         }
 
         // `EXPIREAT` and `PEXPIREAT` reach the shard as the span the edge
@@ -165,27 +168,15 @@ pub fn apply<L: ReplicationLog, P: ShardPolicy>(
         Command::PExpire { key, millis }
         | Command::ExpireAt { key, millis }
         | Command::PExpireAt { key, millis } => {
-            let at = span_deadline(now, *millis, Expiry::Px);
-            set_expiry(dict, log, seq, shard, key, at)
+            let at = span_deadline(now.instant, *millis, Expiry::Px);
+            set_expiry(dict, log, seq, shard, now, key, at)
         }
 
-        Command::Ttl { key } => ttl_reply(dict, key, now, remaining_seconds),
+        Command::Ttl { key } => ttl_reply(dict, key, now.instant, remaining_seconds),
 
-        Command::PTtl { key } => ttl_reply(dict, key, now, remaining_millis),
+        Command::PTtl { key } => ttl_reply(dict, key, now.instant, remaining_millis),
 
-        Command::Persist { key } => {
-            // Two keys answer `0` here for two different reasons: one is not
-            // there, and one is but carries no deadline. Neither answer is a
-            // change, so neither reaches the log.
-            if dict.get(key).is_none_or(|entry| entry.expires_at.is_none()) {
-                return Reply::Integer(0);
-            }
-            if let Err(failed) = append(log, seq, shard) {
-                return failed;
-            }
-            dict.set_deadline(key, None);
-            Reply::Integer(1)
-        }
+        Command::Persist { key } => persist(dict, log, seq, shard, key),
 
         Command::Exists { key } => Reply::Integer(i64::from(dict.get(key).is_some())),
 
@@ -218,7 +209,14 @@ pub fn apply<L: ReplicationLog, P: ShardPolicy>(
             cursor,
             count,
             pattern,
-        } => scan_step(dict, *cursor, *count, pattern.as_deref(), now, policy),
+        } => scan_step(
+            dict,
+            *cursor,
+            *count,
+            pattern.as_deref(),
+            now.instant,
+            policy,
+        ),
 
         // Answered by the executor, which owns the counters this reports —
         // see `run_executor`, which matches it before this is reached. The
@@ -315,7 +313,7 @@ fn set<L: ReplicationLog>(
     log: &mut L,
     seq: &mut u64,
     shard: u16,
-    now: Instant,
+    now: Now,
     args: SetArgs<'_>,
 ) -> Reply {
     let SetArgs {
@@ -350,17 +348,27 @@ fn set<L: ReplicationLog>(
         Some(Cond::Xx) if !existed => return Reply::Bulk(None),
         _ => {}
     }
-    if let Err(failed) = append(log, seq, shard) {
-        return failed;
-    }
     // `KEEPTTL` is the one way a write leaves a deadline where it found it.
     // Without it the deadline is whatever the options name, and naming none
     // clears the one the overwritten key was carrying — see [`Command::Set`].
+    // Decided before the record is appended, because the record carries it.
     let expires_at = if keep_ttl {
         kept
     } else {
-        deadline(now, expiry)
+        deadline(now.instant, expiry)
     };
+    if let Err(failed) = append(
+        log,
+        seq,
+        shard,
+        Effect::Put {
+            key: &key[..],
+            value: &value[..],
+            deadline: now.deadline_millis(expires_at),
+        },
+    ) {
+        return failed;
+    }
     dict.insert(
         key.clone(),
         Entry {
@@ -397,7 +405,7 @@ fn set_nx<L: ReplicationLog>(
     log: &mut L,
     seq: &mut u64,
     shard: u16,
-    now: Instant,
+    now: Now,
     key: &Bytes,
     value: &mut Bytes,
 ) -> Reply {
@@ -432,7 +440,7 @@ fn del<L: ReplicationLog>(
     if dict.get(key).is_none() {
         return Reply::Removed(false);
     }
-    if let Err(failed) = append(log, seq, shard) {
+    if let Err(failed) = append(log, seq, shard, Effect::Del { key }) {
         return failed;
     }
     dict.remove(key);
@@ -444,6 +452,7 @@ fn incr_by<L: ReplicationLog>(
     log: &mut L,
     seq: &mut u64,
     shard: u16,
+    now: Now,
     key: &Bytes,
     delta: i64,
 ) -> Reply {
@@ -457,7 +466,20 @@ fn incr_by<L: ReplicationLog>(
     let Some(next) = current.checked_add(delta) else {
         return Reply::Error(ReplyError::WouldOverflow);
     };
-    if let Err(failed) = append(log, seq, shard) {
+    // The counter's new text is built before the record so the record can
+    // carry it: an increment logs the value it produced, not the delta, so a
+    // prefix of the log replays to a value the shard actually held.
+    let text = next.to_string();
+    if let Err(failed) = append(
+        log,
+        seq,
+        shard,
+        Effect::Put {
+            key: &key[..],
+            value: text.as_bytes(),
+            deadline: now.deadline_millis(expires_at),
+        },
+    ) {
         return failed;
     }
     // The deadline rides along, as it does in Redis: an increment changes what
@@ -465,9 +487,7 @@ fn incr_by<L: ReplicationLog>(
     dict.insert(
         key.clone(),
         Entry {
-            // The one copy on this path: the counter's new text is built
-            // fresh, as it always was.
-            value: Bytes::from(next.to_string()),
+            value: Bytes::from(text),
             expires_at,
             touched: 0,
         },
@@ -513,6 +533,7 @@ fn set_expiry<L: ReplicationLog>(
     log: &mut L,
     seq: &mut u64,
     shard: u16,
+    now: Now,
     key: &[u8],
     at: Deadline,
 ) -> Reply {
@@ -522,7 +543,14 @@ fn set_expiry<L: ReplicationLog>(
     if dict.get(key).is_none() {
         return Reply::Integer(0);
     }
-    if let Err(failed) = append(log, seq, shard) {
+    let effect = match at {
+        Deadline::Passed => Effect::Del { key },
+        Deadline::At(at) => Effect::Deadline {
+            key,
+            deadline: now.deadline_millis(at),
+        },
+    };
+    if let Err(failed) = append(log, seq, shard, effect) {
         return failed;
     }
     match at {
@@ -536,6 +564,38 @@ fn set_expiry<L: ReplicationLog>(
             dict.set_deadline(key, at);
         }
     }
+    Reply::Integer(1)
+}
+
+/// `PERSIST key`: remove the key's deadline, and say whether there was one.
+///
+/// Extracted for [`apply`]'s third reason: its record, once it carried an
+/// effect, took the dispatcher over `clippy::too_many_lines`.
+fn persist<L: ReplicationLog>(
+    dict: &mut Dict,
+    log: &mut L,
+    seq: &mut u64,
+    shard: u16,
+    key: &[u8],
+) -> Reply {
+    // Two keys answer `0` here for two different reasons: one is not there,
+    // and one is but carries no deadline. Neither answer is a change, so
+    // neither reaches the log.
+    if dict.get(key).is_none_or(|entry| entry.expires_at.is_none()) {
+        return Reply::Integer(0);
+    }
+    if let Err(failed) = append(
+        log,
+        seq,
+        shard,
+        Effect::Deadline {
+            key,
+            deadline: None,
+        },
+    ) {
+        return failed;
+    }
+    dict.set_deadline(key, None);
     Reply::Integer(1)
 }
 
@@ -581,7 +641,7 @@ fn flush_db<L: ReplicationLog>(dict: &mut Dict, log: &mut L, seq: &mut u64, shar
     // `append` — and a flush is one mutation. It is also the only spelling
     // under which a refusal can leave the keyspace alone: a record per key
     // could fail partway and there would be no flush to undo.
-    if let Err(failed) = append(log, seq, shard) {
+    if let Err(failed) = append(log, seq, shard, Effect::Flush) {
         return failed;
     }
     dict.clear();
@@ -679,7 +739,7 @@ pub fn evict_if_expired<L: ReplicationLog, P: ExpiryPolicy>(
     if !expiry.due_on_read(entry.expires_at, now) {
         return Ok(false);
     }
-    append(log, seq, shard)?;
+    append(log, seq, shard, Effect::Del { key })?;
     dict.remove(key);
     Ok(true)
 }
@@ -744,14 +804,21 @@ fn ttl_reply(
 
 /// Appends one record for a mutation about to happen, advancing `seq`.
 ///
-/// The payload is empty: today the log records that a mutation occurred and
-/// where it sits in the shard's order, not what it was. Returns the `Reply` to send
-/// instead when the write fails — the mutation must not proceed.
-pub fn append<L: ReplicationLog>(log: &mut L, seq: &mut u64, shard: u16) -> Result<(), Reply> {
+/// The payload is the effect the mutation has — see [`Effect`] for why it is
+/// that and not the command. Returns the `Reply` to send instead when the
+/// write fails — the mutation must not proceed.
+pub fn append<L: ReplicationLog>(
+    log: &mut L,
+    seq: &mut u64,
+    shard: u16,
+    effect: Effect<'_>,
+) -> Result<(), Reply> {
+    let mut payload = Vec::with_capacity(effect.encoded_len());
+    effect.encode(&mut payload);
     let record = Record {
         shard,
         seq: *seq,
-        payload: &[],
+        payload: &payload,
     };
     match log.append(record) {
         Ok(()) => {

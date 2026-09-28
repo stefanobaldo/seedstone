@@ -372,13 +372,22 @@ pub trait ReplicationLog: Send + 'static {
     /// one divergence recovery cannot detect.
     fn append(&mut self, rec: Record<'_>) -> std::io::Result<()>;
 
-    /// Makes everything appended so far durable.
+    /// Writes everything appended so far to the store, without making it
+    /// durable.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying store reports.
+    fn flush(&mut self) -> std::io::Result<()>;
+
+    /// Makes everything flushed so far durable and reports the highest
+    /// sequence that is now durable for this shard, if any.
     ///
     /// # Errors
     ///
     /// Whatever the underlying store reports. Nothing appended since the last
     /// successful sync may be assumed durable afterwards.
-    fn sync(&mut self) -> std::io::Result<()>;
+    fn sync(&mut self) -> std::io::Result<Option<u64>>;
 }
 
 /// A [`ReplicationLog`] that keeps nothing.
@@ -395,8 +404,12 @@ impl ReplicationLog for NoopLog {
         Ok(())
     }
 
-    fn sync(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+
+    fn sync(&mut self) -> std::io::Result<Option<u64>> {
+        Ok(None)
     }
 }
 

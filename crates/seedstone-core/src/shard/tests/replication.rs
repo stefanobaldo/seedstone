@@ -4,7 +4,9 @@
 use super::support::{NoSweep, Recorder, get, set, set_ex};
 use crate::dict::DictSeed;
 use crate::log::{Record, ReplicationLog};
-use crate::shard::{Command, HOUSEKEEPING_TICK, NoTrace, Reply, ReplyError, Router, ShardPool};
+use crate::shard::{
+    Command, Expiry, HOUSEKEEPING_TICK, NoTrace, Reply, ReplyError, Router, ShardPool,
+};
 use crate::slot::shard_of;
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
@@ -153,8 +155,11 @@ async fn a_supplied_log_receives_every_mutation() {
             self.0.lock().expect("log mutex").push((rec.shard, rec.seq));
             Ok(())
         }
-        fn sync(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+        fn sync(&mut self) -> std::io::Result<Option<u64>> {
+            Ok(None)
         }
     }
 
@@ -198,8 +203,11 @@ async fn a_log_that_cannot_write_refuses_the_mutation() {
         fn append(&mut self, _rec: Record<'_>) -> std::io::Result<()> {
             Err(std::io::Error::other("the disk went away"))
         }
-        fn sync(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+        fn sync(&mut self) -> std::io::Result<Option<u64>> {
+            Ok(None)
         }
     }
 
@@ -228,5 +236,102 @@ async fn a_log_that_cannot_write_refuses_the_mutation() {
         })
         .await,
         Reply::Error(ReplyError::LogWriteFailed)
+    );
+}
+
+/// Every mutation logs the effect it had, with the deadline made absolute.
+///
+/// The wall clock is injected and starts at zero here, so a `SET … EX 30`
+/// logs a deadline of exactly thirty thousand milliseconds.
+#[tokio::test]
+async fn every_mutation_logs_its_effect_with_an_absolute_deadline() {
+    use crate::log::effect::{Effect, Owned};
+
+    #[derive(Clone, Default)]
+    struct Recording(Arc<Mutex<Vec<(u64, Owned)>>>);
+
+    impl ReplicationLog for Recording {
+        fn append(&mut self, rec: Record<'_>) -> std::io::Result<()> {
+            let effect = Effect::decode(rec.payload).expect("a well-formed payload");
+            self.0
+                .lock()
+                .expect("log mutex")
+                .push((rec.seq, effect.to_owned()));
+            Ok(())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn sync(&mut self) -> std::io::Result<Option<u64>> {
+            Ok(None)
+        }
+    }
+
+    let log = Recording::default();
+    let pool = ShardPool::spawn_with_log(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace, {
+        let log = log.clone();
+        move |_shard| log.clone()
+    });
+
+    pool.dispatch(Command::Set {
+        key: Bytes::from_static(b"k"),
+        value: Bytes::from_static(b"v"),
+        expiry: Some(Expiry::Ex(30)),
+        cond: None,
+        keep_ttl: false,
+        get: false,
+    })
+    .await;
+    pool.dispatch(Command::IncrBy {
+        key: Bytes::from_static(b"n"),
+        delta: 7,
+    })
+    .await;
+    pool.dispatch(Command::Persist {
+        key: Bytes::from_static(b"k"),
+    })
+    .await;
+    pool.dispatch(Command::Del {
+        key: Bytes::from_static(b"n"),
+    })
+    .await;
+    // `FLUSHDB` addresses every shard, so it goes the way the edge sends it.
+    pool.dispatch_every(Command::FlushDb).await;
+
+    let recorded = log.0.lock().expect("log mutex").clone();
+    assert_eq!(
+        recorded,
+        vec![
+            (
+                0,
+                Owned::Put {
+                    key: Bytes::from_static(b"k"),
+                    value: Bytes::from_static(b"v"),
+                    deadline: Some(30_000),
+                }
+            ),
+            (
+                1,
+                Owned::Put {
+                    key: Bytes::from_static(b"n"),
+                    value: Bytes::from_static(b"7"),
+                    deadline: None,
+                }
+            ),
+            (
+                2,
+                Owned::Deadline {
+                    key: Bytes::from_static(b"k"),
+                    deadline: None,
+                }
+            ),
+            (
+                3,
+                Owned::Del {
+                    key: Bytes::from_static(b"n"),
+                }
+            ),
+            (4, Owned::Flush),
+        ]
     );
 }

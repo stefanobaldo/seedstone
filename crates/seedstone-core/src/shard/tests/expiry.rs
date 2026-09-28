@@ -4,6 +4,7 @@
 use super::support::{NoSweep, Recorder, Shard, gathered, get, set, set_ex, setex};
 use crate::dict::{Dict, DictSeed};
 use crate::log::{Record, ReplicationLog};
+use crate::shard::Now;
 use crate::shard::apply::apply;
 use crate::shard::executor::ShardState;
 use crate::shard::{
@@ -367,8 +368,11 @@ async fn an_expiry_is_logged_exactly_as_a_delete_is() {
             self.0.lock().expect("log mutex").push((rec.shard, rec.seq));
             Ok(())
         }
-        fn sync(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+        fn sync(&mut self) -> std::io::Result<Option<u64>> {
+            Ok(None)
         }
     }
 
@@ -377,7 +381,7 @@ async fn an_expiry_is_logged_exactly_as_a_delete_is() {
 
     let mut set = set_ex(b"k", b"v", 30);
     assert_eq!(
-        apply(&mut state, 3, &mut set, Instant::now(), &Deadlines),
+        apply(&mut state, 3, &mut set, Now::at(Instant::now()), &Deadlines),
         Reply::Ok
     );
     tokio::time::advance(Duration::from_secs(31)).await;
@@ -386,7 +390,13 @@ async fn an_expiry_is_logged_exactly_as_a_delete_is() {
     // expiry's and nothing else.
     let mut read = get(b"k");
     assert_eq!(
-        apply(&mut state, 3, &mut read, Instant::now(), &Deadlines),
+        apply(
+            &mut state,
+            3,
+            &mut read,
+            Now::at(Instant::now()),
+            &Deadlines
+        ),
         Reply::Bulk(None)
     );
     assert_eq!(*log.0.lock().expect("log mutex"), vec![(3, 0), (3, 1)]);
@@ -619,8 +629,11 @@ async fn a_sweep_whose_record_cannot_be_written_leaves_the_key() {
             }
             Ok(())
         }
-        fn sync(&mut self) -> std::io::Result<()> {
+        fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+        fn sync(&mut self) -> std::io::Result<Option<u64>> {
+            Ok(None)
         }
     }
 
