@@ -562,27 +562,38 @@ async fn server(
     node.limit = pool.limit();
     loop {
         let (stream, _peer) = listener.accept().await?;
+        // Onto the host's `LocalSet`, not the runtime's task list, and that is
+        // what keeps a crash replayable. A crash drops every task the host
+        // owns, and a dropped connection sends its closing segment through
+        // the simulated network, drawing its latency from the world's seed.
+        // A current-thread runtime shuts its tasks down shard by shard, and
+        // the shard is the task id — a counter global to the process — so
+        // the order the connections closed in, and every draw after it,
+        // would depend on how many tasks the process had spawned before this
+        // run. A `LocalSet` keeps one list, and shuts it down in the order
+        // it was built.
+        //
         // Two plants are routers: a lost update, which is a defect between two
         // messages of one command, and a crossing that skips a shard, which is
         // a defect in a loop the shards know nothing about. The rest are inside
         // the server, which is where the defects they imitate would be.
         match planted {
             Some(Plant::LostUpdate) => {
-                tokio::spawn(serve_connection(
+                tokio::task::spawn_local(serve_connection(
                     stream,
                     PlantedRouter::new(pool.clone()),
                     node.clone(),
                 ));
             }
             Some(Plant::CrossingSkipsShard) => {
-                tokio::spawn(serve_connection(
+                tokio::task::spawn_local(serve_connection(
                     stream,
                     SkippingRouter::new(pool.clone()),
                     node.clone(),
                 ));
             }
             _ => {
-                tokio::spawn(serve_connection(stream, pool.clone(), node.clone()));
+                tokio::task::spawn_local(serve_connection(stream, pool.clone(), node.clone()));
             }
         }
     }
