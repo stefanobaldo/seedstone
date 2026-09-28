@@ -118,8 +118,8 @@ arrives one of three ways:
 - **The environment**, `SEEDSTONE_REQUIREPASS`, holding one password. It is
   read once: a process does not re-read its environment, and no
   orchestrator updates a running process's. Under this delivery a password
-  change is a restart of the server — and a restart of a server that
-  persists nothing is the whole cache.
+  change is a restart of the server — and a restart of a server started
+  without `--data-dir` is the whole cache.
 - **None**, with `--no-auth`. See the next section.
 
 **Rotation without a restart.** The server accepts either of two passwords

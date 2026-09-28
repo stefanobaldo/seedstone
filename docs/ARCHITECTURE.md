@@ -77,7 +77,8 @@ with no benefit.
 - **The filesystem seam is ours.** The simulated file type resolves its host
   through a context that does not exist outside a simulation, so production and
   simulation cannot be one type and something must dispatch. A narrow trait
-  over the log's own operations is enough.
+  over the log's own operations, `Disk`, is enough; the binary implements it
+  over `std::fs`.
 - **The trace is ours by definition.** A production server compares its
   execution against nothing; the trace exists so a simulated one can.
 - **The shard policy is ours, and it is the one seam built to be broken.** It
@@ -97,14 +98,22 @@ with no benefit.
 
 **Entropy enters in exactly one place.** The hash seed is drawn in `main`, the
 composition root, and injected downward; nothing below it reads randomness or
-wall-clock time. Deadlines are absolute monotonic instants, never wall-clock
-timestamps, so a clock the harness controls is the only clock in the system.
+wall-clock time. The wall clock is injected the same way: the keyspace's
+deadlines are monotonic instants, and only the log reads the injected wall
+clock — to record a deadline as Unix milliseconds the next process can still
+read, and on replay to turn it back into an instant. Under the harness both
+clocks are its own.
 
-**The replication log exists now, as a no-op.** It is the abstraction that
-becomes a write-ahead log when persistence arrives and a consensus log after
-that. Every mutation is recorded before it is applied, at a gapless position,
-whether or not anything is listening. Adding that ordering later would mean
-touching every handler; having it now costs a function call.
+**The replication log writes.** Every mutation is recorded before it is
+applied, at a gapless position per shard, as the *effect* it had — the value
+a key now holds and the absolute deadline it carries, a deletion, a flush —
+rather than the command that caused it, so any prefix of a shard's log
+replays to a state the shard actually held. With `--data-dir` the records go
+to segment files, one per executor per process lifetime with the shards
+interleaved, flushed and synced on the housekeeping tick; on start every
+segment is read through a reader that steps over damage, and each shard
+replays the gapless prefix of its sequence. The same abstraction becomes a
+consensus log after that. Without the flag the log is a no-op, as it was.
 
 ## The edge is an adapter
 
