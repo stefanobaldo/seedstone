@@ -43,24 +43,25 @@
 pub mod disk;
 pub mod effect;
 pub mod file;
+pub mod reader;
 
 /// Magic byte that opens a record.
 ///
 /// Chosen with both nibbles set and alternating bits so that it is not a value
 /// a zero-filled or all-ones region of a torn file produces by accident.
-const MAGIC: u8 = 0xA5;
+pub(crate) const MAGIC: u8 = 0xA5;
 
 /// A `0x00` in the magic position: no record was ever written here.
-const END_OF_LOG: u8 = 0x00;
+pub(crate) const END_OF_LOG: u8 = 0x00;
 
 /// Magic byte, length and checksum: the fixed header before every body.
-const HEADER_LEN: usize = 1 + 4 + 4;
+pub(crate) const HEADER_LEN: usize = 1 + 4 + 4;
 
 /// The fixed part of a body: `shard` (u16) then `seq` (u64).
 ///
 /// A body shorter than this cannot be a record, however plausible its
 /// checksum, so a length field below it is damage rather than a short read.
-const BODY_FIXED_LEN: usize = 2 + 8;
+pub(crate) const BODY_FIXED_LEN: usize = 2 + 8;
 
 /// The largest body this format will believe in.
 ///
@@ -434,43 +435,6 @@ impl ReplicationLog for NoopLog {
 mod tests {
     use super::*;
 
-    /// Decodes `buf` the way a recovery scan over a fully-read log does:
-    /// consume whole records, step one byte over damage, and stop only at a
-    /// boundary it trusts.
-    fn scan(buf: &[u8]) -> Vec<(u16, u64, Vec<u8>)> {
-        let mut records = Vec::new();
-        let mut cursor = 0;
-        let mut resynchronising = false;
-        while cursor < buf.len() {
-            match decode_record(&buf[cursor..]) {
-                Decoded::Record {
-                    shard,
-                    seq,
-                    payload,
-                    consumed,
-                } => {
-                    records.push((shard, seq, payload.to_vec()));
-                    cursor += consumed;
-                    resynchronising = false;
-                }
-                Decoded::Corrupt { skip } => {
-                    cursor += skip;
-                    resynchronising = true;
-                }
-                // While resynchronising the scan sits at an arbitrary offset
-                // inside damage, where neither of these means what it says: a
-                // `0x00` is far more likely to be one byte of a `seq` field
-                // than a marker, and a short read is a length field invented
-                // by the damage. Step one byte and keep looking.
-                Decoded::EndOfLog | Decoded::NeedMore if resynchronising => cursor += 1,
-                // At a trusted boundary they are the two honest ways a log
-                // ends: the explicit marker, or a truncation mid-record.
-                Decoded::EndOfLog | Decoded::NeedMore => break,
-            }
-        }
-        records
-    }
-
     #[test]
     fn crc32_matches_the_iso_hdlc_check_value() {
         assert_eq!(crc32_iso_hdlc(b"123456789"), 0xCBF4_3926);
@@ -544,26 +508,6 @@ mod tests {
         expected.extend_from_slice(&crc32_iso_hdlc(body).to_le_bytes());
         expected.extend_from_slice(body);
         assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn several_records_decode_back_to_back() {
-        let mut buf = Vec::new();
-        for seq in 0..3u8 {
-            encode_record(
-                &Record {
-                    shard: 5,
-                    seq: u64::from(seq),
-                    payload: &[seq; 4],
-                },
-                &mut buf,
-            );
-        }
-        buf.push(END_OF_LOG);
-        assert_eq!(
-            scan(&buf),
-            vec![(5, 0, vec![0; 4]), (5, 1, vec![1; 4]), (5, 2, vec![2; 4]),]
-        );
     }
 
     #[test]
@@ -668,64 +612,6 @@ mod tests {
         buf.extend_from_slice(&max_body_len_u32().to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(decode_record(&buf), Decoded::NeedMore);
-    }
-
-    #[test]
-    fn a_hole_costs_only_the_records_inside_it() {
-        // The whole point of the format: a damaged record must not end the
-        // read. Encode a valid record, damage it, append another valid one,
-        // and the scan must still recover the later record intact. The
-        // damaged record's `seq` field is seven zero bytes, so recovery only
-        // works if resynchronisation steps over a `0x00` instead of reading
-        // it as the end of the log.
-        let mut buf = Vec::new();
-        encode_record(
-            &Record {
-                shard: 1,
-                seq: 1,
-                payload: b"lost to the hole",
-            },
-            &mut buf,
-        );
-        let damaged = buf.len();
-        buf[HEADER_LEN + BODY_FIXED_LEN + 2] ^= 0xFF;
-        encode_record(
-            &Record {
-                shard: 2,
-                seq: 2,
-                payload: b"survived",
-            },
-            &mut buf,
-        );
-        buf.push(END_OF_LOG);
-
-        assert_eq!(
-            decode_record(&buf[..damaged]),
-            Decoded::Corrupt { skip: 1 },
-            "the damaged record must decode as damage on its own"
-        );
-        assert_eq!(scan(&buf), vec![(2, 2, b"survived".to_vec())]);
-    }
-
-    #[test]
-    fn a_zero_run_at_a_trusted_boundary_ends_the_read() {
-        // The limit of an explicit marker, pinned so nobody expects more of
-        // it: a torn write that leaves zeroes exactly at a record boundary is
-        // indistinguishable from a log that ended there, and the scan stops.
-        // Records after such a hole are lost — which is why the marker is
-        // only ever trusted at a boundary, never during resynchronisation.
-        let mut buf = vec![0u8; 24];
-        encode_record(
-            &Record {
-                shard: 4,
-                seq: 8,
-                payload: b"after the hole",
-            },
-            &mut buf,
-        );
-        buf.push(END_OF_LOG);
-        assert_eq!(decode_record(&buf), Decoded::EndOfLog);
-        assert!(scan(&buf).is_empty());
     }
 
     #[test]
