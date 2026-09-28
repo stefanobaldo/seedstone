@@ -370,6 +370,8 @@ mod tests {
             evictable: false,
             forms_emitted: BTreeSet::new(),
             recoveries: 0,
+            crashes: 0,
+            lost_durable_prefixes: 0,
         }
     }
 

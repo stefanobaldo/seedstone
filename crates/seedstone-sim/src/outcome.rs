@@ -108,6 +108,11 @@ pub struct SimOutcome {
     /// Restarts of the node this run observed: one per crash whose
     /// recovery reached the trace.
     pub recoveries: u64,
+    /// Crashes the driver inflicted.
+    pub crashes: u64,
+    /// Shards that resumed at or below the sequence that was durable when
+    /// the node last crashed: a durable write that did not survive.
+    pub lost_durable_prefixes: u64,
 }
 
 impl SimOutcome {
@@ -145,6 +150,9 @@ impl SimOutcome {
             // node evicts keys nobody reads back, and one client's reads are
             // a sample of what it took.
             && self.evicted_keys >= self.evictions_observed
+            // A shard that came back at or below its durable point lost a
+            // record a successful sync had covered.
+            && self.lost_durable_prefixes == 0
     }
 
     /// Whether the run's invariants decided anything at all.
@@ -262,6 +270,11 @@ pub struct Tally {
     pub sync_faults: u64,
     /// Server host starts that failed and were retried.
     pub start_failures: u64,
+    /// Client hosts that finished their bursts and are waiting, at rest,
+    /// for the driver.
+    pub paused: u32,
+    /// Whether the driver has crashed the node at rest yet.
+    pub rest_crashed: bool,
 }
 
 /// Takes a lock that cannot be contended, and says so if it was poisoned.

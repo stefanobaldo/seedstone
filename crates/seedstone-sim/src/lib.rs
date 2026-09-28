@@ -155,7 +155,7 @@ mod trace;
 mod verify;
 mod workload;
 
-pub use config::SimConfig;
+pub use config::{CrashPlan, DiskFaults, SimConfig};
 pub use disk::SimDisk;
 pub use durability::{sim_wall_clock, world_now};
 pub use outcome::SimOutcome;
@@ -165,7 +165,7 @@ pub use sweep::{SweepReport, sweep};
 pub use trace::mix;
 
 use disk::SimFile;
-use durability::Observed;
+use durability::{CrashRecord, CrashSchedule, Observed, REST_SETTLE};
 use model::Model;
 use outcome::{Shared, lock};
 use plant::{EvictsBelowCeiling, IgnoresCeiling, ScanMissesRehash, ServeExpired, SweepEatsAll};
@@ -323,12 +323,7 @@ const CLIENT_CHUNK: usize = 4096;
 /// something a sweep can carry on past.
 #[must_use]
 pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
-    let mut sim = turmoil::Builder::new()
-        .simulation_duration(SIM_DURATION)
-        .min_message_latency(MIN_MESSAGE_LATENCY)
-        .max_message_latency(MAX_MESSAGE_LATENCY)
-        .rng_seed(cfg.sim_seed)
-        .build();
+    let mut sim = build_sim(cfg);
 
     let trace = Arc::new(Mutex::new(TRACE_INIT));
     let shared = Shared::new(cfg.shards);
@@ -374,7 +369,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
     }
     sim.client("verifier", verifier(cfg.clone(), shared.clone()));
 
-    sim.run().expect("simulation failed");
+    drive(&mut sim, cfg, &shared);
 
     let tally = *lock(&shared.tally);
     SimOutcome {
@@ -398,7 +393,86 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         evictable: cfg.maxmemory.is_some(),
         forms_emitted: lock(&shared.forms).clone(),
         recoveries: tally.recoveries,
+        crashes: lock(&shared.crashes).len() as u64,
+        lost_durable_prefixes: tally.lost_durable_prefixes,
     }
+}
+
+/// The simulation a configuration describes: its network, its seed, and
+/// what its disk does.
+fn build_sim<'a>(cfg: &SimConfig) -> turmoil::Sim<'a> {
+    let mut builder = turmoil::Builder::new();
+    builder
+        .simulation_duration(SIM_DURATION)
+        .min_message_latency(MIN_MESSAGE_LATENCY)
+        .max_message_latency(MAX_MESSAGE_LATENCY)
+        .rng_seed(cfg.sim_seed);
+    {
+        let fs = builder.fs();
+        if let Some(block) = cfg.disk.block_size {
+            fs.block_size(block);
+        }
+        if cfg.disk.io_error_permille > 0 {
+            fs.io_error_probability(f64::from(cfg.disk.io_error_permille) / 1000.0);
+        }
+        if cfg.disk.corruption_permille > 0 {
+            fs.corruption_probability(f64::from(cfg.disk.corruption_permille) / 1000.0);
+        }
+    }
+    builder.build()
+}
+
+/// Runs the simulation to its end, crashing the node where the plan says.
+fn drive(sim: &mut turmoil::Sim<'_>, cfg: &SimConfig, shared: &Shared) {
+    // The driver: turmoil's own `run` loop, with the crash plan in it.
+    // Everything the plan does happens between steps, from outside every
+    // host, which is the only place a host can be crashed from.
+    let mut schedule = CrashSchedule::draw(cfg.crashes, cfg.sim_seed);
+    let mut rest_since: Option<Duration> = None;
+    loop {
+        let finished = sim.step().expect("simulation failed");
+        if finished {
+            break;
+        }
+        let now = sim.elapsed();
+        match cfg.crashes {
+            CrashPlan::None => {}
+            CrashPlan::UnderLoad { .. } => {
+                if schedule.next_due(now) {
+                    crash_and_restart(sim, shared, now);
+                }
+            }
+            CrashPlan::AtRest => {
+                let tally = *lock(&shared.tally);
+                if tally.rest_crashed || tally.paused < u32::from(cfg.clients) {
+                    continue;
+                }
+                match rest_since {
+                    None => rest_since = Some(now),
+                    Some(since) if now >= since + REST_SETTLE => {
+                        crash_and_restart(sim, shared, now);
+                        lock(&shared.tally).rest_crashed = true;
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Crashes the server host, records what was durable, and starts it again.
+///
+/// The snapshot is taken *before* the bounce: the restarted node syncs
+/// again within a tick and would overwrite the points the crash is judged
+/// against.
+fn crash_and_restart(sim: &mut turmoil::Sim<'_>, shared: &Shared, now: Duration) {
+    let durable = lock(&shared.durable).clone();
+    lock(&shared.crashes).push(CrashRecord { at: now, durable });
+    sim.crash(SERVER);
+    // One step with the host down, so its connections are seen closed
+    // before it is back.
+    let _ = sim.step().expect("simulation failed");
+    sim.bounce(SERVER);
 }
 
 /// The server host: the real stack, on a simulated listener.
@@ -622,6 +696,16 @@ async fn client(id: u16, cfg: SimConfig, shared: Shared) -> turmoil::Result {
         issued += this_burst;
         let nap = rng.random_range(0..=BURST_NAP_MAX_MS);
         tokio::time::sleep(Duration::from_millis(u64::from(nap))).await;
+    }
+
+    // At rest: every client pauses here, the driver crashes the node once
+    // the log has had three ticks to sync, and the settle that follows reads
+    // back against a model that expects everything.
+    lock(&shared.tally).paused += 1;
+    if cfg.crashes == CrashPlan::AtRest {
+        while !lock(&shared.tally).rest_crashed {
+            tokio::time::sleep(VERIFIER_POLL).await;
+        }
     }
 
     model.settle(&mut conn, depth as usize).await?;

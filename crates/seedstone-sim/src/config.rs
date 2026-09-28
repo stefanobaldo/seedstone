@@ -121,6 +121,70 @@ pub struct SimConfig {
     /// there. Only the shape that set a ceiling excuses one — see
     /// [`crate::SimOutcome::evictions_observed`].
     pub maxmemory: Option<u64>,
+    /// When the driver crashes the node.
+    pub crashes: CrashPlan,
+    /// What the disk does to the node's log.
+    pub disk: DiskFaults,
+}
+
+/// When the driver crashes the server host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashPlan {
+    /// Never.
+    None,
+    /// Once, after every client has paused and the log has had time to
+    /// sync: recovery must then be exact, and the model checks it is.
+    AtRest,
+    /// Up to `max` times, at instants drawn from the simulator seed inside
+    /// the workload window. What survives is a prefix of what was
+    /// acknowledged; what was acknowledged before a shard's last sync
+    /// survives outright.
+    UnderLoad {
+        /// The most crashes one run may draw.
+        max: u8,
+    },
+}
+
+/// What the simulated disk does to the node.
+///
+/// Probabilities in permille so the config stays `Eq`: a trace hash is
+/// comparable only between identical configurations, and a float has no
+/// `Eq` to promise that with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskFaults {
+    /// Writes tear at this granularity on a crash, or not at all.
+    ///
+    /// Smaller than any record, so a torn record is possible: at a block
+    /// larger than a record every write is one block and tears degenerate
+    /// to all-or-nothing.
+    pub block_size: Option<u64>,
+    /// Probability, in permille, that a read or write fails with `EIO`.
+    pub io_error_permille: u16,
+    /// Probability, in permille, that a read returns corrupted bytes.
+    pub corruption_permille: u16,
+}
+
+impl DiskFaults {
+    /// A disk that does what it is told.
+    pub const NONE: Self = Self {
+        block_size: None,
+        io_error_permille: 0,
+        corruption_permille: 0,
+    };
+    /// A disk that tears pending writes on a crash and nothing else: the
+    /// swept shape's disk, where the strong invariant is asserted.
+    pub const TORN: Self = Self {
+        block_size: Some(32),
+        io_error_permille: 0,
+        corruption_permille: 0,
+    };
+    /// A disk that also fails and lies: the `hostile` shape's, where only
+    /// the weak invariant can be asserted.
+    pub const HOSTILE: Self = Self {
+        block_size: Some(32),
+        io_error_permille: 20,
+        corruption_permille: 20,
+    };
 }
 
 /// How many entries [`SimConfig::eviction`]'s ceiling holds: about half of
@@ -160,6 +224,8 @@ impl SimConfig {
             concurrent_scan_cycle: false,
             planted: None,
             maxmemory: None,
+            crashes: CrashPlan::None,
+            disk: DiskFaults::NONE,
         }
     }
 
@@ -205,6 +271,8 @@ impl SimConfig {
             concurrent_scan_cycle: true,
             planted: None,
             maxmemory: None,
+            crashes: CrashPlan::None,
+            disk: DiskFaults::NONE,
         }
     }
 
@@ -227,6 +295,8 @@ impl SimConfig {
             concurrent_scan_cycle: false,
             planted: None,
             maxmemory: None,
+            crashes: CrashPlan::None,
+            disk: DiskFaults::NONE,
         }
     }
 
@@ -262,6 +332,8 @@ impl SimConfig {
             concurrent_scan_cycle: false,
             planted: None,
             maxmemory: Some(EVICTION_ENTRIES * EVICTION_ENTRY_BYTES),
+            crashes: CrashPlan::None,
+            disk: DiskFaults::NONE,
         }
     }
 
@@ -304,6 +376,26 @@ impl SimConfig {
             concurrent_scan_cycle: true,
             planted: None,
             maxmemory: None,
+            crashes: CrashPlan::None,
+            disk: DiskFaults::NONE,
+        }
+    }
+
+    /// `mini`'s dimensions on a disk that tears, fails and lies, with the
+    /// node crashed under load.
+    ///
+    /// The shape where the weak invariant is measured — no phantom value,
+    /// every loss reported, the node up after every restart — and the only
+    /// one where a hole can sit inside the durable region, which is what
+    /// makes the recovery plants observable. Calibrated by
+    /// `tests/planted_recovery.rs`: every honest seed must meet at least one
+    /// fault and still decide its checks.
+    #[must_use]
+    pub const fn hostile(workload_seed: u64, sim_seed: u64) -> Self {
+        Self {
+            crashes: CrashPlan::UnderLoad { max: 2 },
+            disk: DiskFaults::HOSTILE,
+            ..Self::mini(workload_seed, sim_seed)
         }
     }
 }
