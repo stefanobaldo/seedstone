@@ -271,6 +271,18 @@ const _: () = assert!(
 /// [`SETTLE_CAP`].
 const BURST_NAP_MAX_MS: u32 = 60;
 
+/// How long a simulated connection sits idle before it sheds its buffers.
+///
+/// Below [`BURST_NAP_MAX_MS`], so some naps cross it and the shed runs
+/// under the schedule rather than only under a paused clock. Costs no
+/// simulated time: the naps were already there.
+const SIM_IDLE_SHED: Duration = Duration::from_millis(40);
+
+const _: () = assert!(
+    SIM_IDLE_SHED.as_millis() < BURST_NAP_MAX_MS as u128,
+    "the shed threshold must sit inside the nap range, or no nap ever crosses it"
+);
+
 /// The longest a client waits for its own deadlines before reading everything
 /// back.
 ///
@@ -432,6 +444,8 @@ async fn server(
     // connection. No workload here asks a host about itself, so nothing reads
     // it — it is here because the connection code takes one.
     let mut node = NodeInfo::for_tests();
+    // Short enough that a client's nap can cross it: see [`SIM_IDLE_SHED`].
+    node.idle_shed_after = SIM_IDLE_SHED;
     // The simulated node's `INFO` reads the same word its executors keep, for
     // the reason the field states: a scrape and an eviction decision must not
     // be able to disagree.

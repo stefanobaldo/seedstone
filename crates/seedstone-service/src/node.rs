@@ -8,6 +8,7 @@ use seedstone_core::memory::{MemoryGauge, MemoryLimit};
 use seedstone_core::shard::KIND_SLOTS;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 use tokio::time::Instant;
 
 /// What this server answers `HELLO` with, and what it calls itself.
@@ -191,6 +192,16 @@ pub struct NodeInfo {
     /// node, which is why the edge refuses to configure one on an address a
     /// network can reach.
     pub passwords: PasswordStore,
+    /// How long a connection may sit idle above its buffer floor before it
+    /// sheds the buffers.
+    ///
+    /// A parameter rather than the constant it was, for one reader: the
+    /// simulator. At the production value no simulated client ever idles
+    /// long enough to shed, so the path ran only under a paused clock in a
+    /// unit test — held to a clock, never to a schedule. The simulator sets
+    /// it below a client's longest nap and the shed becomes one more thing
+    /// the seed can reorder.
+    pub idle_shed_after: Duration,
     /// Forty hexadecimal characters identifying this run of the process,
     /// drawn once at the composition root beside the keyspace seed.
     ///
@@ -277,6 +288,7 @@ impl NodeInfo {
             memory: MemoryGauge::default(),
             limit: MemoryLimit::default(),
             passwords: PasswordStore::default(),
+            idle_shed_after: crate::connection::IDLE_SHED_AFTER,
             // A node with no process to describe says so: forty zeros is not
             // a run identifier any process would draw, so a document carrying
             // it is recognisably a test's rather than a node's.

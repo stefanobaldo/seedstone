@@ -4,7 +4,8 @@
 use super::support::{FlushCounting, connected, read_frames, req};
 use crate::connection::{
     IDLE_SHED_AFTER, MAX_REQUEST_BYTES, READ_CEILING, READ_FLOOR, READ_QUIET_READS, REPLY_SHED,
-    append_frame, flush_replies, resize_connection_buffers, serve_connection_limited,
+    append_frame, flush_replies, resize_connection_buffers, serve_connection,
+    serve_connection_limited,
 };
 use crate::node::NodeInfo;
 use bytes::Bytes;
@@ -486,6 +487,58 @@ async fn a_connection_that_goes_silent_gives_its_buffers_back() {
         offered.last().copied(),
         Some(READ_FLOOR),
         "after the idle interval the connection must be back at the floor"
+    );
+    served.abort();
+}
+
+/// `serve_connection` takes the interval from the node, so a node handed a
+/// short one sheds on that schedule and not on the constant's.
+///
+/// The silent-peer test's mechanics, through the entry point that reads
+/// the node: at 5 ms and two intervals of 6 ms, a connection still holding
+/// [`IDLE_SHED_AFTER`] would not have been re-measured at all.
+#[tokio::test(start_paused = true)]
+async fn the_shed_interval_comes_from_the_node() {
+    let mut node = NodeInfo::for_tests();
+    node.idle_shed_after = Duration::from_millis(5);
+    assert_ne!(node.idle_shed_after, IDLE_SHED_AFTER);
+
+    let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut request = Vec::new();
+    encode(
+        &Frame::Array(vec![
+            Frame::Bulk("SET".into()),
+            Frame::Bulk("k".into()),
+            Frame::Bulk(Bytes::from(vec![b'x'; 512 * 1024])),
+        ]),
+        &mut request,
+    );
+    let stream = GoesSilent {
+        request,
+        offered: Arc::clone(&offered),
+    };
+    let pool = ShardPool::spawn(4, 4, DictSeed { k0: 1, k1: 2 }, NoTrace);
+    let served = tokio::spawn(serve_connection(stream, pool, node));
+
+    let before = settle(&offered).await;
+    assert!(
+        offered.lock().expect("offered").iter().max() > Some(&READ_FLOOR),
+        "the connection never grew, so this test would pass vacuously"
+    );
+    for _ in 0..2 {
+        tokio::time::advance(Duration::from_millis(6)).await;
+        settle(&offered).await;
+    }
+
+    let offered = offered.lock().expect("offered").clone();
+    assert!(
+        offered.len() > before,
+        "the node's interval never fired: the connection was not re-measured"
+    );
+    assert_eq!(
+        offered.last().copied(),
+        Some(READ_FLOOR),
+        "after the node's interval the connection must be back at the floor"
     );
     served.abort();
 }
