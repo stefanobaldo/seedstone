@@ -42,6 +42,7 @@
 
 pub mod disk;
 pub mod effect;
+pub mod file;
 
 /// Magic byte that opens a record.
 ///
