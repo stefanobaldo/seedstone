@@ -191,12 +191,13 @@ impl DiskFaults {
 /// the shape's steady-state keyspace — 256 plain keys, 128 volatile, the
 /// counters and the walk keys.
 ///
-/// The middle of the range, 190 to 202, over which every seed
+/// The middle of the range, 166 to 191, over which every seed
 /// `tests/planted_eviction.rs` runs evicts, observes an eviction, and still
 /// decides more than ten plain reads per eviction observed. The edges of
 /// that range move with the schedule, so the middle is the value a small
-/// change to the schedule leaves calibrated.
-const EVICTION_ENTRIES: u64 = 196;
+/// change to the schedule leaves calibrated — and a change to how the
+/// simulated node schedules its connections moved them, from 190 to 202.
+const EVICTION_ENTRIES: u64 = 178;
 
 /// What one of that shape's entries is accounted at: the dict's fixed
 /// overhead, the bucket a load factor of one gives each entry on average,
