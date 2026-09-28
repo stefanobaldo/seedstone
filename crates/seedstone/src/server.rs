@@ -12,12 +12,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use seedstone_core::dict::DictSeed;
+use seedstone_core::log::disk::{Disk, StdDisk};
+use seedstone_core::log::file::{FileLog, next_generation, open_segments};
+use seedstone_core::log::recovery::{ReaderMode, recover};
 use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
-use seedstone_core::shard::{NoTrace, ShardPool};
+use seedstone_core::shard::{
+    Command, Deadlines, LogFault, NoTrace, PoolSpec, Reply, ShardPool, TraceSink,
+};
+use seedstone_core::slot::executor_of;
 use seedstone_resp::{Frame, encode};
 use seedstone_service::log::{
-    Event, Field, PASSWORD_RELOAD_FAILED, PASSWORD_RELOAD_SKIPPED, PASSWORD_RELOADED, STOPPING,
-    line,
+    Event, Field, LOG_FAULT, PASSWORD_RELOAD_FAILED, PASSWORD_RELOAD_SKIPPED, PASSWORD_RELOADED,
+    RECOVERY, RECOVERY_FAILED, RECOVERY_TRUNCATED, STOPPING, line,
 };
 use seedstone_service::{NodeInfo, PasswordStore, Passwords, Secret, serve_connection};
 use tokio::io::AsyncWriteExt;
@@ -73,7 +79,7 @@ pub const MAX_CLIENTS_REACHED: &str = "ERR max number of clients reached";
 /// takes is a binary someone has to read the source of.
 pub const USAGE: &str = "usage: seedstone [--bind ADDR:PORT] [--max-clients N] [--maxmemory SIZE] \
                      [--maxmemory-policy allkeys-lru|noeviction] [--requirepass-file PATH] \
-                     [--no-auth]\n       seedstone --version | --help\n\
+                     [--no-auth] [--data-dir PATH]\n       seedstone --version | --help\n\
                      env: SEEDSTONE_REQUIREPASS";
 
 /// The environment variable the password may arrive in instead of a file.
@@ -125,6 +131,10 @@ pub struct Config {
     /// default that only loopback tolerates, and `None` with it set is a
     /// decision an operator wrote down.
     pub no_auth: bool,
+    /// Where the log lives, or `None` for a node that keeps nothing across
+    /// a restart — today's default, and the only mode the node had before
+    /// the flag existed.
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -136,6 +146,7 @@ impl Default for Config {
             passwords: None,
             source: PasswordSource::None,
             no_auth: false,
+            data_dir: None,
         }
     }
 }
@@ -247,6 +258,7 @@ impl Config {
                 }
                 "--requirepass-file" => password_file = Some(value_for(&flag, &mut args)?),
                 "--no-auth" => cfg.no_auth = true,
+                "--data-dir" => cfg.data_dir = Some(value_for(&flag, &mut args)?.into()),
                 other => return Err(refused(&format!("unknown argument: {other}"))),
             }
         }
@@ -405,8 +417,15 @@ impl Server {
     /// # Errors
     ///
     /// Whatever binding the address failed with: in practice the port already
-    /// being in use, or an address this host does not own.
+    /// being in use, or an address this host does not own. Or, with
+    /// [`data_dir`](Config::data_dir) set, whatever reading the log failed
+    /// with — told apart by [`is_recovery_failure`], its line already
+    /// written.
     pub async fn bind(cfg: Config, seed: DictSeed, run_id: String) -> std::io::Result<Self> {
+        // Before the listener, so no client can reach a keyspace that is
+        // still being rebuilt, and a log that cannot be read is refused
+        // before an address is taken.
+        let pool = spawn_pool(&cfg, seed)?;
         let listener = TcpListener::bind(cfg.bind).await?;
         // Asked of the socket rather than copied from the config: with port 0
         // the kernel chose, and the caller needs to learn what it chose.
@@ -415,7 +434,7 @@ impl Server {
             listener,
             local_addr,
             max_clients: cfg.max_clients,
-            pool: ShardPool::spawn_limited(SHARDS, executors(), seed, NoTrace, cfg.limit),
+            pool,
             passwords: PasswordStore::new(cfg.passwords),
             source: cfg.source,
             run_id,
@@ -759,6 +778,135 @@ pub fn emit(event: &Event, values: &[Field<'_>]) {
     eprintln!("{}", line_for(event, values));
 }
 
+/// The trace sink of a node with a log on disk: it observes no commands and
+/// writes one line per failed write or sync.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FaultLines;
+
+impl TraceSink for FaultLines {
+    fn record(&self, _shard: u16, _seq: u64, _cmd: &Command, _reply: &Reply) {}
+
+    fn fault(&self, shard: u16, fault: LogFault, error: &std::io::Error) {
+        let stage = match fault {
+            LogFault::Write => "write",
+            LogFault::Sync => "sync",
+        };
+        emit(
+            &LOG_FAULT,
+            &[
+                Field::Num(u64::from(shard)),
+                Field::Str(stage),
+                Field::Str(&error.to_string()),
+            ],
+        );
+    }
+}
+
+/// The error inside what [`Server::bind`] returns when the log could not be
+/// read, so the composition root writes `recovery_failed` alone and not
+/// `bind_failed` after it.
+#[derive(Debug)]
+struct RecoveryFailed(std::io::Error);
+
+impl std::fmt::Display for RecoveryFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for RecoveryFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Whether `error`, from [`Server::bind`], is the log refusing the start
+/// rather than the address — in which case `recovery_failed` has already
+/// been written.
+#[must_use]
+pub fn is_recovery_failure(error: &std::io::Error) -> bool {
+    matches!(error.get_ref(), Some(inner) if inner.is::<RecoveryFailed>())
+}
+
+/// The pool a node runs on: over a log on disk when `--data-dir` names one,
+/// over the no-op log otherwise.
+///
+/// Recovery happens here, before the listener binds. The lines it writes
+/// are the operator's only view of what the log held.
+///
+/// # Errors
+///
+/// Whatever recovery or opening the segments reports, marked for
+/// [`is_recovery_failure`]; `recovery_failed` is written first.
+fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<ShardPool> {
+    let Some(dir) = &cfg.data_dir else {
+        return Ok(ShardPool::spawn_limited(
+            SHARDS,
+            executors(),
+            seed,
+            NoTrace,
+            cfg.limit,
+        ));
+    };
+    let disk = StdDisk;
+    let wal = dir.join("wal");
+    let executors = executors();
+    let started = (|| {
+        disk.create_dir_all(&wal)?;
+        let recovery = recover(&disk, &wal, SHARDS, ReaderMode::Resynchronising)?;
+        let generation = next_generation(&disk, &wal)?;
+        let segments = open_segments(&disk, &wal, generation, executors)?;
+        Ok::<_, std::io::Error>((recovery, segments))
+    })();
+    let (recovery, segments) = match started {
+        Ok(started) => started,
+        Err(error) => {
+            emit(&RECOVERY_FAILED, &[Field::Str(&error.to_string())]);
+            return Err(std::io::Error::new(error.kind(), RecoveryFailed(error)));
+        }
+    };
+    let report = &recovery.report;
+    emit(
+        &RECOVERY,
+        &[
+            Field::Num(report.segments),
+            Field::Num(report.records),
+            Field::Num(report.applied),
+            Field::Num(report.discarded),
+            Field::Num(report.damage_bytes),
+            Field::Num(report.truncated.len() as u64),
+        ],
+    );
+    for cut in &report.truncated {
+        emit(
+            &RECOVERY_TRUNCATED,
+            &[
+                Field::Num(u64::from(cut.shard)),
+                Field::Num(cut.applied),
+                Field::Num(cut.discarded),
+            ],
+        );
+    }
+    Ok(ShardPool::spawn_spec(PoolSpec {
+        shards: SHARDS,
+        executors,
+        seed,
+        trace: FaultLines,
+        make_log: move |shard| {
+            FileLog::new(
+                shard,
+                std::sync::Arc::clone(
+                    &segments[usize::from(executor_of(shard, SHARDS, executors))],
+                ),
+            )
+        },
+        policy: Deadlines,
+        limit: cfg.limit,
+        clock: wall_clock,
+        recovered: recovery.shards,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -766,7 +914,53 @@ mod tests {
         PasswordSource, SHARDS, TcpListener, TcpStream, USAGE, configure_accepted, executors,
         line_for, parse_password_file,
     };
+    use super::{DictSeed, Server, is_recovery_failure};
     use seedstone_service::log::{Field, STOPPING};
+
+    #[test]
+    fn data_dir_is_parsed_and_absent_by_default() {
+        let cfg = Config::from_args(std::iter::empty()).unwrap();
+        assert_eq!(cfg.data_dir, None);
+        let cfg = Config::from_args(
+            ["--data-dir", "/var/lib/seedstone"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.data_dir.as_deref(),
+            Some(std::path::Path::new("/var/lib/seedstone"))
+        );
+        assert!(Config::from_args(std::iter::once("--data-dir".to_owned())).is_err());
+    }
+
+    #[test]
+    fn the_usage_names_the_flag() {
+        assert!(USAGE.contains("[--data-dir PATH]"));
+    }
+
+    /// Recovery runs before the listener binds, and a log that cannot be
+    /// read is told apart from an address that cannot be bound: on an
+    /// address already taken and a data directory that is a plain file,
+    /// the refusal is the log's.
+    #[tokio::test]
+    async fn a_log_that_cannot_be_read_refuses_the_start_before_the_bind() {
+        let file =
+            std::env::temp_dir().join(format!("seedstone-not-a-directory-{}", std::process::id()));
+        std::fs::write(&file, b"").unwrap();
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = Config {
+            bind: taken.local_addr().unwrap(),
+            data_dir: Some(file.clone()),
+            ..Config::default()
+        };
+        let refused = Server::bind(cfg, DictSeed { k0: 1, k1: 2 }, String::new()).await;
+        std::fs::remove_file(&file).unwrap();
+        let Err(error) = refused else {
+            panic!("a node over an unreadable log started")
+        };
+        assert!(is_recovery_failure(&error), "refused for the bind: {error}");
+    }
 
     /// The binary's lines are the service's format with the wall clock in
     /// `ts`: a real reading, and the event's fields after the envelope.
