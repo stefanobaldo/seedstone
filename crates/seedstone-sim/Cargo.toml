@@ -13,7 +13,12 @@ seedstone-resp = { path = "../seedstone-resp" }
 seedstone-service = { path = "../seedstone-service" }
 # The codec's bulk payload, which the workload builds its requests from.
 bytes.workspace = true
-turmoil.workspace = true
+# `unstable-fs` is what makes turmoil's filesystem exist: the simulated log
+# is written through it, torn on crash and corrupted on read. Enabled here
+# and nowhere else — the production crates never see this feature, which
+# the CI step "no simulator crate in the production dependency graph"
+# keeps true.
+turmoil = { workspace = true, features = ["unstable-fs"] }
 rand.workspace = true
 tokio.workspace = true
 
