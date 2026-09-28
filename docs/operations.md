@@ -2,18 +2,18 @@
 
 How this server is run and watched: its command line, what it writes, the
 signals it answers, how its password is delivered and rotated, what running
-without one means, and what `INFO` gives a monitor. Every claim here is
-measured on the binary of the version it was written for, and a test
-(`crates/seedstone-service/tests/operations_page.rs`) holds the table in
-*Output* to the code, so a line cannot gain or lose a field without this page
-saying so.
+without one means, what `--data-dir` promises, and what `INFO` gives a
+monitor. Every claim here is measured on the binary of the version it was
+written for, and a test (`crates/seedstone-service/tests/operations_page.rs`)
+holds the table in *Output* to the code, so a line cannot gain or lose a field
+without this page saying so.
 
 ## Command line and environment
 
 ```
 seedstone [--bind ADDR:PORT] [--max-clients N] [--maxmemory SIZE]
           [--maxmemory-policy allkeys-lru|noeviction] [--requirepass-file PATH]
-          [--no-auth]
+          [--no-auth] [--data-dir PATH]
 seedstone --version | --help
 ```
 
@@ -25,6 +25,7 @@ seedstone --version | --help
 | `--maxmemory-policy` | `noeviction` | What happens at the ceiling: `allkeys-lru` evicts, `noeviction` refuses writes. Only with `--maxmemory`. |
 | `--requirepass-file PATH` | none | The password file: one password per line, one or two lines. See *Password and rotation*. |
 | `--no-auth` | off | Run with no password, on purpose. See *Running without a password*. |
+| `--data-dir PATH` | none | Where the node keeps its log. With it, every write is recorded and replayed on the next start; without it a restart is an empty keyspace. The log grows until compaction exists; see *What `--data-dir` promises*. |
 
 `--version` and `--help` answer on stdout and exit 0, in first position only.
 `SEEDSTONE_REQUIREPASS` in the environment is the other way to give a
@@ -34,7 +35,8 @@ readable by every process on the host.
 A bind outside loopback with no password is refused unless `--no-auth` is
 given. `--requirepass-file` and `SEEDSTONE_REQUIREPASS` together are refused;
 either beside `--no-auth` is refused. Exit codes: `0` on a clean stop; `1`
-when the address could not be bound (after a `bind_failed` line); `2` on a
+when the address could not be bound (after a `bind_failed` line) or the log
+under `--data-dir` could not be read (after a `recovery_failed` line); `2` on a
 command line the server does not understand (after the usage text, in plain
 text, on stderr).
 
@@ -167,6 +169,20 @@ open on purpose so that both paths stay exercised. It is not, at the time of
 writing, exercised by a deployment the project itself runs; whoever turns
 authentication on for a deployment that ran open should know that the path's
 production evidence is the test suite's.
+
+## What `--data-dir` promises
+
+The node appends every write to a log under `PATH/wal/` and syncs it on its
+housekeeping tick — every 100 ms on a node with room to spare, less often on
+one kept busy, since commands are served before housekeeping. A write
+acknowledged before a sync survives a crash; one acknowledged after the last
+sync may not. On start the
+log is read back: a shard whose records have a gap is replayed up to the gap
+and reported with `recovery_truncated`, and the node serves what it has.
+
+The log only grows. Until snapshots and compaction exist, the directory's
+size is bounded by nothing but the disk; a node that must run for long on a
+small disk should not yet be started with this flag.
 
 ## What `INFO` gives a monitor
 

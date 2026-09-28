@@ -7,7 +7,7 @@
 //! like logic belongs in [`seedstone::server`], where it can be tested without
 //! a process.
 
-use seedstone::server::{Config, Server, USAGE, emit};
+use seedstone::server::{Config, Server, USAGE, emit, is_recovery_failure};
 use seedstone_core::dict::DictSeed;
 use seedstone_service::RUN_ID_HEX;
 use seedstone_service::log::{BIND_FAILED, Field, LISTENING};
@@ -53,6 +53,8 @@ fn main() {
     runtime.block_on(async {
         let server = match Server::bind(cfg, seed, run_id).await {
             Ok(server) => server,
+            // `recovery_failed` was written where the log was read.
+            Err(error) if is_recovery_failure(&error) => std::process::exit(1),
             Err(error) => {
                 emit(
                     &BIND_FAILED,
