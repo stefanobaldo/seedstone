@@ -518,10 +518,32 @@ pub struct Conn {
 }
 
 impl Conn {
-    /// Opens a connection to the simulated server.
+    /// Opens a connection to the simulated server, waiting for it if it is
+    /// down.
+    ///
+    /// A node can be down when a client first reaches for it: restarting
+    /// after a crash, or retrying a start its disk refused. Refused at once
+    /// on a node that is up, so a run without crashes connects exactly as it
+    /// always did.
+    ///
+    /// # Errors
+    ///
+    /// When the node is still not there after [`RECONNECT_ATTEMPTS`] naps —
+    /// a node that did not come back.
     pub async fn connect() -> turmoil::Result<Self> {
+        let mut attempts = 0;
+        let stream = loop {
+            match turmoil::net::TcpStream::connect((SERVER, PORT)).await {
+                Ok(stream) => break stream,
+                Err(_) if attempts < RECONNECT_ATTEMPTS => {
+                    attempts += 1;
+                    tokio::time::sleep(RECONNECT_NAP).await;
+                }
+                Err(_) => return Err("the node did not come back".into()),
+            }
+        };
         Ok(Self {
-            stream: turmoil::net::TcpStream::connect((SERVER, PORT)).await?,
+            stream,
             decoder: Decoder::new(DecoderLimits::default()),
             out: Vec::new(),
         })
@@ -571,16 +593,11 @@ impl Conn {
     /// that is a node that did not come back, which is a finding about the
     /// server and ends the run loudly.
     pub async fn reconnect(&mut self) -> turmoil::Result<()> {
-        for _ in 0..RECONNECT_ATTEMPTS {
-            tokio::time::sleep(RECONNECT_NAP).await;
-            if let Ok(stream) = turmoil::net::TcpStream::connect((SERVER, PORT)).await {
-                self.stream = stream;
-                self.decoder = Decoder::new(DecoderLimits::default());
-                self.out.clear();
-                return Ok(());
-            }
-        }
-        Err("the node did not come back".into())
+        // A nap first: the node that just closed this connection is, at the
+        // earliest, one step from being back.
+        tokio::time::sleep(RECONNECT_NAP).await;
+        *self = Self::connect().await?;
+        Ok(())
     }
 
     /// [`request_many`](Self::request_many), and on a connection lost to a

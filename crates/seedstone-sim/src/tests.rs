@@ -449,3 +449,16 @@ fn the_verdict_knows_what_a_crash_and_a_hostile_disk_excuse() {
         "a value nobody wrote is never excused"
     );
 }
+
+/// A client that first connects while the node is down — restarting, or
+/// retrying a start the disk refused — waits for it instead of ending the
+/// run. `hostile(1, 2)` has a connect land in that window.
+#[test]
+fn a_client_that_meets_a_restarting_node_waits_for_it() {
+    let outcome = run_sim(&SimConfig::hostile(1, 2));
+    assert!(
+        outcome.crashes > 0,
+        "the seed no longer crashes: {outcome:?}"
+    );
+    assert!(outcome.invariant_holds(), "{outcome:?}");
+}
