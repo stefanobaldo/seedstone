@@ -4,6 +4,7 @@
 use crate::durability::{CrashRecord, DurablePoint};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// What one run produced.
 ///
@@ -215,6 +216,29 @@ pub struct Shared {
     pub crashes: Arc<Mutex<Vec<CrashRecord>>>,
     /// Which shards the last recovery reported as having lost records.
     pub truncated: Arc<Mutex<Vec<bool>>>,
+    /// Every acknowledged increment — what the verifier needs to say which
+    /// of them a crash could not have taken.
+    pub increments: Arc<Mutex<Vec<Increment>>>,
+}
+
+/// An acknowledged increment, and what a crash would need to have found
+/// synced for it to survive.
+#[derive(Debug, Clone, Copy)]
+pub struct Increment {
+    /// The shard its counter key hashes to.
+    pub shard: u16,
+    /// What it added.
+    pub delta: i64,
+    /// When its reply arrived, on the world clock — or `None` for one whose
+    /// reply a crash took, which may or may not have been applied.
+    pub acked: Option<Duration>,
+    /// The index, in [`Shared::crashes`], of the first crash that came
+    /// after the node that applied it started — every crash from there on
+    /// could have taken it.
+    ///
+    /// An index and not an instant because a reply can arrive after the
+    /// crash of the node that sent it.
+    pub later: usize,
 }
 
 impl Shared {
@@ -228,6 +252,7 @@ impl Shared {
             durable: Arc::new(Mutex::new(vec![None; usize::from(shards)])),
             crashes: Arc::default(),
             truncated: Arc::new(Mutex::new(vec![false; usize::from(shards)])),
+            increments: Arc::default(),
         }
     }
 }
@@ -275,6 +300,29 @@ pub struct Tally {
     pub paused: u32,
     /// Whether the driver has crashed the node at rest yet.
     pub rest_crashed: bool,
+    /// The least the counters may sum to after the run's crashes: every
+    /// increment no crash could have taken, plus every *negative* one a
+    /// crash may have left standing.
+    pub counter_floor: i64,
+    /// The most they may sum to: the same, with the *positive* ones. The
+    /// deltas are of either sign, so a lost increment can move the sum
+    /// either way, and the range is what every survivable subset lies in.
+    pub counter_ceiling: i64,
+    /// Reads of a plain key a crash left exactly known, as durable, that
+    /// disagreed — on a shard the recovery did not report as truncated.
+    pub lost_durable_writes: u64,
+    /// Those same disagreements on a shard the recovery *did* report: a
+    /// loss the node owned up to.
+    pub excused_losses: u64,
+    /// Reads decided against a value a crash left known to be durable —
+    /// the denominator of the two above.
+    pub durable_checks: u64,
+    /// Reads of a key a crash left open between several candidates that
+    /// returned none of them: a value nobody wrote.
+    pub phantom_writes: u64,
+    /// Reads decided against several candidates — the denominator of
+    /// [`Tally::phantom_writes`].
+    pub either_checks: u64,
 }
 
 /// Takes a lock that cannot be contended, and says so if it was poisoned.

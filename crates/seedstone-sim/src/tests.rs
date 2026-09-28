@@ -330,7 +330,7 @@ fn recovery_reaches_the_trace() {
 /// The driver crashes and restarts the node on the seed's schedule, and the
 /// run still holds every invariant it can state.
 #[test]
-#[ignore = "reconnect lands with the model"]
+#[ignore = "the counter range lands with the verdict"]
 fn a_run_with_crashes_under_load_recovers_and_holds() {
     // Seed 2 draws two crashes, at 61 ms and 499 ms: inside the workload,
     // and more than one, so a restart is itself restarted from.
@@ -355,7 +355,6 @@ fn a_run_with_crashes_under_load_recovers_and_holds() {
 /// At rest, every acknowledged write was synced before the crash, so the
 /// model is exact after it and reads everything back.
 #[test]
-#[ignore = "reconnect lands with the model"]
 fn a_crash_at_rest_recovers_exactly() {
     let mut cfg = SimConfig::mini(1, 3);
     cfg.crashes = CrashPlan::AtRest;
