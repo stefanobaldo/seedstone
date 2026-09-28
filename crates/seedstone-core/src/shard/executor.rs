@@ -5,6 +5,7 @@
 
 use crate::dict::Dict;
 use crate::log::ReplicationLog;
+use crate::log::effect::Effect;
 use crate::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use crate::shard::apply::{append, apply};
 use crate::shard::{
@@ -82,6 +83,80 @@ const EXPIRE_BUCKETS_PER_TICK: usize = 256;
 /// `sampled_eviction_rarely_takes_a_recently_touched_key` in `dict.rs` holds
 /// the sample to a bound on how often it takes a recently used key.
 pub const EVICTION_SAMPLES: usize = 5;
+
+/// The two clocks a command is served at: the monotonic instant every
+/// deadline is kept in, and the wall clock a record has to carry.
+///
+/// One reading of each per envelope, taken by the executor, so the commands
+/// of a batch agree about what time it is. The wall clock is injected rather
+/// than read — the simulator's stands where the simulation says it does —
+/// and reaches the shard only so that a logged deadline is absolute: a
+/// record that said `EX 30` would replay to a different state than the one
+/// it described.
+#[derive(Debug, Clone, Copy)]
+pub struct Now {
+    /// The monotonic instant, from the clock the runtime controls.
+    pub instant: Instant,
+    /// Unix milliseconds, from the injected wall clock.
+    pub unix_millis: u64,
+}
+
+/// What a logged deadline turns out to mean when it is replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replayed {
+    /// The deadline is not in the future: the key is dead.
+    Past,
+    /// The key lives until this instant, or has no deadline the clock can
+    /// represent — which the dict stores as no deadline, the same answer
+    /// the command path gives a span it cannot add.
+    At(Option<Instant>),
+}
+
+impl Now {
+    /// A reading with the wall clock at zero, for callers that have no wall
+    /// clock to offer: the core's own tests.
+    #[must_use]
+    pub const fn at(instant: Instant) -> Self {
+        Self {
+            instant,
+            unix_millis: 0,
+        }
+    }
+
+    /// The Unix milliseconds `at` corresponds to, for a record.
+    ///
+    /// Saturating in both steps: a deadline further off than `u64` can
+    /// count is a deadline nothing will ever reach, and a wall clock that
+    /// overflows has other problems.
+    #[must_use]
+    pub fn deadline_millis(self, at: Option<Instant>) -> Option<u64> {
+        let left = at?.saturating_duration_since(self.instant).as_millis();
+        Some(
+            self.unix_millis
+                .saturating_add(u64::try_from(left).unwrap_or(u64::MAX)),
+        )
+    }
+
+    /// What a record's absolute deadline means now.
+    #[must_use]
+    pub fn replay_deadline(self, millis: u64) -> Replayed {
+        match millis.checked_sub(self.unix_millis) {
+            None | Some(0) => Replayed::Past,
+            Some(left) => Replayed::At(self.instant.checked_add(Duration::from_millis(left))),
+        }
+    }
+}
+
+/// The wall clock of a node that has none to offer: it reads zero.
+///
+/// For the pool constructors that predate the clock and for tests. A node
+/// whose records carry deadlines measured from zero replays them correctly
+/// only against a clock that also reads zero — which is what makes it a
+/// test's clock and not a default.
+#[must_use]
+pub const fn frozen_clock() -> u64 {
+    0
+}
 
 /// What an executor needs to know about the node's memory: the figure, and
 /// what to do when it is too large.
@@ -175,6 +250,7 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
     trace: T,
     policy: P,
     memory: Memory,
+    clock: fn() -> u64,
     mut inbox: mpsc::UnboundedReceiver<Envelope>,
 ) {
     let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
@@ -231,8 +307,11 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                 // It is also the first command's timing start — see
                 // `ShardStats::usec`, which spends one further reading per
                 // command and differences each against the one before it.
-                let now = Instant::now();
-                let mut last = now;
+                let now = Now {
+                    instant: Instant::now(),
+                    unix_millis: clock(),
+                };
+                let mut last = now.instant;
                 // By mutable reference, so a handler can move a command's value
                 // into the dict instead of copying it — see `apply`. The trace
                 // reads the command *after* the handler has had it, and reads
@@ -382,7 +461,14 @@ pub fn sweep_expired<T: TraceSink, L: ReplicationLog, P: ExpiryPolicy>(
             .expire_step(state.expire_cursor, EXPIRE_BUCKETS_PER_TICK, now, expiry);
     for key in dead {
         let at = state.seq;
-        if append(&mut state.log, &mut state.seq, shard).is_err() {
+        if append(
+            &mut state.log,
+            &mut state.seq,
+            shard,
+            Effect::Del { key: &key[..] },
+        )
+        .is_err()
+        {
             return;
         }
         state.dict.remove(&key);
@@ -450,7 +536,14 @@ pub fn evict_until_fits<T: TraceSink, L: ReplicationLog, P: EvictionPolicy>(
             return;
         };
         let at = state.seq;
-        if append(&mut state.log, &mut state.seq, shard).is_err() {
+        if append(
+            &mut state.log,
+            &mut state.seq,
+            shard,
+            Effect::Del { key: &victim[..] },
+        )
+        .is_err()
+        {
             return;
         }
         let before = state.dict.used_bytes();

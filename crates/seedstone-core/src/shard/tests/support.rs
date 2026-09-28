@@ -4,6 +4,7 @@
 
 use crate::dict::{Dict, DictSeed, WalkOrder};
 use crate::log::NoopLog;
+use crate::shard::Now;
 use crate::shard::apply::apply;
 use crate::shard::executor::ShardState;
 use crate::shard::{
@@ -31,7 +32,7 @@ impl Shard {
     /// been run has had its value moved out of it, so a caller cannot
     /// usefully hold one across two runs.
     pub fn run(&mut self, mut cmd: Command, now: Instant) -> Reply {
-        apply(self, 0, &mut cmd, now, &Deadlines)
+        apply(self, 0, &mut cmd, Now::at(now), &Deadlines)
     }
 }
 

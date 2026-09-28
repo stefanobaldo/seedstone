@@ -6,7 +6,7 @@
 use crate::dict::{Dict, DictSeed};
 use crate::log::{NoopLog, ReplicationLog};
 use crate::memory::{MemoryGauge, MemoryLimit};
-use crate::shard::executor::{Memory, ShardState, run_executor};
+use crate::shard::executor::{Memory, ShardState, frozen_clock, run_executor};
 use crate::shard::{
     Command, Deadlines, KIND_SLOTS, Reply, ReplyError, Route, ShardPolicy, TraceSink,
 };
@@ -387,6 +387,7 @@ impl ShardPool {
             |_shard| NoopLog,
             Deadlines,
             MemoryLimit::default(),
+            frozen_clock,
         )
     }
 
@@ -418,6 +419,7 @@ impl ShardPool {
             |_shard| NoopLog,
             Deadlines,
             limit,
+            frozen_clock,
         )
     }
 
@@ -459,6 +461,7 @@ impl ShardPool {
             make_log,
             Deadlines,
             MemoryLimit::default(),
+            frozen_clock,
         )
     }
 
@@ -490,6 +493,7 @@ impl ShardPool {
             |_shard| NoopLog,
             policy,
             MemoryLimit::default(),
+            frozen_clock,
         )
     }
 
@@ -525,11 +529,16 @@ impl ShardPool {
             |_shard| NoopLog,
             policy,
             limit,
+            frozen_clock,
         )
     }
 
     /// The one constructor with every seam exposed; the public ones above are
     /// its defaults.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per seam; the next change gathers them into one struct"
+    )]
     #[allow(
         clippy::needless_pass_by_value,
         reason = "every executor gets a clone of the sink and of the policy and the \
@@ -545,6 +554,7 @@ impl ShardPool {
         make_log: F,
         policy: P,
         limit: MemoryLimit,
+        clock: fn() -> u64,
     ) -> Self
     where
         T: TraceSink,
@@ -598,6 +608,7 @@ impl ShardPool {
                             trace.clone(),
                             policy.clone(),
                             memory.clone(),
+                            clock,
                         ));
                     }
                     pending = Some((shard, vec![state]));
@@ -611,6 +622,7 @@ impl ShardPool {
                 trace,
                 policy,
                 memory.clone(),
+                clock,
             ));
         }
 
@@ -715,9 +727,18 @@ fn spawn_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
     trace: T,
     policy: P,
     memory: Memory,
+    clock: fn() -> u64,
 ) -> mpsc::UnboundedSender<Envelope> {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_executor(first_shard, states, trace, policy, memory, rx));
+    tokio::spawn(run_executor(
+        first_shard,
+        states,
+        trace,
+        policy,
+        memory,
+        clock,
+        rx,
+    ));
     tx
 }
 

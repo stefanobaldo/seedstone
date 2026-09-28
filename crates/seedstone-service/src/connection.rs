@@ -853,12 +853,12 @@ mod tests {
         // The replication log debug-asserts that no record body exceeds
         // `MAX_BODY_LEN`, and a record describes exactly one key — so the
         // largest body the command layer could ever hand it is a key and a
-        // value at the codec's bulk ceiling, plus framing. Today that assert
-        // is unreachable because every payload is empty; this test is what
-        // keeps 16 MiB-under-64 MiB a stated contract rather than a
-        // coincidence of two constants, so that raising `MAX_BULK_LEN` or
-        // shrinking `MAX_BODY_LEN` fails here, not in a release-build log
-        // whose reader refuses the record. A payload that stops describing
+        // value at the codec's bulk ceiling, plus framing: the payload is the
+        // key's effect, and a `Put` is its key and value plus eighteen bytes
+        // (`log::effect`). This test is what keeps 16 MiB-under-64 MiB a
+        // stated contract rather than a coincidence of two constants, so
+        // that raising `MAX_BULK_LEN` or shrinking `MAX_BODY_LEN` fails
+        // here, not in a release-build log whose reader refuses the record. A payload that stops describing
         // one key re-opens this arithmetic, and inherits this test.
         let largest_one_key_payload = 2 * MAX_BULK_LEN + 1024;
         assert!(largest_one_key_payload < seedstone_core::log::MAX_BODY_LEN);

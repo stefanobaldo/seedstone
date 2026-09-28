@@ -103,6 +103,27 @@ impl<'a> Effect<'a> {
         }
     }
 
+    /// How many bytes [`encode`](Effect::encode) appends, so the caller can
+    /// size its buffer once: every mutation pays for an encoding, and a
+    /// buffer that grows while it is written pays for it more than once.
+    #[must_use]
+    pub const fn encoded_len(&self) -> usize {
+        const LEN: usize = 4;
+        const fn deadline_len(deadline: Option<u64>) -> usize {
+            if deadline.is_some() { 1 + 8 } else { 1 }
+        }
+        1 + match self {
+            Self::Put {
+                key,
+                value,
+                deadline,
+            } => LEN + key.len() + LEN + value.len() + deadline_len(*deadline),
+            Self::Del { key } => LEN + key.len(),
+            Self::Deadline { key, deadline } => LEN + key.len() + deadline_len(*deadline),
+            Self::Flush => 0,
+        }
+    }
+
     /// Decodes a payload, or `None` if it is not a well-formed effect.
     #[must_use]
     pub fn decode(payload: &'a [u8]) -> Option<Self> {
@@ -238,6 +259,7 @@ mod tests {
         for effect in cases {
             let mut out = Vec::new();
             effect.encode(&mut out);
+            assert_eq!(out.len(), effect.encoded_len(), "{effect:?}");
             assert_eq!(Effect::decode(&out), Some(effect), "{effect:?}");
         }
     }
