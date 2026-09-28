@@ -30,16 +30,14 @@ pub struct Args {
     /// `--workload-seed W` — pinned across a sweep so a differing trace means
     /// a differing schedule and nothing else.
     pub workload_seed: u64,
-    /// `--mini` — the small configuration, for tests and quick checks.
-    pub mini: bool,
-    /// `--eviction` — the shape with a ceiling, where the memory invariants
-    /// decide.
+    /// Which shape the run takes: `--mini`, `--eviction`, `--hostile`, or
+    /// none of them for the standard one.
     ///
-    /// A shape of its own rather than a modifier on the others: the ceiling
-    /// changes what the plain model is allowed to excuse, and a flag that
-    /// could be combined with `--mini` would leave two shapes claiming to be
-    /// the one that ran.
-    pub eviction: bool,
+    /// One value rather than a flag each, and that is the refusal below made
+    /// structural: every shape but the standard one changes what a run is
+    /// held to, and two asked for at once would leave two shapes claiming to
+    /// be the one that ran.
+    pub shape: Shape,
     /// `--plant NAME` — serve the workload through one deliberate defect.
     ///
     /// Named rather than boolean: there are three of them now, one per
@@ -62,6 +60,22 @@ pub struct Args {
     /// output depends on it: seeds are reported in ascending order whatever
     /// the count, so this buys wall clock and nothing else.
     pub workers: Option<usize>,
+}
+
+/// A run's shape, as the command line names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// No shape flag: the swept shape.
+    Standard,
+    /// `--mini` — the small configuration, for tests and quick checks.
+    Mini,
+    /// `--eviction` — the shape with a ceiling, where the memory invariants
+    /// decide: the ceiling changes what the plain model is allowed to excuse.
+    Eviction,
+    /// `--hostile` — the shape whose disk tears, fails and lies, with the
+    /// node crashed under load: where a lost durable write is excused if the
+    /// node reported it, and where the recovery plants are caught.
+    Hostile,
 }
 
 /// The workload seed a sweep pins when none is given.
@@ -90,8 +104,7 @@ impl Args {
             seeds: None,
             seed_start: None,
             workload_seed: DEFAULT_WORKLOAD_SEED,
-            mini: false,
-            eviction: false,
+            shape: Shape::Standard,
             plant: None,
             hashes: false,
             workers: None,
@@ -104,8 +117,9 @@ impl Args {
                 "--seeds" => parsed.seeds = Some(number(&arg, argv.next())?),
                 "--seed-start" => parsed.seed_start = Some(number(&arg, argv.next())?),
                 "--workload-seed" => parsed.workload_seed = number(&arg, argv.next())?,
-                "--mini" => parsed.mini = true,
-                "--eviction" => parsed.eviction = true,
+                "--mini" => parsed.choose(Shape::Mini)?,
+                "--eviction" => parsed.choose(Shape::Eviction)?,
+                "--hostile" => parsed.choose(Shape::Hostile)?,
                 "--plant" => parsed.plant = Some(plant(argv.next())?),
                 "--hashes" => parsed.hashes = true,
                 "--workers" => parsed.workers = Some(workers(&arg, argv.next())?),
@@ -113,21 +127,27 @@ impl Args {
             }
         }
 
-        if parsed.mini && parsed.eviction {
-            return Err("one shape per sweep: --mini and --eviction are two".to_owned());
-        }
-
         Ok(parsed)
+    }
+
+    /// Takes `shape` as the run's, refusing a second one.
+    fn choose(&mut self, shape: Shape) -> Result<(), String> {
+        if self.shape != Shape::Standard {
+            return Err(
+                "one shape per sweep: --mini, --eviction and --hostile are three".to_owned(),
+            );
+        }
+        self.shape = shape;
+        Ok(())
     }
 
     /// The configuration these arguments describe, at `sim_seed`.
     pub const fn config(&self, sim_seed: u64) -> SimConfig {
-        let mut cfg = if self.mini {
-            SimConfig::mini(self.workload_seed, sim_seed)
-        } else if self.eviction {
-            SimConfig::eviction(self.workload_seed, sim_seed)
-        } else {
-            SimConfig::standard(self.workload_seed, sim_seed)
+        let mut cfg = match self.shape {
+            Shape::Mini => SimConfig::mini(self.workload_seed, sim_seed),
+            Shape::Eviction => SimConfig::eviction(self.workload_seed, sim_seed),
+            Shape::Hostile => SimConfig::hostile(self.workload_seed, sim_seed),
+            Shape::Standard => SimConfig::standard(self.workload_seed, sim_seed),
         };
         cfg.planted = self.plant;
         cfg
@@ -232,14 +252,28 @@ mod tests {
     #[test]
     fn the_two_shape_flags_are_refused_together() {
         let args = parse(&["--seeds", "10", "--eviction"]).expect("--eviction parses");
-        assert!(args.eviction);
-        assert!(!args.mini);
+        assert_eq!(args.shape, Shape::Eviction);
         assert_eq!(
             args.seeds,
             Some(10),
             "the new flag must not swallow its neighbour"
         );
         assert!(parse(&["--seeds", "10", "--mini", "--eviction"]).is_err());
+    }
+
+    /// The hostile disk is a shape of its own, for the reason `--eviction`
+    /// is: it changes what a run is held to.
+    #[test]
+    fn hostile_is_a_shape_and_refused_beside_the_others() {
+        let args = parse(&["--seeds", "10", "--hostile"]).expect("--hostile parses");
+        assert_eq!(args.shape, Shape::Hostile);
+        assert_eq!(
+            args.seeds,
+            Some(10),
+            "the new flag must not swallow its neighbour"
+        );
+        assert!(parse(&["--seeds", "10", "--mini", "--hostile"]).is_err());
+        assert!(parse(&["--seeds", "10", "--eviction", "--hostile"]).is_err());
     }
 
     #[test]

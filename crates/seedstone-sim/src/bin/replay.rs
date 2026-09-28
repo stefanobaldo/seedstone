@@ -7,7 +7,7 @@
 //! stdout directly, with no parsing in between.
 //!
 //! ```text
-//! replay --sim-seed S [--workload-seed W] [--mini | --eviction] [--plant NAME]
+//! replay --sim-seed S [--workload-seed W] [--mini | --eviction | --hostile] [--plant NAME]
 //! ```
 //!
 //! Exits 1 if the run violated any invariant, so it also works as a plain
@@ -19,8 +19,7 @@ use std::process::ExitCode;
 #[path = "shared/args.rs"]
 mod args;
 
-const USAGE: &str =
-    "usage: replay --sim-seed S [--workload-seed W] [--mini | --eviction] [--plant NAME]";
+const USAGE: &str = "usage: replay --sim-seed S [--workload-seed W] [--mini | --eviction | --hostile] [--plant NAME]";
 
 fn main() -> ExitCode {
     let args = match args::Args::from_env() {
@@ -54,7 +53,8 @@ fn main() -> ExitCode {
     // the invariant held or never ran.
     println!(
         "trace_hash=0x{:016x} expected={} actual={} stale={}/{} spurious={}/{} plain={}/{} \
-         walk={}/{} invariant={}",
+         walk={}/{} invariant={} crashes={} recoveries={} durable={}/{} phantom={}/{} \
+         prefix_lost={} unreported={} faults={}/{}",
         outcome.trace_hash,
         outcome.expected_sum,
         outcome.actual_sum,
@@ -66,7 +66,17 @@ fn main() -> ExitCode {
         outcome.plain_checks,
         outcome.walk_mismatches,
         outcome.walk_checks,
-        if held { "ok" } else { "violated" }
+        if held { "ok" } else { "violated" },
+        outcome.crashes,
+        outcome.recoveries,
+        outcome.lost_durable_writes,
+        outcome.durable_checks,
+        outcome.phantom_writes,
+        outcome.either_checks,
+        outcome.lost_durable_prefixes,
+        outcome.unreported_losses,
+        outcome.write_faults,
+        outcome.sync_faults,
     );
 
     if held {
