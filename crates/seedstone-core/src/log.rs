@@ -44,6 +44,7 @@ pub mod disk;
 pub mod effect;
 pub mod file;
 pub mod reader;
+pub mod recovery;
 
 /// Magic byte that opens a record.
 ///

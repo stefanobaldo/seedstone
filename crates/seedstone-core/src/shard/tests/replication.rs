@@ -388,6 +388,7 @@ async fn the_tick_flushes_then_syncs_and_reports_a_failure() {
         policy: crate::shard::Deadlines,
         limit: crate::memory::MemoryLimit::default(),
         clock: crate::shard::frozen_clock,
+        recovered: Vec::new(),
     });
     pool.dispatch(set(b"k", b"v")).await;
     tokio::time::advance(HOUSEKEEPING_TICK + Duration::from_millis(1)).await;
@@ -403,4 +404,187 @@ async fn the_tick_flushes_then_syncs_and_reports_a_failure() {
         1,
         "one flush failed, one fault reported"
     );
+}
+
+/// Replay from an in-memory log: the four effects, a deadline in the future
+/// kept, a deadline in the past removing the key, and a flush clearing what
+/// came before it.
+#[tokio::test(start_paused = true)]
+async fn replay_applies_effects_and_resolves_absolute_deadlines() {
+    use crate::dict::Dict;
+    use crate::log::NoopLog;
+    use crate::shard::Now;
+    use crate::shard::executor::ShardState;
+
+    let mut state = ShardState::new(Dict::with_seed(DictSeed { k0: 1, k1: 2 }), NoopLog);
+    let now = Now {
+        instant: tokio::time::Instant::now(),
+        unix_millis: 1_000_000,
+    };
+    state.replay(replayed_log(), now);
+    assert_eq!(state.seq, 10, "the shard resumes after the last record");
+    assert!(state.dict.get(b"stale").is_none(), "flushed");
+    assert!(
+        state.dict.get(b"dead").is_none(),
+        "a past deadline removes the key"
+    );
+    assert!(
+        state.dict.get(b"n").is_none(),
+        "a deadline exactly now is past"
+    );
+    let p = state.dict.get(b"p").expect("persisted");
+    assert_eq!(
+        p.expires_at, None,
+        "a Deadline of None removes the deadline"
+    );
+    let live = state.dict.get(b"live").expect("re-put after its delete");
+    assert_eq!(&live.value[..], b"3");
+    assert_eq!(
+        live.expires_at,
+        Some(now.instant + Duration::from_secs(30)),
+        "a future deadline resolves against the moving wall clock"
+    );
+}
+
+/// The log `replay_applies_effects_and_resolves_absolute_deadlines` replays,
+/// against a wall clock reading 1 000 000.
+fn replayed_log() -> Vec<(u64, crate::log::effect::Owned)> {
+    use crate::log::effect::Owned;
+    let key = |k: &'static [u8]| Bytes::from_static(k);
+    vec![
+        (
+            0,
+            Owned::Put {
+                key: key(b"stale"),
+                value: key(b"v"),
+                deadline: None,
+            },
+        ),
+        (1, Owned::Flush),
+        (
+            2,
+            Owned::Put {
+                key: key(b"live"),
+                value: key(b"1"),
+                deadline: Some(1_030_000),
+            },
+        ),
+        (
+            3,
+            Owned::Put {
+                key: key(b"dead"),
+                value: key(b"2"),
+                deadline: Some(999_000),
+            },
+        ),
+        (
+            4,
+            Owned::Put {
+                key: key(b"n"),
+                value: key(b"7"),
+                deadline: None,
+            },
+        ),
+        (
+            5,
+            Owned::Deadline {
+                key: key(b"n"),
+                deadline: Some(1_000_000),
+            },
+        ),
+        (
+            6,
+            Owned::Put {
+                key: key(b"p"),
+                value: key(b"8"),
+                deadline: Some(1_005_000),
+            },
+        ),
+        (
+            7,
+            Owned::Deadline {
+                key: key(b"p"),
+                deadline: None,
+            },
+        ),
+        (8, Owned::Del { key: key(b"live") }),
+        (
+            9,
+            Owned::Put {
+                key: key(b"live"),
+                value: key(b"3"),
+                deadline: Some(1_030_000),
+            },
+        ),
+    ]
+}
+
+/// A pool built from a recovery serves what the log held, and reports each
+/// shard's resumed position to the sink.
+#[tokio::test]
+async fn a_pool_spawned_from_a_recovery_serves_the_recovered_keys() {
+    use crate::log::effect::Owned;
+    use crate::log::recovery::ShardRecords;
+    use crate::shard::{PoolSpec, TraceSink};
+
+    #[derive(Clone, Default)]
+    struct Resumed(Arc<Mutex<Vec<(u16, u64, bool)>>>);
+    impl TraceSink for Resumed {
+        fn record(&self, _shard: u16, _seq: u64, _cmd: &Command, _reply: &Reply) {}
+        fn recovered(&self, shard: u16, next_seq: u64, lossy: bool) {
+            self.0
+                .lock()
+                .expect("resumed")
+                .push((shard, next_seq, lossy));
+        }
+    }
+
+    let resumed = Resumed::default();
+    // `k` hashes to shard 1 of 2 — asserted, so the test cannot silently
+    // stop meaning what it says — and the recovery puts it there.
+    assert_eq!(
+        crate::slot::shard_of(b"k", 2),
+        1,
+        "a key that lands on shard 1"
+    );
+    let recovered = vec![
+        ShardRecords {
+            records: Vec::new(),
+            discarded: 2,
+            lossy: true,
+        },
+        ShardRecords {
+            records: vec![(
+                0,
+                Owned::Put {
+                    key: Bytes::from_static(b"k"),
+                    value: Bytes::from_static(b"v"),
+                    deadline: None,
+                },
+            )],
+            discarded: 0,
+            lossy: false,
+        },
+    ];
+    let pool = ShardPool::spawn_spec(PoolSpec {
+        shards: 2,
+        executors: 1,
+        seed: DictSeed { k0: 1, k1: 2 },
+        trace: resumed.clone(),
+        make_log: |_shard| crate::log::NoopLog,
+        policy: crate::shard::Deadlines,
+        limit: crate::memory::MemoryLimit::default(),
+        clock: crate::shard::frozen_clock,
+        recovered,
+    });
+    assert_eq!(
+        pool.dispatch(Command::Get {
+            key: Bytes::from_static(b"k")
+        })
+        .await,
+        Reply::Bulk(Some(Bytes::from_static(b"v")))
+    );
+    let mut seen = resumed.0.lock().expect("resumed").clone();
+    seen.sort_unstable();
+    assert_eq!(seen, vec![(0, 0, true), (1, 1, false)]);
 }

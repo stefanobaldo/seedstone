@@ -4,17 +4,19 @@
 //! replies go; [`ShardStats`] is what comes back for `INFO`.
 
 use crate::dict::{Dict, DictSeed};
+use crate::log::recovery::ShardRecords;
 use crate::log::{NoopLog, ReplicationLog};
 use crate::memory::{MemoryGauge, MemoryLimit};
 use crate::shard::executor::{Memory, ShardState, frozen_clock, run_executor};
 use crate::shard::{
-    Command, Deadlines, KIND_SLOTS, Reply, ReplyError, Route, ShardPolicy, TraceSink,
+    Command, Deadlines, KIND_SLOTS, Now, Reply, ReplyError, Route, ShardPolicy, TraceSink,
 };
 use crate::slot::{executor_of, shard_of};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::time::Instant;
 
 /// One shard's counters, as [`Command::Stats`] reports them.
 ///
@@ -386,6 +388,12 @@ pub struct PoolSpec<T, F, P> {
     pub limit: MemoryLimit,
     /// The wall clock, injected. See [`Now`](crate::shard::Now).
     pub clock: fn() -> u64,
+    /// What recovery read for each shard, or empty for a fresh node.
+    ///
+    /// Replayed here, before the shard's state is moved onto its executor:
+    /// the dict is built on this thread anyway, and replaying it here
+    /// keeps the executor's start free of a second code path.
+    pub recovered: Vec<ShardRecords>,
 }
 
 impl ShardPool {
@@ -414,6 +422,7 @@ impl ShardPool {
             policy: Deadlines,
             limit: MemoryLimit::default(),
             clock: frozen_clock,
+            recovered: Vec::new(),
         })
     }
 
@@ -446,6 +455,7 @@ impl ShardPool {
             policy: Deadlines,
             limit,
             clock: frozen_clock,
+            recovered: Vec::new(),
         })
     }
 
@@ -488,6 +498,7 @@ impl ShardPool {
             policy: Deadlines,
             limit: MemoryLimit::default(),
             clock: frozen_clock,
+            recovered: Vec::new(),
         })
     }
 
@@ -520,6 +531,7 @@ impl ShardPool {
             policy,
             limit: MemoryLimit::default(),
             clock: frozen_clock,
+            recovered: Vec::new(),
         })
     }
 
@@ -556,6 +568,7 @@ impl ShardPool {
             policy,
             limit,
             clock: frozen_clock,
+            recovered: Vec::new(),
         })
     }
 
@@ -589,6 +602,7 @@ impl ShardPool {
             policy,
             limit,
             clock,
+            mut recovered,
         } = spec;
         assert!(
             shards > 0,
@@ -597,6 +611,10 @@ impl ShardPool {
         assert!(
             executors > 0 && executors <= shards,
             "ShardPool::spawn: executors must be in 1..=shards"
+        );
+        assert!(
+            recovered.is_empty() || recovered.len() == usize::from(shards),
+            "ShardPool::spawn_spec: a recovery must describe every shard or none"
         );
 
         // Built by walking the shards once in order: `executor_of` is monotone,
@@ -610,16 +628,29 @@ impl ShardPool {
         let mut inboxes = Vec::with_capacity(usize::from(executors));
         let mut pending: Option<(u16, Vec<ShardState<L>>)> = None;
         for shard in 0..shards {
-            let state = ShardState::new(
+            let mut state = ShardState::new(
                 Dict::with_seed(DictSeed {
                     k0: seed.k0 ^ u64::from(shard),
                     k1: seed.k1,
                 }),
                 make_log(shard),
             );
+            let (records, lossy) = recovered
+                .get_mut(usize::from(shard))
+                .map_or((Vec::new(), false), |shard| {
+                    (std::mem::take(&mut shard.records), shard.lossy)
+                });
+            state.replay(
+                records,
+                Now {
+                    instant: Instant::now(),
+                    unix_millis: clock(),
+                },
+            );
+            trace.recovered(shard, state.seq, lossy);
             // A fresh dict already costs its table, and the gauge is the sum
-            // of what the dicts account — so it starts at the sum of the
-            // empty ones rather than at zero.
+            // of what the dicts account — so it starts at the sum of what
+            // they hold after replay rather than at zero.
             memory.gauge.apply(0, state.dict.used_bytes());
             match &mut pending {
                 Some((first_shard, states))

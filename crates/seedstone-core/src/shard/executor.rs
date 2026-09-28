@@ -3,9 +3,9 @@
 //! tick and the per-tick budgets are declared here with the measurements that
 //! set them.
 
-use crate::dict::Dict;
+use crate::dict::{Dict, Entry};
 use crate::log::ReplicationLog;
-use crate::log::effect::Effect;
+use crate::log::effect::{Effect, Owned};
 use crate::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use crate::shard::apply::{append, apply};
 use crate::shard::{
@@ -232,6 +232,61 @@ impl<L> ShardState<L> {
             expired: 0,
             calls: [0; KIND_SLOTS],
             usec: [0; KIND_SLOTS],
+        }
+    }
+
+    pub fn replay(&mut self, records: Vec<(u64, Owned)>, now: Now) {
+        for (seq, effect) in records {
+            debug_assert_eq!(seq, self.seq, "recovery hands over a gapless prefix");
+            match effect {
+                Owned::Put {
+                    key,
+                    value,
+                    deadline,
+                } => match deadline.map(|millis| now.replay_deadline(millis)) {
+                    Some(Replayed::Past) => {
+                        self.dict.remove(&key);
+                    }
+                    Some(Replayed::At(expires_at)) => {
+                        self.dict.insert(
+                            key,
+                            Entry {
+                                value,
+                                expires_at,
+                                touched: 0,
+                            },
+                        );
+                    }
+                    None => {
+                        self.dict.insert(
+                            key,
+                            Entry {
+                                value,
+                                expires_at: None,
+                                touched: 0,
+                            },
+                        );
+                    }
+                },
+                Owned::Del { key } => {
+                    self.dict.remove(&key);
+                }
+                Owned::Deadline { key, deadline } => {
+                    match deadline.map(|millis| now.replay_deadline(millis)) {
+                        Some(Replayed::Past) => {
+                            self.dict.remove(&key);
+                        }
+                        Some(Replayed::At(at)) => {
+                            self.dict.set_deadline(&key, at);
+                        }
+                        None => {
+                            self.dict.set_deadline(&key, None);
+                        }
+                    }
+                }
+                Owned::Flush => self.dict.clear(),
+            }
+            self.seq = seq + 1;
         }
     }
 }
