@@ -165,7 +165,7 @@ pub use sweep::{SweepReport, sweep};
 pub use trace::mix;
 
 use disk::SimFile;
-use durability::{CrashRecord, CrashSchedule, Observed, REST_SETTLE};
+use durability::{CrashRecord, CrashSchedule, Observed, REST_SETTLE, increment_is_durable};
 use model::Model;
 use outcome::{Shared, lock};
 use plant::{EvictsBelowCeiling, IgnoresCeiling, ScanMissesRehash, ServeExpired, SweepEatsAll};
@@ -685,8 +685,18 @@ async fn client(id: u16, cfg: SimConfig, shared: Shared) -> turmoil::Result {
             burst.push(op.frame);
             checks.push(op.check);
         }
-        let replies = conn.request_many(&burst).await?;
+        let Some(replies) = conn.request_or_reconnect(&burst).await? else {
+            // Lost to a crash: every write in the burst may or may not have
+            // landed, and the model widens to say so.
+            model.in_flight(&checks);
+            model.absorb_crashes();
+            issued += this_burst;
+            continue;
+        };
+        // Observed first: see `Model::absorb_crashes` for why a reply that
+        // arrives after a crash still belongs before it.
         model.observe(&replies, &checks, sent, Instant::now());
+        model.absorb_crashes();
         // After the burst rather than inside it: the reading has to describe
         // a node with every one of those writes applied, and an `INFO`
         // pipelined among them describes whatever had run by the time it was
@@ -739,7 +749,13 @@ async fn verifier(cfg: SimConfig, shared: Shared) -> turmoil::Result {
         .map(|key| command(&["GET", &counter_key(key)]))
         .collect();
     for (batch, burst) in keys.chunks(depth).enumerate() {
-        for (offset, reply) in conn.request_many(burst).await?.into_iter().enumerate() {
+        // Reads, so a burst lost to a crash is simply asked again.
+        let replies = loop {
+            if let Some(replies) = conn.request_or_reconnect(burst).await? {
+                break replies;
+            }
+        };
+        for (offset, reply) in replies.into_iter().enumerate() {
             let key = batch * depth + offset;
             total += match reply {
                 // Never incremented, or incremented back out of existence.
@@ -752,6 +768,31 @@ async fn verifier(cfg: SimConfig, shared: Shared) -> turmoil::Result {
         }
     }
     lock(&shared.tally).actual = total;
+
+    // The counter range a crash leaves. An increment every later crash
+    // found synced is owed. Any other — acknowledged after its shard's last
+    // sync, or whose reply a crash took — may or may not be there, and the
+    // deltas are of either sign, so each widens the floor by what it could
+    // subtract and the ceiling by what it could add.
+    {
+        let crashes = lock(&shared.crashes).clone();
+        let (mut floor, mut ceiling) = (0i64, 0i64);
+        for inc in lock(&shared.increments).iter() {
+            let owed = inc
+                .acked
+                .is_some_and(|acked| increment_is_durable(acked, inc.shard, &crashes[inc.later..]));
+            if owed {
+                floor += inc.delta;
+                ceiling += inc.delta;
+            } else {
+                floor += inc.delta.min(0);
+                ceiling += inc.delta.max(0);
+            }
+        }
+        let mut tally = lock(&shared.tally);
+        tally.counter_floor = floor;
+        tally.counter_ceiling = ceiling;
+    }
 
     // The node's own account of the run, taken once and last: every client
     // has finished, so `evicted_keys` is final and `used_memory` describes a

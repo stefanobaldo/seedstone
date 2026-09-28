@@ -7,12 +7,14 @@
 
 use rand::RngExt;
 use rand::rngs::ChaCha8Rng;
+use seedstone_core::slot::shard_of;
 use seedstone_resp::Frame;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::time::Instant;
 
-use crate::outcome::{Shared, lock};
+use crate::durability::{SlotHistory, world_now};
+use crate::outcome::{Increment, Shared, lock};
 use crate::verify::{WalkOutcome, check_ceiling, listed_keys, scan_reply};
 use crate::workload::{
     COUNTER_OPS, Check, CondReply, Conn, DEADLINES, EXPIRE_SECONDS, KeyRange, Known, Op,
@@ -21,6 +23,10 @@ use crate::workload::{
     command, counter_key, plain_key, volatile_key, walk_key, walk_pattern,
 };
 use crate::{LIVE_SLACK, SETTLE_CAP, STALE_SLACK, SimConfig, contract};
+
+// What a crash leaves the model knowing: the candidates, the burst whose
+// replies never came, and the read that settles which candidate is there.
+mod crash;
 
 /// One client's picture of the keys it owns, and the invariants it holds the
 /// server to over them.
@@ -50,6 +56,25 @@ pub struct Model {
     /// The ceiling itself, for the readings taken against it.
     ceiling: Option<u64>,
     shared: Shared,
+    /// Per plain slot, what this client wrote since the last write it knows
+    /// to be durable.
+    plain_history: Vec<SlotHistory>,
+    /// Per plain slot, the shard its key hashes to — the durable point that
+    /// governs it.
+    plain_shard: Vec<u16>,
+    /// Per plain slot, whether its current `Known` was settled by a crash
+    /// with every write durable: a read that then disagrees is a lost
+    /// durable write, not a plain mismatch.
+    plain_durable: Vec<bool>,
+    /// Per volatile slot, the shard its key hashes to.
+    volatile_shard: Vec<u16>,
+    /// Per volatile slot, when its last deadline was acknowledged, on the
+    /// world clock.
+    volatile_acked: Vec<Option<Duration>>,
+    /// How many crashes this client has absorbed into its model.
+    crashes_seen: usize,
+    /// The node's shard count, for placing a counter key on its shard.
+    shards: u16,
 }
 
 impl Model {
@@ -58,8 +83,21 @@ impl Model {
     pub fn new(id: u16, cfg: &SimConfig, shared: Shared) -> Self {
         let plain = KeyRange::new(id, cfg.plain_keys, cfg.clients);
         let volatile = KeyRange::new(id, cfg.volatile_keys, cfg.clients);
+        let plain_shard = (0..plain.len)
+            .map(|slot| shard_of(plain_key(plain.key(slot)).as_bytes(), cfg.shards))
+            .collect();
+        let volatile_shard = (0..volatile.len)
+            .map(|slot| shard_of(volatile_key(volatile.key(slot)).as_bytes(), cfg.shards))
+            .collect();
         Self {
             id,
+            plain_history: vec![SlotHistory::default(); plain.len as usize],
+            plain_shard,
+            plain_durable: vec![false; plain.len as usize],
+            volatile_shard,
+            volatile_acked: vec![None; volatile.len as usize],
+            crashes_seen: 0,
+            shards: cfg.shards,
             counter_keys: cfg.counter_keys,
             plain_state: vec![Known::Nothing; plain.len as usize],
             deadlines: vec![None; volatile.len as usize],
@@ -116,7 +154,7 @@ impl Model {
                 let delta = rng.random_range(-10..=10i64);
                 Op {
                     frame: command(&["INCRBY", &counter_key(key), &delta.to_string()]),
-                    check: Check::Counter(delta),
+                    check: Check::Counter { key, delta },
                     form: contract::FORM_INCRBY,
                 }
             }
@@ -385,6 +423,10 @@ impl Model {
         sent: Instant,
         received: Instant,
     ) {
+        // When the replies arrived, on the world clock: the instant every
+        // write in this burst counts as acknowledged at. After the server
+        // applied them, so a durable point strictly later covers them.
+        let acked = world_now();
         for (reply, check) in replies.iter().zip(checks) {
             match check {
                 Check::Ignored => {}
@@ -393,79 +435,53 @@ impl Model {
                 // a promise the server made, so counting it would manufacture
                 // a violation the system never committed. Every arm below
                 // reads its reply the same way.
-                Check::Counter(delta) => {
+                Check::Counter { key, delta } => {
                     if matches!(reply, Frame::Integer(_)) {
                         lock(&self.shared.tally).expected += delta;
+                        let shard = shard_of(counter_key(*key).as_bytes(), self.shards);
+                        // The crashes this client has not absorbed yet are
+                        // the ones that came after the node that applied it
+                        // started: see `Model::absorb_crashes`.
+                        lock(&self.shared.increments).push(Increment {
+                            shard,
+                            delta: *delta,
+                            acked: Some(acked),
+                            later: self.crashes_seen,
+                        });
                     }
                 }
                 Check::PlainSet { slot, value } => {
-                    self.plain_state[*slot as usize] = match reply {
-                        Frame::Simple(text) if text == "OK" => Known::Value(value.clone()),
-                        _ => Known::Nothing,
-                    };
+                    if matches!(reply, Frame::Simple(text) if text == "OK") {
+                        self.wrote(*slot, Known::Value(value.clone()), acked);
+                    } else {
+                        self.plain_state[*slot as usize] = Known::Nothing;
+                    }
                 }
                 Check::PlainSetCond {
                     slot,
                     value,
                     only_if_present,
                     reply: spelling,
-                } => {
-                    let held = self.plain_state[*slot as usize].clone();
-                    // The two answers a condition can give, in whichever type
-                    // this spelling gives them. Anything else is the server
-                    // declining to run the command at all, which is no
-                    // statement about the key and leaves the model with
-                    // nothing to hold — and a `SETNX` answering `+OK` lands
-                    // there too, which is the point of reading the frame the
-                    // spelling names rather than either frame that means yes.
-                    let (took, refused) = match spelling {
-                        CondReply::OkOrNull => (
-                            matches!(reply, Frame::Simple(text) if text == "OK"),
-                            matches!(reply, Frame::Null),
-                        ),
-                        CondReply::OneOrZero => (
-                            matches!(reply, Frame::Integer(1)),
-                            matches!(reply, Frame::Integer(0)),
-                        ),
-                    };
-                    let present = match held {
-                        Known::Nothing => None,
-                        Known::Absent => Some(false),
-                        Known::Value(_) => Some(true),
-                    };
-                    if let Some(present) = present
-                        && (took || refused)
-                    {
-                        let mut tally = lock(&self.shared.tally);
-                        tally.plain_checks += 1;
-                        if took != (present == *only_if_present) {
-                            tally.plain_mismatches += 1;
-                        }
-                    }
-                    self.plain_state[*slot as usize] = if took {
-                        Known::Value(value.clone())
-                    } else if refused {
-                        // The condition did not hold, so nothing was written
-                        // and the key is exactly what it was.
-                        held
-                    } else {
-                        Known::Nothing
-                    };
-                }
+                } => self.observe_set_cond(*slot, value, *only_if_present, *spelling, reply, acked),
                 Check::PlainSetGet { slot, value } => {
                     // The reply is the key's *previous* value, so it answers
                     // the question a `GET` would have — held against the model
                     // by the same code, so the two cannot disagree about what
                     // agreement means.
                     self.check_plain(*slot, reply);
-                    self.plain_state[*slot as usize] = match reply {
-                        // A value or its absence is the command having run.
-                        Frame::Bulk(_) | Frame::Null => Known::Value(value.clone()),
-                        _ => Known::Nothing,
-                    };
+                    // A value or its absence is the command having run.
+                    if matches!(reply, Frame::Bulk(_) | Frame::Null) {
+                        self.wrote(*slot, Known::Value(value.clone()), acked);
+                    } else {
+                        self.plain_state[*slot as usize] = Known::Nothing;
+                    }
                 }
-                Check::PlainDel { slots } => self.check_plain_fan_out(slots, reply, true),
-                Check::PlainExists { slots } => self.check_plain_fan_out(slots, reply, false),
+                Check::PlainDel { slots } => {
+                    self.check_plain_fan_out(slots, reply, true, acked);
+                }
+                Check::PlainExists { slots } => {
+                    self.check_plain_fan_out(slots, reply, false, acked);
+                }
                 Check::PlainMGet { slots } => self.check_plain_mget(slots, reply),
                 Check::PlainGet { slot } => self.check_plain(*slot, reply),
                 Check::PlainType { slot } => self.check_plain_shape(
@@ -474,6 +490,10 @@ impl Model {
                     &Frame::Simple("none".into()),
                     &Frame::Simple("string".into()),
                 ),
+                // Several candidates of several lengths predict no one
+                // length: the next `GET` narrows them.
+                Check::PlainStrLen { slot }
+                    if matches!(self.plain_state[*slot as usize], Known::Either(_)) => {}
                 Check::PlainStrLen { slot } => {
                     let held = match &self.plain_state[*slot as usize] {
                         Known::Value(value) => value.len(),
@@ -487,6 +507,7 @@ impl Model {
                         Frame::Simple(text) if text == "OK" => Some(*deadline),
                         _ => None,
                     };
+                    self.volatile_acked[*slot as usize] = Some(acked);
                 }
                 // A zero says the key was already gone, which is no statement
                 // about when it will next die: the model gives up on it until
@@ -496,6 +517,7 @@ impl Model {
                         Frame::Integer(1) => Some(*deadline),
                         _ => None,
                     };
+                    self.volatile_acked[*slot as usize] = Some(acked);
                 }
                 // Whatever it answered, the key carries no deadline
                 // afterwards: `1` removed one, and `0` says there was none to
@@ -507,6 +529,58 @@ impl Model {
                 Check::VolatileGet { slot } => self.check_volatile(*slot, reply, sent, received),
             }
         }
+    }
+
+    /// Holds a `SET … NX`, `SET … XX` or `SETNX` against the model, and
+    /// applies it.
+    fn observe_set_cond(
+        &mut self,
+        slot: u32,
+        value: &[u8],
+        only_if_present: bool,
+        spelling: CondReply,
+        reply: &Frame,
+        acked: Duration,
+    ) {
+        let held = self.plain_state[slot as usize].clone();
+        // The two answers a condition can give, in whichever type
+        // this spelling gives them. Anything else is the server
+        // declining to run the command at all, which is no
+        // statement about the key and leaves the model with
+        // nothing to hold — and a `SETNX` answering `+OK` lands
+        // there too, which is the point of reading the frame the
+        // spelling names rather than either frame that means yes.
+        let (took, refused) = match spelling {
+            CondReply::OkOrNull => (
+                matches!(reply, Frame::Simple(text) if text == "OK"),
+                matches!(reply, Frame::Null),
+            ),
+            CondReply::OneOrZero => (
+                matches!(reply, Frame::Integer(1)),
+                matches!(reply, Frame::Integer(0)),
+            ),
+        };
+        let present = match held {
+            Known::Nothing | Known::Either(_) => None,
+            Known::Absent => Some(false),
+            Known::Value(_) => Some(true),
+        };
+        if let Some(present) = present
+            && (took || refused)
+        {
+            let mut tally = lock(&self.shared.tally);
+            tally.plain_checks += 1;
+            if took != (present == only_if_present) {
+                tally.plain_mismatches += 1;
+            }
+        }
+        if took {
+            self.wrote(slot, Known::Value(value.to_vec()), acked);
+        } else if !refused {
+            self.plain_state[slot as usize] = Known::Nothing;
+        }
+        // Refused: the condition did not hold, so nothing was
+        // written and the key is exactly what it was.
     }
 
     /// Holds a variadic `DEL` or `EXISTS` against the model, and — for `DEL` —
@@ -526,13 +600,19 @@ impl Model {
     /// more than this client wrote is finding something nobody wrote. What is
     /// given up is the exactness, and it is given up only on the shape that
     /// has a ceiling; every other shape decides this as strictly as before.
-    fn check_plain_fan_out(&mut self, slots: &[u32], reply: &Frame, removing: bool) {
+    fn check_plain_fan_out(
+        &mut self,
+        slots: &[u32],
+        reply: &Frame,
+        removing: bool,
+        acked: Duration,
+    ) {
         let mut counted = 0i64;
         let mut predictable = true;
         let mut seen: Vec<u32> = Vec::with_capacity(slots.len());
         for slot in slots {
             match self.plain_state[*slot as usize] {
-                Known::Nothing => predictable = false,
+                Known::Nothing | Known::Either(_) => predictable = false,
                 Known::Absent => {}
                 // A removal takes the key out, so naming it twice can only
                 // remove it once; a count sees it every time it is named.
@@ -558,11 +638,11 @@ impl Model {
         if removing {
             let removed = matches!(reply, Frame::Integer(_));
             for slot in slots {
-                self.plain_state[*slot as usize] = if removed {
-                    Known::Absent
+                if removed {
+                    self.wrote(*slot, Known::Absent, acked);
                 } else {
-                    Known::Nothing
-                };
+                    self.plain_state[*slot as usize] = Known::Nothing;
+                }
             }
         }
     }
@@ -605,7 +685,7 @@ impl Model {
                         // Unpredictable on its own, and the element beside it
                         // still is: one unknown key does not excuse the rest
                         // of the array.
-                        (Known::Nothing, _) => true,
+                        (Known::Nothing | Known::Either(_), _) => true,
                         (Known::Absent, value) => matches!(value, Frame::Null),
                         (Known::Value(expected), Frame::Bulk(got)) => got == expected,
                         (Known::Value(_), _) => false,
@@ -633,7 +713,7 @@ impl Model {
     /// difference between them.
     fn check_plain_shape(&self, slot: u32, reply: &Frame, absent: &Frame, present: &Frame) {
         let agrees = match &self.plain_state[slot as usize] {
-            Known::Nothing => return,
+            Known::Nothing | Known::Either(_) => return,
             Known::Absent => reply == absent,
             // Under a ceiling the key may have been reclaimed between the
             // write and this question, so both answers are legitimate. The
@@ -660,7 +740,14 @@ impl Model {
             return Ok(());
         };
         self.record_form(contract::FORM_INFO_MEMORY);
-        let replies = conn.request_many(&[command(&["INFO", "memory"])]).await?;
+        // A reading lost to a crash is a reading not taken; the next burst
+        // folds the crash into the model.
+        let Some(replies) = conn
+            .request_or_reconnect(&[command(&["INFO", "memory"])])
+            .await?
+        else {
+            return Ok(());
+        };
         check_ceiling(&replies[0], ceiling, &self.shared);
         Ok(())
     }
@@ -674,6 +761,10 @@ impl Model {
     /// there, an error frame is a question left unanswered; here, a `GET` of
     /// a key this client owns has no legitimate way to fail.
     fn check_plain(&mut self, slot: u32, reply: &Frame) {
+        if matches!(self.plain_state[slot as usize], Known::Either(_)) {
+            self.check_either(slot, reply);
+            return;
+        }
         // The one thing a ceiling excuses, and it is excused before anything
         // else is judged: a key this client wrote is simply gone. The model
         // follows the server rather than keeping a value it now knows is not
@@ -692,11 +783,15 @@ impl Model {
             return;
         }
         let agrees = match (&self.plain_state[slot as usize], reply) {
-            (Known::Nothing, _) => return,
+            (Known::Nothing | Known::Either(_), _) => return,
             (Known::Absent, reply) => matches!(reply, Frame::Null),
             (Known::Value(value), Frame::Bulk(got)) => got == value,
             (Known::Value(_), _) => false,
         };
+        if self.plain_durable[slot as usize] {
+            self.check_durable(slot, agrees);
+            return;
+        }
         let mut tally = lock(&self.shared.tally);
         tally.plain_checks += 1;
         if !agrees {
@@ -812,8 +907,15 @@ impl Model {
 
         for (burst, checks) in frames.chunks(depth).zip(checks.chunks(depth)) {
             let sent = Instant::now();
-            let replies = conn.request_many(burst).await?;
+            let Some(replies) = conn.request_or_reconnect(burst).await? else {
+                self.in_flight(checks);
+                self.absorb_crashes();
+                continue;
+            };
+            // Observed first: see `Model::absorb_crashes` for why a reply
+            // that arrives after a crash still belongs before it.
             self.observe(&replies, checks, sent, Instant::now());
+            self.absorb_crashes();
         }
         self.probe_ceiling(conn).await?;
         Ok(())
@@ -912,9 +1014,17 @@ impl Model {
             contract::FORM_SCAN_MATCH
         });
 
+        // A walk a crash fell into decides nothing: a stable key it wrote
+        // may not have been synced, and nothing here can tell that from a
+        // key the walk lost. Every tally below is taken only if the count
+        // this started at is the count it ends at.
+        let crashes_at_start = lock(&self.shared.crashes).len();
         let mut stable = BTreeSet::new();
         for (batch, burst) in writes.chunks(depth).enumerate() {
-            for (offset, reply) in conn.request_many(burst).await?.into_iter().enumerate() {
+            let Some(replies) = conn.request_or_reconnect(burst).await? else {
+                return Ok(());
+            };
+            for (offset, reply) in replies.into_iter().enumerate() {
                 // Only an acknowledged write is a key we may insist on. A
                 // refusal is a key that is legitimately absent, and demanding
                 // it back would manufacture a violation.
@@ -924,14 +1034,22 @@ impl Model {
             }
         }
 
-        let walk = self.walk_the_family(conn, cfg, &stable).await?;
+        let Some(walk) = self.walk_the_family(conn, cfg, &stable).await? else {
+            return Ok(());
+        };
         let mut present = stable;
         present.extend(walk.present.iter().cloned());
         lock(&self.shared.walk).extend(present.iter().cloned());
 
-        let reply = conn
-            .request_many(&[command(&["KEYS", &walk_pattern(self.id)])])
-            .await?;
+        let Some(reply) = conn
+            .request_or_reconnect(&[command(&["KEYS", &walk_pattern(self.id)])])
+            .await?
+        else {
+            return Ok(());
+        };
+        if lock(&self.shared.crashes).len() != crashes_at_start {
+            return Ok(());
+        }
         {
             let mut tally = lock(&self.shared.tally);
             tally.walk_checks += 2;
@@ -968,7 +1086,8 @@ impl Model {
         !self.id.is_multiple_of(2)
     }
 
-    /// Drives the `SCAN` half of [`Model::walk`] and reports what it found.
+    /// Drives the `SCAN` half of [`Model::walk`] and reports what it found,
+    /// or `None` if a crash took one of its bursts.
     ///
     /// Every burst is churn first and the step last, in one write, so the
     /// step meets a family that has changed since the step before it. Which
@@ -980,7 +1099,7 @@ impl Model {
         conn: &mut Conn,
         cfg: &SimConfig,
         stable: &BTreeSet<Vec<u8>>,
-    ) -> turmoil::Result<WalkOutcome> {
+    ) -> turmoil::Result<Option<WalkOutcome>> {
         let pattern = walk_pattern(self.id);
         let count = WALK_STEP_COUNT.to_string();
 
@@ -1031,7 +1150,9 @@ impl Model {
                 command(&["SCAN", &cursor_text, "MATCH", &pattern])
             });
 
-            let replies = conn.request_many(&burst).await?;
+            let Some(replies) = conn.request_or_reconnect(&burst).await? else {
+                return Ok(None);
+            };
             steps += 1;
             for (name, reply) in fresh.iter().zip(&replies) {
                 sent.insert(name.clone().into_bytes());
@@ -1099,13 +1220,13 @@ impl Model {
             holds = false;
         }
 
-        Ok(WalkOutcome {
+        Ok(Some(WalkOutcome {
             holds,
             present: written
                 .into_iter()
                 .map(String::into_bytes)
                 .filter(|name| !gone.contains(name))
                 .collect(),
-        })
+        }))
     }
 }

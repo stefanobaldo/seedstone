@@ -6,6 +6,7 @@ use bytes::Bytes;
 use rand::RngExt;
 use rand::rngs::ChaCha8Rng;
 use seedstone_resp::{Decoder, DecoderLimits, Frame, encode};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 
@@ -45,7 +46,7 @@ impl KeyRange {
 }
 
 /// What a client believes about one plain key it owns.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Known {
     /// Never written, or written and answered with something the client could
     /// not read. Nothing is asserted about the key until it is written again.
@@ -55,6 +56,12 @@ pub enum Known {
     /// Written by its owner with these bytes, and nothing has written it
     /// since.
     Value(Vec<u8>),
+    /// One of these, and the client does not know which: a crash fell
+    /// between the write's acknowledgement and the log's next sync, or the
+    /// burst was in flight when it fell. Each is a `Value` or `Absent`.
+    /// The next read of the key narrows it to the one the server holds —
+    /// or to none of them, which is a value nobody wrote.
+    Either(Vec<Self>),
 }
 
 /// One operation a client is about to issue.
@@ -83,8 +90,10 @@ pub enum Check {
     /// invariants already assert.
     Ignored,
     /// An `INCRBY` this client owes the shared expected sum, if it is
-    /// acknowledged.
-    Counter(i64),
+    /// acknowledged. The key's index is carried so the increment can be
+    /// placed on its shard — whose durable point decides whether a crash
+    /// may have taken it.
+    Counter { key: u32, delta: i64 },
     /// A `SET` of an owned plain key: the model adopts `value` if it took.
     ///
     /// Also what a `KEEPTTL` is checked as. On a family no deadline is ever
@@ -552,4 +561,52 @@ impl Conn {
         }
         Ok(replies)
     }
+
+    /// Replaces the stream with a fresh connection, waiting for the node to
+    /// be back.
+    ///
+    /// # Errors
+    ///
+    /// When [`RECONNECT_ATTEMPTS`] naps pass with no node to connect to:
+    /// that is a node that did not come back, which is a finding about the
+    /// server and ends the run loudly.
+    pub async fn reconnect(&mut self) -> turmoil::Result<()> {
+        for _ in 0..RECONNECT_ATTEMPTS {
+            tokio::time::sleep(RECONNECT_NAP).await;
+            if let Ok(stream) = turmoil::net::TcpStream::connect((SERVER, PORT)).await {
+                self.stream = stream;
+                self.decoder = Decoder::new(DecoderLimits::default());
+                self.out.clear();
+                return Ok(());
+            }
+        }
+        Err("the node did not come back".into())
+    }
+
+    /// [`request_many`](Self::request_many), and on a connection lost to a
+    /// crash, a reconnect: `Ok(None)` says the burst's fate is unknown.
+    ///
+    /// What a client sees of a crashed server host under turmoil is a read
+    /// of zero bytes, which `request_many` reports as a closed connection;
+    /// a reset or a refused write lands here the same way.
+    ///
+    /// # Errors
+    ///
+    /// Only [`reconnect`](Self::reconnect)'s.
+    pub async fn request_or_reconnect(
+        &mut self,
+        frames: &[Frame],
+    ) -> turmoil::Result<Option<Vec<Frame>>> {
+        if let Ok(replies) = self.request_many(frames).await {
+            return Ok(Some(replies));
+        }
+        self.reconnect().await?;
+        Ok(None)
+    }
 }
+
+/// How many times a client tries to reconnect before giving up on the run.
+const RECONNECT_ATTEMPTS: u32 = 300;
+
+/// How long a client waits between attempts.
+const RECONNECT_NAP: Duration = Duration::from_millis(10);
