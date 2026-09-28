@@ -263,6 +263,16 @@ fn every_plant_answers_whether_the_swept_shapes_catch_it() {
                     "a reader sent somewhere must be sent to a file: {place}"
                 );
             }
+            Plant::PrefixScanRecovery | Plant::DropsFailedWrite => {
+                let place = place.expect(
+                    "a shape with no read corruption or write errors cannot observe a reader \
+                     or a writer that loses records",
+                );
+                assert!(
+                    place.contains("planted_recovery.rs"),
+                    "a reader sent somewhere must be sent to a file: {place}"
+                );
+            }
         }
     }
     // The place is a string, so nothing but this stops it outliving the
@@ -272,6 +282,7 @@ fn every_plant_answers_whether_the_swept_shapes_catch_it() {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../seedstone-core/src/dict.rs"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/planted_eviction.rs"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/planted_crossing.rs"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/planted_recovery.rs"),
     ] {
         assert!(
             std::path::Path::new(path).exists(),
@@ -285,7 +296,7 @@ fn every_plant_answers_whether_the_swept_shapes_catch_it() {
 /// are outside what the swept shapes reach, and one appearing or leaving
 /// that set is a change in what those shapes measure.
 #[test]
-fn the_plants_the_swept_shapes_cannot_catch_are_the_three_that_need_a_shape() {
+fn the_plants_the_swept_shapes_cannot_catch_are_the_five_that_need_a_shape() {
     let unobservable: Vec<&str> = Plant::ALL
         .into_iter()
         .filter(|plant| plant.unobservable_on_swept_shapes().is_some())
@@ -296,8 +307,21 @@ fn the_plants_the_swept_shapes_cannot_catch_are_the_three_that_need_a_shape() {
         [
             "scan-misses-rehash",
             "ignores-ceiling",
-            "crossing-skips-shard"
+            "crossing-skips-shard",
+            "prefix-scan-recovery",
+            "drops-failed-write"
         ],
         "the plants a swept violation count says nothing about have changed"
     );
+}
+
+/// A fresh node's every shard reports a resumed position of zero, and the
+/// sink folds each into the trace: a run that started from a log and one
+/// that started empty have different hashes.
+#[test]
+fn recovery_reaches_the_trace() {
+    let outcome = run_sim(&SimConfig::mini(1, 42));
+    assert_eq!(outcome.recoveries, 0, "no crash, no recovery counted");
+    // The fold itself is pinned by `the_trace_hash_is_pinned…`, re-cut once
+    // every input to it is in.
 }

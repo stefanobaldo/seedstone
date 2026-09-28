@@ -10,7 +10,12 @@
 
 use std::time::Duration;
 
+use seedstone_core::log::disk::LogFile;
+use seedstone_core::log::file::FileLog;
+use seedstone_core::log::{Record, ReplicationLog};
 use seedstone_service::FIXED_UNIX_MILLIS;
+
+use crate::outcome::{Shared, lock};
 
 /// The simulation's elapsed time, as every host sees it.
 ///
@@ -35,4 +40,74 @@ pub fn world_now() -> Duration {
 #[must_use]
 pub fn sim_wall_clock() -> u64 {
     FIXED_UNIX_MILLIS + u64::try_from(world_now().as_millis()).expect("a simulation is short")
+}
+
+/// A shard's durable point: the highest sequence a successful sync covered,
+/// and when on the world clock — or `None` before its first.
+pub type DurablePoint = Option<(u64, Duration)>;
+
+/// A crash, and what was durable when it struck.
+#[derive(Debug, Clone)]
+pub struct CrashRecord {
+    /// When, on the world clock.
+    #[expect(
+        dead_code,
+        reason = "read by the clients' model once it learns of crashes; the \
+                  expectation fails, and goes, the moment it is"
+    )]
+    pub at: Duration,
+    /// Each shard's durable point at that instant — a copy, because the
+    /// node overwrites its own the moment it syncs again.
+    pub durable: Vec<DurablePoint>,
+}
+
+/// The simulated node's log: the real one, with every successful sync
+/// reported into the run's shared state.
+pub struct Observed<F: LogFile> {
+    shard: u16,
+    inner: FileLog<F>,
+    /// The planted defect: a failed flush drops its buffer instead of
+    /// keeping it.
+    drops_failed_writes: bool,
+    /// The run's shared state, where each durable point is reported.
+    run: Shared,
+}
+
+impl<F: LogFile> Observed<F> {
+    /// Wraps `inner`, the log of `shard`, reporting into `run`.
+    pub const fn new(
+        shard: u16,
+        inner: FileLog<F>,
+        drops_failed_writes: bool,
+        run: Shared,
+    ) -> Self {
+        Self {
+            shard,
+            inner,
+            drops_failed_writes,
+            run,
+        }
+    }
+}
+
+impl<F: LogFile> ReplicationLog for Observed<F> {
+    fn append(&mut self, rec: Record<'_>) -> std::io::Result<()> {
+        self.inner.append(rec)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let result = self.inner.flush();
+        if result.is_err() && self.drops_failed_writes {
+            self.inner.drop_pending();
+        }
+        result
+    }
+
+    fn sync(&mut self) -> std::io::Result<Option<u64>> {
+        let durable = self.inner.sync()?;
+        if let Some(seq) = durable {
+            lock(&self.run.durable)[usize::from(self.shard)] = Some((seq, world_now()));
+        }
+        Ok(durable)
+    }
 }

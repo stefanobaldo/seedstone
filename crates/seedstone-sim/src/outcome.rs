@@ -1,6 +1,7 @@
 //! What one simulation reports: the trace hash, the verifier's counts, and
 //! the shared tallies the clients write into while it runs.
 
+use crate::durability::{CrashRecord, DurablePoint};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -104,6 +105,9 @@ pub struct SimOutcome {
     /// missing from one seed is expected; missing from a whole sweep is a
     /// claim that was never true.
     pub forms_emitted: BTreeSet<&'static str>,
+    /// Restarts of the node this run observed: one per crash whose
+    /// recovery reached the trace.
+    pub recoveries: u64,
 }
 
 impl SimOutcome {
@@ -169,7 +173,7 @@ impl SimOutcome {
 /// Every host in a turmoil simulation runs on the same OS thread, so this
 /// mutex is never actually contended; it is here because [`TraceSink`] and
 /// the futures turmoil holds must be `Send`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Shared {
     /// The counters every host adds to.
     pub tally: Arc<Mutex<Tally>>,
@@ -189,6 +193,35 @@ pub struct Shared {
     /// one a bug made unreachable — and the only thing that can tell the two
     /// apart is a record of what was really sent.
     pub forms: Arc<Mutex<BTreeSet<&'static str>>>,
+    /// Each shard's durable point as its log last reported it: the highest
+    /// sequence a successful sync covered, and when.
+    ///
+    /// Written by the simulated node's log — white-box on purpose. The
+    /// durable point is a fact about the server, cheap to read where it is
+    /// made and impossible to derive from outside: the housekeeping tick
+    /// has no time quota under load, so no band of wall clock says when a
+    /// sync happened.
+    pub durable: Arc<Mutex<Vec<DurablePoint>>>,
+    /// Every crash the driver inflicted, with the durable points as they
+    /// stood at that instant.
+    pub crashes: Arc<Mutex<Vec<CrashRecord>>>,
+    /// Which shards the last recovery reported as having lost records.
+    pub truncated: Arc<Mutex<Vec<bool>>>,
+}
+
+impl Shared {
+    /// Shared state for a node of `shards` shards.
+    #[must_use]
+    pub fn new(shards: u16) -> Self {
+        Self {
+            tally: Arc::default(),
+            walk: Arc::default(),
+            forms: Arc::default(),
+            durable: Arc::new(Mutex::new(vec![None; usize::from(shards)])),
+            crashes: Arc::default(),
+            truncated: Arc::new(Mutex::new(vec![false; usize::from(shards)])),
+        }
+    }
 }
 
 /// Everything the hosts count between them.
@@ -216,6 +249,19 @@ pub struct Tally {
     pub executor_calls: u64,
     pub ceiling_breaches: u64,
     pub ceiling_checks: u64,
+    /// Restarts observed.
+    pub recoveries: u64,
+    /// Shards whose resumed position was at or below the durable point at
+    /// the last crash.
+    pub lost_durable_prefixes: u64,
+    /// Of those, the ones recovery did not report as lossy.
+    pub unreported_losses: u64,
+    /// Flush failures reported by the node.
+    pub write_faults: u64,
+    /// Sync failures reported by the node.
+    pub sync_faults: u64,
+    /// Server host starts that failed and were retried.
+    pub start_failures: u64,
 }
 
 /// Takes a lock that cannot be contended, and says so if it was poisoned.

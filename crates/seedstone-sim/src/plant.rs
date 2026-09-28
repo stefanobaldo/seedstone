@@ -109,6 +109,19 @@ pub enum Plant {
     /// budget — and a defect that breaks a command predating the crossing is no
     /// longer a statement about the crossing.
     CrossingSkipsShard,
+    /// A recovery reader that treats the first damaged record as the end of
+    /// the segment, silently — the reader the record format was designed
+    /// to replace. It loses every intact record after a hole, on every
+    /// shard, and reports nothing, so a durable record it dropped is an
+    /// *unreported* loss. Observable only where a hole can sit inside the
+    /// durable region: read corruption, which `SimConfig::hostile` has and
+    /// the swept shapes do not.
+    PrefixScanRecovery,
+    /// A node whose tick drops a buffer its write failed on, instead of
+    /// keeping it for the next tick. The next successful write leaves a gap
+    /// under the durable point with no damage on disk to explain it.
+    /// Observable only where a write can fail: `SimConfig::hostile`.
+    DropsFailedWrite,
 }
 
 impl Plant {
@@ -124,12 +137,14 @@ impl Plant {
             Self::IgnoresCeiling => "ignores-ceiling",
             Self::EvictsBelowCeiling => "evicts-below-ceiling",
             Self::CrossingSkipsShard => "crossing-skips-shard",
+            Self::PrefixScanRecovery => "prefix-scan-recovery",
+            Self::DropsFailedWrite => "drops-failed-write",
         }
     }
 
     /// Every plant, so a caller listing or sweeping them cannot miss one
     /// added later.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::LostUpdate,
         Self::ServeExpired,
         Self::SweepEatsAll,
@@ -137,6 +152,8 @@ impl Plant {
         Self::IgnoresCeiling,
         Self::EvictsBelowCeiling,
         Self::CrossingSkipsShard,
+        Self::PrefixScanRecovery,
+        Self::DropsFailedWrite,
     ];
 
     /// The plant `name` selects, if it names one.
@@ -199,6 +216,12 @@ impl Plant {
             Self::CrossingSkipsShard => Some(
                 "SimConfig::crossing, walked by crates/seedstone-sim/tests/planted_crossing.rs",
             ),
+            // A hole inside the durable region needs read corruption, and a
+            // dropped buffer needs a write that fails: the swept shapes
+            // tear pending writes at a crash and do neither.
+            Self::PrefixScanRecovery | Self::DropsFailedWrite => {
+                Some("SimConfig::hostile, swept by crates/seedstone-sim/tests/planted_recovery.rs")
+            }
         }
     }
 }

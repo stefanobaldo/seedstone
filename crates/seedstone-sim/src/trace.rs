@@ -3,10 +3,10 @@
 //!
 //! Changing anything here moves every pinned hash.
 
-use seedstone_core::shard::{Command, Reply, Route, TraceSink};
+use seedstone_core::shard::{Command, LogFault, Reply, Route, TraceSink};
 use std::sync::{Arc, Mutex};
 
-use crate::outcome::lock;
+use crate::outcome::{Shared, lock};
 
 /// The odd 64-bit constant from Fibonacci hashing, used both to decorrelate
 /// per-client workload seeds and as the trace hash's multiplier.
@@ -36,12 +36,26 @@ pub const fn mix(h: u64, v: u64) -> u64 {
 ///
 /// Calls arrive in each shard's own execution order, which under a
 /// deterministic scheduler is a function of the seeds alone.
+///
+/// It also carries the run's shared state, because two of the node's
+/// reports are about durability rather than commands: what a shard resumed
+/// at after a restart, and a log that could not be written.
 #[derive(Clone)]
-pub struct HashSink(pub Arc<Mutex<u64>>);
+pub struct HashSink {
+    hash: Arc<Mutex<u64>>,
+    shared: Shared,
+}
+
+impl HashSink {
+    /// A sink folding into `hash` and reporting into `shared`.
+    pub const fn new(hash: Arc<Mutex<u64>>, shared: Shared) -> Self {
+        Self { hash, shared }
+    }
+}
 
 impl TraceSink for HashSink {
     fn record(&self, shard: u16, seq: u64, cmd: &Command, reply: &Reply) {
-        let mut h = lock(&self.0);
+        let mut h = lock(&self.hash);
         let mut acc = *h;
         acc = mix(acc, u64::from(shard));
         // `seq` is the replication position where the command's effects
@@ -75,6 +89,52 @@ impl TraceSink for HashSink {
         acc = fold_inputs(acc, cmd);
         acc = fold_reply(acc, reply);
         *h = acc;
+    }
+
+    /// Folded: two runs that recovered different prefixes are different
+    /// runs. Checked: a shard that resumed at or below the sequence that was
+    /// durable when the node last crashed lost a durable record — the
+    /// invariant the log makes, measured on the server's own numbers.
+    fn recovered(&self, shard: u16, next_seq: u64, lossy: bool) {
+        {
+            let mut h = lock(&self.hash);
+            *h = mix(
+                mix(
+                    mix(mix(*h, 0x5EED_0000_0000_0001), u64::from(shard)),
+                    next_seq,
+                ),
+                u64::from(lossy),
+            );
+        }
+        lock(&self.shared.truncated)[usize::from(shard)] = lossy;
+        // A start with no crash before it is the node's first: nothing was
+        // durable, so nothing can have been lost.
+        let Some(durable) = lock(&self.shared.crashes)
+            .last()
+            .map(|last| last.durable[usize::from(shard)])
+        else {
+            return;
+        };
+        let mut tally = lock(&self.shared.tally);
+        if shard == 0 {
+            tally.recoveries += 1;
+        }
+        if let Some((durable_seq, _)) = durable
+            && next_seq <= durable_seq
+        {
+            tally.lost_durable_prefixes += 1;
+            if !lossy {
+                tally.unreported_losses += 1;
+            }
+        }
+    }
+
+    fn fault(&self, _shard: u16, fault: LogFault, _error: &std::io::Error) {
+        let mut tally = lock(&self.shared.tally);
+        match fault {
+            LogFault::Write => tally.write_faults += 1,
+            LogFault::Sync => tally.sync_faults += 1,
+        }
     }
 }
 

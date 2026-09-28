@@ -369,6 +369,7 @@ mod tests {
             ceiling_checks: 0,
             evictable: false,
             forms_emitted: BTreeSet::new(),
+            recoveries: 0,
         }
     }
 
