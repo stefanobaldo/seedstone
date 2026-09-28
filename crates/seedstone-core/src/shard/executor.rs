@@ -9,8 +9,8 @@ use crate::log::effect::Effect;
 use crate::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use crate::shard::apply::{append, apply};
 use crate::shard::{
-    Command, Envelope, EvictionPolicy, ExpiryPolicy, KIND_SLOTS, Reply, ReplyError, ReplyTo, Route,
-    ShardPolicy, ShardStats, TraceSink,
+    Command, Envelope, EvictionPolicy, ExpiryPolicy, KIND_SLOTS, LogFault, Reply, ReplyError,
+    ReplyTo, Route, ShardPolicy, ShardStats, TraceSink,
 };
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -397,6 +397,14 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                 // executor should not disagree about which keys this tick found
                 // expired.
                 let now = Instant::now();
+                // The inverse of the envelope arm's `shard - first_shard`:
+                // these states were built from a `0..shards` walk in
+                // ascending order, so a range's offsets are shard ids and fit
+                // the `u16` a shard id is.
+                let shard_at = |offset: usize| {
+                    first_shard
+                        + u16::try_from(offset).expect("a shard range is shorter than u16::MAX")
+                };
                 for (offset, state) in states.iter_mut().enumerate() {
                     // One reading either side of the whole tick's work: the
                     // rehash step changes what the tables cost and the sweep
@@ -404,27 +412,29 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                     // about the sum.
                     let before = state.dict.used_bytes();
                     state.dict.rehash_step(REHASH_BUCKETS_PER_TICK);
-                    // The inverse of the envelope arm's `shard - first_shard`:
-                    // these states were built from a `0..shards` walk in
-                    // ascending order, so a range's offsets are shard ids and
-                    // fit the `u16` a shard id is.
-                    let shard = first_shard
-                        + u16::try_from(offset).expect("a shard range is shorter than u16::MAX");
-                    sweep_expired(state, shard, &trace, now, &policy);
+                    sweep_expired(state, shard_at(offset), &trace, now, &policy);
                     memory.gauge.apply(before, state.dict.used_bytes());
-                    // The durability point, and the only place in a shard that
-                    // can afford to be one: `append` runs inside a handler that
-                    // cannot `await`, so it must stay cheap, while this arm is
-                    // already async and may block. That split is why the trait
-                    // has two methods rather than one.
-                    //
-                    // The cadence is the tick's, which is a starting shape
-                    // rather than a policy — a real log picks its own, and may
-                    // want group commit across shards instead. The error has
-                    // nowhere to go until this project has somewhere to report
-                    // to; a log that cannot sync is a problem for the release
-                    // that gives it bytes to write, and an answer from there too.
-                    let _ = state.log.sync();
+                }
+                // The durability point, and the only place in a shard that
+                // can afford one: `append` runs inside a handler that cannot
+                // `await`, so it buffers; this arm is already async and may
+                // block on the disk. Two passes rather than one: every
+                // shard's buffer is written first, then every shard is
+                // synced, so an implementation that shares a file between
+                // the shards of an executor pays one `fsync` for the whole
+                // tick rather than one per shard. A failure of either pass
+                // is reported to the sink and retried on the next tick; see
+                // `ReplicationLog::flush` for why a failed write keeps its
+                // bytes.
+                for (offset, state) in states.iter_mut().enumerate() {
+                    if let Err(error) = state.log.flush() {
+                        trace.fault(shard_at(offset), LogFault::Write, &error);
+                    }
+                }
+                for (offset, state) in states.iter_mut().enumerate() {
+                    if let Err(error) = state.log.sync() {
+                        trace.fault(shard_at(offset), LogFault::Sync, &error);
+                    }
                 }
             }
         }
