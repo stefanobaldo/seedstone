@@ -330,7 +330,6 @@ fn recovery_reaches_the_trace() {
 /// The driver crashes and restarts the node on the seed's schedule, and the
 /// run still holds every invariant it can state.
 #[test]
-#[ignore = "the counter range lands with the verdict"]
 fn a_run_with_crashes_under_load_recovers_and_holds() {
     // Seed 2 draws two crashes, at 61 ms and 499 ms: inside the workload,
     // and more than one, so a restart is itself restarted from.
@@ -391,4 +390,62 @@ fn the_crash_schedule_is_drawn_from_the_seed() {
             .is_empty()
     );
     let _ = (a.next_due(Duration::ZERO), b.next_due(Duration::ZERO));
+}
+
+/// The verdict's shape under a crash: the counter sum is a range, a lost
+/// durable write is a violation on the swept disk and an excused one on
+/// the hostile disk only when recovery reported the shard.
+#[test]
+fn the_verdict_knows_what_a_crash_and_a_hostile_disk_excuse() {
+    let clean = run_sim(&SimConfig::mini(1, 42));
+    let mut held = clean.clone();
+    held.crashes = 1;
+    held.counter_floor = held.expected_sum - 5;
+    held.counter_ceiling = held.expected_sum;
+    held.actual_sum = held.expected_sum - 3;
+    assert!(
+        held.invariant_holds(),
+        "a sum inside [floor, ceiling] holds under a crash"
+    );
+    held.actual_sum = held.expected_sum - 6;
+    assert!(
+        !held.invariant_holds(),
+        "below the floor is a lost durable increment"
+    );
+    held.actual_sum = held.expected_sum + 1;
+    assert!(
+        !held.invariant_holds(),
+        "above the ceiling is an increment nobody sent"
+    );
+    held.counter_ceiling = held.expected_sum + 1;
+    assert!(
+        held.invariant_holds(),
+        "an increment whose reply a crash took may have landed"
+    );
+
+    let mut lost = clean.clone();
+    lost.crashes = 1;
+    lost.lost_durable_prefixes = 1;
+    assert!(!lost.invariant_holds(), "the swept disk promises survival");
+    lost.hostile = true;
+    assert!(
+        lost.invariant_holds(),
+        "the hostile disk promises only that a loss is reported"
+    );
+    lost.unreported_losses = 1;
+    assert!(!lost.invariant_holds());
+
+    let mut read_lost = clean.clone();
+    read_lost.lost_durable_writes = 1;
+    assert!(
+        !read_lost.invariant_holds(),
+        "a durable value read back wrong"
+    );
+
+    let mut phantom = clean;
+    phantom.phantom_writes = 1;
+    assert!(
+        !phantom.invariant_holds(),
+        "a value nobody wrote is never excused"
+    );
 }

@@ -371,7 +371,19 @@ mod tests {
             forms_emitted: BTreeSet::new(),
             recoveries: 0,
             crashes: 0,
+            counter_floor: 0,
+            counter_ceiling: 0,
             lost_durable_prefixes: 0,
+            unreported_losses: 0,
+            lost_durable_writes: 0,
+            excused_losses: 0,
+            durable_checks: 0,
+            phantom_writes: 0,
+            either_checks: 0,
+            write_faults: 0,
+            sync_faults: 0,
+            start_failures: 0,
+            hostile: false,
         }
     }
 

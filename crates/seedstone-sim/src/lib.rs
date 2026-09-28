@@ -394,7 +394,19 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         forms_emitted: lock(&shared.forms).clone(),
         recoveries: tally.recoveries,
         crashes: lock(&shared.crashes).len() as u64,
+        counter_floor: tally.counter_floor,
+        counter_ceiling: tally.counter_ceiling,
         lost_durable_prefixes: tally.lost_durable_prefixes,
+        unreported_losses: tally.unreported_losses,
+        lost_durable_writes: tally.lost_durable_writes,
+        excused_losses: tally.excused_losses,
+        durable_checks: tally.durable_checks,
+        phantom_writes: tally.phantom_writes,
+        either_checks: tally.either_checks,
+        write_faults: tally.write_faults,
+        sync_faults: tally.sync_faults,
+        start_failures: tally.start_failures,
+        hostile: cfg.disk.corruption_permille > 0 || cfg.disk.io_error_permille > 0,
     }
 }
 

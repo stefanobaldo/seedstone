@@ -6,7 +6,7 @@
 //! seed on that line goes straight into `replay`.
 //!
 //! ```text
-//! sweep --seeds N [--seed-start S] [--workload-seed W] [--mini | --eviction] [--plant NAME]
+//! sweep --seeds N [--seed-start S] [--workload-seed W] [--mini | --eviction | --hostile] [--plant NAME]
 //!       [--hashes] [--workers K]
 //! ```
 //!
@@ -34,7 +34,7 @@ use std::process::ExitCode;
 mod args;
 
 const USAGE: &str = "usage: sweep --seeds N [--seed-start S] [--workload-seed W] \
-                     [--mini | --eviction] [--plant NAME] [--hashes] [--workers K]";
+                     [--mini | --eviction | --hostile] [--plant NAME] [--hashes] [--workers K]";
 
 fn main() -> ExitCode {
     let args = match args::Args::from_env() {
@@ -82,7 +82,8 @@ fn main() -> ExitCode {
                 // found up to that point.
                 println!(
                     "FAIL seed={} trace=0x{:016x} expected={} actual={} stale={} spurious={} \
-                     plain={} walk={} breaches={} evicted={} observed={}",
+                     plain={} walk={} breaches={} evicted={} observed={} crashes={} \
+                     durable_lost={} phantom={} prefix_lost={} unreported={}",
                     sim_seed,
                     outcome.trace_hash,
                     outcome.expected_sum,
@@ -93,7 +94,12 @@ fn main() -> ExitCode {
                     outcome.walk_mismatches,
                     outcome.ceiling_breaches,
                     outcome.evicted_keys,
-                    outcome.evictions_observed
+                    outcome.evictions_observed,
+                    outcome.crashes,
+                    outcome.lost_durable_writes,
+                    outcome.phantom_writes,
+                    outcome.lost_durable_prefixes,
+                    outcome.unreported_losses
                 );
             }
         },
@@ -170,12 +176,11 @@ fn range(seed_start: u64, seeds: u64) -> Result<RangeInclusive<u64>, String> {
 /// How the swept configuration is named in the summary, so a pasted line says
 /// which shape produced it.
 const fn shape(args: &args::Args) -> &'static str {
-    if args.mini {
-        "mini"
-    } else if args.eviction {
-        "eviction"
-    } else {
-        "standard"
+    match args.shape {
+        args::Shape::Standard => "standard",
+        args::Shape::Mini => "mini",
+        args::Shape::Eviction => "eviction",
+        args::Shape::Hostile => "hostile",
     }
 }
 
@@ -239,6 +244,7 @@ mod tests {
             "--workload-seed",
             "--mini",
             "--eviction",
+            "--hostile",
             "--plant",
             "--hashes",
             "--workers",

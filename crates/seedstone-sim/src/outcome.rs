@@ -111,9 +111,42 @@ pub struct SimOutcome {
     pub recoveries: u64,
     /// Crashes the driver inflicted.
     pub crashes: u64,
+    /// The least the counters may sum to after the run's crashes. See
+    /// [`Tally::counter_floor`]; meaningful only where [`crashes`] is not
+    /// zero.
+    ///
+    /// [`crashes`]: SimOutcome::crashes
+    pub counter_floor: i64,
+    /// The most they may sum to. See [`Tally::counter_ceiling`].
+    pub counter_ceiling: i64,
     /// Shards that resumed at or below the sequence that was durable when
     /// the node last crashed: a durable write that did not survive.
     pub lost_durable_prefixes: u64,
+    /// Of those, the ones the node's recovery did not report as lossy.
+    pub unreported_losses: u64,
+    /// Reads of a value a crash left known to be durable that disagreed, on
+    /// a shard the recovery did not report.
+    pub lost_durable_writes: u64,
+    /// The same disagreements on a shard the recovery did report.
+    pub excused_losses: u64,
+    /// Reads decided against a value a crash left known to be durable — the
+    /// denominator of the two above.
+    pub durable_checks: u64,
+    /// Reads that returned none of the candidates a crash left open: a
+    /// value nobody wrote.
+    pub phantom_writes: u64,
+    /// Reads decided against several candidates — the denominator of
+    /// [`SimOutcome::phantom_writes`].
+    pub either_checks: u64,
+    /// Flush failures the node reported.
+    pub write_faults: u64,
+    /// Sync failures the node reported.
+    pub sync_faults: u64,
+    /// Server host starts that failed on the disk and were retried.
+    pub start_failures: u64,
+    /// Whether the run's disk could fail and lie, which is what decides
+    /// whether a reported loss is excused.
+    pub hostile: bool,
 }
 
 impl SimOutcome {
@@ -124,7 +157,10 @@ impl SimOutcome {
     /// increment that did not survive. Then the keyspace invariants, each of
     /// which a schedule is equally powerless to excuse — a deadline is a
     /// deadline, a key nobody else can write is what its owner last wrote,
-    /// and a walk over a set nobody is touching returns that set.
+    /// and a walk over a set nobody is touching returns that set. Then what
+    /// a crash may not do: lose a write a sync covered (on the disk that only
+    /// tears), lose one without saying so (on the disk that also fails and
+    /// lies), or bring back a value nobody wrote (on any disk).
     #[must_use]
     pub const fn invariant_holds(&self) -> bool {
         // The counter sum is claimed only where nothing can reclaim a
@@ -138,7 +174,36 @@ impl SimOutcome {
         // shapes that sweep for lost updates are the ones with no ceiling,
         // which is where that invariant is measured — see
         // `tests/planted_race.rs`.
-        (self.evictable || self.expected_sum == self.actual_sum)
+        //
+        // Under a crash it is a range rather than an equality: an increment
+        // acknowledged after its shard's last sync may be gone, and one
+        // whose reply the crash took may have landed. Every increment every
+        // later crash found synced is owed; each of the others may add or
+        // take away its own delta. Sound — every sum a crash can leave lies
+        // in the range — and weaker than equality, which stays the claim on
+        // runs without one.
+        let counters = if self.evictable {
+            true
+        } else if self.crashes == 0 {
+            self.expected_sum == self.actual_sum
+        } else {
+            self.counter_floor <= self.actual_sum && self.actual_sum <= self.counter_ceiling
+        };
+        // Survival on the disk that only tears: a write a successful sync
+        // covered came back, by the server's own numbers and by the
+        // clients' reads. On the disk that also fails and lies, read
+        // corruption can destroy a durable record and no honest server can
+        // promise otherwise — what it owes there is to say so.
+        let durability = if self.hostile {
+            self.unreported_losses == 0
+        } else {
+            self.lost_durable_prefixes == 0 && self.lost_durable_writes == 0
+        };
+        counters
+            && durability
+            // A value no acknowledged write produced is never excused, on
+            // any disk: that is a replay that invented a record.
+            && self.phantom_writes == 0
             && self.stale_reads == 0
             && self.spurious_deaths == 0
             && self.plain_mismatches == 0
@@ -151,9 +216,6 @@ impl SimOutcome {
             // node evicts keys nobody reads back, and one client's reads are
             // a sample of what it took.
             && self.evicted_keys >= self.evictions_observed
-            // A shard that came back at or below its durable point lost a
-            // record a successful sync had covered.
-            && self.lost_durable_prefixes == 0
     }
 
     /// Whether the run's invariants decided anything at all.
@@ -174,6 +236,10 @@ impl SimOutcome {
             // none, a zero here is the honest answer and not a harness that
             // measured nothing.
             && (!self.evictable || self.ceiling_checks > 0)
+            // A run that crashed must have restarted, and read something
+            // back against what the crash left.
+            && (self.crashes == 0
+                || (self.recoveries > 0 && self.durable_checks + self.either_checks > 0))
     }
 }
 
