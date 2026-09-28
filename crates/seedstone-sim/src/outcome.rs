@@ -111,13 +111,16 @@ pub struct SimOutcome {
     pub recoveries: u64,
     /// Crashes the driver inflicted.
     pub crashes: u64,
-    /// The least the counters may sum to after the run's crashes. See
-    /// [`Tally::counter_floor`]; meaningful only where [`crashes`] is not
+    /// The least the counters may sum to after the run's crashes: every
+    /// increment no crash could have taken, plus every negative one a crash
+    /// may have left standing. Meaningful only where [`crashes`] is not
     /// zero.
     ///
     /// [`crashes`]: SimOutcome::crashes
     pub counter_floor: i64,
-    /// The most they may sum to. See [`Tally::counter_ceiling`].
+    /// The most they may sum to: the same, with the positive ones. The
+    /// deltas are of either sign, so a lost increment can move the sum
+    /// either way.
     pub counter_ceiling: i64,
     /// Shards that resumed at or below the sequence that was durable when
     /// the node last crashed: a durable write that did not survive.
