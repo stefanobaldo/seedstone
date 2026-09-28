@@ -40,6 +40,7 @@
 //! only meaningful at a record boundary the reader arrived at by consuming
 //! whole records — see [`Decoded::EndOfLog`].
 
+pub mod disk;
 pub mod effect;
 
 /// Magic byte that opens a record.
