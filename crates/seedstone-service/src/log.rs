@@ -132,6 +132,45 @@ pub static PASSWORD_RELOAD_SKIPPED: Event = Event {
     fields: &[],
 };
 
+/// The log was read on start-up. One line per start, before `listening`.
+pub static RECOVERY: Event = Event {
+    name: "recovery",
+    level: Level::Info,
+    fields: &[
+        "segments",
+        "records",
+        "applied",
+        "discarded",
+        "damage_bytes",
+        "truncated_shards",
+    ],
+};
+
+/// One shard's log had a gap: what precedes it was replayed, what follows
+/// it was discarded. `warn`: the node is serving, with less than it had.
+pub static RECOVERY_TRUNCATED: Event = Event {
+    name: "recovery_truncated",
+    level: Level::Warn,
+    fields: &["shard", "applied", "discarded"],
+};
+
+/// The log could not be read at all — a directory that cannot be listed
+/// or created, or a segment from a newer version; the process exits after
+/// this line.
+pub static RECOVERY_FAILED: Event = Event {
+    name: "recovery_failed",
+    level: Level::Error,
+    fields: &["error"],
+};
+
+/// A shard's log could not be written or synced on a housekeeping tick.
+/// `stage` is `write` or `sync`; the records are kept and retried.
+pub static LOG_FAULT: Event = Event {
+    name: "log_fault",
+    level: Level::Error,
+    fields: &["shard", "stage", "error"],
+};
+
 /// Every event the server can write, in the order the page lists them.
 pub static EVENTS: &[&Event] = &[
     &LISTENING,
@@ -141,6 +180,10 @@ pub static EVENTS: &[&Event] = &[
     &PASSWORD_RELOADED,
     &PASSWORD_RELOAD_FAILED,
     &PASSWORD_RELOAD_SKIPPED,
+    &RECOVERY,
+    &RECOVERY_TRUNCATED,
+    &RECOVERY_FAILED,
+    &LOG_FAULT,
 ];
 
 /// One line: the envelope, then `event`'s fields with `values` in order.
