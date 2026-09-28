@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::{CrashPlan, DiskFaults};
 
 #[test]
 fn same_seeds_same_hash_and_no_lost_updates() {
@@ -324,4 +325,71 @@ fn recovery_reaches_the_trace() {
     assert_eq!(outcome.recoveries, 0, "no crash, no recovery counted");
     // The fold itself is pinned by `the_trace_hash_is_pinned…`, re-cut once
     // every input to it is in.
+}
+
+/// The driver crashes and restarts the node on the seed's schedule, and the
+/// run still holds every invariant it can state.
+#[test]
+#[ignore = "reconnect lands with the model"]
+fn a_run_with_crashes_under_load_recovers_and_holds() {
+    // Seed 2 draws two crashes, at 61 ms and 499 ms: inside the workload,
+    // and more than one, so a restart is itself restarted from.
+    let mut cfg = SimConfig::mini(1, 2);
+    cfg.crashes = CrashPlan::UnderLoad { max: 2 };
+    cfg.disk = DiskFaults::TORN;
+    let outcome = run_sim(&cfg);
+    assert_eq!(
+        outcome.crashes, 2,
+        "the seed's schedule was not driven: {outcome:?}"
+    );
+    assert!(outcome.invariant_holds(), "{outcome:?}");
+    assert_eq!(
+        outcome.recoveries, outcome.crashes,
+        "every crash was followed by a recovery: {outcome:?}"
+    );
+    // Determinism across the crash: the same seed crashes at the same
+    // instants and folds the same recoveries.
+    assert_eq!(run_sim(&cfg).trace_hash, outcome.trace_hash);
+}
+
+/// At rest, every acknowledged write was synced before the crash, so the
+/// model is exact after it and reads everything back.
+#[test]
+#[ignore = "reconnect lands with the model"]
+fn a_crash_at_rest_recovers_exactly() {
+    let mut cfg = SimConfig::mini(1, 3);
+    cfg.crashes = CrashPlan::AtRest;
+    cfg.disk = DiskFaults::TORN;
+    let outcome = run_sim(&cfg);
+    assert!(outcome.invariant_holds(), "{outcome:?}");
+    assert_eq!(outcome.crashes, 1);
+    assert_eq!(outcome.recoveries, 1);
+    assert_eq!(outcome.lost_durable_prefixes, 0);
+    assert!(outcome.plain_checks > 0);
+}
+
+/// The schedule is a function of the seed and the plan, and nothing else.
+#[test]
+fn the_crash_schedule_is_drawn_from_the_seed() {
+    use crate::durability::{CRASH_WINDOW, CrashSchedule};
+    let mut a = CrashSchedule::draw(CrashPlan::UnderLoad { max: 2 }, 5);
+    let mut b = CrashSchedule::draw(CrashPlan::UnderLoad { max: 2 }, 5);
+    assert_eq!(a.instants(), b.instants());
+    assert!(a.instants().iter().all(|at| *at <= CRASH_WINDOW));
+    assert!(a.instants().len() <= 2);
+    let differs = (1..20u64).any(|seed| {
+        CrashSchedule::draw(CrashPlan::UnderLoad { max: 2 }, seed).instants() != a.instants()
+    });
+    assert!(differs, "twenty seeds drew the same schedule");
+    assert!(
+        CrashSchedule::draw(CrashPlan::None, 5)
+            .instants()
+            .is_empty()
+    );
+    assert!(
+        CrashSchedule::draw(CrashPlan::AtRest, 5)
+            .instants()
+            .is_empty()
+    );
+    let _ = (a.next_due(Duration::ZERO), b.next_due(Duration::ZERO));
 }
