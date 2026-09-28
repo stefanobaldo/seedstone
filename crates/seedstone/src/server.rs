@@ -489,6 +489,7 @@ impl Server {
             memory: self.pool.memory(),
             limit: self.pool.limit(),
             passwords: self.passwords.clone(),
+            idle_shed_after: seedstone_service::IDLE_SHED_AFTER,
             run_id: self.run_id.clone(),
             process_id: std::process::id(),
             // A path this process cannot name is reported as unknown rather

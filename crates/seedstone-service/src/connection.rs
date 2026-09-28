@@ -149,6 +149,9 @@ pub const READ_QUIET_READS: u32 = 4;
 /// the timer is armed only while the buffers are above the floor, and it
 /// disarms itself after shedding. A server at its connection limit with every
 /// peer silent therefore holds no timers at all.
+///
+/// This is production's value; a connection reads the interval from
+/// [`NodeInfo::idle_shed_after`], which the simulator sets shorter.
 pub const IDLE_SHED_AFTER: Duration = Duration::from_secs(2);
 
 /// The reply buffer capacity a connection sheds back to after each write.
@@ -297,7 +300,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     R: Router,
 {
-    serve_connection_limited(stream, router, node, MAX_REQUEST_BYTES, IDLE_SHED_AFTER).await;
+    let idle_shed = node.idle_shed_after;
+    serve_connection_limited(stream, router, node, MAX_REQUEST_BYTES, idle_shed).await;
 }
 
 /// [`serve_connection`] with the accumulation ceiling and the idle interval as
