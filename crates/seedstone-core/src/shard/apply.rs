@@ -813,8 +813,11 @@ pub fn append<L: ReplicationLog>(
     shard: u16,
     effect: Effect<'_>,
 ) -> Result<(), Reply> {
-    let mut payload = Vec::with_capacity(effect.encoded_len());
-    effect.encode(&mut payload);
+    let mut payload = Vec::new();
+    if log.keeps_payloads() {
+        payload.reserve_exact(effect.encoded_len());
+        effect.encode(&mut payload);
+    }
     let record = Record {
         shard,
         seq: *seq,
