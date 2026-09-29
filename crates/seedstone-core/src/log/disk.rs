@@ -5,7 +5,7 @@
 //! purpose. The simulator's filesystem is a type swap that panics outside a
 //! simulation, so production and simulation cannot share one file type; but
 //! its `File` implements the real `std::io` traits, so what has to be
-//! abstracted is only the eight verbs below, not a filesystem.
+//! abstracted is only the nine verbs below, not a filesystem.
 //!
 //! A verb added here is a review question: the seam is narrow so that a
 //! reader can hold in one sitting everything the log can do to a disk.
@@ -95,6 +95,19 @@ pub trait Disk {
     ///
     /// Whatever the store reports.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+
+    /// Removes `path`.
+    ///
+    /// The one thing the log deletes, and it is a whole file it wrote
+    /// itself: a segment or a snapshot a durable snapshot has made
+    /// redundant. The directory is not synced here — the caller syncs once
+    /// after every removal of a batch.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports, `NotFound` included: the caller counts
+    /// what it removed, and a file that was already gone is not one of them.
+    fn remove_file(&self, path: &Path) -> io::Result<()>;
 }
 
 /// The real filesystem.
@@ -158,6 +171,10 @@ impl Disk for StdDisk {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
     }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
+    }
 }
 
 /// A filesystem in a map, for the tests of everything above the seam.
@@ -178,6 +195,7 @@ pub(crate) mod mem {
         dirs: BTreeSet<PathBuf>,
         files: BTreeMap<PathBuf, Vec<u8>>,
         fail_writes: bool,
+        fail_removes: bool,
     }
 
     /// The map, shared by every handle onto it.
@@ -208,6 +226,11 @@ pub(crate) mod mem {
         /// Whether every write from now on fails.
         pub fn fail_writes(&self, fail: bool) {
             self.lock().fail_writes = fail;
+        }
+
+        /// Whether every removal from now on fails.
+        pub fn fail_removes(&self, fail: bool) {
+            self.lock().fail_removes = fail;
         }
     }
 
@@ -309,6 +332,17 @@ pub(crate) mod mem {
             drop(fs);
             Ok(())
         }
+
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            let mut fs = self.lock();
+            if fs.fail_removes {
+                return Err(io::Error::other("injected removal failure"));
+            }
+            fs.files
+                .remove(path)
+                .map(|_| ())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))
+        }
     }
 }
 
@@ -350,6 +384,14 @@ mod tests {
         names.sort();
         assert_eq!(names, ["a.seg", "g"]);
 
+        disk.remove_file(&wal.join("g")).unwrap();
+        assert_eq!(disk.list(&wal).unwrap(), ["a.seg"]);
+        assert_eq!(
+            disk.remove_file(&wal.join("g")).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "removing what is not there is an error, not a no-op: the caller counts"
+        );
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -375,6 +417,20 @@ mod tests {
         let mut names = disk.list(wal).unwrap();
         names.sort();
         assert_eq!(names, ["a.seg", "g"]);
+
+        disk.remove_file(&wal.join("g")).unwrap();
+        assert_eq!(disk.list(wal).unwrap(), ["a.seg"]);
+        assert_eq!(
+            disk.remove_file(&wal.join("g")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        disk.fail_removes(true);
+        assert!(
+            disk.remove_file(&path).is_err(),
+            "an injected removal failure"
+        );
+        assert_eq!(disk.contents(&path), b"hello world", "and the file stays");
+        disk.fail_removes(false);
 
         disk.fail_writes(true);
         assert!(file.write_all(b"!").is_err());
