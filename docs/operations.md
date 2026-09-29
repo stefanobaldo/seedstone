@@ -78,7 +78,7 @@ as the server writes them:
 | `recovery` | `info` | `segments`, `records`, `applied`, `discarded`, `damage_bytes`, `holes`, `abandoned_segments`, `malformed`, `truncated_shards`, `lossy_shards` | the log under `--data-dir` was read on start-up; `applied` records were replayed, `discarded` were cut after a gap, `damage_bytes` were stepped over in `holes` damaged regions, `abandoned_segments` could not be read past a point, `malformed` records were intact but unreadable by this build; `lossy_shards` is how many shards any of that may have cost records — a hole can take a shard's last records without leaving a gap |
 | `recovery_truncated` | `warn` | `shard`, `applied`, `discarded` | one shard's log had a gap: `applied` records before it were replayed, `discarded` after it were not; the node serves what it has |
 | `recovery_failed` | `error` | `error` | the log could not be read — the directory cannot be created or listed, or a segment is from a newer version; the process exits 1 after this line |
-| `log_fault` | `error` | `shard`, `stage`, `error` | a shard's log could not be written (`stage` `write`) or made durable (`sync`) on a housekeeping tick; the records are kept and the next tick retries |
+| `log_fault` | `error` | `shard`, `stage`, `error` | a shard's log could not be written (`stage` `write`) or made durable (`sync`) on a housekeeping tick. A failed write keeps its records and the next tick retries it. A failed sync is retried too, but a filesystem may drop what it could not write and report the retry as a success, so writes acknowledged since the last successful sync may be lost; the next start reads what the disk kept and reports any damage it finds |
 
 `error_reply` is `warn` and not `error` on purpose: an `ERR unknown command`
 is the client's mistake or the deployment's, and the server that reported it
@@ -176,9 +176,16 @@ The node appends every write to a log under `PATH/wal/` and syncs it on its
 housekeeping tick — every 100 ms on a node with room to spare, less often on
 one kept busy, since commands are served before housekeeping. A write
 acknowledged before a sync survives a crash; one acknowledged after the last
-sync may not. On start the
+sync may not — nor, once a sync has failed (`log_fault` with `stage` `sync`),
+may anything acknowledged since the last one that succeeded. On start the
 log is read back: a shard whose records have a gap is replayed up to the gap
 and reported with `recovery_truncated`, and the node serves what it has.
+
+Start-up reads the whole log and holds every record it replays in memory
+until replay is done, so both the time a start takes and the memory it
+needs grow with everything ever written, not with the keyspace that
+results. A node restarted after a long run with this flag needs memory for
+its whole write history, briefly.
 
 One process at a time: the node takes an exclusive lock on `PATH/wal/LOCK`
 before it reads the log, and a second node started on the same directory

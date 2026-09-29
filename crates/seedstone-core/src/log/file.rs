@@ -120,6 +120,11 @@ pub struct Segment<F: LogFile> {
     /// Public to the crate so a test can see the one-sync-per-tick property
     /// it exists for.
     pub(crate) dirty: bool,
+    /// Whether a sync of this segment has ever failed. A filesystem may drop
+    /// the pages a failed sync could not write and report success on the
+    /// next one, so from then on no sync of this segment proves anything
+    /// new: every shard's durable point on it stays where it was.
+    sync_failed: bool,
 }
 
 /// A segment behind the lock the shards of one executor share.
@@ -138,6 +143,8 @@ pub struct FileLog<F: LogFile> {
     pending_through: Option<u64>,
     /// The highest sequence written to the segment.
     flushed_through: Option<u64>,
+    /// The highest sequence a sync has made durable.
+    durable: Option<u64>,
     segment: SharedSegment<F>,
 }
 
@@ -150,6 +157,7 @@ impl<F: LogFile> FileLog<F> {
             pending: Vec::new(),
             pending_through: None,
             flushed_through: None,
+            durable: None,
             segment,
         }
     }
@@ -206,11 +214,17 @@ impl<F: LogFile> ReplicationLog for FileLog<F> {
     fn sync(&mut self) -> io::Result<Option<u64>> {
         let mut segment = lock(&self.segment);
         if segment.dirty {
-            segment.file.sync_data()?;
+            if let Err(error) = segment.file.sync_data() {
+                segment.sync_failed = true;
+                return Err(error);
+            }
             segment.dirty = false;
         }
+        if !segment.sync_failed {
+            self.durable = self.flushed_through;
+        }
         drop(segment);
-        Ok(self.flushed_through)
+        Ok(self.durable)
     }
 }
 
@@ -275,7 +289,11 @@ pub fn open_segments<D: Disk>(
         encode_segment_header(generation, executor, &mut header);
         file.write_all(&header)?;
         file.sync_data()?;
-        segments.push(Arc::new(Mutex::new(Segment { file, dirty: false })));
+        segments.push(Arc::new(Mutex::new(Segment {
+            file,
+            dirty: false,
+            sync_failed: false,
+        })));
     }
     disk.sync_dir(wal)?;
     Ok(segments)
@@ -442,14 +460,34 @@ mod tests {
         })
         .unwrap();
         log.flush().unwrap();
+        assert_eq!(log.sync().unwrap(), Some(0));
+        log.append(Record {
+            shard: 0,
+            seq: 1,
+            payload: b"y",
+        })
+        .unwrap();
+        log.flush().unwrap();
         disk.fail_writes(true);
         assert!(log.sync().is_err());
         disk.fail_writes(false);
+        // A filesystem may drop the pages a failed sync could not write and
+        // report success on the next one, so the retry proves nothing about
+        // what the failed sync held: the point stays where it was, and
+        // recovery on the next start finds whatever was really lost.
         assert_eq!(
             log.sync().unwrap(),
             Some(0),
-            "the retried sync covers the flushed record"
+            "a sync after a failed one does not advance the durable point"
         );
+        log.append(Record {
+            shard: 0,
+            seq: 2,
+            payload: b"z",
+        })
+        .unwrap();
+        log.flush().unwrap();
+        assert_eq!(log.sync().unwrap(), Some(0), "nor does any later one");
     }
 
     #[test]
