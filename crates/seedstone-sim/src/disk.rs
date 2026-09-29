@@ -78,4 +78,8 @@ impl Disk for SimDisk {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         sim_fs::rename(from, to)
     }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        sim_fs::remove_file(path)
+    }
 }
