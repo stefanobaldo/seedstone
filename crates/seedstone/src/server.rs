@@ -796,6 +796,8 @@ impl TraceSink for FaultLines {
         let stage = match fault {
             LogFault::Write => "write",
             LogFault::Sync => "sync",
+            LogFault::Snapshot => "snapshot",
+            LogFault::Remove => "remove",
         };
         emit(
             &LOG_FAULT,
