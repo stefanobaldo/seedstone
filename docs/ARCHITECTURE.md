@@ -112,8 +112,11 @@ replays to a state the shard actually held. With `--data-dir` the records go
 to segment files, one per executor per process lifetime with the shards
 interleaved, flushed and synced on the housekeeping tick; on start every
 segment is read through a reader that steps over damage, and each shard
-replays the gapless prefix of its sequence. The same abstraction becomes a
-consensus log after that. Without the flag the log is a no-op, as it was.
+replays the gapless prefix of its sequence. A shard whose prefix was cut
+resumes there behind a *rebase* record, synced before it serves, so the
+records the cut left on disk are never replayed by a later start. The same
+abstraction becomes a consensus log after that. Without the flag the log is
+a no-op, as it was, and a write encodes no record at all.
 
 ## The edge is an adapter
 
