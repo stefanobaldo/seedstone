@@ -39,6 +39,7 @@
 //! only meaningful at a record boundary the reader arrived at by consuming
 //! whole records — see [`Decoded::EndOfLog`].
 
+pub mod checkpoint;
 pub mod disk;
 pub mod effect;
 pub mod file;

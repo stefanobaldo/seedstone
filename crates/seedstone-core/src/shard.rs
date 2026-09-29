@@ -50,14 +50,14 @@
 
 mod apply;
 mod command;
-mod executor;
+pub(crate) mod executor;
 mod policy;
 mod pool;
 mod reply;
 
 pub use apply::parse_i64;
 pub use command::{Command, Cond, Expiry, KIND_SLOTS, Route};
-pub use executor::{EVICTION_SAMPLES, HOUSEKEEPING_TICK, Now, Replayed, frozen_clock};
+pub use executor::{EVICTION_SAMPLES, HOUSEKEEPING_TICK, Now, Replayed, ShardState, frozen_clock};
 pub use policy::{
     CompactionReport, Deadlines, EvictionPolicy, ExpiryPolicy, LogFault, NoTrace, ShardPolicy,
     SnapshotReport, TraceSink,
