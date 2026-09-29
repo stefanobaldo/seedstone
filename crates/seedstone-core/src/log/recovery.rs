@@ -44,8 +44,11 @@ pub struct ShardRecords {
     pub records: Vec<(u64, Owned)>,
     /// Records of this shard discarded after the first gap.
     pub discarded: u64,
-    /// Whether any of this shard's records may have been lost: a gap, damage
-    /// in a segment its executor wrote, or a segment nobody could read.
+    /// Whether damage on disk could explain a loss of this shard's records:
+    /// damage in a segment its executor wrote, or a segment nobody could
+    /// read. A gap alone does not set it — a gap in an intact log is not
+    /// something a disk did, so it is reported as a truncation and left
+    /// unexcused.
     pub lossy: bool,
 }
 
@@ -203,12 +206,16 @@ impl Scan {
             self.report.malformed += 1;
             return;
         };
-        match Effect::decode(&item.payload) {
-            Some(effect) => bucket.push((item.seq, effect.to_owned())),
+        if let Some(effect) = Effect::decode(&item.payload) {
+            bucket.push((item.seq, effect.to_owned()));
+        } else {
             // A well-checksummed record this build cannot read ends the
             // shard's prefix where it sits: leaving its sequence out of the
-            // bucket is exactly a gap.
-            None => self.report.malformed += 1,
+            // bucket is exactly a gap, and one recovery knows the cause of.
+            self.report.malformed += 1;
+            if let Some(hit) = self.damaged.get_mut(usize::from(item.shard)) {
+                *hit = true;
+            }
         }
     }
 
@@ -236,7 +243,7 @@ impl Scan {
             shards.push(ShardRecords {
                 records,
                 discarded,
-                lossy: gap || damaged || self.unattributed_loss,
+                lossy: damaged || self.unattributed_loss,
             });
         }
         Recovery {
@@ -384,7 +391,11 @@ mod tests {
         .unwrap();
         assert_eq!(recovery.shards[0].records.len(), 2);
         assert_eq!(recovery.shards[0].discarded, 1);
-        assert!(recovery.shards[0].lossy);
+        assert!(
+            !recovery.shards[0].lossy,
+            "the segment is intact, so nothing on disk explains the gap: it is reported, \
+             not excused"
+        );
         assert_eq!(recovery.shards[1].records.len(), 2);
         assert!(!recovery.shards[1].lossy);
         assert_eq!(recovery.report.truncated.len(), 1);
@@ -521,7 +532,10 @@ mod tests {
         assert_eq!(recovery.report.malformed, 1);
         assert_eq!(recovery.shards[0].records.len(), 1);
         assert_eq!(recovery.shards[0].discarded, 1);
-        assert!(recovery.shards[0].lossy);
+        assert!(
+            recovery.shards[0].lossy,
+            "recovery read the record and could not apply it: the loss is known"
+        );
     }
 
     #[test]

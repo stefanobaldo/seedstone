@@ -41,8 +41,10 @@ pub trait TraceSink: Clone + Send + 'static {
 
     /// Called once per shard when the node starts, after that shard's log
     /// has been replayed: `next_seq` is the position the shard resumes at,
-    /// and `lossy` says whether recovery had to discard records of this
-    /// shard — a gap in its sequence, or a segment it could not read at all.
+    /// and `lossy` says whether damage on disk could have cost this shard
+    /// records — a hole or a cut tail in a segment its executor wrote, or a
+    /// segment that could not be read at all. A gap in an otherwise intact
+    /// log is reported as a truncation but does not set it.
     ///
     /// A default that does nothing, so a sink that folds commands need not
     /// know a restart exists. The simulator's does: two runs that recovered
