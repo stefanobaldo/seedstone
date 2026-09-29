@@ -445,10 +445,19 @@ fn a_durable_snapshot_deletes_the_older_rotations_and_the_previous_snapshot() {
     );
 }
 
-#[test]
-fn the_executor_that_closes_the_round_deletes_every_older_generation() {
-    // Generation 1 left a segment and a snapshot behind; generation 2 runs
-    // two executors, and only the second to complete a cycle removes them.
+type MemStates = Vec<ShardState<FileLog<crate::log::disk::mem::MemFile>>>;
+
+/// Generation 1 left a segment and a snapshot behind; generation 2 runs two
+/// executors of one shard each.
+struct TwoExecutors {
+    disk: MemDisk,
+    round: Arc<AtomicU16>,
+    checkpoints: [SegmentCheckpoint<MemDisk>; 2],
+    states: [MemStates; 2],
+    recorder: Recorder,
+}
+
+fn two_executors_over_an_older_generation() -> TwoExecutors {
     let disk = MemDisk::default();
     disk.create_dir_all(Path::new(WAL)).unwrap();
     disk.write_file(&Path::new(WAL).join(segment_name(1, 0, 3)), b"old")
@@ -472,58 +481,121 @@ fn the_executor_that_closes_the_round_deletes_every_older_generation() {
             config: FLOOR_ONLY,
         })
     };
-    let mut checkpoints = [make(0), make(1)];
-    let mut states: Vec<Vec<ShardState<FileLog<crate::log::disk::mem::MemFile>>>> = (0..2u16)
-        .map(|executor| {
-            vec![ShardState::new(
-                Dict::with_seed(DictSeed {
-                    k0: u64::from(executor),
-                    k1: 1,
-                }),
-                FileLog::new(executor, Arc::clone(&segments[usize::from(executor)])),
-            )]
-        })
-        .collect();
-    let recorder = Recorder::default();
-    for executor in 0..2usize {
+    let state = |executor: u16| {
+        vec![ShardState::new(
+            Dict::with_seed(DictSeed {
+                k0: u64::from(executor),
+                k1: 1,
+            }),
+            FileLog::new(executor, Arc::clone(&segments[usize::from(executor)])),
+        )]
+    };
+    TwoExecutors {
+        checkpoints: [make(0), make(1)],
+        states: [state(0), state(1)],
+        disk,
+        round,
+        recorder: Recorder::default(),
+    }
+}
+
+impl TwoExecutors {
+    /// Writes past the floor on `executor` and ticks it until its cycle is
+    /// reported.
+    fn cycle(&mut self, executor: usize, prefix: u8) {
         for i in 0..8u8 {
             put(
-                &mut states[executor][0],
-                &[b'k', i],
+                &mut self.states[executor][0],
+                &[prefix, i],
                 b"value-long-enough-to-cross",
             );
         }
-        flush_and_sync(&mut states[executor]);
-        let done = recorder.snapshots.lock().unwrap().len();
-        while recorder.snapshots.lock().unwrap().len() == done {
-            checkpoints[executor].tick(
+        flush_and_sync(&mut self.states[executor]);
+        let done = self.recorder.snapshots.lock().unwrap().len();
+        while self.recorder.snapshots.lock().unwrap().len() == done {
+            self.checkpoints[executor].tick(
                 u16::try_from(executor).unwrap(),
-                &mut states[executor],
+                &mut self.states[executor],
                 now(),
-                &recorder,
+                &self.recorder,
             );
         }
-        let names = disk.list(Path::new(WAL)).unwrap();
-        let old_left = names.iter().any(|n| n.starts_with("0000000000000001-"));
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.disk.list(Path::new(WAL)).unwrap()
+    }
+
+    fn older_left(&self) -> bool {
+        self.names()
+            .iter()
+            .any(|n| n.starts_with("0000000000000001-"))
+    }
+}
+
+#[test]
+fn the_executor_that_closes_the_round_deletes_every_older_generation() {
+    let mut t = two_executors_over_an_older_generation();
+    for executor in 0..2usize {
+        t.cycle(executor, b'k');
         assert_eq!(
-            old_left,
+            t.older_left(),
             executor == 0,
-            "after executor {executor}'s first cycle: {names:?}"
+            "after executor {executor}'s first cycle: {:?}",
+            t.names()
         );
     }
-    let names = disk.list(Path::new(WAL)).unwrap();
+    let names = t.names();
     assert!(names.contains(&"GENERATION".to_owned()) && names.contains(&"LOCK".to_owned()));
-    assert_eq!(round.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(t.round.load(std::sync::atomic::Ordering::SeqCst), 2);
     // A second cycle on either executor counts no further.
-    for i in 0..8u8 {
-        put(&mut states[0][0], &[b'm', i], b"value-long-enough-to-cross");
-    }
-    flush_and_sync(&mut states[0]);
-    let done = recorder.snapshots.lock().unwrap().len();
-    while recorder.snapshots.lock().unwrap().len() == done {
-        checkpoints[0].tick(0, &mut states[0], now(), &recorder);
-    }
-    assert_eq!(round.load(std::sync::atomic::Ordering::SeqCst), 2);
+    t.cycle(0, b'm');
+    assert_eq!(t.round.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// The start writes each cut shard's `Rebase` into rotation 0, and the
+/// `Rebase` is what keeps an older generation's records above it dead. So
+/// rotation 0 outlives every older generation's file, or the next start
+/// would replay records this process declared gone.
+#[test]
+fn rotation_zero_stays_while_an_older_generation_is_on_disk() {
+    let mut t = two_executors_over_an_older_generation();
+    t.cycle(0, b'k');
+    assert!(t.older_left());
+    assert!(
+        t.names().contains(&segment_name(2, 0, 0)),
+        "the round is open, so rotation 0 stays: {:?}",
+        t.names()
+    );
+    t.cycle(1, b'k');
+    assert!(!t.older_left());
+    t.cycle(0, b'm');
+    assert!(
+        !t.names().contains(&segment_name(2, 0, 0)),
+        "with the older generation gone it is an ordinary old rotation: {:?}",
+        t.names()
+    );
+}
+
+/// A removal of an older generation's file that failed is tried again by
+/// the next compaction, on any executor, once the round has closed.
+#[test]
+fn an_older_generation_a_removal_failed_on_is_removed_by_a_later_compaction() {
+    let mut t = two_executors_over_an_older_generation();
+    t.cycle(0, b'k');
+    t.disk.fail_removes(true);
+    t.cycle(1, b'k');
+    t.disk.fail_removes(false);
+    assert!(t.older_left(), "the removals failed");
+    assert!(
+        t.recorder
+            .faults
+            .lock()
+            .unwrap()
+            .contains(&LogFault::Remove)
+    );
+    t.cycle(0, b'm');
+    assert!(!t.older_left(), "{:?}", t.names());
 }
 
 #[test]

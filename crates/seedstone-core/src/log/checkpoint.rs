@@ -553,28 +553,52 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
     }
 
     /// Removes what the snapshot of `cycle` made redundant: this executor's
-    /// older rotations and older snapshots of this generation; and, when
-    /// this executor's first completed cycle brings the round to every
-    /// executor, every older generation's files.
+    /// older rotations and older snapshots of this generation; and, once
+    /// every executor of this process has completed a cycle, every older
+    /// generation's files — on every compaction from then on, so a removal
+    /// that failed is tried again by whichever executor compacts next.
+    ///
+    /// Rotation 0 is where the start wrote each cut shard's `Rebase`, and a
+    /// `Rebase` is what keeps an older generation's records above it dead:
+    /// it stays for as long as any older generation's file does.
     fn compact<T: TraceSink>(&mut self, first_shard: u16, cycle: u32, trace: &T) {
         let rotation = lock(&self.segment).rotation;
-        let older_generations = !self.rounded && {
+        if !self.rounded {
             self.rounded = true;
-            self.round.fetch_add(1, Ordering::SeqCst) + 1 == self.executors
-        };
+            self.round.fetch_add(1, Ordering::SeqCst);
+        }
+        let round_closed = self.round.load(Ordering::SeqCst) >= self.executors;
         let mut removed = CompactionReport {
             executor: self.executor,
             files: 0,
             bytes: 0,
         };
-        for name in self.disk.list(&self.wal).unwrap_or_default() {
-            if !self.is_redundant(&name, rotation, cycle, older_generations) {
+        let names = self.disk.list(&self.wal).unwrap_or_default();
+        let mut older_left = false;
+        for name in names.iter().filter(|name| self.is_older(name)) {
+            if !round_closed {
+                older_left = true;
                 continue;
             }
-            let path = self.wal.join(&name);
-            let bytes = self.disk.len(&path).unwrap_or(0);
-            match self.disk.remove_file(&path) {
-                Ok(()) => {
+            match self.remove(name) {
+                Ok(bytes) => {
+                    removed.files += 1;
+                    removed.bytes += bytes;
+                }
+                // Another executor, past the same round, removed it first.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    older_left = true;
+                    trace.fault(first_shard, LogFault::Remove, &error);
+                }
+            }
+        }
+        for name in &names {
+            if !self.is_redundant(name, rotation, cycle, older_left) {
+                continue;
+            }
+            match self.remove(name) {
+                Ok(bytes) => {
                     removed.files += 1;
                     removed.bytes += bytes;
                 }
@@ -587,18 +611,30 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         trace.compaction(&removed);
     }
 
-    /// Whether `name` is a file the snapshot of `cycle` made redundant. The
-    /// older-generation arm comes first, so a file of an older generation is
-    /// judged by the round and never by this executor's counters.
-    fn is_redundant(&self, name: &str, rotation: u32, cycle: u32, older_generations: bool) -> bool {
+    /// Removes `name`, and says how many bytes it held.
+    fn remove(&self, name: &str) -> io::Result<u64> {
+        let path = self.wal.join(name);
+        let bytes = self.disk.len(&path).unwrap_or(0);
+        self.disk.remove_file(&path)?;
+        Ok(bytes)
+    }
+
+    /// Whether `name` is a file of an older generation.
+    fn is_older(&self, name: &str) -> bool {
+        parse_segment_name(name)
+            .or_else(|| parse_snapshot_name(name))
+            .is_some_and(|(generation, _, _)| generation < self.generation)
+    }
+
+    /// Whether `name` is one of this executor's files of this generation
+    /// that the snapshot of `cycle` made redundant.
+    fn is_redundant(&self, name: &str, rotation: u32, cycle: u32, older_left: bool) -> bool {
         match (parse_segment_name(name), parse_snapshot_name(name)) {
-            (Some((generation, _, _)), _) | (_, Some((generation, _, _)))
-                if generation < self.generation =>
-            {
-                older_generations
-            }
             (Some((generation, executor, this)), _) => {
-                generation == self.generation && executor == self.executor && this < rotation
+                generation == self.generation
+                    && executor == self.executor
+                    && this < rotation
+                    && (this > 0 || !older_left)
             }
             (_, Some((generation, executor, this))) => {
                 generation == self.generation && executor == self.executor && this < cycle
