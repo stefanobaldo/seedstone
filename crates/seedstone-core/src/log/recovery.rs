@@ -51,18 +51,18 @@
 //! and cut the log. So a snapshot of generation `g` with base `b` is dead
 //! for a shard when a `Rebase` of a generation above `g` sits below `b`.
 //!
-//! **A refused image is a possible loss only if it could have been relied
-//! on.** Compaction deletes what a snapshot covers only once its footer is
-//! durable, so a file with no footer — what a crash in the middle of a
-//! cycle leaves, its unsynced tail torn or not — never stood in for any
-//! record, and refusing it costs nothing. A file whose footer is there but
-//! whose counts disagree, or one with damage before its end, is damage that
-//! may explain a loss — but only a loss the log cannot make up for: its
-//! shards are marked lossy if the log they fall back to stops short of the
-//! image's base. Damage alone is not evidence of one. A crash can persist a
-//! file's unsynced writes out of order, so an unfinished snapshot may hold
-//! a hole before where it stops, and the log it would have covered is then
-//! still whole.
+//! **A refused image is a possible loss only where the log cannot make up
+//! for it.** Its shards are marked lossy if the log they fall back to stops
+//! short of the image's base, and not otherwise, whatever made it refused:
+//! a footer whose counts disagree, damage before its end, or no footer at
+//! all. Damage alone is not evidence of a loss — a crash can persist a
+//! file's unsynced writes out of order, so a snapshot interrupted mid-cycle
+//! may hold a hole before where it stops while the log it would have
+//! covered is still whole. Nor is a missing footer evidence of none: a
+//! finished file whose footer was lost reads as one a crash interrupted,
+//! and compaction may already have removed its log. A refused file whose
+//! shards the log does not cover stays on disk, since the next read of it
+//! may be whole.
 //!
 //! A segment whose header names a format version above this build's is
 //! refused, and the node does not start: that is not damage, it is a
@@ -213,6 +213,12 @@ pub fn recover<D: Disk>(spec: RecoverSpec<'_, D>) -> io::Result<Recovery> {
     let chosen = read_images(&spec, &mut snaps, &rebases, &mut building, &mut report);
     let unread = std::mem::take(&mut scan.unread);
     let (shards, kept) = replay_tails(&spec, scan, &chosen, building, segments.len(), &mut report);
+    for snap in &mut snaps {
+        snap.damaged |= snap
+            .unfinished_for
+            .iter()
+            .any(|(shard, base)| shards[usize::from(*shard)].seq < *base);
+    }
     remove_garbage(&spec, &snaps, &segments, &kept, &unread, &mut report);
     Ok(Recovery { shards, report })
 }
@@ -234,6 +240,10 @@ struct SnapFile {
     /// Damage was met reading it — its header in pass 1, or its body in
     /// pass 3. Such a file is never garbage: see [`remove_garbage`].
     damaged: bool,
+    /// The shards and bases pass 3 refused it for with no footer. It is
+    /// kept if the log of any of them stops short of its base: nothing on
+    /// disk says it was never finished, and it may be the only copy.
+    unfinished_for: Vec<(u16, u64)>,
 }
 
 impl SnapFile {
@@ -297,6 +307,7 @@ fn read_headers<D: Disk>(
             damaged: unreadable,
             header,
             used: false,
+            unfinished_for: Vec::new(),
         });
     }
     snaps.sort_by_key(SnapFile::age);
@@ -486,7 +497,7 @@ impl Scan {
 struct Chosen {
     /// The base of the image the shard took, if it took one.
     images: Vec<Option<u64>>,
-    /// The highest base of an image of the shard refused for damage. The
+    /// The highest base of an image of the shard that was refused. The
     /// shard is lossy if the log it falls back to stops short of it: what
     /// the image covered may have been compacted away.
     refused: Vec<Option<u64>>,
@@ -498,7 +509,9 @@ enum Verdict {
     /// Footer present, counts matching, no damage met: the image stands.
     Usable,
     /// No footer and nothing wrong before where the file stops: a cycle a
-    /// crash interrupted. Refused, and no loss — it never covered a record.
+    /// crash interrupted, or a finished file whose footer was lost — which
+    /// nothing on disk tells apart. Refused, and a loss only where the log
+    /// stops short of its base, as for [`Verdict::Damaged`].
     Unfinished,
     /// Anything else: refused, and damage that may explain a loss — the
     /// shards it imaged are lossy unless the log still reaches its base.
@@ -545,12 +558,13 @@ fn read_images<D: Disk>(
             for (shard, base) in &wanted {
                 building.dicts[usize::from(*shard)].clear();
                 building.due[usize::from(*shard)].clear();
-                if verdict == Verdict::Damaged {
-                    let refused = &mut chosen.refused[usize::from(*shard)];
-                    *refused = (*refused).max(Some(*base));
-                }
+                let refused = &mut chosen.refused[usize::from(*shard)];
+                *refused = (*refused).max(Some(*base));
             }
             snap.damaged |= verdict == Verdict::Damaged;
+            if verdict == Verdict::Unfinished {
+                snap.unfinished_for.clone_from(&wanted);
+            }
             report.snapshots_refused += 1;
         }
     }

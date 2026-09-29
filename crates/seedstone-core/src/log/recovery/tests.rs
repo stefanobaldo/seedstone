@@ -948,6 +948,37 @@ fn every_executors_newest_segment_stays_even_when_it_holds_nothing() {
     );
 }
 
+/// A finished snapshot whose footer was lost — here cut short, so the file
+/// reads as one a crash interrupted — after compaction removed the log it
+/// covered. Nothing on disk says whether it was ever finished, but the log
+/// stops short of its base: the shard is lossy, and the file stays, since
+/// the next read of it may be whole and it is the only copy.
+#[test]
+fn an_unfinished_looking_snapshot_whose_log_is_gone_is_a_loss_and_is_kept() {
+    let disk = MemDisk::default();
+    let segments = wal(&disk, 1, 1);
+    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
+    rotate(&disk, 1, 0, &segments[0]);
+    disk.remove_file(&Path::new("/data/wal").join(segment_name(1, 0, 0)))
+        .unwrap();
+    write(&mut s0, 4, &put(b"x", b"4"));
+    snapshot(&disk, 1, 0, 0, &[(0, 4)], &[(0, b"a", b"1", None)], true);
+    let path = Path::new("/data/wal").join(snapshot_name(1, 0, 0));
+    let mut bytes = disk.contents(&path);
+    bytes.truncate(bytes.len() - 4);
+    disk.overwrite(&path, bytes);
+    let recovery = recover(spec(&disk, 1)).unwrap();
+    assert_eq!(recovery.report.snapshots_refused, 1);
+    let shard = &recovery.shards[0];
+    assert_eq!(shard.seq, 0);
+    assert!(
+        shard.lossy,
+        "the log stops short of the refused image's base"
+    );
+    let names = disk.list(Path::new("/data/wal")).unwrap();
+    assert!(names.contains(&snapshot_name(1, 0, 0)), "kept: {names:?}");
+}
+
 /// A segment shorter than its header is a creation that failed before the
 /// header was written whole: nothing is appended to a segment before its
 /// header is synced, so it never held a record, and no shard lost one.
