@@ -197,6 +197,23 @@ pub(crate) mod mem {
         fail_writes: bool,
         fail_syncs: bool,
         fail_removes: bool,
+        /// File syncs to let through before one fails, once.
+        sync_fails_after: Option<u32>,
+    }
+
+    /// Counts a sync down: `true` when this is the one that fails.
+    fn countdown(slot: &mut Option<u32>) -> bool {
+        match slot {
+            Some(0) => {
+                *slot = None;
+                true
+            }
+            Some(left) => {
+                *left -= 1;
+                false
+            }
+            None => false,
+        }
     }
 
     /// The map, shared by every handle onto it.
@@ -239,6 +256,12 @@ pub(crate) mod mem {
         pub fn fail_removes(&self, fail: bool) {
             self.lock().fail_removes = fail;
         }
+
+        /// The file sync after the next `skip` fails, once: how a test fails
+        /// one step of a sequence of syncs and lets the rest succeed.
+        pub fn fail_one_sync_after(&self, skip: u32) {
+            self.lock().sync_fails_after = Some(skip);
+        }
     }
 
     impl LogFile for MemFile {
@@ -256,8 +279,8 @@ pub(crate) mod mem {
         }
 
         fn sync_data(&mut self) -> io::Result<()> {
-            let fs = self.disk.lock();
-            let failing = fs.fail_writes || fs.fail_syncs;
+            let mut fs = self.disk.lock();
+            let failing = fs.fail_writes || fs.fail_syncs || countdown(&mut fs.sync_fails_after);
             drop(fs);
             if failing {
                 return Err(io::Error::other("injected sync failure"));

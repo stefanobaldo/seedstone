@@ -527,7 +527,7 @@ fn the_executor_that_closes_the_round_deletes_every_older_generation() {
 }
 
 #[test]
-fn a_failed_write_keeps_the_buffer_and_the_next_tick_writes_it_first() {
+fn a_failed_write_abandons_the_file_and_the_scan_restarts_into_a_new_one() {
     let mut b = bench(
         1,
         CheckpointConfig {
@@ -542,32 +542,27 @@ fn a_failed_write_keeps_the_buffer_and_the_next_tick_writes_it_first() {
     flush_and_sync(&mut b.states);
     let recorder = Recorder::default();
     b.checkpoint.tick(0, &mut b.states, now(), &recorder); // opens, writes the header
-    let path = Path::new(WAL).join(snapshot_name(1, 0, 0));
-    let before = b.disk.contents(&path).len();
+    let first = Path::new(WAL).join(snapshot_name(1, 0, 0));
+    assert!(b.disk.len(&first).is_ok());
     b.disk.fail_writes(true);
     b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+    b.disk.fail_writes(false);
     assert_eq!(
         recorder.faults.lock().unwrap().as_slice(),
         [LogFault::Snapshot]
     );
-    assert_eq!(b.disk.contents(&path).len(), before, "nothing landed");
-    b.disk.fail_writes(false);
-    b.checkpoint.tick(0, &mut b.states, now(), &recorder);
-    assert!(
-        b.disk.contents(&path).len() > before,
-        "the kept buffer landed"
-    );
+    // What a failed write left in the file is unknown, so nothing is
+    // written after it: the file goes, and the scan starts over.
+    assert!(b.disk.len(&first).is_err(), "the abandoned file is removed");
     let mut ticks = 0;
     while recorder.snapshots.lock().unwrap().is_empty() {
         b.checkpoint.tick(0, &mut b.states, now(), &recorder);
         ticks += 1;
         assert!(ticks < 50);
     }
-    assert_eq!(
-        recorder.snapshots.lock().unwrap()[0].entries,
-        12,
-        "nothing was lost or doubled"
-    );
+    let report = recorder.snapshots.lock().unwrap()[0];
+    assert_eq!(report.cycle, 1, "the second file, not the abandoned first");
+    assert_eq!(report.entries, 12, "nothing was lost or doubled");
 }
 
 #[test]
@@ -723,4 +718,64 @@ fn what_was_written_past_the_floor_before_the_cycle_opened_is_reported_as_writte
         snapshots[0].written_during, past_the_floor,
         "nothing was written after the rotation, so what is reported is the overshoot"
     );
+}
+
+/// Eight keys over two shards, synced past the floor.
+fn eight_keys_past_the_floor(b: &mut Bench) {
+    for i in 0..8u8 {
+        put(
+            &mut b.states[usize::from(i % 2)],
+            &[b'k', i],
+            b"value-long-enough-to-cross",
+        );
+    }
+    flush_and_sync(&mut b.states);
+}
+
+/// Ticks until a snapshot is reported, sixteen ticks at most.
+fn tick_until_snapshot(b: &mut Bench, trace: &Recorder) {
+    for _ in 0..16 {
+        b.checkpoint.tick(0, &mut b.states, now(), trace);
+        if !trace.snapshots.lock().unwrap().is_empty() {
+            return;
+        }
+    }
+}
+
+/// What a start would make of the bench's directory.
+fn recovered(b: &Bench) -> crate::log::recovery::Recovery {
+    crate::log::recovery::recover(crate::log::recovery::RecoverSpec {
+        disk: &b.disk,
+        wal: Path::new(WAL),
+        shards: u16::try_from(b.states.len()).unwrap(),
+        reader: ReaderMode::Resynchronising,
+        trust_unfinished: false,
+        seed: DictSeed { k0: 0, k1: 7 },
+        now: now(),
+    })
+    .unwrap()
+}
+
+/// A snapshot file whose header could not be synced is abandoned, never
+/// reopened: a second header appended under the same name would leave the
+/// finished image unreadable once compaction had deleted the log it covers.
+#[test]
+fn a_failed_header_sync_abandons_the_file_and_the_image_still_reads_whole() {
+    let mut b = bench(2, SMALL);
+    eight_keys_past_the_floor(&mut b);
+    // The rotation's header sync goes through; the snapshot header's fails.
+    b.disk.fail_one_sync_after(1);
+    let trace = Recorder::default();
+    tick_until_snapshot(&mut b, &trace);
+    assert_eq!(*trace.faults.lock().unwrap(), [LogFault::Snapshot]);
+    assert_eq!(
+        trace.snapshots.lock().unwrap().len(),
+        1,
+        "the cycle finished"
+    );
+    let recovery = recovered(&b);
+    assert_eq!(recovery.report.snapshots_used, 1, "{:?}", recovery.report);
+    let keys: usize = recovery.shards.iter().map(|s| s.dict.len()).sum();
+    assert_eq!(keys, 8);
+    assert!(recovery.shards.iter().all(|s| !s.lossy));
 }
