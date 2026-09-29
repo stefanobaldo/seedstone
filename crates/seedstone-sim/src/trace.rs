@@ -106,15 +106,22 @@ impl TraceSink for HashSink {
                 u64::from(lossy),
             );
         }
-        lock(&self.shared.truncated)[usize::from(shard)] = lossy;
         // A start with no crash before it is the node's first: nothing was
         // durable, so nothing can have been lost.
-        let Some(durable) = lock(&self.shared.crashes)
-            .last()
-            .map(|last| last.durable[usize::from(shard)])
-        else {
+        let Some((crash, durable)) = ({
+            let crashes = lock(&self.shared.crashes);
+            crashes
+                .last()
+                .map(|last| (crashes.len() - 1, last.durable[usize::from(shard)]))
+        }) else {
             return;
         };
+        // Which crash's recovery last reported the shard: a later clean
+        // restart does not clear it, because a client may read a key the
+        // earlier one lost only after it.
+        if lossy {
+            lock(&self.shared.truncated)[usize::from(shard)] = Some(crash);
+        }
         let mut tally = lock(&self.shared.tally);
         if shard == 0 {
             tally.recoveries += 1;

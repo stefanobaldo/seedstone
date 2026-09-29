@@ -198,9 +198,12 @@ impl SimOutcome {
         // covered came back, by the server's own numbers and by the
         // clients' reads. On the disk that also fails and lies, read
         // corruption can destroy a durable record and no honest server can
-        // promise otherwise — what it owes there is to say so.
+        // promise otherwise — what it owes there is to say so, by its own
+        // numbers and by what its clients read back: a recovery that resumes
+        // at the right position with the wrong records under it is a loss
+        // the server's numbers cannot see.
         let durability = if self.hostile {
-            self.unreported_losses == 0
+            self.unreported_losses == 0 && self.lost_durable_writes == 0
         } else {
             self.lost_durable_prefixes == 0 && self.lost_durable_writes == 0
         };
@@ -285,8 +288,9 @@ pub struct Shared {
     /// Every crash the driver inflicted, with the durable points as they
     /// stood at that instant.
     pub crashes: Arc<Mutex<Vec<CrashRecord>>>,
-    /// Which shards the last recovery reported as having lost records.
-    pub truncated: Arc<Mutex<Vec<bool>>>,
+    /// Per shard, the index of the latest crash whose recovery reported it
+    /// as having lost records, or `None` if none has.
+    pub truncated: Arc<Mutex<Vec<Option<usize>>>>,
     /// Every acknowledged increment — what the verifier needs to say which
     /// of them a crash could not have taken.
     pub increments: Arc<Mutex<Vec<Increment>>>,
@@ -322,7 +326,7 @@ impl Shared {
             forms: Arc::default(),
             durable: Arc::new(Mutex::new(vec![None; usize::from(shards)])),
             crashes: Arc::default(),
-            truncated: Arc::new(Mutex::new(vec![false; usize::from(shards)])),
+            truncated: Arc::new(Mutex::new(vec![None; usize::from(shards)])),
             increments: Arc::default(),
         }
     }
