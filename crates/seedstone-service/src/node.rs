@@ -197,10 +197,12 @@ pub struct NodeInfo {
     ///
     /// A parameter rather than the constant it was, for one reader: the
     /// simulator. At the production value no simulated client ever idles
-    /// long enough to shed, so the path ran only under a paused clock in a
-    /// unit test — held to a clock, never to a schedule. The simulator sets
-    /// it below a client's longest nap and the shed becomes one more thing
-    /// the seed can reorder.
+    /// long enough to shed. The simulator sets it below a client's longest
+    /// nap, so that a workload that grows a connection's buffer and then
+    /// idles it sheds on the seed's schedule — but the timer arms only above
+    /// the buffer floor, and on the shapes swept today no connection sheds
+    /// (a probe at the shed, over every swept seed, read zero on 2026-09-28).
+    /// The path is still held to a clock in a unit test, not to a schedule.
     pub idle_shed_after: Duration,
     /// Forty hexadecimal characters identifying this run of the process,
     /// drawn once at the composition root beside the keyspace seed.
