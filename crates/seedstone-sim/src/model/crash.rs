@@ -129,7 +129,7 @@ impl Model {
     /// A write to `slot` that may or may not have landed.
     fn maybe_wrote(&mut self, slot: u32, known: Known, at: Duration) {
         let slot = slot as usize;
-        self.plain_history[slot].record(known, at, None);
+        self.plain_history[slot].record_unacknowledged(known, at);
         self.plain_state[slot] = Known::Either(flatten(self.plain_history[slot].candidates(None)));
         self.plain_durable[slot] = false;
     }
