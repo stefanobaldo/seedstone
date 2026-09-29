@@ -124,7 +124,7 @@ use seedstone_core::dict::DictSeed;
 // indistinguishable from the honest one except in its atomicity, and these
 // strings enter the trace hash — a private copy that drifted would make a
 // planted trace differ for a reason unrelated to the race.
-use seedstone_core::log::checkpoint::{CheckpointConfig, NoCheckpoint};
+use seedstone_core::log::checkpoint::{CheckpointConfig, CheckpointSpec, SegmentCheckpoint};
 use seedstone_core::log::disk::Disk;
 use seedstone_core::log::file::{FileLog, SharedSegment, next_generation, open_segments};
 use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, RecoveredShard, Recovery, recover};
@@ -136,6 +136,7 @@ use seedstone_service::{NodeInfo, serve_connection};
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::path::Path;
+use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -293,16 +294,18 @@ const _: () = assert!(
 
 /// The simulated node's checkpoint.
 ///
-/// A floor of 2 KiB, so every swept seed
-/// cycles several times over a workload that writes tens of kilobytes per
-/// executor; 4 KiB per tick, so a cycle spans a few ticks and the crash
-/// window can fall inside one, and still finishes well inside a run.
-/// Calibrated by `tests/planted_compaction.rs`, which holds every swept
-/// shape to at least one completed cycle per seed.
+/// A floor of 2 KiB and ratio 1: an executor's image on the swept shape is
+/// 3 to 9 KiB, and every `standard` seed of 1 to 24 completed 10 to 25
+/// cycles over its ten executors. 1 KiB per tick, so a cycle spans 2 to 9
+/// ticks and a crash lands inside one on most seeds that draw a crash: at
+/// 4 KiB most cycles finished on the tick that opened them, and no crash
+/// ever met an unfinished snapshot. Calibrated by
+/// `tests/planted_compaction.rs`, which holds every swept shape to at least
+/// one completed cycle per seed.
 pub const SIM_CHECKPOINT: CheckpointConfig = CheckpointConfig {
     floor: 2048,
     ratio: 1,
-    bytes_per_tick: 4096,
+    bytes_per_tick: 1024,
 };
 
 /// The longest a client waits for its own deadlines before reading everything
@@ -539,8 +542,8 @@ async fn server(
     // that fails I/O a start can fail on the header write of a segment, and
     // a node that gave up there would end the run with a harness error
     // rather than a finding.
-    let (recovery, segments) = loop {
-        if let Ok(started) = start_log(shards, executors, seed, planted) {
+    let (recovery, generation, segments) = loop {
+        if let Ok(started) = start_log(shards, executors, seed, planted, &shared) {
             break started;
         }
         lock(&shared.tally).start_failures += 1;
@@ -550,6 +553,11 @@ async fn server(
     // ceiling is the shape's, not the plant's, and a run whose honest node
     // had no ceiling would be measuring a different server from the one its
     // planted twin runs.
+    // Shared by the process's executors: how many have completed a cycle in
+    // this generation, which is what lets the last of them delete the
+    // previous process's files.
+    let round = Arc::new(AtomicU16::new(0));
+    let checkpoint_segments = segments.clone();
     let parts = PoolParts {
         shards,
         executors,
@@ -569,6 +577,18 @@ async fn server(
                     shared.clone(),
                 )
             }
+        },
+        make_checkpoint: move |executor: u16| {
+            SegmentCheckpoint::new(CheckpointSpec {
+                disk: SimDisk,
+                wal: Path::new(DATA_DIR).join("wal"),
+                generation,
+                executor,
+                executors,
+                segment: Arc::clone(&checkpoint_segments[usize::from(executor)]),
+                round: Arc::clone(&round),
+                config: SIM_CHECKPOINT,
+            })
         },
     };
     let pool = match planted {
@@ -659,10 +679,18 @@ fn start_log(
     executors: u16,
     seed: DictSeed,
     planted: Option<Plant>,
-) -> std::io::Result<(Recovery, Vec<SharedSegment<SimFile>>)> {
+    shared: &Shared,
+) -> std::io::Result<(Recovery, u64, Vec<SharedSegment<SimFile>>)> {
     let disk = SimDisk;
     let wal = Path::new(DATA_DIR).join("wal");
     disk.create_dir_all(&wal)?;
+    // The directory as the crash left it, before recovery removes anything:
+    // one of the instants the bound is read at.
+    let on_disk: u64 = disk
+        .list(&wal)?
+        .iter()
+        .filter_map(|name| disk.len(&wal.join(name)).ok())
+        .sum();
     let mode = if planted == Some(Plant::PrefixScanRecovery) {
         ReaderMode::PrefixScan
     } else {
@@ -682,13 +710,19 @@ fn start_log(
             unix_millis: sim_wall_clock(),
         },
     })?;
+    {
+        let mut tally = lock(&shared.tally);
+        tally.disk_peak_bytes = tally.disk_peak_bytes.max(on_disk);
+        tally.snapshots_refused_at_start += recovery.report.snapshots_refused;
+        tally.files_removed_at_start += recovery.report.files_removed;
+    }
     let generation = next_generation(&disk, &wal)?;
     let segments = open_segments(&disk, &wal, generation, executors)?;
-    Ok((recovery, segments))
+    Ok((recovery, generation, segments))
 }
 
 /// What every arm of the plant match spawns from: the spec minus its policy.
-struct PoolParts<F> {
+struct PoolParts<F, G> {
     shards: u16,
     executors: u16,
     seed: DictSeed,
@@ -696,11 +730,13 @@ struct PoolParts<F> {
     limit: MemoryLimit,
     recovered: Vec<RecoveredShard>,
     make_log: F,
+    make_checkpoint: G,
 }
 
-impl<F> PoolParts<F>
+impl<F, G> PoolParts<F, G>
 where
     F: Fn(u16) -> Observed<SimFile>,
+    G: Fn(u16) -> SegmentCheckpoint<SimDisk>,
 {
     fn spawn<P: ShardPolicy>(self, policy: P) -> ShardPool {
         ShardPool::spawn_spec(PoolSpec {
@@ -713,7 +749,7 @@ where
             limit: self.limit,
             clock: sim_wall_clock,
             recovered: self.recovered,
-            make_checkpoint: |_executor| NoCheckpoint,
+            make_checkpoint: self.make_checkpoint,
         })
     }
 }
