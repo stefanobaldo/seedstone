@@ -249,3 +249,186 @@ async fn a_second_process_on_the_same_directory_is_refused() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Waits until a line with `evt` appears in `stderr`, returning every line
+/// so far; fails after ten seconds.
+async fn until_event(stderr: &Path, evt: &str) -> Vec<String> {
+    let needle = format!("\"evt\":\"{evt}\"");
+    for _ in 0..500 {
+        let text = std::fs::read_to_string(stderr).unwrap_or_default();
+        if text.contains(&needle) {
+            return text.lines().map(str::to_owned).collect();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no {evt} line within ten seconds")
+}
+
+/// The number `name` holds in the line `line`.
+fn field(line: &str, name: &str) -> u64 {
+    let start = line
+        .find(&format!("\"{name}\":"))
+        .unwrap_or_else(|| panic!("no {name} in {line}"))
+        + name.len()
+        + 3;
+    line[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} is not a number in {line}"))
+}
+
+/// Bytes of every file under `dir/wal`.
+fn wal_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir.join("wal"))
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .sum()
+}
+
+/// `count` keys that all live on the node's first shard, and so on its
+/// first executor whatever the number of cores.
+///
+/// The log is kept per executor, and so is the floor a snapshot waits for:
+/// spread over every executor, the writes below would leave each one's log
+/// far short of it. A key's shard is its CRC16 modulo the binary's 1024
+/// shards, so a CRC that 1024 divides is shard 0, which every partition
+/// gives to executor 0.
+fn keys_on_one_executor(count: usize) -> Vec<String> {
+    (0u64..)
+        .map(|i| format!("k{i}"))
+        .filter(|key| seedstone_core::slot::crc16_xmodem(key.as_bytes()).is_multiple_of(1024))
+        .take(count)
+        .collect()
+}
+
+/// Writes `total` bytes of values over `keys`, `value_len` each, in turn.
+async fn write_past(stream: &mut TcpStream, total: u64, keys: &[String], value_len: usize) {
+    let value = "v".repeat(value_len);
+    let mut written = 0u64;
+    for key in keys.iter().cycle() {
+        if written >= total {
+            break;
+        }
+        assert_eq!(
+            round_trip(stream, &["SET", key, &value]).await,
+            Frame::Simple("OK".into())
+        );
+        written += value_len as u64;
+    }
+}
+
+/// Past the floor the node snapshots, the directory shrinks, and a restart
+/// serves the keyspace from the image plus the tail.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_past_the_floor_snapshots_compacts_and_restarts_from_the_image() {
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let (mut first, port) = start(&dir, &stderr).await;
+    let floor = seedstone_core::log::checkpoint::SNAPSHOT_FLOOR;
+    let keys = keys_on_one_executor(100);
+    {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // 100 keys of 16 KiB: an image of 1.6 MiB, a log that crosses the
+        // floor after ~4100 writes, and 20 % more to leave a tail.
+        write_past(&mut stream, floor + floor / 5, &keys, 16 * 1024).await;
+        assert_eq!(
+            round_trip(&mut stream, &["SET", "after", "tail"]).await,
+            Frame::Simple("OK".into())
+        );
+    }
+    let lines = until_event(&stderr, "compaction").await;
+    let snapshot = lines
+        .iter()
+        .find(|line| line.contains("\"evt\":\"snapshot\""))
+        .expect("a snapshot line precedes the compaction");
+    assert_eq!(field(snapshot, "executor"), 0, "{snapshot}");
+    assert_eq!(field(snapshot, "entries"), 100, "{snapshot}");
+    assert!(field(snapshot, "disk_bytes") >= floor, "{snapshot}");
+    let compaction = lines
+        .iter()
+        .find(|line| line.contains("\"evt\":\"compaction\""))
+        .unwrap();
+    assert!(field(compaction, "bytes") >= floor, "{compaction}");
+    let after = wal_bytes(&dir);
+    assert!(
+        after < floor / 2,
+        "the directory shrank below the floor once the snapshot covered the log: {after} bytes"
+    );
+    // The tail since the snapshot began is on disk before the kill.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    first.kill().expect("SIGKILL");
+    first.wait().expect("reaped");
+
+    let (mut second, port) = start(&dir, &stderr).await;
+    let text = std::fs::read_to_string(&stderr).unwrap();
+    let recovery = text
+        .lines()
+        .find(|line| line.contains("\"evt\":\"recovery\""))
+        .unwrap();
+    assert_eq!(field(recovery, "snapshots_used"), 1, "{recovery}");
+    assert_eq!(field(recovery, "lossy_shards"), 0, "{recovery}");
+    {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        assert_eq!(
+            round_trip(&mut stream, &["DBSIZE"]).await,
+            Frame::Integer(101),
+            "100 keys from image plus tail, and the one written after"
+        );
+        assert_eq!(
+            round_trip(&mut stream, &["GET", "after"]).await,
+            Frame::Bulk("tail".into())
+        );
+        let Frame::Bulk(value) = round_trip(&mut stream, &["GET", &keys[7]]).await else {
+            panic!("{} holds a value", keys[7])
+        };
+        assert_eq!(value.len(), 16 * 1024);
+    }
+    second.kill().expect("SIGKILL");
+    second.wait().expect("reaped");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}
+
+/// Killed the instant its snapshot line appears — with the compaction
+/// possibly half done — the node starts again clean.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_killed_at_its_snapshot_line_starts_again_clean() {
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let (mut first, port) = start(&dir, &stderr).await;
+    let floor = seedstone_core::log::checkpoint::SNAPSHOT_FLOOR;
+    let keys = keys_on_one_executor(50);
+    {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        write_past(&mut stream, floor + floor / 10, &keys, 16 * 1024).await;
+    }
+    until_event(&stderr, "snapshot").await;
+    first.kill().expect("SIGKILL");
+    first.wait().expect("reaped");
+
+    let (mut second, port) = start(&dir, &stderr).await;
+    let text = std::fs::read_to_string(&stderr).unwrap();
+    assert!(!text.contains("\"evt\":\"recovery_failed\""), "{text}");
+    let recovery = text
+        .lines()
+        .find(|line| line.contains("\"evt\":\"recovery\""))
+        .unwrap();
+    assert_eq!(field(recovery, "lossy_shards"), 0, "{recovery}");
+    {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        assert_eq!(
+            round_trip(&mut stream, &["DBSIZE"]).await,
+            Frame::Integer(50)
+        );
+        let Frame::Bulk(value) = round_trip(&mut stream, &["GET", &keys[0]]).await else {
+            panic!("{} holds a value", keys[0])
+        };
+        assert_eq!(value.len(), 16 * 1024);
+    }
+    second.kill().expect("SIGKILL");
+    second.wait().expect("reaped");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}
