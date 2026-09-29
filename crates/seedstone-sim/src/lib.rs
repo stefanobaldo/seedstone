@@ -796,14 +796,19 @@ async fn verifier(cfg: SimConfig, shared: Shared) -> turmoil::Result {
     // found synced is owed. Any other — acknowledged after its shard's last
     // sync, or whose reply a crash took — may or may not be there, and the
     // deltas are of either sign, so each widens the floor by what it could
-    // subtract and the ceiling by what it could add.
+    // subtract and the ceiling by what it could add. So does an owed one on
+    // a shard a later recovery reported as having lost records: the node
+    // owned up to losing it.
     {
         let crashes = lock(&shared.crashes).clone();
+        let truncated = lock(&shared.truncated).clone();
         let (mut floor, mut ceiling) = (0i64, 0i64);
         for inc in lock(&shared.increments).iter() {
-            let owed = inc
-                .acked
-                .is_some_and(|acked| increment_is_durable(acked, inc.shard, &crashes[inc.later..]));
+            let reported = truncated[usize::from(inc.shard)].is_some_and(|at| at >= inc.later);
+            let owed = !reported
+                && inc.acked.is_some_and(|acked| {
+                    increment_is_durable(acked, inc.shard, &crashes[inc.later..])
+                });
             if owed {
                 floor += inc.delta;
                 ceiling += inc.delta;

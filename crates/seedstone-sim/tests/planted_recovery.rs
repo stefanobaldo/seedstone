@@ -104,3 +104,20 @@ fn the_durability_counters_stay_silent_on_unrelated_plants() {
         );
     }
 }
+
+/// Hostile seeds beyond the calibration range that once caught the verdict
+/// out, each for a reason now written into the model or the node: a cut
+/// replayed on the next start (107), a durable claim resting on a recovery
+/// that reported loss (147), a reported loss that reverted a key to an
+/// older value, an absence or an older deadline (39, 42, 135, 177), and an
+/// owed increment on a reported shard (104). The honest node holds on all.
+#[test]
+fn the_honest_node_holds_on_the_seeds_that_once_caught_the_verdict_out() {
+    for sim_seed in [39, 42, 104, 107, 135, 147, 177] {
+        let outcome = hostile(sim_seed, None);
+        assert!(
+            outcome.invariant_holds(),
+            "seed {sim_seed} violated an invariant with an honest node: {outcome:?}"
+        );
+    }
+}

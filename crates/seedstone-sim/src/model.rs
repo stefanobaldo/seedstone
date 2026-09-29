@@ -62,15 +62,25 @@ pub struct Model {
     /// Per plain slot, the shard its key hashes to — the durable point that
     /// governs it.
     plain_shard: Vec<u16>,
-    /// Per plain slot, whether its current `Known` was settled by a crash
-    /// with every write durable: a read that then disagrees is a lost
-    /// durable write, not a plain mismatch.
-    plain_durable: Vec<bool>,
+    /// Per plain slot, the index of the earliest crash since which its
+    /// current `Known` has been settled with every write durable, or `None`:
+    /// a read that then disagrees is a lost durable write, not a plain
+    /// mismatch — excused only by a recovery at or after that crash.
+    plain_durable: Vec<Option<usize>>,
+    /// Per plain slot, the index of the earliest crash since which its
+    /// current `Known` has been what crashes left it, with no write since.
+    plain_since: Vec<Option<usize>>,
+    /// Per plain slot, every value its owner ever wrote: what a recovery
+    /// that reported losing records may have left the key holding instead.
+    plain_ever: Vec<Vec<Vec<u8>>>,
     /// Per volatile slot, the shard its key hashes to.
     volatile_shard: Vec<u16>,
     /// Per volatile slot, when its last deadline was acknowledged, on the
     /// world clock.
     volatile_acked: Vec<Option<Duration>>,
+    /// Per volatile slot, the index of the earliest crash its deadline has
+    /// been kept across since it was written, or `None`.
+    volatile_kept: Vec<Option<usize>>,
     /// How many crashes this client has absorbed into its model.
     crashes_seen: usize,
     /// The node's shard count, for placing a counter key on its shard.
@@ -93,8 +103,11 @@ impl Model {
             id,
             plain_history: vec![SlotHistory::default(); plain.len as usize],
             plain_shard,
-            plain_durable: vec![false; plain.len as usize],
+            plain_durable: vec![None; plain.len as usize],
+            plain_since: vec![None; plain.len as usize],
+            plain_ever: vec![Vec::new(); plain.len as usize],
             volatile_shard,
+            volatile_kept: vec![None; volatile.len as usize],
             volatile_acked: vec![None; volatile.len as usize],
             crashes_seen: 0,
             shards: cfg.shards,
@@ -427,6 +440,7 @@ impl Model {
         // write in this burst counts as acknowledged at. After the server
         // applied them, so a durable point strictly later covers them.
         let acked = world_now();
+        self.open_reported();
         for (reply, check) in replies.iter().zip(checks) {
             match check {
                 Check::Ignored => {}
@@ -508,6 +522,7 @@ impl Model {
                         _ => None,
                     };
                     self.volatile_acked[*slot as usize] = Some(acked);
+                    self.volatile_kept[*slot as usize] = None;
                 }
                 // A zero says the key was already gone, which is no statement
                 // about when it will next die: the model gives up on it until
@@ -518,6 +533,7 @@ impl Model {
                         _ => None,
                     };
                     self.volatile_acked[*slot as usize] = Some(acked);
+                    self.volatile_kept[*slot as usize] = None;
                 }
                 // Whatever it answered, the key carries no deadline
                 // afterwards: `1` removed one, and `0` says there was none to
@@ -788,7 +804,7 @@ impl Model {
             (Known::Value(value), Frame::Bulk(got)) => got == value,
             (Known::Value(_), _) => false,
         };
-        if self.plain_durable[slot as usize] {
+        if self.plain_durable[slot as usize].is_some() {
             self.check_durable(slot, agrees);
             return;
         }
@@ -840,9 +856,6 @@ impl Model {
         if self.evictable && !present && received + LIVE_SLACK < deadline {
             self.deadlines[slot as usize] = None;
             lock(&self.shared.tally).evictions_observed += 1;
-            return;
-        }
-        if !present && received + LIVE_SLACK < deadline && self.excused_volatile_death(slot) {
             return;
         }
         let mut tally = lock(&self.shared.tally);
