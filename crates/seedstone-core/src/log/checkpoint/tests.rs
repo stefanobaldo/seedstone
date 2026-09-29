@@ -779,3 +779,36 @@ fn a_failed_header_sync_abandons_the_file_and_the_image_still_reads_whole() {
     assert_eq!(keys, 8);
     assert!(recovery.shards.iter().all(|s| !s.lossy));
 }
+
+/// A rotation whose directory sync failed is retried under a new name: a
+/// second header appended to the half-made segment would read as damage at
+/// the next start, and every shard of the executor would be reported lossy
+/// for a disk that lost nothing.
+#[test]
+fn a_failed_rotation_is_retried_under_a_new_name_and_the_start_reads_no_damage() {
+    let mut b = bench(2, SMALL);
+    eight_keys_past_the_floor(&mut b);
+    // The rotation's directory sync is the first the cycle makes.
+    b.disk.fail_one_dir_sync_after(0);
+    let trace = Recorder::default();
+    tick_until_snapshot(&mut b, &trace);
+    assert_eq!(*trace.faults.lock().unwrap(), [LogFault::Snapshot]);
+    assert_eq!(
+        trace.snapshots.lock().unwrap().len(),
+        1,
+        "the cycle finished"
+    );
+    // Writes after the rotation land in the new segment.
+    put(&mut b.states[0], b"after", b"1");
+    flush_and_sync(&mut b.states);
+    let recovery = recovered(&b);
+    assert_eq!(
+        (recovery.report.damage_bytes, recovery.report.holes),
+        (0, 0),
+        "{:?}",
+        recovery.report
+    );
+    assert!(recovery.shards.iter().all(|s| !s.lossy && !s.cut));
+    let keys: usize = recovery.shards.iter().map(|s| s.dict.len()).sum();
+    assert_eq!(keys, 9);
+}

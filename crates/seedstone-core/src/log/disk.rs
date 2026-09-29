@@ -199,6 +199,8 @@ pub(crate) mod mem {
         fail_removes: bool,
         /// File syncs to let through before one fails, once.
         sync_fails_after: Option<u32>,
+        /// Directory syncs to let through before one fails, once.
+        dir_sync_fails_after: Option<u32>,
     }
 
     /// Counts a sync down: `true` when this is the one that fails.
@@ -262,6 +264,11 @@ pub(crate) mod mem {
         pub fn fail_one_sync_after(&self, skip: u32) {
             self.lock().sync_fails_after = Some(skip);
         }
+
+        /// The directory sync after the next `skip` fails, once.
+        pub fn fail_one_dir_sync_after(&self, skip: u32) {
+            self.lock().dir_sync_fails_after = Some(skip);
+        }
     }
 
     impl LogFile for MemFile {
@@ -299,7 +306,11 @@ pub(crate) mod mem {
         }
 
         fn sync_dir(&self, dir: &Path) -> io::Result<()> {
-            if self.lock().dirs.contains(dir) {
+            let mut fs = self.lock();
+            if countdown(&mut fs.dir_sync_fails_after) {
+                return Err(io::Error::other("injected directory sync failure"));
+            }
+            if fs.dirs.contains(dir) {
                 Ok(())
             } else {
                 Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"))
