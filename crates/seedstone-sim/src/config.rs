@@ -173,6 +173,13 @@ impl DiskFaults {
     };
     /// A disk that tears pending writes on a crash and nothing else: the
     /// swept shape's disk, where the strong invariant is asserted.
+    ///
+    /// On this node it tears nothing today: the log's tick writes and syncs
+    /// without yielding between the two, and a host is crashed only between
+    /// steps, so no write is ever pending when the crash lands. It stays
+    /// the swept disk so that a change which leaves one pending is torn by
+    /// the gate rather than by production; a torn record is otherwise met
+    /// on `hostile`, behind a failed sync, and in the reader's own tests.
     pub const TORN: Self = Self {
         block_size: Some(32),
         io_error_permille: 0,
@@ -208,6 +215,15 @@ const EVICTION_ENTRY_BYTES: u64 = ENTRY_OVERHEAD + BUCKET_OVERHEAD + 16;
 impl SimConfig {
     /// The sweep configuration: the shape measured to be schedule-sensitive,
     /// which is what makes a seed sweep find anything.
+    ///
+    /// Every seed of the gate now crashes the node up to twice, under load,
+    /// and holds it to the strong invariant: everything acknowledged before
+    /// a shard's last sync survives, and what survives is a prefix of what
+    /// was acknowledged. What a crash costs here is the log's unsynced
+    /// buffer, cut at a record boundary — see [`DiskFaults::TORN`] for why
+    /// nothing is torn. The crash count is drawn uniformly from none, one
+    /// or two, so about a third of the seeds draw no crash and keep the
+    /// exact counter sum.
     #[must_use]
     pub const fn standard(workload_seed: u64, sim_seed: u64) -> Self {
         Self {
@@ -225,8 +241,8 @@ impl SimConfig {
             concurrent_scan_cycle: false,
             planted: None,
             maxmemory: None,
-            crashes: CrashPlan::None,
-            disk: DiskFaults::NONE,
+            crashes: CrashPlan::UnderLoad { max: 2 },
+            disk: DiskFaults::TORN,
         }
     }
 
