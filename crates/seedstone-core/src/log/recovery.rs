@@ -104,17 +104,17 @@ pub fn recover<D: Disk>(
     shards: u16,
     mode: ReaderMode,
 ) -> io::Result<Recovery> {
-    let mut names: Vec<(u64, u16, String)> = disk
+    let mut names: Vec<(u64, u16, u32, String)> = disk
         .list(wal)?
         .into_iter()
-        .filter_map(|name| parse_segment_name(&name).map(|(g, e)| (g, e, name)))
+        .filter_map(|name| parse_segment_name(&name).map(|(g, e, r)| (g, e, r, name)))
         .collect();
     names.sort();
     // How many executors each generation ran: the segment names say, and a
     // shard's executor in that generation follows from it — which is what
     // lets damage in one segment be charged to the shards that wrote there.
     let mut executors_in: BTreeMap<u64, u16> = BTreeMap::new();
-    for (generation, executor, _) in &names {
+    for (generation, executor, _, _) in &names {
         let count = executors_in.entry(*generation).or_default();
         *count = (*count).max(executor.saturating_add(1));
     }
@@ -125,7 +125,7 @@ pub fn recover<D: Disk>(
         damaged: vec![false; usize::from(shards)],
         unattributed_loss: false,
     };
-    for (generation, executor, name) in names {
+    for (generation, executor, _, name) in names {
         let executors = executors_in.get(&generation).copied().unwrap_or(1);
         scan.segment(disk, wal, &name, mode, generation, (executor, executors))?;
     }
@@ -172,7 +172,7 @@ impl Scan {
                     format!("{name}: format version {version} is newer than this build reads"),
                 ));
             }
-            Err(HeaderError::Short | HeaderError::BadMagic) => {
+            Err(HeaderError::Short | HeaderError::BadMagic | HeaderError::BadChecksum) => {
                 self.abandon();
                 return Ok(());
             }
@@ -499,7 +499,7 @@ mod tests {
         write(&mut s0, 0, &put(b"a", b"1"));
         write(&mut s1, 0, &put(b"b", b"1"));
         write(&mut s1, 1, &put(b"b", b"2"));
-        let path = Path::new("/data/wal").join(segment_name(1, 0));
+        let path = Path::new("/data/wal").join(segment_name(1, 0, 0));
         let mut bytes = disk.contents(&path);
         // Flip a byte inside the first record's payload.
         bytes[SEGMENT_HEADER_LEN + 9 + 10 + 1] ^= 0xFF;
@@ -539,7 +539,7 @@ mod tests {
         let mut s1 = FileLog::new(1, Arc::clone(&segments[0]));
         write(&mut s0, 0, &put(b"a", b"1"));
         write(&mut s1, 0, &put(b"b", b"1"));
-        let path = Path::new("/data/wal").join(segment_name(1, 0));
+        let path = Path::new("/data/wal").join(segment_name(1, 0, 0));
         let mut bytes = disk.contents(&path);
         bytes[SEGMENT_HEADER_LEN + 9 + 10 + 1] ^= 0xFF;
         disk.overwrite(&path, bytes);
@@ -560,9 +560,9 @@ mod tests {
         let disk = MemDisk::default();
         wal(&disk, 1, 1);
         let mut header = Vec::new();
-        encode_segment_header(2, 0, &mut header);
+        encode_segment_header(2, 0, 0, &mut header);
         header[4] = FORMAT_VERSION + 1;
-        disk.write_file(&Path::new("/data/wal").join(segment_name(2, 0)), &header)
+        disk.write_file(&Path::new("/data/wal").join(segment_name(2, 0, 0)), &header)
             .unwrap();
         let error = recover(
             &disk,
@@ -581,7 +581,7 @@ mod tests {
         let segments = wal(&disk, 1, 1);
         let mut s1 = FileLog::new(1, Arc::clone(&segments[0]));
         write(&mut s1, 0, &put(b"b", b"1"));
-        disk.write_file(&Path::new("/data/wal").join(segment_name(2, 0)), b"junk")
+        disk.write_file(&Path::new("/data/wal").join(segment_name(2, 0, 0)), b"junk")
             .unwrap();
         let recovery = recover(
             &disk,

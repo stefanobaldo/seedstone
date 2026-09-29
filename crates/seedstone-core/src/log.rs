@@ -175,7 +175,7 @@ pub enum Decoded<'a> {
 /// output reflected, final XOR `0xFFFF_FFFF`. Written bitwise rather than
 /// pulled in as a dependency: it runs once per logged command, and a table
 /// would be a build-time input to a value the format is pinned to forever.
-fn crc32_iso_hdlc(data: &[u8]) -> u32 {
+pub(crate) fn crc32_iso_hdlc(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
         crc ^= u32::from(byte);
