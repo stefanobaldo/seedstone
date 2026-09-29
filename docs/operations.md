@@ -194,9 +194,11 @@ snapshot never holds them for longer than one tick's share takes to write,
 and the `snapshot` line says when it is durable. The log it covers is then
 removed, on the `compaction` line. What that bounds: **an executor's files
 never exceed its last snapshot, plus the one it is writing, plus the larger
-of 64 MiB and its last snapshot, plus what was written while the snapshot
-was being taken** — three times the last snapshot plus 64 MiB, and the
-writes of one snapshot's duration, on a keyspace that is not growing. The
+of 64 MiB and its last snapshot, plus what was written from the moment
+the log crossed that size until the snapshot was durable** — three times
+the last snapshot plus 64 MiB, and the writes of that span, on a keyspace
+that is not growing. The crossing is noticed on the next housekeeping
+tick, so the span starts up to one tick before the snapshot does. The
 directory is the sum over the executors.
 
 After a restart, the previous process's files stay until every executor of

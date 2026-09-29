@@ -198,10 +198,13 @@ struct Cycle<F> {
     footer_written: bool,
     /// The file is synced and the directory sync is what remains.
     dir_pending: bool,
+    /// How far past the threshold the log had grown when the cycle opened:
+    /// it crosses between two ticks and the cycle opens on the next.
+    overshoot: u64,
 }
 
 impl<F> Cycle<F> {
-    fn fresh(number: u32, bases: Vec<u64>) -> Self {
+    fn fresh(number: u32, bases: Vec<u64>, overshoot: u64) -> Self {
         let shards = bases.len();
         Self {
             file: None,
@@ -215,6 +218,7 @@ impl<F> Cycle<F> {
             ticks: 0,
             footer_written: false,
             dir_pending: false,
+            overshoot,
         }
     }
 
@@ -276,6 +280,7 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         states: &[ShardState<L>],
         trace: &T,
     ) -> io::Result<()> {
+        let overshoot = live_log_bytes(&self.segment).saturating_sub(self.threshold());
         rotate_segment(
             &self.disk,
             &self.wal,
@@ -284,7 +289,7 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
             &self.segment,
         )?;
         let bases = states.iter().map(|state| state.seq).collect();
-        self.open = Some(Cycle::fresh(self.cycle, bases));
+        self.open = Some(Cycle::fresh(self.cycle, bases, overshoot));
         self.cycle += 1;
         if self.deletes_before_durable {
             // The plant: the rotation taken for the durable point.
@@ -469,7 +474,11 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
     fn sync_footer(&mut self, cycle: &mut Cycle<D::File>) -> io::Result<bool> {
         let file = cycle.file.as_mut().expect("the footer was written");
         if let Err(error) = file.sync_data() {
-            let restarted = Cycle::fresh(self.cycle, std::mem::take(&mut cycle.bases));
+            let restarted = Cycle::fresh(
+                self.cycle,
+                std::mem::take(&mut cycle.bases),
+                cycle.overshoot,
+            );
             self.cycle += 1;
             *cycle = restarted;
             return Err(error);
@@ -505,7 +514,7 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
             bytes: cycle.bytes,
             ticks: cycle.ticks,
             disk_bytes: self.disk_bytes(),
-            written_during: live_log_bytes(&self.segment),
+            written_during: cycle.overshoot + live_log_bytes(&self.segment),
         });
         self.compact(first_shard, cycle.number, trace);
     }

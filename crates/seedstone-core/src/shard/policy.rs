@@ -36,7 +36,10 @@ pub struct SnapshotReport {
     /// Every file under `wal/`, summed, at the instant before compaction
     /// removed what the snapshot made redundant: the directory's peak.
     pub disk_bytes: u64,
-    /// Bytes of log written during the cycle — the `W` of the disk bound.
+    /// Bytes of log written since the log crossed the size that opened the
+    /// cycle, until the snapshot was durable — the `W` of the disk bound.
+    /// The crossing falls between two ticks and the cycle opens on the
+    /// next, so this counts what that tick's interval wrote past it too.
     pub written_during: u64,
 }
 

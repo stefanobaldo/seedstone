@@ -693,3 +693,34 @@ fn the_plant_deletes_at_the_rotation_before_any_snapshot_exists() {
         "and the removal was reported"
     );
 }
+
+/// The log crosses the floor between two ticks, and the cycle opens only on
+/// the next one: what was written past the floor before it opened is part
+/// of what the cycle reports as written, or the disk bound misses it.
+#[test]
+fn what_was_written_past_the_floor_before_the_cycle_opened_is_reported_as_written() {
+    let mut b = bench(2, SMALL);
+    for i in 0..8u8 {
+        put(
+            &mut b.states[usize::from(i % 2)],
+            &[b'k', i],
+            b"value-long-enough-to-cross",
+        );
+    }
+    flush_and_sync(&mut b.states);
+    let past_the_floor = live_log_bytes(&b.segment) - SMALL.floor;
+    assert!(past_the_floor > 0);
+    let trace = Recorder::default();
+    for _ in 0..16 {
+        b.checkpoint.tick(0, &mut b.states, now(), &trace);
+        if !trace.snapshots.lock().unwrap().is_empty() {
+            break;
+        }
+    }
+    let snapshots = trace.snapshots.lock().unwrap().clone();
+    assert_eq!(snapshots.len(), 1, "the cycle finished");
+    assert_eq!(
+        snapshots[0].written_during, past_the_floor,
+        "nothing was written after the rotation, so what is reported is the overshoot"
+    );
+}
