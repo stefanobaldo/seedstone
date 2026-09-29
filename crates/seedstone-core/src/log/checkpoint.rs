@@ -6,7 +6,7 @@
 //! rotates the segment, records every owned shard's sequence as its
 //! *base*, and opens a snapshot file. Each tick after that serialises up
 //! to [`CheckpointConfig::bytes_per_tick`] of entries through
-//! [`Dict::scan`], shard by shard, into the file. When every shard's
+//! [`Dict::scan`](crate::dict::Dict::scan), shard by shard, into the file. When every shard's
 //! cursor has come back to `0` the footer is written and the file synced:
 //! the snapshot is durable, every record below a shard's base is covered
 //! by its image, and the executor's older rotations and its previous
@@ -38,14 +38,19 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU16;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::log::ReplicationLog;
 use crate::log::disk::{Disk, LogFile};
-use crate::log::file::{SharedSegment, live_log_bytes, rotate_segment, segment_snapshot_covered};
-use crate::log::snapshot::{Footer, SnapshotHeader, encode_entry, snapshot_name};
+use crate::log::file::{
+    SharedSegment, live_log_bytes, lock, parse_segment_name, rotate_segment,
+    segment_snapshot_covered,
+};
+use crate::log::snapshot::{
+    Footer, SnapshotHeader, encode_entry, parse_snapshot_name, snapshot_name,
+};
 use crate::shard::executor::ShardState;
-use crate::shard::{LogFault, Now, SnapshotReport, TraceSink};
+use crate::shard::{CompactionReport, LogFault, Now, SnapshotReport, TraceSink};
 
 /// Bytes of live log that open a cycle on an executor with no snapshot
 /// yet, and the least that opens one afterwards.
@@ -239,6 +244,17 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         }
     }
 
+    /// The planted defect: compaction runs at the rotation, when the cycle
+    /// opens, instead of when its snapshot is durable. What a node that
+    /// took "the old log is redundant" to mean the rotation rather than the
+    /// synced footer would do — a crash anywhere in the cycle then finds
+    /// neither the old segments nor an image. This server never does it;
+    /// it exists so the simulator can plant exactly that and show it
+    /// caught.
+    pub const fn deletes_before_durable(&mut self, plant: bool) {
+        self.deletes_before_durable = plant;
+    }
+
     /// Cycles that reached a durable footer.
     #[must_use]
     pub const fn cycles_completed(&self) -> u32 {
@@ -254,7 +270,12 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
 
     /// Rotates the segment, takes the bases, and opens the cycle. Nothing
     /// is written to the snapshot file yet; `step` creates it.
-    fn open_cycle<L: ReplicationLog>(&mut self, states: &[ShardState<L>]) -> io::Result<()> {
+    fn open_cycle<L: ReplicationLog, T: TraceSink>(
+        &mut self,
+        first_shard: u16,
+        states: &[ShardState<L>],
+        trace: &T,
+    ) -> io::Result<()> {
         rotate_segment(
             &self.disk,
             &self.wal,
@@ -265,9 +286,12 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         let bases = states.iter().map(|state| state.seq).collect();
         self.open = Some(Cycle::fresh(self.cycle, bases));
         self.cycle += 1;
+        if self.deletes_before_durable {
+            // The plant: the rotation taken for the durable point.
+            self.compact(first_shard, self.cycle - 1, trace);
+        }
         Ok(())
     }
-    // Task 8 adds the plant's deletion at the end of `open_cycle`.
 
     /// Creates the cycle's file with its header, if it is not open yet.
     fn ensure_file(&self, first_shard: u16, cycle: &mut Cycle<D::File>) -> io::Result<()> {
@@ -496,8 +520,60 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
             .sum()
     }
 
-    /// Task 8 fills this in.
-    fn compact<T: TraceSink>(&mut self, _first_shard: u16, _cycle: u32, _trace: &T) {}
+    /// Removes what the snapshot of `cycle` made redundant: this executor's
+    /// older rotations and older snapshots of this generation; and, when
+    /// this executor's first completed cycle brings the round to every
+    /// executor, every older generation's files.
+    fn compact<T: TraceSink>(&mut self, first_shard: u16, cycle: u32, trace: &T) {
+        let rotation = lock(&self.segment).rotation;
+        let older_generations = !self.rounded && {
+            self.rounded = true;
+            self.round.fetch_add(1, Ordering::SeqCst) + 1 == self.executors
+        };
+        let mut removed = CompactionReport {
+            executor: self.executor,
+            files: 0,
+            bytes: 0,
+        };
+        for name in self.disk.list(&self.wal).unwrap_or_default() {
+            if !self.is_redundant(&name, rotation, cycle, older_generations) {
+                continue;
+            }
+            let path = self.wal.join(&name);
+            let bytes = self.disk.len(&path).unwrap_or(0);
+            match self.disk.remove_file(&path) {
+                Ok(()) => {
+                    removed.files += 1;
+                    removed.bytes += bytes;
+                }
+                Err(error) => trace.fault(first_shard, LogFault::Remove, &error),
+            }
+        }
+        if let Err(error) = self.disk.sync_dir(&self.wal) {
+            trace.fault(first_shard, LogFault::Remove, &error);
+        }
+        trace.compaction(&removed);
+    }
+
+    /// Whether `name` is a file the snapshot of `cycle` made redundant. The
+    /// older-generation arm comes first, so a file of an older generation is
+    /// judged by the round and never by this executor's counters.
+    fn is_redundant(&self, name: &str, rotation: u32, cycle: u32, older_generations: bool) -> bool {
+        match (parse_segment_name(name), parse_snapshot_name(name)) {
+            (Some((generation, _, _)), _) | (_, Some((generation, _, _)))
+                if generation < self.generation =>
+            {
+                older_generations
+            }
+            (Some((generation, executor, this)), _) => {
+                generation == self.generation && executor == self.executor && this < rotation
+            }
+            (_, Some((generation, executor, this))) => {
+                generation == self.generation && executor == self.executor && this < cycle
+            }
+            (None, None) => false,
+        }
+    }
 }
 
 impl<D: Disk + Send + 'static> Checkpoint for SegmentCheckpoint<D> {
@@ -512,7 +588,7 @@ impl<D: Disk + Send + 'static> Checkpoint for SegmentCheckpoint<D> {
             if live_log_bytes(&self.segment) < self.threshold() {
                 return;
             }
-            if let Err(error) = self.open_cycle(states) {
+            if let Err(error) = self.open_cycle(first_shard, states, trace) {
                 trace.fault(first_shard, LogFault::Snapshot, &error);
                 return;
             }

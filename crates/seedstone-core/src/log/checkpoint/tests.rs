@@ -146,6 +146,15 @@ impl TraceSink for Recorder {
     }
 }
 
+/// The floor alone opens a cycle: a test that runs several cycles writes a
+/// few records each time, never as much as the last image, so under a ratio
+/// of one its second cycle would never open.
+const FLOOR_ONLY: CheckpointConfig = CheckpointConfig {
+    floor: 64,
+    ratio: 0,
+    bytes_per_tick: 1024,
+};
+
 const SMALL: CheckpointConfig = CheckpointConfig {
     floor: 64,
     ratio: 1,
@@ -384,4 +393,303 @@ fn a_deadline_goes_out_as_unix_milliseconds() {
         })
         .expect("k is in the image");
     assert_eq!(deadline, Some(1_000_000 + 5_000));
+}
+
+#[test]
+fn a_durable_snapshot_deletes_the_older_rotations_and_the_previous_snapshot() {
+    let mut b = bench(2, FLOOR_ONLY);
+    let recorder = Recorder::default();
+    for cycle in 0..2u8 {
+        for i in 0..8u8 {
+            put(
+                &mut b.states[usize::from(i % 2)],
+                &[b'k', cycle, i],
+                b"value-long-enough-to-cross",
+            );
+        }
+        flush_and_sync(&mut b.states);
+        let done = recorder.snapshots.lock().unwrap().len();
+        while recorder.snapshots.lock().unwrap().len() == done {
+            b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+        }
+    }
+    let mut names = b.disk.list(Path::new(WAL)).unwrap();
+    names.sort();
+    assert_eq!(
+        names,
+        [snapshot_name(1, 0, 1), segment_name(1, 0, 2)],
+        "only the current rotation and the latest snapshot remain"
+    );
+    let compactions = recorder.compactions.lock().unwrap().clone();
+    assert_eq!(compactions.len(), 2);
+    assert_eq!(
+        compactions[0].files, 1,
+        "the first cycle removed rotation 0"
+    );
+    assert_eq!(
+        compactions[1].files, 2,
+        "the second removed rotation 1 and snapshot 0"
+    );
+    assert!(compactions[1].bytes > 0);
+    let reports = recorder.snapshots.lock().unwrap().clone();
+    assert!(
+        reports[1].disk_bytes > reports[1].bytes,
+        "the peak was read before the deletion: {:?}",
+        reports[1]
+    );
+    assert!(recorder.faults.lock().unwrap().is_empty());
+    assert_eq!(
+        b.round.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a lone executor closes the round on its first cycle, and only once"
+    );
+}
+
+#[test]
+fn the_executor_that_closes_the_round_deletes_every_older_generation() {
+    // Generation 1 left a segment and a snapshot behind; generation 2 runs
+    // two executors, and only the second to complete a cycle removes them.
+    let disk = MemDisk::default();
+    disk.create_dir_all(Path::new(WAL)).unwrap();
+    disk.write_file(&Path::new(WAL).join(segment_name(1, 0, 3)), b"old")
+        .unwrap();
+    disk.write_file(&Path::new(WAL).join(snapshot_name(1, 0, 2)), b"old")
+        .unwrap();
+    disk.write_file(&Path::new(WAL).join("GENERATION"), b"2")
+        .unwrap();
+    disk.write_file(&Path::new(WAL).join("LOCK"), b"").unwrap();
+    let segments = open_segments(&disk, Path::new(WAL), 2, 2).unwrap();
+    let round = Arc::new(AtomicU16::new(0));
+    let make = |executor: u16| {
+        SegmentCheckpoint::new(CheckpointSpec {
+            disk: disk.clone(),
+            wal: Path::new(WAL).to_path_buf(),
+            generation: 2,
+            executor,
+            executors: 2,
+            segment: Arc::clone(&segments[usize::from(executor)]),
+            round: Arc::clone(&round),
+            config: FLOOR_ONLY,
+        })
+    };
+    let mut checkpoints = [make(0), make(1)];
+    let mut states: Vec<Vec<ShardState<FileLog<crate::log::disk::mem::MemFile>>>> = (0..2u16)
+        .map(|executor| {
+            vec![ShardState::new(
+                Dict::with_seed(DictSeed {
+                    k0: u64::from(executor),
+                    k1: 1,
+                }),
+                FileLog::new(executor, Arc::clone(&segments[usize::from(executor)])),
+            )]
+        })
+        .collect();
+    let recorder = Recorder::default();
+    for executor in 0..2usize {
+        for i in 0..8u8 {
+            put(
+                &mut states[executor][0],
+                &[b'k', i],
+                b"value-long-enough-to-cross",
+            );
+        }
+        flush_and_sync(&mut states[executor]);
+        let done = recorder.snapshots.lock().unwrap().len();
+        while recorder.snapshots.lock().unwrap().len() == done {
+            checkpoints[executor].tick(
+                u16::try_from(executor).unwrap(),
+                &mut states[executor],
+                now(),
+                &recorder,
+            );
+        }
+        let names = disk.list(Path::new(WAL)).unwrap();
+        let old_left = names.iter().any(|n| n.starts_with("0000000000000001-"));
+        assert_eq!(
+            old_left,
+            executor == 0,
+            "after executor {executor}'s first cycle: {names:?}"
+        );
+    }
+    let names = disk.list(Path::new(WAL)).unwrap();
+    assert!(names.contains(&"GENERATION".to_owned()) && names.contains(&"LOCK".to_owned()));
+    assert_eq!(round.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // A second cycle on either executor counts no further.
+    for i in 0..8u8 {
+        put(&mut states[0][0], &[b'm', i], b"value-long-enough-to-cross");
+    }
+    flush_and_sync(&mut states[0]);
+    let done = recorder.snapshots.lock().unwrap().len();
+    while recorder.snapshots.lock().unwrap().len() == done {
+        checkpoints[0].tick(0, &mut states[0], now(), &recorder);
+    }
+    assert_eq!(round.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_failed_write_keeps_the_buffer_and_the_next_tick_writes_it_first() {
+    let mut b = bench(
+        1,
+        CheckpointConfig {
+            floor: 64,
+            ratio: 1,
+            bytes_per_tick: 64,
+        },
+    );
+    for i in 0..12u8 {
+        put(&mut b.states[0], &[b'k', i], b"v");
+    }
+    flush_and_sync(&mut b.states);
+    let recorder = Recorder::default();
+    b.checkpoint.tick(0, &mut b.states, now(), &recorder); // opens, writes the header
+    let path = Path::new(WAL).join(snapshot_name(1, 0, 0));
+    let before = b.disk.contents(&path).len();
+    b.disk.fail_writes(true);
+    b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+    assert_eq!(
+        recorder.faults.lock().unwrap().as_slice(),
+        [LogFault::Snapshot]
+    );
+    assert_eq!(b.disk.contents(&path).len(), before, "nothing landed");
+    b.disk.fail_writes(false);
+    b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+    assert!(
+        b.disk.contents(&path).len() > before,
+        "the kept buffer landed"
+    );
+    let mut ticks = 0;
+    while recorder.snapshots.lock().unwrap().is_empty() {
+        b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+        ticks += 1;
+        assert!(ticks < 50);
+    }
+    assert_eq!(
+        recorder.snapshots.lock().unwrap()[0].entries,
+        12,
+        "nothing was lost or doubled"
+    );
+}
+
+#[test]
+fn a_failed_footer_sync_abandons_the_file_and_restarts_with_the_same_bases() {
+    // A budget of one entry or two, so the opening tick creates the file and
+    // the footer lands on a later one — whose sync alone is made to fail.
+    let mut b = bench(
+        1,
+        CheckpointConfig {
+            floor: 64,
+            ratio: 1,
+            bytes_per_tick: 64,
+        },
+    );
+    for i in 0..8u8 {
+        put(&mut b.states[0], &[b'k', i], b"value-long-enough-to-cross");
+    }
+    flush_and_sync(&mut b.states);
+    let recorder = Recorder::default();
+    b.checkpoint.tick(0, &mut b.states, now(), &recorder); // opens
+    assert!(recorder.snapshots.lock().unwrap().is_empty());
+    b.disk.fail_syncs(true);
+    let mut ticks = 0;
+    while recorder.faults.lock().unwrap().is_empty() {
+        b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+        ticks += 1;
+        assert!(ticks < 50, "the footer's sync is reached and fails");
+    }
+    b.disk.fail_syncs(false);
+    assert_eq!(
+        recorder.faults.lock().unwrap().as_slice(),
+        [LogFault::Snapshot]
+    );
+    assert!(recorder.snapshots.lock().unwrap().is_empty());
+    while recorder.snapshots.lock().unwrap().is_empty() {
+        b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+        ticks += 1;
+        assert!(ticks < 100, "the restarted cycle finishes");
+    }
+    let report = recorder.snapshots.lock().unwrap()[0];
+    assert_eq!(report.cycle, 1, "the second file, not the abandoned first");
+    let header = SnapshotHeader::decode(
+        &b.disk
+            .contents(&Path::new(WAL).join(snapshot_name(1, 0, 1))),
+    )
+    .unwrap();
+    assert_eq!(
+        header.bases,
+        vec![(0, 8)],
+        "the bases taken at the rotation"
+    );
+    assert_eq!(report.entries, 8);
+}
+
+#[test]
+fn a_failed_removal_is_reported_and_the_next_cycle_removes_it() {
+    let mut b = bench(1, FLOOR_ONLY);
+    let recorder = Recorder::default();
+    let run_cycle = |b: &mut Bench, tag: u8| {
+        for i in 0..8u8 {
+            put(&mut b.states[0], &[tag, i], b"value-long-enough-to-cross");
+        }
+        flush_and_sync(&mut b.states);
+        let done = recorder.snapshots.lock().unwrap().len();
+        while recorder.snapshots.lock().unwrap().len() == done {
+            b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+        }
+    };
+    b.disk.fail_removes(true);
+    run_cycle(&mut b, b'a');
+    assert!(recorder.faults.lock().unwrap().contains(&LogFault::Remove));
+    assert!(
+        b.disk
+            .list(Path::new(WAL))
+            .unwrap()
+            .contains(&segment_name(1, 0, 0)),
+        "still there"
+    );
+    b.disk.fail_removes(false);
+    run_cycle(&mut b, b'b');
+    let names = b.disk.list(Path::new(WAL)).unwrap();
+    assert!(
+        !names.contains(&segment_name(1, 0, 0)),
+        "removed at the next cycle: {names:?}"
+    );
+    assert!(!names.contains(&segment_name(1, 0, 1)));
+}
+
+#[test]
+fn the_plant_deletes_at_the_rotation_before_any_snapshot_exists() {
+    // Observable here only as the order of operations: the test disk never
+    // loses a file, so the plant is seen by the removal landing on the tick
+    // that opened the cycle, with no footer anywhere. The simulator is
+    // where it costs data: a crash during the cycle finds neither the old
+    // segments nor an image.
+    let mut b = bench(
+        1,
+        CheckpointConfig {
+            floor: 64,
+            ratio: 1,
+            bytes_per_tick: 40,
+        },
+    );
+    b.checkpoint.deletes_before_durable(true);
+    for i in 0..8u8 {
+        put(&mut b.states[0], &[b'k', i], b"value-long-enough-to-cross");
+    }
+    flush_and_sync(&mut b.states);
+    let recorder = Recorder::default();
+    b.checkpoint.tick(0, &mut b.states, now(), &recorder); // opens — and, planted, deletes
+    let names = b.disk.list(Path::new(WAL)).unwrap();
+    assert!(
+        !names.contains(&segment_name(1, 0, 0)),
+        "the old rotation is already gone: {names:?}"
+    );
+    assert!(
+        recorder.snapshots.lock().unwrap().is_empty(),
+        "nothing was durable"
+    );
+    assert_eq!(
+        recorder.compactions.lock().unwrap().len(),
+        1,
+        "and the removal was reported"
+    );
 }
