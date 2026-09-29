@@ -12,19 +12,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use seedstone_core::dict::DictSeed;
-use seedstone_core::log::checkpoint::NoCheckpoint;
+use seedstone_core::log::checkpoint::{CheckpointConfig, CheckpointSpec, SegmentCheckpoint};
 use seedstone_core::log::disk::{Disk, StdDisk};
 use seedstone_core::log::file::{FileLog, next_generation, open_segments};
 use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, recover};
 use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{
-    Command, Deadlines, LogFault, NoTrace, Now, PoolSpec, Reply, ShardPool, TraceSink,
+    Command, CompactionReport, Deadlines, LogFault, NoTrace, Now, PoolSpec, Reply, ShardPool,
+    SnapshotReport, TraceSink,
 };
 use seedstone_core::slot::executor_of;
 use seedstone_resp::{Frame, encode};
 use seedstone_service::log::{
-    Event, Field, LOG_FAULT, PASSWORD_RELOAD_FAILED, PASSWORD_RELOAD_SKIPPED, PASSWORD_RELOADED,
-    RECOVERY, RECOVERY_FAILED, RECOVERY_TRUNCATED, STOPPING, line,
+    COMPACTION, Event, Field, LOG_FAULT, PASSWORD_RELOAD_FAILED, PASSWORD_RELOAD_SKIPPED,
+    PASSWORD_RELOADED, RECOVERY, RECOVERY_FAILED, RECOVERY_TRUNCATED, SNAPSHOT, STOPPING, line,
 };
 use seedstone_service::{NodeInfo, PasswordStore, Passwords, Secret, serve_connection};
 use tokio::io::AsyncWriteExt;
@@ -785,8 +786,9 @@ pub fn emit(event: &Event, values: &[Field<'_>]) {
     eprintln!("{}", line_for(event, values));
 }
 
-/// The trace sink of a node with a log on disk: it observes no commands and
-/// writes one line per failed write or sync.
+/// The trace sink of a node with a log on disk: it observes no commands,
+/// writes one line per failed write, sync, snapshot or removal, and one per
+/// durable snapshot and per compaction.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FaultLines;
 
@@ -806,6 +808,31 @@ impl TraceSink for FaultLines {
                 Field::Num(u64::from(shard)),
                 Field::Str(stage),
                 Field::Str(&error.to_string()),
+            ],
+        );
+    }
+
+    fn snapshot(&self, report: &SnapshotReport) {
+        emit(
+            &SNAPSHOT,
+            &[
+                Field::Num(u64::from(report.executor)),
+                Field::Num(u64::from(report.cycle)),
+                Field::Num(report.entries),
+                Field::Num(report.bytes),
+                Field::Num(report.ticks),
+                Field::Num(report.disk_bytes),
+            ],
+        );
+    }
+
+    fn compaction(&self, report: &CompactionReport) {
+        emit(
+            &COMPACTION,
+            &[
+                Field::Num(u64::from(report.executor)),
+                Field::Num(report.files),
+                Field::Num(report.bytes),
             ],
         );
     }
@@ -857,6 +884,9 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
     let executors = executors();
     let started = (|| {
         disk.create_dir_all(&wal)?;
+        // `wal/` is a directory entry of `PATH`: a crash before this sync
+        // could lose the directory the segments' own syncs assume exists.
+        disk.sync_dir(dir)?;
         let lock = lock_data_dir(&wal)?;
         let recovery = recover(RecoverSpec {
             disk: &disk,
@@ -872,9 +902,9 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
         })?;
         let generation = next_generation(&disk, &wal)?;
         let segments = open_segments(&disk, &wal, generation, executors)?;
-        Ok::<_, std::io::Error>((recovery, segments, lock))
+        Ok::<_, std::io::Error>((recovery, generation, segments, lock))
     })();
-    let (recovery, segments, lock) = match started {
+    let (recovery, generation, segments, lock) = match started {
         Ok(started) => started,
         Err(error) => {
             emit(&RECOVERY_FAILED, &[Field::Str(&error.to_string())]);
@@ -895,6 +925,9 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
             Field::Num(report.malformed),
             Field::Num(report.truncated.len() as u64),
             Field::Num(recovery.shards.iter().filter(|shard| shard.lossy).count() as u64),
+            Field::Num(report.snapshots_used),
+            Field::Num(report.snapshots_refused),
+            Field::Num(report.files_removed),
         ],
     );
     for cut in &report.truncated {
@@ -907,6 +940,10 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
             ],
         );
     }
+    // Shared by every executor's checkpoint: the one that completes this
+    // process's first round of snapshots removes every older process's files.
+    let round = Arc::new(std::sync::atomic::AtomicU16::new(0));
+    let log_segments = segments.clone();
     let pool = ShardPool::spawn_spec(PoolSpec {
         shards: SHARDS,
         executors,
@@ -915,16 +952,25 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
         make_log: move |shard| {
             FileLog::new(
                 shard,
-                std::sync::Arc::clone(
-                    &segments[usize::from(executor_of(shard, SHARDS, executors))],
-                ),
+                Arc::clone(&log_segments[usize::from(executor_of(shard, SHARDS, executors))]),
             )
         },
         policy: Deadlines,
         limit: cfg.limit,
         clock: wall_clock,
         recovered: recovery.shards,
-        make_checkpoint: |_executor| NoCheckpoint,
+        make_checkpoint: move |executor| {
+            SegmentCheckpoint::new(CheckpointSpec {
+                disk: StdDisk,
+                wal: wal.clone(),
+                generation,
+                executor,
+                executors,
+                segment: Arc::clone(&segments[usize::from(executor)]),
+                round: Arc::clone(&round),
+                config: CheckpointConfig::PRODUCTION,
+            })
+        },
     });
     Ok((pool, Some(lock)))
 }

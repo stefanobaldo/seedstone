@@ -137,7 +137,9 @@ pub static PASSWORD_RELOAD_SKIPPED: Event = Event {
 /// It says every way recovery can have cost records, not only a gap: a hole
 /// can swallow a shard's last records and leave no gap behind, and a
 /// segment given up whole loses whatever it held. `lossy_shards` counts the
-/// shards any of it may have touched.
+/// shards any of it may have touched. The last three say what the
+/// snapshots did: how many files gave a shard its image, how many were
+/// refused, and how many files nothing used were removed.
 pub static RECOVERY: Event = Event {
     name: "recovery",
     level: Level::Info,
@@ -152,6 +154,9 @@ pub static RECOVERY: Event = Event {
         "malformed",
         "truncated_shards",
         "lossy_shards",
+        "snapshots_used",
+        "snapshots_refused",
+        "files_removed",
     ],
 };
 
@@ -172,12 +177,40 @@ pub static RECOVERY_FAILED: Event = Event {
     fields: &["error"],
 };
 
-/// A shard's log could not be written or synced on a housekeeping tick.
-/// `stage` is `write` or `sync`; the records are kept and retried.
+/// Something on disk failed on a housekeeping tick, and will be retried.
+///
+/// A shard's log could not be written or synced, the executor's snapshot
+/// could not be written or made durable, or a file a durable snapshot made
+/// redundant could not be removed: `stage` is `write`, `sync`, `snapshot`
+/// or `remove`.
 pub static LOG_FAULT: Event = Event {
     name: "log_fault",
     level: Level::Error,
     fields: &["shard", "stage", "error"],
+};
+
+/// One executor's snapshot became durable: every record below each of its
+/// shards' bases is now covered by the image on disk.
+pub static SNAPSHOT: Event = Event {
+    name: "snapshot",
+    level: Level::Info,
+    fields: &[
+        "executor",
+        "cycle",
+        "entries",
+        "bytes",
+        "ticks",
+        "disk_bytes",
+    ],
+};
+
+/// One executor removed what its durable snapshot made redundant — its
+/// own older segments and snapshot, or every older process's files when it
+/// closed this process's first round of snapshots.
+pub static COMPACTION: Event = Event {
+    name: "compaction",
+    level: Level::Info,
+    fields: &["executor", "files", "bytes"],
 };
 
 /// Every event the server can write, in the order the page lists them.
@@ -193,6 +226,8 @@ pub static EVENTS: &[&Event] = &[
     &RECOVERY_TRUNCATED,
     &RECOVERY_FAILED,
     &LOG_FAULT,
+    &SNAPSHOT,
+    &COMPACTION,
 ];
 
 /// One line: the envelope, then `event`'s fields with `values` in order.
