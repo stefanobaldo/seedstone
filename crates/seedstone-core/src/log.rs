@@ -407,14 +407,23 @@ pub trait ReplicationLog: Send + 'static {
     /// Whatever the store reports. Nothing flushed since the last successful
     /// sync may be assumed durable afterwards; the next tick syncs again.
     fn sync(&mut self) -> std::io::Result<Option<u64>>;
+
+    /// Whether [`append`](ReplicationLog::append) reads the record's
+    /// payload. A log that keeps nothing says no, and the caller does not
+    /// encode one: the default path — a node with no log — then pays for no
+    /// payload on any write.
+    fn keeps_payloads(&self) -> bool {
+        true
+    }
 }
 
-/// A [`ReplicationLog`] that keeps nothing.
+/// A [`ReplicationLog`] that keeps nothing: the log of a node started
+/// without `--data-dir`.
 ///
-/// The one implementation this server ships today. Every method succeeds
-/// without doing anything: there are no bytes to write, so there is nothing
-/// for [`sync`](ReplicationLog::sync) to make durable and it is trivially
-/// satisfied.
+/// Every method succeeds without doing anything: there are no bytes to
+/// write, so there is nothing for [`sync`](ReplicationLog::sync) to make
+/// durable and it is trivially satisfied. It keeps no payloads, so no write
+/// on such a node encodes one.
 #[derive(Debug)]
 pub struct NoopLog;
 
@@ -429,6 +438,10 @@ impl ReplicationLog for NoopLog {
 
     fn sync(&mut self) -> std::io::Result<Option<u64>> {
         Ok(None)
+    }
+
+    fn keeps_payloads(&self) -> bool {
+        false
     }
 }
 

@@ -790,3 +790,34 @@ async fn a_shard_cut_by_its_recovery_rebases_before_its_first_write() {
         "the shard recovered whole writes no rebase: {seen:?}"
     );
 }
+
+/// A log that keeps nothing is handed no payload: the node without a log
+/// encodes nothing on any write.
+#[tokio::test]
+async fn a_log_that_keeps_no_payloads_is_handed_none() {
+    #[derive(Clone, Default)]
+    struct Lengths(Arc<Mutex<Vec<usize>>>);
+    impl ReplicationLog for Lengths {
+        fn append(&mut self, rec: Record<'_>) -> std::io::Result<()> {
+            self.0.lock().expect("lengths").push(rec.payload.len());
+            Ok(())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn sync(&mut self) -> std::io::Result<Option<u64>> {
+            Ok(None)
+        }
+        fn keeps_payloads(&self) -> bool {
+            false
+        }
+    }
+
+    let lengths = Lengths::default();
+    let pool = ShardPool::spawn_with_log(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace, {
+        let lengths = lengths.clone();
+        move |_shard| lengths.clone()
+    });
+    pool.dispatch(set(b"k", &[b'v'; 4096])).await;
+    assert_eq!(*lengths.0.lock().expect("lengths"), [0]);
+}
