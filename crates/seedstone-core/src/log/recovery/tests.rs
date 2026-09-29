@@ -498,6 +498,58 @@ fn a_torn_unfinished_snapshot_is_refused_without_a_loss() {
     assert!(!recovery.shards[0].lossy && !recovery.shards[0].cut);
 }
 
+/// A crash can persist a file's unsynced writes out of order: a later
+/// write kept, an earlier one lost, and the gap between them zeros. An
+/// unfinished snapshot then has a hole before where it stops. The log it
+/// would have covered is still whole, so nothing is lost.
+#[test]
+fn an_unfinished_snapshot_with_a_hole_is_refused_without_a_loss_while_the_log_covers_it() {
+    let disk = MemDisk::default();
+    let segments = wal(&disk, 1, 1);
+    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
+    write(&mut s0, 0, &put(b"a", b"1"));
+    write(&mut s0, 1, &put(b"b", b"1"));
+    write(&mut s0, 2, &put(b"c", b"1"));
+    snapshot(
+        &disk,
+        1,
+        0,
+        0,
+        &[(0, 3)],
+        &[
+            (0, b"a", b"1", None),
+            (0, b"b", b"1", None),
+            (0, b"c", b"1", None),
+        ],
+        false,
+    );
+    let path = Path::new("/data/wal").join(snapshot_name(1, 0, 0));
+    let mut bytes = disk.contents(&path);
+    // Zero the middle of the entries: the first survives, the last too.
+    let entries = bytes.len()
+        - SnapshotHeader {
+            generation: 1,
+            executor: 0,
+            cycle: 0,
+            bases: vec![(0, 3)],
+        }
+        .encoded_len();
+    let middle = bytes.len() - entries * 2 / 3;
+    bytes[middle..middle + entries / 3].fill(0);
+    disk.overwrite(&path, bytes);
+    let recovery = recover(spec(&disk, 1)).unwrap();
+    assert_eq!(recovery.report.snapshots_refused, 1);
+    assert_eq!(
+        contents(&recovery.shards[0].dict),
+        pairs(&[(b"a", b"1"), (b"b", b"1"), (b"c", b"1")])
+    );
+    assert_eq!(recovery.shards[0].seq, 3);
+    assert!(
+        !recovery.shards[0].lossy && !recovery.shards[0].cut,
+        "the log still holds every record the refused image covered"
+    );
+}
+
 #[test]
 fn the_planted_recovery_trusts_an_unfinished_snapshot_and_loses_the_rest() {
     let disk = MemDisk::default();
@@ -583,8 +635,8 @@ fn a_snapshot_whose_counts_do_not_match_falls_back_to_the_older_image() {
         (1, 1)
     );
     assert!(
-        recovery.shards[0].lossy,
-        "a finished image refused is damage that may explain a loss"
+        !recovery.shards[0].lossy,
+        "a refused image explains no loss while the log still reaches its base"
     );
     let names = disk.list(Path::new("/data/wal")).unwrap();
     assert!(

@@ -57,7 +57,12 @@
 //! cycle leaves, its unsynced tail torn or not — never stood in for any
 //! record, and refusing it costs nothing. A file whose footer is there but
 //! whose counts disagree, or one with damage before its end, is damage that
-//! may explain a loss, and the shards it imaged are marked lossy.
+//! may explain a loss — but only a loss the log cannot make up for: its
+//! shards are marked lossy if the log they fall back to stops short of the
+//! image's base. Damage alone is not evidence of one. A crash can persist a
+//! file's unsynced writes out of order, so an unfinished snapshot may hold
+//! a hole before where it stops, and the log it would have covered is then
+//! still whole.
 //!
 //! A segment whose header names a format version above this build's is
 //! refused, and the node does not start: that is not damage, it is a
@@ -468,9 +473,10 @@ impl Scan {
 struct Chosen {
     /// The base of the image the shard took, if it took one.
     images: Vec<Option<u64>>,
-    /// Whether a finished image of the shard was refused — damage that may
-    /// explain a loss, exactly as a hole in its segment would.
-    refused: Vec<bool>,
+    /// The highest base of an image of the shard refused for damage. The
+    /// shard is lossy if the log it falls back to stops short of it: what
+    /// the image covered may have been compacted away.
+    refused: Vec<Option<u64>>,
 }
 
 /// What reading one snapshot file concluded.
@@ -481,7 +487,8 @@ enum Verdict {
     /// No footer and nothing wrong before where the file stops: a cycle a
     /// crash interrupted. Refused, and no loss — it never covered a record.
     Unfinished,
-    /// Anything else: refused, and the shards it imaged are lossy.
+    /// Anything else: refused, and damage that may explain a loss — the
+    /// shards it imaged are lossy unless the log still reaches its base.
     Damaged,
 }
 
@@ -496,7 +503,7 @@ fn read_images<D: Disk>(
     let shards = building.dicts.len();
     let mut chosen = Chosen {
         images: vec![None; shards],
-        refused: vec![false; shards],
+        refused: vec![None; shards],
     };
     for snap in snaps.iter_mut() {
         let Some(header) = &snap.header else {
@@ -522,10 +529,13 @@ fn read_images<D: Disk>(
             snap.used = true;
             report.snapshots_used += 1;
         } else {
-            for (shard, _) in &wanted {
+            for (shard, base) in &wanted {
                 building.dicts[usize::from(*shard)].clear();
                 building.due[usize::from(*shard)].clear();
-                chosen.refused[usize::from(*shard)] |= verdict == Verdict::Damaged;
+                if verdict == Verdict::Damaged {
+                    let refused = &mut chosen.refused[usize::from(*shard)];
+                    *refused = (*refused).max(Some(*base));
+                }
             }
             snap.damaged |= verdict == Verdict::Damaged;
             report.snapshots_refused += 1;
@@ -687,7 +697,10 @@ fn replay_tails<D: Disk>(
         }
         let mut seq = base;
         replay_into(&mut dict, &mut seq, records, spec.now, due);
-        let lossy = damaged || scan.unattributed_loss || chosen.refused[index];
+        // A refused image is a loss only where the log does not reach what
+        // it covered: short of its base, those records may be gone.
+        let short_of_refused = chosen.refused[index].is_some_and(|refused| seq < refused);
+        let lossy = damaged || scan.unattributed_loss || short_of_refused;
         shards.push(RecoveredShard {
             dict,
             seq,
