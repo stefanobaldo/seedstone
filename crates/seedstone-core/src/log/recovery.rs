@@ -1,63 +1,144 @@
-//! Start-up: read every segment, bucket the records by shard, and hand each
-//! shard the gapless prefix of its sequence.
+//! Start-up: the newest usable image of each shard, the tail of its log
+//! replayed over it, and everything nothing used removed.
 //!
-//! **The prefix rule.** A shard applies sequence `0, 1, 2, …` and stops at
-//! the first number that is missing; everything of that shard with a higher
-//! sequence, in any segment, is discarded and counted. Replaying past a gap
-//! would produce a state the shard never held. What the server does with a
-//! gap is serve the prefix and say so, per shard — a cache that refused to
-//! start over damage it can absorb would be down for longer than the
-//! damage costs.
+//! Five passes, each bounded:
 //!
-//! **Segments in name order** — generation, then executor — so a shard's
-//! records arrive in sequence order even when it moved executors between
-//! processes; they are sorted by sequence afterwards anyway, because a
-//! segment abandoned mid-way or read out of order must not turn into a
-//! wrong prefix.
+//! 1. **Headers.** Every `.snap`'s header — one chunk each — gives the
+//!    shards it images and their bases. A header that is short, carries the
+//!    wrong magic or fails its checksum is damage, charged to every shard as
+//!    a bad segment header is; a version above this build's refuses the
+//!    start.
+//! 2. **Segments.** Every `.seg` in name order, every intact record
+//!    bucketed by shard — the whole of what is on disk, which compaction
+//!    keeps to about a snapshot's worth per executor. Not only the tail
+//!    from the newest image's base: whether that image is usable is not
+//!    known until this pass has found every `Rebase`, so a tail read
+//!    against an image that then proves dead would be a tail with a hole
+//!    where the image was. Memory: the keyspace plus the log on disk.
+//! 3. **Images.** Every `.snap` newest first, its entries inserted straight
+//!    into the dicts of the shards that still want one. At the file's end
+//!    the footer must be there and its counts must match, and no damage may
+//!    have been met; otherwise the file is refused and those shards wait
+//!    for the next older file.
+//! 4. **Tails.** Per shard, the gapless prefix from the chosen base — the
+//!    same prefix rule as ever, starting at the base rather than at `0` —
+//!    replayed over the image.
+//! 5. **Garbage.** Every `.snap` no shard used and every `.seg` no kept
+//!    record came from is removed.
+//!
+//! **The prefix rule.** A shard applies sequence `base, base+1, …` and
+//! stops at the first number that is missing; everything of that shard
+//! with a higher sequence, in any segment, is discarded and counted.
+//! Replaying past a gap would produce a state the shard never held. What
+//! the server does with a gap is serve the prefix and say so, per shard —
+//! a cache that refused to start over damage it can absorb would be down
+//! for longer than the damage costs.
 //!
 //! **A cut is not undone by a later start.** A shard cut at a gap resumes
-//! there, and the next generation reuses the sequence numbers of the records
-//! that were cut — which are still on disk. So the first record a shard
-//! writes after a cut is a `Rebase` at its resume point, and a record of an
-//! older generation at or above a newer generation's `Rebase` is dead: never
-//! replayed, never counted as a gap. Where two generations still hold the
-//! same sequence number, the newer one's record is the one kept.
+//! there, and the next generation reuses the sequence numbers of the
+//! records that were cut — which are still on disk. So the first record a
+//! shard writes after a cut is a `Rebase` at its resume point, and a
+//! record of an older generation at or above a newer generation's `Rebase`
+//! is dead: never replayed, never counted as a gap. Where two generations
+//! still hold the same sequence number, the newer one's record is kept.
+//!
+//! **A snapshot can be dead too.** Its image holds the effect of every
+//! record below its base — including records a later start declared dead
+//! by rebasing below that base, which can happen when that start refused
+//! the snapshot (read corruption is drawn per read, and can be transient)
+//! and cut the log. So a snapshot of generation `g` with base `b` is dead
+//! for a shard when a `Rebase` of a generation above `g` sits below `b`.
+//!
+//! **A refused image is a possible loss only if it could have been relied
+//! on.** Compaction deletes what a snapshot covers only once its footer is
+//! durable, so a file with no footer — what a crash in the middle of a
+//! cycle leaves, its unsynced tail torn or not — never stood in for any
+//! record, and refusing it costs nothing. A file whose footer is there but
+//! whose counts disagree, or one with damage before its end, is damage that
+//! may explain a loss, and the shards it imaged are marked lossy.
 //!
 //! A segment whose header names a format version above this build's is
 //! refused, and the node does not start: that is not damage, it is a
 //! downgrade, and guessing at it would be worse than stopping. A header
-//! that is short or carries the wrong magic is damage: the segment is
-//! abandoned and counted, and every shard is marked lossy, because a loss
-//! nobody can attribute to a shard is a possible loss for all of them.
+//! that is short, carries the wrong magic or fails its checksum is damage:
+//! the segment is abandoned and counted, and every shard is marked lossy,
+//! because a loss nobody can attribute to a shard is a possible loss for
+//! all of them.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
+use bytes::Bytes;
+
+use crate::dict::{Dict, DictSeed, Entry, shard_seed};
 use crate::log::disk::Disk;
 use crate::log::effect::{Effect, Owned};
 use crate::log::file::{
     HeaderError, SEGMENT_HEADER_LEN, decode_segment_header, parse_segment_name,
 };
 use crate::log::reader::{Item, Reader};
+use crate::log::snapshot::{FOOTER_SHARD, Footer, SnapshotHeader, parse_snapshot_name};
+use crate::shard::{Now, Replayed, replay_into};
+use crate::slot::executor_of;
 
 /// Re-exported: every caller of [`recover`] chooses one.
 pub use crate::log::reader::ReaderMode;
-use crate::slot::executor_of;
 
-/// What one shard gets back: its gapless prefix, and what was cut.
-#[derive(Debug, Default)]
-pub struct ShardRecords {
-    /// `(seq, effect)` from `0` upwards with no gap.
-    pub records: Vec<(u64, Owned)>,
-    /// Records of this shard discarded after the first gap.
-    pub discarded: u64,
-    /// Whether damage on disk could explain a loss of this shard's records:
-    /// damage in a segment its executor wrote, or a segment nobody could
-    /// read. A gap alone does not set it — a gap in an intact log is not
-    /// something a disk did, so it is reported as a truncation and left
-    /// unexcused.
+/// How much of a snapshot is read to get its header: the fixed part plus
+/// ten bytes per shard, which for the deployed 1024 shards is under 11 KiB.
+const HEADER_CHUNK: usize = 16 * 1024;
+
+/// What [`recover`] is asked for.
+pub struct RecoverSpec<'a, D: Disk> {
+    pub disk: &'a D,
+    /// The `wal/` directory.
+    pub wal: &'a Path,
+    pub shards: u16,
+    pub reader: ReaderMode,
+    /// The planted defect: accept a snapshot with no footer. What a
+    /// recovery that trusted an unfinished image would do — it restores
+    /// the keys scanned before the crash and loses the rest.
+    pub trust_unfinished: bool,
+    pub seed: DictSeed,
+    /// The clock the image's deadlines are resolved against.
+    pub now: Now,
+}
+
+// By hand: a derive would ask `D: Copy`, and the spec only borrows it.
+impl<D: Disk> Clone for RecoverSpec<'_, D> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<D: Disk> Copy for RecoverSpec<'_, D> {}
+
+/// One shard as recovery rebuilt it.
+pub struct RecoveredShard {
+    pub dict: Dict,
+    /// The position the shard resumes at.
+    pub seq: u64,
+    /// Whether damage on disk could explain a loss of this shard's
+    /// records: damage in a segment its executor wrote, a segment or
+    /// snapshot header nobody could read, or a finished image of it that
+    /// was refused. A gap alone does not set it — a gap in an intact log is
+    /// not something a disk did.
     pub lossy: bool,
+    /// Whether the shard's prefix was cut, or its loss is possible: the
+    /// pool writes a `Rebase` before serving it.
+    pub cut: bool,
+}
+
+impl std::fmt::Debug for RecoveredShard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveredShard")
+            .field("keys", &self.dict.len())
+            .field("seq", &self.seq)
+            .field("lossy", &self.lossy)
+            .field("cut", &self.cut)
+            .finish()
+    }
 }
 
 /// One shard the report names as cut.
@@ -82,62 +163,170 @@ pub struct Report {
     pub holes: u64,
     pub abandoned_segments: u64,
     pub truncated: Vec<ShardTruncation>,
+    /// Snapshot files at least one shard took its image from.
+    pub snapshots_used: u64,
+    /// Snapshot files refused: no footer, counts that did not match,
+    /// damage inside, a header that failed, or shards outside the node.
+    pub snapshots_refused: u64,
+    /// Files removed because nothing used them.
+    pub files_removed: u64,
 }
 
-/// Every shard's prefix, and the report.
-#[derive(Debug, Default)]
+/// Every shard, and the report.
+#[derive(Debug)]
 pub struct Recovery {
-    pub shards: Vec<ShardRecords>,
+    pub shards: Vec<RecoveredShard>,
     pub report: Report,
 }
 
-/// Reads `wal` and hands each of `shards` shards its gapless prefix.
+/// Reads `wal` and rebuilds every shard.
 ///
 /// # Errors
 ///
-/// The directory cannot be listed, or a segment names a format version
-/// above this build's — the two cases where the node must not start.
-/// Everything else is damage, counted and survived.
-pub fn recover<D: Disk>(
-    disk: &D,
-    wal: &Path,
-    shards: u16,
-    mode: ReaderMode,
-) -> io::Result<Recovery> {
-    let mut names: Vec<(u64, u16, u32, String)> = disk
-        .list(wal)?
-        .into_iter()
-        .filter_map(|name| parse_segment_name(&name).map(|(g, e, r)| (g, e, r, name)))
+/// The directory cannot be listed, or a file names a format version above
+/// this build's — the two cases where the node must not start. Everything
+/// else is damage, counted and survived.
+pub fn recover<D: Disk>(spec: RecoverSpec<'_, D>) -> io::Result<Recovery> {
+    let names = spec.disk.list(spec.wal)?;
+    let mut report = Report::default();
+    let (mut snaps, header_damage) = read_headers(&spec, &names, &mut report)?;
+    let mut scan = Scan::new(spec.shards);
+    scan.unattributed_loss |= header_damage;
+    let segments = segment_files(&names);
+    for (index, file) in segments.iter().enumerate() {
+        scan.segment(spec.disk, spec.wal, spec.reader, file, index)?;
+    }
+    let rebases = scan.rebases();
+    let mut building = Building {
+        dicts: (0..spec.shards)
+            .map(|shard| Dict::with_seed(shard_seed(spec.seed, shard)))
+            .collect(),
+        due: vec![Vec::new(); usize::from(spec.shards)],
+    };
+    let chosen = read_images(&spec, &mut snaps, &rebases, &mut building, &mut report);
+    let (shards, kept) = replay_tails(&spec, scan, &chosen, building, segments.len(), &mut report);
+    remove_garbage(&spec, &snaps, &segments, &kept, &mut report);
+    Ok(Recovery { shards, report })
+}
+
+/// The dicts being rebuilt, and per shard the image keys whose deadline
+/// had already passed — removed after the tail unless the tail moved them.
+struct Building {
+    dicts: Vec<Dict>,
+    due: Vec<Vec<Bytes>>,
+}
+
+/// One snapshot file, as its header describes it.
+struct SnapFile {
+    name: String,
+    /// `None` when pass 1 refused the file: nothing takes an image from it.
+    header: Option<SnapshotHeader>,
+    /// Set in pass 3 when at least one shard took its image from here.
+    used: bool,
+}
+
+impl SnapFile {
+    /// Newest first: generation, then cycle — from the name, which pass 1
+    /// checked against the header wherever there is one.
+    fn age(&self) -> std::cmp::Reverse<(u64, u32)> {
+        let (generation, _, cycle) = parse_snapshot_name(&self.name).unwrap_or_default();
+        std::cmp::Reverse((generation, cycle))
+    }
+}
+
+/// Pass 1: every `.snap`'s header, newest first. The flag is whether any
+/// header was damage — a loss no shard can be named for.
+fn read_headers<D: Disk>(
+    spec: &RecoverSpec<'_, D>,
+    names: &[String],
+    report: &mut Report,
+) -> io::Result<(Vec<SnapFile>, bool)> {
+    let mut snaps = Vec::new();
+    let mut damage = false;
+    for name in names {
+        let Some(from_name) = parse_snapshot_name(name) else {
+            continue;
+        };
+        let mut chunk = vec![0u8; HEADER_CHUNK];
+        let read = spec
+            .disk
+            .open_read(&spec.wal.join(name))
+            .map_or(0, |mut src| read_fully(&mut src, &mut chunk));
+        let header = match SnapshotHeader::decode(&chunk[..read]) {
+            Ok(header) => Some(header).filter(|header| {
+                // Not this node's file, or damage the checksum happened to
+                // pass: refused, and nothing takes an image from it.
+                let mut seen = vec![false; usize::from(spec.shards)];
+                (header.generation, header.executor, header.cycle) == from_name
+                    && header.bases.iter().all(|(shard, _)| {
+                        seen.get_mut(usize::from(*shard))
+                            .is_some_and(|seen| !std::mem::replace(seen, true))
+                    })
+            }),
+            Err(HeaderError::NewerVersion(version)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("{name}: format version {version} is newer than this build reads"),
+                ));
+            }
+            Err(HeaderError::Short | HeaderError::BadMagic | HeaderError::BadChecksum) => {
+                // Synced before the file's name was: a header that does
+                // not read is damage, not a crash.
+                damage = true;
+                None
+            }
+        };
+        if header.is_none() {
+            report.snapshots_refused += 1;
+        }
+        snaps.push(SnapFile {
+            name: name.clone(),
+            header,
+            used: false,
+        });
+    }
+    snaps.sort_by_key(SnapFile::age);
+    Ok((snaps, damage))
+}
+
+/// One `.seg`, and how many executors its generation ran — which is what
+/// lets damage in it be charged to the shards that wrote there.
+struct SegmentFile {
+    generation: u64,
+    executor: u16,
+    executors: u16,
+    name: String,
+}
+
+/// Every `.seg`, sorted by name.
+fn segment_files(names: &[String]) -> Vec<SegmentFile> {
+    let mut parsed: Vec<(u64, u16, u32, String)> = names
+        .iter()
+        .filter_map(|name| parse_segment_name(name).map(|(g, e, r)| (g, e, r, name.clone())))
         .collect();
-    names.sort();
-    // How many executors each generation ran: the segment names say, and a
-    // shard's executor in that generation follows from it — which is what
-    // lets damage in one segment be charged to the shards that wrote there.
+    parsed.sort();
     let mut executors_in: BTreeMap<u64, u16> = BTreeMap::new();
-    for (generation, executor, _, _) in &names {
+    for (generation, executor, _, _) in &parsed {
         let count = executors_in.entry(*generation).or_default();
         *count = (*count).max(executor.saturating_add(1));
     }
-
-    let mut scan = Scan {
-        report: Report::default(),
-        buckets: (0..shards).map(|_| Vec::new()).collect(),
-        damaged: vec![false; usize::from(shards)],
-        unattributed_loss: false,
-    };
-    for (generation, executor, _, name) in names {
-        let executors = executors_in.get(&generation).copied().unwrap_or(1);
-        scan.segment(disk, wal, &name, mode, generation, (executor, executors))?;
-    }
-    Ok(scan.finish())
+    parsed
+        .into_iter()
+        .map(|(generation, executor, _, name)| SegmentFile {
+            generation,
+            executor,
+            executors: executors_in.get(&generation).copied().unwrap_or(1),
+            name,
+        })
+        .collect()
 }
 
-/// What recovery has read so far.
+/// What pass 2 has read: per shard, every intact record on disk, each
+/// with the generation and file it came from.
 struct Scan {
     report: Report,
-    /// Each shard's intact records, in the order they were read, with the
-    /// generation of the segment each came from.
-    buckets: Vec<Vec<(u64, u64, Owned)>>,
+    /// Per shard: `(seq, generation, file index, effect)`.
+    buckets: Vec<Vec<(u64, u64, usize, Owned)>>,
     /// Per shard: damage sat in a segment its executor wrote.
     damaged: Vec<bool>,
     /// A loss nobody can attribute to a shard: every shard may have paid.
@@ -145,19 +334,26 @@ struct Scan {
 }
 
 impl Scan {
-    /// Reads one segment into the buckets. `writer` is the executor that
-    /// wrote it and how many its generation ran.
+    fn new(shards: u16) -> Self {
+        Self {
+            report: Report::default(),
+            buckets: (0..shards).map(|_| Vec::new()).collect(),
+            damaged: vec![false; usize::from(shards)],
+            unattributed_loss: false,
+        }
+    }
+
+    /// Reads one segment, the `index`th, into the buckets.
     fn segment<D: Disk>(
         &mut self,
         disk: &D,
         wal: &Path,
-        name: &str,
         mode: ReaderMode,
-        generation: u64,
-        writer: (u16, u16),
+        file: &SegmentFile,
+        index: usize,
     ) -> io::Result<()> {
         self.report.segments += 1;
-        let path = wal.join(name);
+        let path = wal.join(&file.name);
         let (Ok(len), Ok(mut src)) = (disk.len(&path), disk.open_read(&path)) else {
             self.abandon();
             return Ok(());
@@ -169,7 +365,10 @@ impl Scan {
             Err(HeaderError::NewerVersion(version)) => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    format!("{name}: format version {version} is newer than this build reads"),
+                    format!(
+                        "{}: format version {version} is newer than this build reads",
+                        file.name
+                    ),
                 ));
             }
             Err(HeaderError::Short | HeaderError::BadMagic | HeaderError::BadChecksum) => {
@@ -181,7 +380,7 @@ impl Scan {
         let mut reader = Reader::new(src, body_len, mode);
         loop {
             match reader.next_record() {
-                Ok(Some(item)) => self.item(&item, generation),
+                Ok(Some(item)) => self.item(&item, file.generation, index),
                 Ok(None) => break,
                 Err(_) => {
                     self.abandon();
@@ -200,32 +399,29 @@ impl Scan {
         // record rather than a crash. Either may have cost any shard this
         // segment's executor hosted.
         if damage.holes > 0 || damage.truncated_tail > 0 {
-            let (executor, executors) = writer;
             let shards = u16::try_from(self.damaged.len()).unwrap_or(u16::MAX);
             for (shard, hit) in (0..shards).zip(self.damaged.iter_mut()) {
-                *hit |= executor_of(shard, shards, executors) == executor;
+                *hit |= executor_of(shard, shards, file.executors) == file.executor;
             }
         }
         Ok(())
     }
 
     /// One intact record, bucketed by shard.
-    fn item(&mut self, item: &Item, generation: u64) {
+    fn item(&mut self, item: &Item, generation: u64, file: usize) {
         self.report.records += 1;
         let Some(bucket) = self.buckets.get_mut(usize::from(item.shard)) else {
             self.report.malformed += 1;
             return;
         };
         if let Some(effect) = Effect::decode(&item.payload) {
-            bucket.push((item.seq, generation, effect.to_owned()));
+            bucket.push((item.seq, generation, file, effect.to_owned()));
         } else {
             // A well-checksummed record this build cannot read ends the
             // shard's prefix where it sits: leaving its sequence out of the
             // bucket is exactly a gap, and one recovery knows the cause of.
             self.report.malformed += 1;
-            if let Some(hit) = self.damaged.get_mut(usize::from(item.shard)) {
-                *hit = true;
-            }
+            self.damaged[usize::from(item.shard)] = true;
         }
     }
 
@@ -235,61 +431,292 @@ impl Scan {
         self.unattributed_loss = true;
     }
 
-    /// Cuts every shard's bucket to its gapless prefix.
-    fn finish(mut self) -> Recovery {
-        let mut shards = Vec::with_capacity(self.buckets.len());
-        for (shard, (bucket, damaged)) in (0u16..).zip(self.buckets.into_iter().zip(self.damaged)) {
-            let (records, discarded) = prefix(bucket);
-            let gap = discarded > 0;
-            self.report.applied += records.len() as u64;
-            self.report.discarded += discarded;
-            if gap {
-                self.report.truncated.push(ShardTruncation {
-                    shard,
-                    applied: records.len() as u64,
-                    discarded,
-                });
-            }
-            shards.push(ShardRecords {
-                records,
-                discarded,
-                lossy: damaged || self.unattributed_loss,
-            });
-        }
-        Recovery {
-            shards,
-            report: self.report,
-        }
+    /// Per shard, every `(generation, seq)` a `Rebase` was read at.
+    fn rebases(&self) -> Vec<Vec<(u64, u64)>> {
+        self.buckets
+            .iter()
+            .map(|bucket| {
+                bucket
+                    .iter()
+                    .filter(|(_, _, _, effect)| matches!(effect, Owned::Rebase))
+                    .map(|(seq, generation, _, _)| (*generation, *seq))
+                    .collect()
+            })
+            .collect()
     }
 }
 
-/// A shard's records from `0` upwards up to the first missing sequence,
+/// What pass 3 chose, per shard.
+struct Chosen {
+    /// The base of the image the shard took, if it took one.
+    images: Vec<Option<u64>>,
+    /// Whether a finished image of the shard was refused — damage that may
+    /// explain a loss, exactly as a hole in its segment would.
+    refused: Vec<bool>,
+}
+
+/// What reading one snapshot file concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Footer present, counts matching, no damage met: the image stands.
+    Usable,
+    /// No footer and nothing wrong before where the file stops: a cycle a
+    /// crash interrupted. Refused, and no loss — it never covered a record.
+    Unfinished,
+    /// Anything else: refused, and the shards it imaged are lossy.
+    Damaged,
+}
+
+/// Pass 3: the newest usable image of every shard, streamed into its dict.
+fn read_images<D: Disk>(
+    spec: &RecoverSpec<'_, D>,
+    snaps: &mut [SnapFile],
+    rebases: &[Vec<(u64, u64)>],
+    building: &mut Building,
+    report: &mut Report,
+) -> Chosen {
+    let shards = building.dicts.len();
+    let mut chosen = Chosen {
+        images: vec![None; shards],
+        refused: vec![false; shards],
+    };
+    for snap in snaps.iter_mut() {
+        let Some(header) = &snap.header else {
+            continue; // refused in pass 1
+        };
+        let wanted: Vec<(u16, u64)> = header
+            .bases
+            .iter()
+            .copied()
+            .filter(|(shard, base)| {
+                chosen.images[usize::from(*shard)].is_none()
+                    && !is_dead(header.generation, *base, &rebases[usize::from(*shard)])
+            })
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        let verdict = read_image(spec, &snap.name, header, &wanted, building);
+        if verdict == Verdict::Usable {
+            for (shard, base) in &wanted {
+                chosen.images[usize::from(*shard)] = Some(*base);
+            }
+            snap.used = true;
+            report.snapshots_used += 1;
+        } else {
+            for (shard, _) in &wanted {
+                building.dicts[usize::from(*shard)].clear();
+                building.due[usize::from(*shard)].clear();
+                chosen.refused[usize::from(*shard)] |= verdict == Verdict::Damaged;
+            }
+            report.snapshots_refused += 1;
+        }
+    }
+    chosen
+}
+
+/// A snapshot of `generation` with `base` is dead for a shard when a
+/// newer generation rebased it below the base — see the module doc.
+fn is_dead(generation: u64, base: u64, rebases: &[(u64, u64)]) -> bool {
+    rebases
+        .iter()
+        .any(|(newer, at)| *newer > generation && *at < base)
+}
+
+/// Reads one snapshot's entries into the dicts of `wanted`, and says
+/// whether the file is usable.
+fn read_image<D: Disk>(
+    spec: &RecoverSpec<'_, D>,
+    name: &str,
+    header: &SnapshotHeader,
+    wanted: &[(u16, u64)],
+    building: &mut Building,
+) -> Verdict {
+    let path = spec.wal.join(name);
+    let header_len = header.encoded_len();
+    let (Ok(len), Ok(mut src)) = (spec.disk.len(&path), spec.disk.open_read(&path)) else {
+        return Verdict::Damaged;
+    };
+    let mut skip = vec![0u8; header_len];
+    if read_fully(&mut src, &mut skip) != header_len {
+        return Verdict::Damaged;
+    }
+    let mut reader = Reader::new(src, len.saturating_sub(header_len as u64), spec.reader);
+    let mut counts: Vec<(u16, u64)> = header.bases.iter().map(|(shard, _)| (*shard, 0)).collect();
+    let mut footer: Option<Footer> = None;
+    let mut clean = true;
+    while clean {
+        let item = match reader.next_record() {
+            Ok(Some(item)) => item,
+            Ok(None) => break,
+            Err(_) => {
+                clean = false;
+                break;
+            }
+        };
+        clean = if footer.is_some() {
+            false // nothing follows the footer
+        } else if item.shard == FOOTER_SHARD {
+            footer = Footer::decode(&item.payload);
+            footer.is_some()
+        } else {
+            take_entry(spec.now, &item, wanted, &mut counts, building)
+        };
+    }
+    let damage = reader.damage();
+    // A torn tail is what a crash leaves of entries not yet synced, so it
+    // only counts against a file that claims to be finished.
+    let damaged_inside = damage.bytes > 0 || damage.holes > 0 || damage.abandoned;
+    let torn = damage.truncated_tail > 0;
+    match footer {
+        // The plant takes a file with no footer at its word, damage and
+        // all — what a recovery that read an image up to wherever it
+        // stopped would do. A file *with* a footer is held to the honest
+        // rule either way.
+        None if spec.trust_unfinished => Verdict::Usable,
+        None if clean && !damaged_inside => Verdict::Unfinished,
+        Some(footer) if clean && !damaged_inside && !torn && footer.counts == counts => {
+            Verdict::Usable
+        }
+        _ => Verdict::Damaged,
+    }
+}
+
+/// One entry of a snapshot: counted, and inserted if its shard wants this
+/// image. `false` if it is not an entry this file can hold.
+fn take_entry(
+    now: Now,
+    item: &Item,
+    wanted: &[(u16, u64)],
+    counts: &mut [(u16, u64)],
+    building: &mut Building,
+) -> bool {
+    let Some(count) = counts.iter_mut().find(|(shard, _)| *shard == item.shard) else {
+        return false; // a shard the header did not list
+    };
+    count.1 += 1;
+    let Some(Effect::Put {
+        key,
+        value,
+        deadline,
+    }) = Effect::decode(&item.payload)
+    else {
+        return false;
+    };
+    if !wanted.iter().any(|(shard, _)| *shard == item.shard) {
+        return true;
+    }
+    let (expires_at, passed) = match deadline.map(|at| now.replay_deadline(at)) {
+        None => (None, false),
+        Some(Replayed::At(at)) => (at, false),
+        Some(Replayed::Past) => (Some(now.instant), true),
+    };
+    let key = Bytes::copy_from_slice(key);
+    let shard = usize::from(item.shard);
+    if passed {
+        building.due[shard].push(key.clone());
+    }
+    building.dicts[shard].insert(
+        key,
+        Entry {
+            value: Bytes::copy_from_slice(value),
+            expires_at,
+            touched: 0,
+        },
+    );
+    true
+}
+
+/// Pass 4: every shard's tail replayed over its image. Returns the shards
+/// and, per segment file, whether a kept record came from it.
+fn replay_tails<D: Disk>(
+    spec: &RecoverSpec<'_, D>,
+    scan: Scan,
+    chosen: &Chosen,
+    building: Building,
+    files: usize,
+    report: &mut Report,
+) -> (Vec<RecoveredShard>, Vec<bool>) {
+    let mut kept = vec![false; files];
+    report.segments = scan.report.segments;
+    report.records = scan.report.records;
+    report.malformed = scan.report.malformed;
+    report.damage_bytes = scan.report.damage_bytes;
+    report.holes = scan.report.holes;
+    report.abandoned_segments = scan.report.abandoned_segments;
+    let Building { dicts, due } = building;
+    let mut shards = Vec::with_capacity(dicts.len());
+    let zipped = dicts
+        .into_iter()
+        .zip(due)
+        .zip(scan.buckets)
+        .zip(scan.damaged);
+    for (shard, (((mut dict, due), bucket), damaged)) in (0u16..).zip(zipped) {
+        let index = usize::from(shard);
+        let base = chosen.images[index].unwrap_or(0);
+        let (records, discarded) = prefix(bucket, base, &mut kept);
+        let applied = records.len() as u64;
+        report.applied += applied;
+        report.discarded += discarded;
+        let gap = discarded > 0;
+        if gap {
+            report.truncated.push(ShardTruncation {
+                shard,
+                applied,
+                discarded,
+            });
+        }
+        let mut seq = base;
+        replay_into(&mut dict, &mut seq, records, spec.now, due);
+        let lossy = damaged || scan.unattributed_loss || chosen.refused[index];
+        shards.push(RecoveredShard {
+            dict,
+            seq,
+            lossy,
+            cut: gap || lossy,
+        });
+    }
+    (shards, kept)
+}
+
+/// A shard's records from `start` upwards to the first missing sequence,
 /// and how many came after it — once every record a newer generation's
-/// `Rebase` made dead is gone.
-fn prefix(bucket: Vec<(u64, u64, Owned)>) -> (Vec<(u64, Owned)>, u64) {
+/// `Rebase` made dead is gone. Marks in `kept` the files the returned
+/// records came from, and the file of every `Rebase`, which must outlive
+/// the records it kills.
+fn prefix(
+    bucket: Vec<(u64, u64, usize, Owned)>,
+    start: u64,
+    kept: &mut [bool],
+) -> (Vec<(u64, Owned)>, u64) {
     let rebases: Vec<(u64, u64)> = bucket
         .iter()
-        .filter(|(_, _, effect)| matches!(effect, Owned::Rebase))
-        .map(|(seq, generation, _)| (*seq, *generation))
+        .filter(|(_, _, _, effect)| matches!(effect, Owned::Rebase))
+        .map(|(seq, generation, file, _)| {
+            kept[*file] = true;
+            (*seq, *generation)
+        })
         .collect();
-    let mut live: Vec<(u64, u64, Owned)> = bucket
+    let mut live: Vec<(u64, u64, usize, Owned)> = bucket
         .into_iter()
-        .filter(|(seq, generation, _)| {
-            !rebases
-                .iter()
-                .any(|(from, newer)| newer > generation && seq >= from)
+        .filter(|(seq, generation, _, _)| {
+            *seq >= start
+                && !rebases
+                    .iter()
+                    .any(|(from, newer)| newer > generation && seq >= from)
         })
         .collect();
     // By sequence, the newest generation first within one: the duplicate
     // below is then the older record, and it is the one skipped.
-    live.sort_by_key(|(seq, generation, _)| (*seq, std::cmp::Reverse(*generation)));
+    live.sort_by_key(|(seq, generation, _, _)| (*seq, std::cmp::Reverse(*generation)));
     let mut records = Vec::with_capacity(live.len());
-    let mut expected = 0u64;
+    let mut expected = start;
     let mut discarded = 0u64;
-    for (seq, _, effect) in live {
+    for (seq, _, file, effect) in live {
         if discarded > 0 || seq > expected {
             discarded += 1;
         } else if seq == expected {
+            kept[file] = true;
             records.push((seq, effect));
             expected += 1;
         }
@@ -298,6 +725,40 @@ fn prefix(bucket: Vec<(u64, u64, Owned)>) -> (Vec<(u64, Owned)>, u64) {
         // record under a newer one's.
     }
     (records, discarded)
+}
+
+/// Pass 5: remove every snapshot nothing used and every segment no kept
+/// record came from. A removal that fails is left for the next start.
+fn remove_garbage<D: Disk>(
+    spec: &RecoverSpec<'_, D>,
+    snaps: &[SnapFile],
+    segments: &[SegmentFile],
+    kept: &[bool],
+    report: &mut Report,
+) {
+    let garbage = snaps
+        .iter()
+        .filter(|snap| !snap.used)
+        .map(|snap| snap.name.as_str())
+        .chain(
+            segments
+                .iter()
+                .zip(kept)
+                .filter(|(_, kept)| !**kept)
+                .map(|(file, _)| file.name.as_str()),
+        );
+    let mut removed = 0;
+    for name in garbage {
+        if spec.disk.remove_file(&spec.wal.join(name)).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        // Best effort: an entry the sync did not make durable is found and
+        // removed again by the next start.
+        let _ = spec.disk.sync_dir(spec.wal);
+    }
+    report.files_removed = removed;
 }
 
 fn read_fully<R: io::Read>(src: &mut R, buf: &mut [u8]) -> usize {
@@ -312,344 +773,4 @@ fn read_fully<R: io::Read>(src: &mut R, buf: &mut [u8]) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::log::disk::mem::MemDisk;
-    use crate::log::effect::Effect;
-    use crate::log::file::{
-        FORMAT_VERSION, FileLog, SEGMENT_HEADER_LEN, encode_segment_header, open_segments,
-        segment_name,
-    };
-    use crate::log::{Record, ReplicationLog};
-    use bytes::Bytes;
-    use std::sync::Arc;
-
-    fn put(key: &[u8], value: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        Effect::Put {
-            key,
-            value,
-            deadline: None,
-        }
-        .encode(&mut out);
-        out
-    }
-
-    /// A wal directory with one generation of `executors` segments, and the
-    /// logs to write into them.
-    fn wal(
-        disk: &MemDisk,
-        generation: u64,
-        executors: u16,
-    ) -> Vec<Arc<std::sync::Mutex<crate::log::file::Segment<crate::log::disk::mem::MemFile>>>> {
-        let dir = Path::new("/data/wal");
-        disk.create_dir_all(dir).unwrap();
-        open_segments(disk, dir, generation, executors).unwrap()
-    }
-
-    fn write(log: &mut FileLog<crate::log::disk::mem::MemFile>, seq: u64, payload: &[u8]) {
-        log.append(Record {
-            shard: log.shard(),
-            seq,
-            payload,
-        })
-        .unwrap();
-        log.flush().unwrap();
-        log.sync().unwrap();
-    }
-
-    #[test]
-    fn records_are_recovered_per_shard_in_sequence_order_across_segments() {
-        let disk = MemDisk::default();
-        // Generation 1: shard 0 on executor 0, shard 1 on executor 1.
-        let segments = wal(&disk, 1, 2);
-        let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-        let mut s1 = FileLog::new(1, Arc::clone(&segments[1]));
-        write(&mut s0, 0, &put(b"a", b"1"));
-        write(&mut s1, 0, &put(b"b", b"1"));
-        write(&mut s0, 1, &put(b"a", b"2"));
-        // Generation 2: one executor, both shards on it.
-        let later = open_segments(&disk, Path::new("/data/wal"), 2, 1).unwrap();
-        let mut s0 = FileLog::new(0, Arc::clone(&later[0]));
-        let mut s1 = FileLog::new(1, Arc::clone(&later[0]));
-        write(&mut s1, 1, &put(b"b", b"2"));
-        write(&mut s0, 2, &put(b"a", b"3"));
-
-        let recovery = recover(
-            &disk,
-            Path::new("/data/wal"),
-            2,
-            ReaderMode::Resynchronising,
-        )
-        .unwrap();
-        assert_eq!(recovery.report.segments, 3);
-        assert_eq!(recovery.report.records, 5);
-        assert_eq!(recovery.report.applied, 5);
-        let seqs = |shard: usize| -> Vec<u64> {
-            recovery.shards[shard]
-                .records
-                .iter()
-                .map(|(seq, _)| *seq)
-                .collect()
-        };
-        assert_eq!(seqs(0), [0, 1, 2]);
-        assert_eq!(seqs(1), [0, 1]);
-        assert!(recovery.report.truncated.is_empty());
-        assert!(!recovery.shards[0].lossy);
-    }
-
-    /// A start whose recovery cut a shard leaves the cut records on disk.
-    /// The next generation resumes at the cut and reuses those sequence
-    /// numbers, so on the start after it the old records must lose to the
-    /// new ones — or the node replays what it had discarded over writes it
-    /// acknowledged and synced.
-    #[test]
-    fn records_a_cut_left_behind_never_return_on_a_later_start() {
-        let disk = MemDisk::default();
-        let gen1 = wal(&disk, 1, 1);
-        let mut old = FileLog::new(0, Arc::clone(&gen1[0]));
-        write(&mut old, 0, &put(b"a", b"1"));
-        write(&mut old, 1, &put(b"a", b"2"));
-        write(&mut old, 3, &put(b"c", b"stale")); // seq 2 never written
-        write(&mut old, 4, &put(b"d", b"stale"));
-        let first = recover(
-            &disk,
-            Path::new("/data/wal"),
-            1,
-            ReaderMode::Resynchronising,
-        )
-        .unwrap();
-        assert_eq!(first.shards[0].records.len(), 2, "cut at the gap");
-
-        // The next generation resumes at 2, as the node does after a cut.
-        let gen2 = wal(&disk, 2, 1);
-        let mut new = FileLog::new(0, Arc::clone(&gen2[0]));
-        let mut rebase = Vec::new();
-        Effect::Rebase.encode(&mut rebase);
-        write(&mut new, 2, &rebase);
-        write(&mut new, 3, &put(b"b", b"new"));
-
-        let second = recover(
-            &disk,
-            Path::new("/data/wal"),
-            1,
-            ReaderMode::Resynchronising,
-        )
-        .unwrap();
-        let shard = &second.shards[0];
-        let seqs: Vec<u64> = shard.records.iter().map(|(seq, _)| *seq).collect();
-        assert_eq!(
-            seqs,
-            [0, 1, 2, 3],
-            "the new generation's prefix, and nothing past it"
-        );
-        assert_eq!(
-            shard.records[3].1,
-            Owned::Put {
-                key: Bytes::from_static(b"b"),
-                value: Bytes::from_static(b"new"),
-                deadline: None,
-            },
-            "the acknowledged write, not the record the first start discarded"
-        );
-        assert_eq!(shard.discarded, 0, "the dead records are not a gap");
-    }
-
-    #[test]
-    fn a_gap_truncates_that_shard_and_nothing_else() {
-        let disk = MemDisk::default();
-        let segments = wal(&disk, 1, 1);
-        let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-        let mut s1 = FileLog::new(1, Arc::clone(&segments[0]));
-        write(&mut s0, 0, &put(b"a", b"1"));
-        write(&mut s0, 1, &put(b"a", b"2"));
-        write(&mut s1, 0, &put(b"b", b"1"));
-        write(&mut s0, 3, &put(b"a", b"4")); // seq 2 never written
-        write(&mut s1, 1, &put(b"b", b"2"));
-
-        let recovery = recover(
-            &disk,
-            Path::new("/data/wal"),
-            2,
-            ReaderMode::Resynchronising,
-        )
-        .unwrap();
-        assert_eq!(recovery.shards[0].records.len(), 2);
-        assert_eq!(recovery.shards[0].discarded, 1);
-        assert!(
-            !recovery.shards[0].lossy,
-            "the segment is intact, so nothing on disk explains the gap: it is reported, \
-             not excused"
-        );
-        assert_eq!(recovery.shards[1].records.len(), 2);
-        assert!(!recovery.shards[1].lossy);
-        assert_eq!(recovery.report.truncated.len(), 1);
-        assert_eq!(recovery.report.truncated[0].shard, 0);
-        assert_eq!(recovery.report.truncated[0].applied, 2);
-        assert_eq!(recovery.report.truncated[0].discarded, 1);
-    }
-
-    #[test]
-    fn damage_in_one_segment_loses_only_the_records_in_the_hole() {
-        // Two executors, one shard each: the hole is in shard 0's segment.
-        let disk = MemDisk::default();
-        let segments = wal(&disk, 1, 2);
-        let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-        let mut s1 = FileLog::new(1, Arc::clone(&segments[1]));
-        write(&mut s0, 0, &put(b"a", b"1"));
-        write(&mut s1, 0, &put(b"b", b"1"));
-        write(&mut s1, 1, &put(b"b", b"2"));
-        let path = Path::new("/data/wal").join(segment_name(1, 0, 0));
-        let mut bytes = disk.contents(&path);
-        // Flip a byte inside the first record's payload.
-        bytes[SEGMENT_HEADER_LEN + 9 + 10 + 1] ^= 0xFF;
-        disk.overwrite(&path, bytes);
-
-        let recovery = recover(
-            &disk,
-            Path::new("/data/wal"),
-            2,
-            ReaderMode::Resynchronising,
-        )
-        .unwrap();
-        assert_eq!(recovery.report.holes, 1);
-        assert!(
-            recovery.shards[0].records.is_empty(),
-            "shard 0's only record was in the hole"
-        );
-        assert!(
-            recovery.shards[0].lossy,
-            "no gap shows the loss — nothing of shard 0 came after — so the damage in its segment must"
-        );
-        assert_eq!(recovery.shards[1].records.len(), 2, "shard 1 is untouched");
-        assert!(
-            !recovery.shards[1].lossy,
-            "its executor's segment was intact"
-        );
-    }
-
-    #[test]
-    fn damage_is_charged_to_every_shard_its_segment_hosted() {
-        // One executor hosting both shards: a hole in the segment could have
-        // held either shard's records, so both are lossy though shard 1
-        // recovered everything it wrote.
-        let disk = MemDisk::default();
-        let segments = wal(&disk, 1, 1);
-        let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-        let mut s1 = FileLog::new(1, Arc::clone(&segments[0]));
-        write(&mut s0, 0, &put(b"a", b"1"));
-        write(&mut s1, 0, &put(b"b", b"1"));
-        let path = Path::new("/data/wal").join(segment_name(1, 0, 0));
-        let mut bytes = disk.contents(&path);
-        bytes[SEGMENT_HEADER_LEN + 9 + 10 + 1] ^= 0xFF;
-        disk.overwrite(&path, bytes);
-
-        let recovery = recover(
-            &disk,
-            Path::new("/data/wal"),
-            2,
-            ReaderMode::Resynchronising,
-        )
-        .unwrap();
-        assert_eq!(recovery.shards[1].records.len(), 1);
-        assert!(recovery.shards.iter().all(|shard| shard.lossy));
-    }
-
-    #[test]
-    fn a_newer_format_version_refuses_to_recover() {
-        let disk = MemDisk::default();
-        wal(&disk, 1, 1);
-        let mut header = Vec::new();
-        encode_segment_header(2, 0, 0, &mut header);
-        header[4] = FORMAT_VERSION + 1;
-        disk.write_file(&Path::new("/data/wal").join(segment_name(2, 0, 0)), &header)
-            .unwrap();
-        let error = recover(
-            &disk,
-            Path::new("/data/wal"),
-            1,
-            ReaderMode::Resynchronising,
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains("version 2"), "{error}");
-    }
-
-    #[test]
-    fn a_segment_with_a_bad_header_is_abandoned_and_every_shard_is_lossy() {
-        let disk = MemDisk::default();
-        let segments = wal(&disk, 1, 1);
-        let mut s1 = FileLog::new(1, Arc::clone(&segments[0]));
-        write(&mut s1, 0, &put(b"b", b"1"));
-        disk.write_file(&Path::new("/data/wal").join(segment_name(2, 0, 0)), b"junk")
-            .unwrap();
-        let recovery = recover(
-            &disk,
-            Path::new("/data/wal"),
-            2,
-            ReaderMode::Resynchronising,
-        )
-        .unwrap();
-        assert_eq!(recovery.report.abandoned_segments, 1);
-        assert!(recovery.shards.iter().all(|shard| shard.lossy));
-        assert_eq!(
-            recovery.shards[1].records.len(),
-            1,
-            "the good segment still counts"
-        );
-    }
-
-    #[test]
-    fn a_malformed_payload_ends_that_shards_prefix() {
-        let disk = MemDisk::default();
-        let segments = wal(&disk, 1, 1);
-        let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-        write(&mut s0, 0, &put(b"a", b"1"));
-        write(&mut s0, 1, &[99]); // no such tag
-        write(&mut s0, 2, &put(b"a", b"3"));
-        let recovery = recover(
-            &disk,
-            Path::new("/data/wal"),
-            1,
-            ReaderMode::Resynchronising,
-        )
-        .unwrap();
-        assert_eq!(recovery.report.malformed, 1);
-        assert_eq!(recovery.shards[0].records.len(), 1);
-        assert_eq!(recovery.shards[0].discarded, 1);
-        assert!(
-            recovery.shards[0].lossy,
-            "recovery read the record and could not apply it: the loss is known"
-        );
-    }
-
-    #[test]
-    fn a_missing_directory_is_an_error_and_an_empty_one_is_a_fresh_node() {
-        let disk = MemDisk::default();
-        assert!(
-            recover(
-                &disk,
-                Path::new("/data/wal"),
-                4,
-                ReaderMode::Resynchronising
-            )
-            .is_err()
-        );
-        disk.create_dir_all(Path::new("/data/wal")).unwrap();
-        let recovery = recover(
-            &disk,
-            Path::new("/data/wal"),
-            4,
-            ReaderMode::Resynchronising,
-        )
-        .unwrap();
-        assert_eq!(recovery.shards.len(), 4);
-        assert!(
-            recovery
-                .shards
-                .iter()
-                .all(|shard| shard.records.is_empty() && !shard.lossy)
-        );
-        assert_eq!(recovery.report.segments, 0);
-    }
-}
+mod tests;

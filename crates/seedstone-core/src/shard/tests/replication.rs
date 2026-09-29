@@ -621,8 +621,7 @@ fn replayed_log() -> Vec<(u64, crate::log::effect::Owned)> {
 /// shard's resumed position to the sink.
 #[tokio::test]
 async fn a_pool_spawned_from_a_recovery_serves_the_recovered_keys() {
-    use crate::log::effect::Owned;
-    use crate::log::recovery::ShardRecords;
+    use crate::log::recovery::RecoveredShard;
     use crate::shard::{PoolSpec, TraceSink};
 
     #[derive(Clone, Default)]
@@ -645,23 +644,28 @@ async fn a_pool_spawned_from_a_recovery_serves_the_recovered_keys() {
         1,
         "a key that lands on shard 1"
     );
-    let recovered = vec![
-        ShardRecords {
-            records: Vec::new(),
-            discarded: 2,
-            lossy: true,
+    let root = DictSeed { k0: 1, k1: 2 };
+    let mut imaged = Dict::with_seed(crate::dict::shard_seed(root, 1));
+    imaged.insert(
+        Bytes::from_static(b"k"),
+        Entry {
+            value: Bytes::from_static(b"v"),
+            expires_at: None,
+            touched: 0,
         },
-        ShardRecords {
-            records: vec![(
-                0,
-                Owned::Put {
-                    key: Bytes::from_static(b"k"),
-                    value: Bytes::from_static(b"v"),
-                    deadline: None,
-                },
-            )],
-            discarded: 0,
+    );
+    let recovered = vec![
+        RecoveredShard {
+            dict: Dict::with_seed(crate::dict::shard_seed(root, 0)),
+            seq: 0,
+            lossy: true,
+            cut: true,
+        },
+        RecoveredShard {
+            dict: imaged,
+            seq: 1,
             lossy: false,
+            cut: false,
         },
     ];
     let pool = ShardPool::spawn_spec(PoolSpec {
@@ -693,8 +697,8 @@ async fn a_pool_spawned_from_a_recovery_serves_the_recovered_keys() {
 /// every later start; a shard recovered whole writes none.
 #[tokio::test]
 async fn a_shard_cut_by_its_recovery_rebases_before_its_first_write() {
-    use crate::log::effect::{Effect, Owned};
-    use crate::log::recovery::ShardRecords;
+    use crate::log::effect::Effect;
+    use crate::log::recovery::RecoveredShard;
     use crate::shard::PoolSpec;
 
     /// `(shard, seq, payload)` of each append; a sync is `(u16::MAX, 0, "sync")`.
@@ -725,28 +729,14 @@ async fn a_shard_cut_by_its_recovery_rebases_before_its_first_write() {
         .map(|i| format!("key{i}"))
         .find(|key| shard_of(key.as_bytes(), 2) == 0)
         .expect("some key lands on shard 0");
-    let put = |seq: u64| {
-        (
-            seq,
-            Owned::Put {
-                key: Bytes::from_static(b"x"),
-                value: Bytes::from_static(b"1"),
-                deadline: None,
-            },
-        )
+    // Each shard resumes at 1; shard 0's recovery cut records after it.
+    let resumed = |shard: u16, cut: bool| RecoveredShard {
+        dict: Dict::with_seed(crate::dict::shard_seed(DictSeed { k0: 1, k1: 2 }, shard)),
+        seq: 1,
+        lossy: false,
+        cut,
     };
-    let recovered = vec![
-        ShardRecords {
-            records: vec![put(0)],
-            discarded: 1,
-            lossy: false,
-        },
-        ShardRecords {
-            records: vec![put(0)],
-            discarded: 0,
-            lossy: false,
-        },
-    ];
+    let recovered = vec![resumed(0, true), resumed(1, false)];
     let kept = Kept::default();
     let pool = ShardPool::spawn_spec(PoolSpec {
         shards: 2,

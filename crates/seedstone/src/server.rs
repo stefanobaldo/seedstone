@@ -15,10 +15,10 @@ use seedstone_core::dict::DictSeed;
 use seedstone_core::log::checkpoint::NoCheckpoint;
 use seedstone_core::log::disk::{Disk, StdDisk};
 use seedstone_core::log::file::{FileLog, next_generation, open_segments};
-use seedstone_core::log::recovery::{ReaderMode, recover};
+use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, recover};
 use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{
-    Command, Deadlines, LogFault, NoTrace, PoolSpec, Reply, ShardPool, TraceSink,
+    Command, Deadlines, LogFault, NoTrace, Now, PoolSpec, Reply, ShardPool, TraceSink,
 };
 use seedstone_core::slot::executor_of;
 use seedstone_resp::{Frame, encode};
@@ -858,7 +858,18 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
     let started = (|| {
         disk.create_dir_all(&wal)?;
         let lock = lock_data_dir(&wal)?;
-        let recovery = recover(&disk, &wal, SHARDS, ReaderMode::Resynchronising)?;
+        let recovery = recover(RecoverSpec {
+            disk: &disk,
+            wal: &wal,
+            shards: SHARDS,
+            reader: ReaderMode::Resynchronising,
+            trust_unfinished: false,
+            seed,
+            now: Now {
+                instant: tokio::time::Instant::now(),
+                unix_millis: wall_clock(),
+            },
+        })?;
         let generation = next_generation(&disk, &wal)?;
         let segments = open_segments(&disk, &wal, generation, executors)?;
         Ok::<_, std::io::Error>((recovery, segments, lock))

@@ -127,9 +127,9 @@ use seedstone_core::dict::DictSeed;
 use seedstone_core::log::checkpoint::NoCheckpoint;
 use seedstone_core::log::disk::Disk;
 use seedstone_core::log::file::{FileLog, SharedSegment, next_generation, open_segments};
-use seedstone_core::log::recovery::{ReaderMode, Recovery, ShardRecords, recover};
+use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, RecoveredShard, Recovery, recover};
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
-use seedstone_core::shard::{Deadlines, PoolSpec, ShardPolicy, ShardPool, parse_i64};
+use seedstone_core::shard::{Deadlines, Now, PoolSpec, ShardPolicy, ShardPool, parse_i64};
 use seedstone_core::slot::executor_of;
 use seedstone_resp::Frame;
 use seedstone_service::{NodeInfo, serve_connection};
@@ -508,7 +508,7 @@ async fn server(
     // a node that gave up there would end the run with a harness error
     // rather than a finding.
     let (recovery, segments) = loop {
-        if let Ok(started) = start_log(shards, executors, planted) {
+        if let Ok(started) = start_log(shards, executors, seed, planted) {
             break started;
         }
         lock(&shared.tally).start_failures += 1;
@@ -625,6 +625,7 @@ const DATA_DIR: &str = "/data";
 fn start_log(
     shards: u16,
     executors: u16,
+    seed: DictSeed,
     planted: Option<Plant>,
 ) -> std::io::Result<(Recovery, Vec<SharedSegment<SimFile>>)> {
     let disk = SimDisk;
@@ -635,7 +636,20 @@ fn start_log(
     } else {
         ReaderMode::Resynchronising
     };
-    let recovery = recover(&disk, &wal, shards, mode)?;
+    let recovery = recover(RecoverSpec {
+        disk: &disk,
+        wal: &wal,
+        shards,
+        reader: mode,
+        trust_unfinished: false,
+        seed,
+        // Inside the host, the simulated clock — the same reading the pool
+        // took when it replayed the log itself.
+        now: Now {
+            instant: tokio::time::Instant::now(),
+            unix_millis: sim_wall_clock(),
+        },
+    })?;
     let generation = next_generation(&disk, &wal)?;
     let segments = open_segments(&disk, &wal, generation, executors)?;
     Ok((recovery, segments))
@@ -648,7 +662,7 @@ struct PoolParts<F> {
     seed: DictSeed,
     sink: HashSink,
     limit: MemoryLimit,
-    recovered: Vec<ShardRecords>,
+    recovered: Vec<RecoveredShard>,
     make_log: F,
 }
 
