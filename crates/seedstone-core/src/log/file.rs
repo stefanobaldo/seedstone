@@ -3,8 +3,8 @@
 //! ```text
 //! <data-dir>/wal/
 //!   GENERATION                  the generation counter, decimal ASCII
-//!   0000000000000003-0000.seg   <generation:016x>-<executor:04x>.seg
-//!   0000000000000003-0001.seg
+//!   0000000000000003-0000-00000000.seg   <generation:016x>-<executor:04x>-<rotation:08x>.seg
+//!   0000000000000003-0001-00000000.seg
 //! ```
 //!
 //! A **generation** is one process lifetime: read on start-up, incremented,
@@ -33,7 +33,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::log::disk::{Disk, LogFile};
-use crate::log::{Record, ReplicationLog, encode_record};
+use crate::log::{Record, ReplicationLog, crc32_iso_hdlc, encode_record};
 
 /// The four bytes every segment starts with.
 pub const SEGMENT_MAGIC: [u8; 4] = *b"SSEG";
@@ -41,8 +41,8 @@ pub const SEGMENT_MAGIC: [u8; 4] = *b"SSEG";
 /// The layout version this build writes and the highest it reads.
 pub const FORMAT_VERSION: u8 = 1;
 
-/// Magic, version, generation, executor.
-pub const SEGMENT_HEADER_LEN: usize = 4 + 1 + 8 + 2;
+/// Magic, version, generation, executor, rotation, and a CRC over the rest.
+pub const SEGMENT_HEADER_LEN: usize = 4 + 1 + 8 + 2 + 4 + 4;
 
 /// The file the generation counter lives in.
 pub const GENERATION_FILE: &str = "GENERATION";
@@ -50,52 +50,75 @@ pub const GENERATION_FILE: &str = "GENERATION";
 /// The name the counter is written under before it is renamed into place.
 const GENERATION_TMP: &str = "GENERATION.tmp";
 
-/// The name of the segment `executor` writes in `generation`.
+/// The name the segment `executor` writes in `generation` at `rotation`.
+///
+/// Rotation is the checkpoint's counter: every cycle opens a fresh segment
+/// so that what precedes it can be deleted as a whole file. Zero at start.
 #[must_use]
-pub fn segment_name(generation: u64, executor: u16) -> String {
-    format!("{generation:016x}-{executor:04x}.seg")
+pub fn segment_name(generation: u64, executor: u16, rotation: u32) -> String {
+    format!("{generation:016x}-{executor:04x}-{rotation:08x}.seg")
 }
 
-/// The generation and executor a segment name carries, if it is one.
+/// The generation, executor and rotation a segment name carries, if it is
+/// one.
 #[must_use]
-pub fn parse_segment_name(name: &str) -> Option<(u64, u16)> {
-    let stem = name.strip_suffix(".seg")?;
-    let (generation, executor) = stem.split_once('-')?;
-    if generation.len() != 16 || executor.len() != 4 {
+pub fn parse_segment_name(name: &str) -> Option<(u64, u16, u32)> {
+    parse_name(name, ".seg")
+}
+
+/// `<generation:016x>-<executor:04x>-<counter:08x><suffix>`, the shape both
+/// file types share.
+pub(crate) fn parse_name(name: &str, suffix: &str) -> Option<(u64, u16, u32)> {
+    let stem = name.strip_suffix(suffix)?;
+    let mut parts = stem.split('-');
+    let (generation, executor, counter) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || generation.len() != 16 || executor.len() != 4 || counter.len() != 8
+    {
         return None;
     }
     Some((
         u64::from_str_radix(generation, 16).ok()?,
         u16::from_str_radix(executor, 16).ok()?,
+        u32::from_str_radix(counter, 16).ok()?,
     ))
 }
 
-/// Appends a segment header to `out`.
-pub fn encode_segment_header(generation: u64, executor: u16, out: &mut Vec<u8>) {
+/// Appends a segment header to `out`: the fields, then a CRC over them.
+pub fn encode_segment_header(generation: u64, executor: u16, rotation: u32, out: &mut Vec<u8>) {
+    let at = out.len();
     out.extend_from_slice(&SEGMENT_MAGIC);
     out.push(FORMAT_VERSION);
     out.extend_from_slice(&generation.to_le_bytes());
     out.extend_from_slice(&executor.to_le_bytes());
+    out.extend_from_slice(&rotation.to_le_bytes());
+    let crc = crc32_iso_hdlc(&out[at..]);
+    out.extend_from_slice(&crc.to_le_bytes());
 }
 
-/// Why a segment header could not be read.
+/// Why a header could not be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderError {
-    /// Fewer than [`SEGMENT_HEADER_LEN`] bytes.
+    /// Fewer bytes than the header needs.
     Short,
-    /// The magic is not [`SEGMENT_MAGIC`]: not a segment, or damaged.
+    /// The magic is wrong: not this kind of file, or damaged.
     BadMagic,
     /// A version above [`FORMAT_VERSION`]: a file this build must not guess
     /// at.
     NewerVersion(u8),
+    /// The fields do not match their CRC: damage.
+    BadChecksum,
 }
 
-/// Reads a segment header: the generation and executor it names.
+/// Reads a segment header: the generation, executor and rotation it names.
+///
+/// The version is checked before the checksum: a newer version may lay its
+/// header out differently, and refusing it as damage would scan a downgrade
+/// as a hole.
 ///
 /// # Errors
 ///
 /// [`HeaderError`], as each variant says.
-pub fn decode_segment_header(buf: &[u8]) -> Result<(u64, u16), HeaderError> {
+pub fn decode_segment_header(buf: &[u8]) -> Result<(u64, u16, u32), HeaderError> {
     let Some(header) = buf.get(..SEGMENT_HEADER_LEN) else {
         return Err(HeaderError::Short);
     };
@@ -105,11 +128,29 @@ pub fn decode_segment_header(buf: &[u8]) -> Result<(u64, u16), HeaderError> {
     if header[4] > FORMAT_VERSION {
         return Err(HeaderError::NewerVersion(header[4]));
     }
+    check_header_crc(header)?;
     let mut generation = [0; 8];
     generation.copy_from_slice(&header[5..13]);
-    let generation = u64::from_le_bytes(generation);
     let executor = u16::from_le_bytes([header[13], header[14]]);
-    Ok((generation, executor))
+    let mut rotation = [0; 4];
+    rotation.copy_from_slice(&header[15..19]);
+    Ok((
+        u64::from_le_bytes(generation),
+        executor,
+        u32::from_le_bytes(rotation),
+    ))
+}
+
+/// The last four bytes of `header` are the CRC of everything before them.
+pub(crate) fn check_header_crc(header: &[u8]) -> Result<(), HeaderError> {
+    let (fields, crc) = header.split_at(header.len() - 4);
+    let mut expected = [0; 4];
+    expected.copy_from_slice(crc);
+    if crc32_iso_hdlc(fields) == u32::from_le_bytes(expected) {
+        Ok(())
+    } else {
+        Err(HeaderError::BadChecksum)
+    }
 }
 
 /// One open segment, shared by the shards of the executor that writes it.
@@ -246,7 +287,7 @@ pub fn next_generation<D: Disk>(disk: &D, wal: &Path) -> io::Result<u64> {
         .list(wal)?
         .iter()
         .filter_map(|name| parse_segment_name(name))
-        .map(|(generation, _)| generation)
+        .map(|(generation, _, _)| generation)
         .max()
         .unwrap_or(0);
     let next = recorded.max(on_disk) + 1;
@@ -284,9 +325,9 @@ pub fn open_segments<D: Disk>(
 ) -> io::Result<Vec<SharedSegment<D::File>>> {
     let mut segments = Vec::with_capacity(usize::from(executors));
     for executor in 0..executors {
-        let mut file = disk.create_append(&wal.join(segment_name(generation, executor)))?;
+        let mut file = disk.create_append(&wal.join(segment_name(generation, executor, 0)))?;
         let mut header = Vec::with_capacity(SEGMENT_HEADER_LEN);
-        encode_segment_header(generation, executor, &mut header);
+        encode_segment_header(generation, executor, 0, &mut header);
         file.write_all(&header)?;
         file.sync_data()?;
         segments.push(Arc::new(Mutex::new(Segment {
@@ -306,34 +347,62 @@ mod tests {
     use crate::log::{Decoded, decode_record};
 
     #[test]
-    fn segment_names_sort_by_generation_then_executor() {
-        assert_eq!(segment_name(3, 1), "0000000000000003-0001.seg");
+    fn segment_names_sort_by_generation_then_executor_then_rotation() {
+        assert_eq!(segment_name(3, 1, 0), "0000000000000003-0001-00000000.seg");
         assert_eq!(
-            parse_segment_name("0000000000000003-0001.seg"),
-            Some((3, 1))
+            parse_segment_name("0000000000000003-0001-00000002.seg"),
+            Some((3, 1, 2))
         );
         assert_eq!(parse_segment_name("GENERATION"), None);
-        assert_eq!(parse_segment_name("0000000000000003-0001.tmp"), None);
-        let mut names = vec![segment_name(2, 0), segment_name(1, 3), segment_name(1, 0)];
+        assert_eq!(
+            parse_segment_name("0000000000000003-0001.seg"),
+            None,
+            "the old shape"
+        );
+        assert_eq!(
+            parse_segment_name("0000000000000003-0001-00000002.snap"),
+            None
+        );
+        let mut names = vec![
+            segment_name(2, 0, 0),
+            segment_name(1, 3, 0),
+            segment_name(1, 0, 1),
+            segment_name(1, 0, 0),
+        ];
         names.sort();
         assert_eq!(
             names,
-            [segment_name(1, 0), segment_name(1, 3), segment_name(2, 0)]
+            [
+                segment_name(1, 0, 0),
+                segment_name(1, 0, 1),
+                segment_name(1, 3, 0),
+                segment_name(2, 0, 0)
+            ]
         );
     }
 
     #[test]
-    fn a_segment_header_round_trips_and_refuses_a_newer_version() {
+    fn a_segment_header_round_trips_and_refuses_a_newer_version_or_a_bad_checksum() {
         let mut out = Vec::new();
-        encode_segment_header(9, 2, &mut out);
+        encode_segment_header(9, 2, 5, &mut out);
         assert_eq!(out.len(), SEGMENT_HEADER_LEN);
-        assert_eq!(decode_segment_header(&out), Ok((9, 2)));
+        assert_eq!(decode_segment_header(&out), Ok((9, 2, 5)));
         assert_eq!(decode_segment_header(&out[..3]), Err(HeaderError::Short));
         let mut bad = out.clone();
         bad[0] = b'X';
         assert_eq!(decode_segment_header(&bad), Err(HeaderError::BadMagic));
+        let mut flipped = out.clone();
+        flipped[7] ^= 0x01; // inside the generation
+        assert_eq!(
+            decode_segment_header(&flipped),
+            Err(HeaderError::BadChecksum),
+            "a header whose bytes moved is damage, not a different header"
+        );
         let mut newer = out;
         newer[4] = FORMAT_VERSION + 1;
+        // The version is read before the checksum: a newer version writes a
+        // header this build cannot checksum, and refusing it as damage would
+        // scan a downgrade as a hole.
         assert_eq!(
             decode_segment_header(&newer),
             Err(HeaderError::NewerVersion(FORMAT_VERSION + 1))
@@ -349,9 +418,9 @@ mod tests {
         assert_eq!(segments.len(), 2);
         let mut names = disk.list(wal).unwrap();
         names.sort();
-        assert_eq!(names, [segment_name(4, 0), segment_name(4, 1)]);
-        let header = disk.contents(&wal.join(segment_name(4, 1)));
-        assert_eq!(decode_segment_header(&header), Ok((4, 1)));
+        assert_eq!(names, [segment_name(4, 0, 0), segment_name(4, 1, 0)]);
+        let header = disk.contents(&wal.join(segment_name(4, 1, 0)));
+        assert_eq!(decode_segment_header(&header), Ok((4, 1, 0)));
     }
 
     #[test]
@@ -360,7 +429,7 @@ mod tests {
         let wal = Path::new("/data/wal");
         disk.create_dir_all(wal).unwrap();
         let segments = open_segments(&disk, wal, 1, 1).unwrap();
-        let path = wal.join(segment_name(1, 0));
+        let path = wal.join(segment_name(1, 0, 0));
         let mut log = FileLog::new(5, Arc::clone(&segments[0]));
 
         log.append(Record {
@@ -412,7 +481,7 @@ mod tests {
         let wal = Path::new("/data/wal");
         disk.create_dir_all(wal).unwrap();
         let segments = open_segments(&disk, wal, 1, 1).unwrap();
-        let path = wal.join(segment_name(1, 0));
+        let path = wal.join(segment_name(1, 0, 0));
         let mut log = FileLog::new(0, Arc::clone(&segments[0]));
         log.append(Record {
             shard: 0,
