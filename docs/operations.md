@@ -25,7 +25,7 @@ seedstone --version | --help
 | `--maxmemory-policy` | `noeviction` | What happens at the ceiling: `allkeys-lru` evicts, `noeviction` refuses writes. Only with `--maxmemory`. |
 | `--requirepass-file PATH` | none | The password file: one password per line, one or two lines. See *Password and rotation*. |
 | `--no-auth` | off | Run with no password, on purpose. See *Running without a password*. |
-| `--data-dir PATH` | none | Where the node keeps its log. With it, every write is recorded and replayed on the next start; without it a restart is an empty keyspace. The log grows until compaction exists; see *What `--data-dir` promises*. |
+| `--data-dir PATH` | none | Where the node keeps its log. With it, every write is recorded and replayed on the next start; without it a restart is an empty keyspace. Snapshots keep it bounded; see *What `--data-dir` promises*. |
 
 `--version` and `--help` answer on stdout and exit 0, in first position only.
 `SEEDSTONE_REQUIREPASS` in the environment is the other way to give a
@@ -179,24 +179,42 @@ housekeeping tick — every 100 ms on a node with room to spare, less often on
 one kept busy, since commands are served before housekeeping. A write
 acknowledged before a sync survives a crash; one acknowledged after the last
 sync may not — nor, once a sync has failed (`log_fault` with `stage` `sync`),
-may anything acknowledged since the last one that succeeded. On start the
-log is read back: a shard whose records have a gap is replayed up to the gap
-and reported with `recovery_truncated`, and the node serves what it has.
+may anything acknowledged since the last one that succeeded, until a
+snapshot covers it. On start the log is read back: a shard whose records
+have a gap is replayed up to the gap and reported with
+`recovery_truncated`, and the node serves what it has.
 
-Start-up reads the whole log and holds every record it replays in memory
-until replay is done, so both the time a start takes and the memory it
-needs grow with everything ever written, not with the keyspace that
-results. A node restarted after a long run with this flag needs memory for
-its whole write history, briefly.
+The node runs one *executor* per available core, each serving a fixed
+range of the shards and keeping one log for them; the `snapshot` and
+`compaction` lines name it by number. Once an executor's log has grown past
+64 MiB — or past the size of its last snapshot, whichever is larger — it
+takes a snapshot of its shards: about 1 MiB of it is written per
+housekeeping tick while the shards keep serving between ticks, so a
+snapshot never holds them for longer than one tick's share takes to write,
+and the `snapshot` line says when it is durable. The log it covers is then
+removed, on the `compaction` line. What that bounds: **an executor's files
+never exceed its last snapshot, plus the one it is writing, plus the larger
+of 64 MiB and its last snapshot, plus what was written while the snapshot
+was being taken** — three times the last snapshot plus 64 MiB, and the
+writes of one snapshot's duration, on a keyspace that is not growing. The
+directory is the sum over the executors.
+
+After a restart, the previous process's files stay until every executor of
+the new one has taken a snapshot of its own; an executor that receives
+little writing may take a long time to reach 64 MiB, and until it does the
+directory holds the previous process's files beside the new one's. A start
+reads the newest snapshot of each shard and the log still on disk, so both
+the time a start takes and the memory it needs grow with the keyspace plus
+that log — which the bound above limits — not with the whole write history.
+
+The bound holds on a disk that eventually writes. A disk that refuses every
+write parks the snapshot (`log_fault` with `stage` `snapshot`, retried on
+every tick), and the log grows until it accepts one.
 
 One process at a time: the node takes an exclusive lock on `PATH/wal/LOCK`
 before it reads the log, and a second node started on the same directory
 writes `recovery_failed` and exits 1. The kernel releases the lock when the
 process dies, so a crashed node never leaves it behind.
-
-The log only grows. Until snapshots and compaction exist, the directory's
-size is bounded by nothing but the disk; a node that must run for long on a
-small disk should not yet be started with this flag.
 
 ## What `INFO` gives a monitor
 

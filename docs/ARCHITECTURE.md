@@ -118,6 +118,20 @@ records the cut left on disk are never replayed by a later start. The same
 abstraction becomes a consensus log after that. Without the flag the log is
 a no-op, as it was, and a write encodes no record at all.
 
+**Snapshots are fuzzy, and there is no fork.** When an executor's log has
+grown past a floor, or past the size of its last snapshot, it takes an
+image of its shards a budget per housekeeping tick, through the same
+cursor `SCAN` uses, while the shards keep serving. The image is not the
+state at any instant, and does not need to be: every record is an absolute
+effect, so the log's tail from the moment the image began, replayed over
+it, is the state. That is the reason the log records effects rather than
+commands, cashed in: a snapshot with no pause beyond one tick's budget and
+no copy of the keyspace, where a server that forks for its snapshot copies,
+page by page, every part of the heap written while the child runs. Once the image's commit record is synced the segments it
+covers are deleted, and a start reads image plus tail. The image is
+ordinary log records in a file of its own, so the reader that steps over
+damage reads both.
+
 ## The edge is an adapter
 
 SeedStone speaks RESP2 over TCP. That is a boundary decision, not an identity:
