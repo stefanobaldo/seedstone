@@ -130,7 +130,9 @@ pub struct SimOutcome {
     /// Reads of a value a crash left known to be durable that disagreed, on
     /// a shard the recovery did not report.
     pub lost_durable_writes: u64,
-    /// The same disagreements on a shard the recovery did report.
+    /// The same disagreements on a shard the recovery did report, and the
+    /// volatile keys written before a crash that read dead inside their
+    /// live band on such a shard.
     pub excused_losses: u64,
     /// Reads decided against a value a crash left known to be durable — the
     /// denominator of the two above.
@@ -381,7 +383,8 @@ pub struct Tally {
     /// disagreed — on a shard the recovery did not report as truncated.
     pub lost_durable_writes: u64,
     /// Those same disagreements on a shard the recovery *did* report: a
-    /// loss the node owned up to.
+    /// loss the node owned up to. Also counts a volatile key written before
+    /// a crash that read dead inside its live band on such a shard.
     pub excused_losses: u64,
     /// Reads decided against a value a crash left known to be durable —
     /// the denominator of the two above.

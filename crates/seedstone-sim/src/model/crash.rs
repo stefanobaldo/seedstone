@@ -163,6 +163,31 @@ impl Model {
         }
     }
 
+    /// Whether a volatile key read dead inside its live band is a loss the
+    /// node's recovery owned up to: the deadline was written before the last
+    /// crash this client absorbed, and the recovery that followed reported
+    /// the key's shard as having lost records. Counted as excused, and the
+    /// deadline forgotten, as [`check_durable`](Self::check_durable) does
+    /// for a plain key.
+    pub(super) fn excused_volatile_death(&mut self, slot: u32) -> bool {
+        let Some(crash_at) = lock(&self.shared.crashes)
+            .get(self.crashes_seen.wrapping_sub(1))
+            .map(|crash| crash.at)
+        else {
+            return false;
+        };
+        let written_before =
+            self.volatile_acked[slot as usize].is_some_and(|acked| acked < crash_at);
+        let shard = usize::from(self.volatile_shard[slot as usize]);
+        if !(written_before && lock(&self.shared.truncated)[shard]) {
+            return false;
+        }
+        lock(&self.shared.tally).excused_losses += 1;
+        self.deadlines[slot as usize] = None;
+        self.volatile_acked[slot as usize] = None;
+        true
+    }
+
     /// Counts a read of a key a crash left exactly known, as durable.
     ///
     /// A disagreement is a durable write the node did not keep — excused

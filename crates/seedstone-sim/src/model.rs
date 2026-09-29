@@ -842,6 +842,9 @@ impl Model {
             lock(&self.shared.tally).evictions_observed += 1;
             return;
         }
+        if !present && received + LIVE_SLACK < deadline && self.excused_volatile_death(slot) {
+            return;
+        }
         let mut tally = lock(&self.shared.tally);
         if sent > deadline + STALE_SLACK {
             tally.dead_checks += 1;
