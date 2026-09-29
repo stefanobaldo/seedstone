@@ -389,6 +389,7 @@ async fn the_tick_flushes_then_syncs_and_reports_a_failure() {
         limit: crate::memory::MemoryLimit::default(),
         clock: crate::shard::frozen_clock,
         recovered: Vec::new(),
+        make_checkpoint: |_executor| crate::log::checkpoint::NoCheckpoint,
     });
     pool.dispatch(set(b"k", b"v")).await;
     tokio::time::advance(HOUSEKEEPING_TICK + Duration::from_millis(1)).await;
@@ -670,6 +671,7 @@ async fn a_pool_spawned_from_a_recovery_serves_the_recovered_keys() {
         limit: crate::memory::MemoryLimit::default(),
         clock: crate::shard::frozen_clock,
         recovered,
+        make_checkpoint: |_executor| crate::log::checkpoint::NoCheckpoint,
     });
     assert_eq!(
         pool.dispatch(Command::Get {
@@ -756,6 +758,7 @@ async fn a_shard_cut_by_its_recovery_rebases_before_its_first_write() {
         limit: crate::memory::MemoryLimit::default(),
         clock: crate::shard::frozen_clock,
         recovered,
+        make_checkpoint: |_executor| crate::log::checkpoint::NoCheckpoint,
     });
     let mut rebase = Vec::new();
     Effect::Rebase.encode(&mut rebase);
@@ -820,4 +823,72 @@ async fn a_log_that_keeps_no_payloads_is_handed_none() {
     });
     pool.dispatch(set(b"k", &[b'v'; 4096])).await;
     assert_eq!(*lengths.0.lock().expect("lengths"), [0]);
+}
+
+/// The checkpoint runs in the tick, after the log's two passes, once per
+/// executor — it sees the executor's shards and the tick's clock.
+#[tokio::test(start_paused = true)]
+async fn the_checkpoint_is_ticked_once_per_executor_per_housekeeping_tick() {
+    use crate::log::NoopLog;
+    use crate::log::checkpoint::Checkpoint;
+    use crate::shard::executor::ShardState;
+    use crate::shard::{Now, PoolSpec, TraceSink};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Clone)]
+    struct Counting {
+        ticks: Arc<AtomicU64>,
+        shards_seen: Arc<AtomicU64>,
+    }
+    impl Checkpoint for Counting {
+        fn tick<L: ReplicationLog, T: TraceSink>(
+            &mut self,
+            _first_shard: u16,
+            states: &mut [ShardState<L>],
+            _now: Now,
+            _trace: &T,
+        ) {
+            self.ticks.fetch_add(1, Ordering::SeqCst);
+            self.shards_seen
+                .fetch_max(states.len() as u64, Ordering::SeqCst);
+        }
+    }
+
+    let ticks = Arc::new(AtomicU64::new(0));
+    let shards_seen = Arc::new(AtomicU64::new(0));
+    let counting = Counting {
+        ticks: Arc::clone(&ticks),
+        shards_seen: Arc::clone(&shards_seen),
+    };
+    let pool = ShardPool::spawn_spec(PoolSpec {
+        shards: 8,
+        executors: 2,
+        seed: DictSeed { k0: 1, k1: 2 },
+        trace: NoTrace,
+        make_log: |_shard| NoopLog,
+        policy: crate::shard::Deadlines,
+        limit: crate::memory::MemoryLimit::default(),
+        clock: crate::shard::frozen_clock,
+        recovered: Vec::new(),
+        make_checkpoint: move |_executor| counting.clone(),
+    });
+    // Let both executors start their interval, then step the clock one
+    // period at a time: a single jump of three periods would fire one tick,
+    // the interval delaying rather than bursting what it missed.
+    tokio::task::yield_now().await;
+    for _ in 0..3 {
+        tokio::time::advance(HOUSEKEEPING_TICK).await;
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        ticks.load(Ordering::SeqCst),
+        6,
+        "three ticks on each of two executors"
+    );
+    assert_eq!(
+        shards_seen.load(Ordering::SeqCst),
+        4,
+        "each sees its own four shards"
+    );
+    drop(pool);
 }

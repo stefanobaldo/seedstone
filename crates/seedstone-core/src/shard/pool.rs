@@ -4,12 +4,13 @@
 //! replies go; [`ShardStats`] is what comes back for `INFO`.
 
 use crate::dict::{Dict, DictSeed};
+use crate::log::checkpoint::{Checkpoint, NoCheckpoint};
 use crate::log::effect::Effect;
 use crate::log::recovery::ShardRecords;
 use crate::log::{NoopLog, ReplicationLog};
 use crate::memory::{MemoryGauge, MemoryLimit};
 use crate::shard::apply::append;
-use crate::shard::executor::{Memory, ShardState, frozen_clock, run_executor};
+use crate::shard::executor::{ExecutorSpec, Memory, ShardState, frozen_clock, run_executor};
 use crate::shard::{
     Command, Deadlines, KIND_SLOTS, LogFault, Now, Reply, ReplyError, Route, ShardPolicy, TraceSink,
 };
@@ -373,7 +374,7 @@ pub struct ShardPool {
 /// that names its fields cannot swap two clocks or two counts by position.
 /// The public constructors on [`ShardPool`] are this with defaults filled
 /// in; [`ShardPool::spawn_spec`] takes it whole.
-pub struct PoolSpec<T, F, P> {
+pub struct PoolSpec<T, F, P, G> {
     /// How many virtual shards the node runs.
     pub shards: u16,
     /// How many executor tasks host them.
@@ -396,6 +397,10 @@ pub struct PoolSpec<T, F, P> {
     /// the dict is built on this thread anyway, and replaying it here
     /// keeps the executor's start free of a second code path.
     pub recovered: Vec<ShardRecords>,
+    /// Builds each executor's checkpoint, called once per executor with
+    /// its index. [`NoCheckpoint`](crate::log::checkpoint::NoCheckpoint)
+    /// for a node with no data directory.
+    pub make_checkpoint: G,
 }
 
 impl ShardPool {
@@ -425,6 +430,7 @@ impl ShardPool {
             limit: MemoryLimit::default(),
             clock: frozen_clock,
             recovered: Vec::new(),
+            make_checkpoint: |_executor| NoCheckpoint,
         })
     }
 
@@ -458,6 +464,7 @@ impl ShardPool {
             limit,
             clock: frozen_clock,
             recovered: Vec::new(),
+            make_checkpoint: |_executor| NoCheckpoint,
         })
     }
 
@@ -501,6 +508,7 @@ impl ShardPool {
             limit: MemoryLimit::default(),
             clock: frozen_clock,
             recovered: Vec::new(),
+            make_checkpoint: |_executor| NoCheckpoint,
         })
     }
 
@@ -534,6 +542,7 @@ impl ShardPool {
             limit: MemoryLimit::default(),
             clock: frozen_clock,
             recovered: Vec::new(),
+            make_checkpoint: |_executor| NoCheckpoint,
         })
     }
 
@@ -571,6 +580,7 @@ impl ShardPool {
             limit,
             clock: frozen_clock,
             recovered: Vec::new(),
+            make_checkpoint: |_executor| NoCheckpoint,
         })
     }
 
@@ -588,12 +598,14 @@ impl ShardPool {
                   is what lets a caller move them in rather than keep them alive \
                   alongside the pool"
     )]
-    pub fn spawn_spec<T, L, F, P>(spec: PoolSpec<T, F, P>) -> Self
+    pub fn spawn_spec<T, L, F, P, C, G>(spec: PoolSpec<T, F, P, G>) -> Self
     where
         T: TraceSink,
         L: ReplicationLog,
         F: Fn(u16) -> L,
         P: ShardPolicy,
+        C: Checkpoint,
+        G: Fn(u16) -> C,
     {
         let PoolSpec {
             shards,
@@ -605,6 +617,7 @@ impl ShardPool {
             limit,
             clock,
             mut recovered,
+            make_checkpoint,
         } = spec;
         assert!(
             shards > 0,
@@ -674,28 +687,34 @@ impl ShardPool {
                 }
                 _ => {
                     if let Some((first_shard, states)) = pending.take() {
-                        inboxes.push(spawn_executor(
+                        inboxes.push(spawn_executor(ExecutorSpec {
                             first_shard,
                             states,
-                            trace.clone(),
-                            policy.clone(),
-                            memory.clone(),
+                            trace: trace.clone(),
+                            policy: policy.clone(),
+                            memory: memory.clone(),
                             clock,
-                        ));
+                            checkpoint: make_checkpoint(executor_of(
+                                first_shard,
+                                shards,
+                                executors,
+                            )),
+                        }));
                     }
                     pending = Some((shard, vec![state]));
                 }
             }
         }
         if let Some((first_shard, states)) = pending {
-            inboxes.push(spawn_executor(
+            inboxes.push(spawn_executor(ExecutorSpec {
                 first_shard,
                 states,
                 trace,
                 policy,
-                memory.clone(),
+                memory: memory.clone(),
                 clock,
-            ));
+                checkpoint: make_checkpoint(executor_of(first_shard, shards, executors)),
+            }));
         }
 
         Self {
@@ -793,24 +812,11 @@ async fn one_reply(pending: Option<oneshot::Receiver<Vec<Reply>>>) -> Reply {
 }
 
 /// Spawns one executor task and returns the inbox that reaches it.
-fn spawn_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
-    first_shard: u16,
-    states: Vec<ShardState<L>>,
-    trace: T,
-    policy: P,
-    memory: Memory,
-    clock: fn() -> u64,
+fn spawn_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint>(
+    spec: ExecutorSpec<T, L, P, C>,
 ) -> mpsc::UnboundedSender<Envelope> {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_executor(
-        first_shard,
-        states,
-        trace,
-        policy,
-        memory,
-        clock,
-        rx,
-    ));
+    tokio::spawn(run_executor(spec, rx));
     tx
 }
 

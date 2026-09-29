@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use seedstone_core::dict::DictSeed;
+use seedstone_core::log::checkpoint::NoCheckpoint;
 use seedstone_core::log::disk::{Disk, StdDisk};
 use seedstone_core::log::file::{FileLog, next_generation, open_segments};
 use seedstone_core::log::recovery::{ReaderMode, recover};
@@ -912,6 +913,7 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
         limit: cfg.limit,
         clock: wall_clock,
         recovered: recovery.shards,
+        make_checkpoint: |_executor| NoCheckpoint,
     });
     Ok((pool, Some(lock)))
 }

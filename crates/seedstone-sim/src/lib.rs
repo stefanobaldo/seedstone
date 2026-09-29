@@ -124,6 +124,7 @@ use seedstone_core::dict::DictSeed;
 // indistinguishable from the honest one except in its atomicity, and these
 // strings enter the trace hash — a private copy that drifted would make a
 // planted trace differ for a reason unrelated to the race.
+use seedstone_core::log::checkpoint::NoCheckpoint;
 use seedstone_core::log::disk::Disk;
 use seedstone_core::log::file::{FileLog, SharedSegment, next_generation, open_segments};
 use seedstone_core::log::recovery::{ReaderMode, Recovery, ShardRecords, recover};
@@ -666,6 +667,7 @@ where
             limit: self.limit,
             clock: sim_wall_clock,
             recovered: self.recovered,
+            make_checkpoint: |_executor| NoCheckpoint,
         })
     }
 }
