@@ -640,6 +640,18 @@ impl ShardPool {
             gauge: MemoryGauge::default(),
             limit,
         };
+        // Each executor gets its checkpoint by index, built as it spawns.
+        let spawn = |first_shard: u16, states: Vec<ShardState<L>>, trace: T, policy: P| {
+            spawn_executor(ExecutorSpec {
+                first_shard,
+                states,
+                trace,
+                policy,
+                memory: memory.clone(),
+                clock,
+                checkpoint: make_checkpoint(executor_of(first_shard, shards, executors)),
+            })
+        };
         let mut inboxes = Vec::with_capacity(usize::from(executors));
         let mut pending: Option<(u16, Vec<ShardState<L>>)> = None;
         for shard in 0..shards {
@@ -687,34 +699,14 @@ impl ShardPool {
                 }
                 _ => {
                     if let Some((first_shard, states)) = pending.take() {
-                        inboxes.push(spawn_executor(ExecutorSpec {
-                            first_shard,
-                            states,
-                            trace: trace.clone(),
-                            policy: policy.clone(),
-                            memory: memory.clone(),
-                            clock,
-                            checkpoint: make_checkpoint(executor_of(
-                                first_shard,
-                                shards,
-                                executors,
-                            )),
-                        }));
+                        inboxes.push(spawn(first_shard, states, trace.clone(), policy.clone()));
                     }
                     pending = Some((shard, vec![state]));
                 }
             }
         }
         if let Some((first_shard, states)) = pending {
-            inboxes.push(spawn_executor(ExecutorSpec {
-                first_shard,
-                states,
-                trace,
-                policy,
-                memory: memory.clone(),
-                clock,
-                checkpoint: make_checkpoint(executor_of(first_shard, shards, executors)),
-            }));
+            inboxes.push(spawn(first_shard, states, trace, policy));
         }
 
         Self {

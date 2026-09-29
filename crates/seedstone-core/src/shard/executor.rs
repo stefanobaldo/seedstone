@@ -498,27 +498,7 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
                     sweep_expired(state, shard_at(offset), &trace, now, &policy);
                     memory.gauge.apply(before, state.dict.used_bytes());
                 }
-                // The durability point, and the only place in a shard that
-                // can afford one: `append` runs inside a handler that cannot
-                // `await`, so it buffers; this arm is already async and may
-                // block on the disk. Two passes rather than one: every
-                // shard's buffer is written first, then every shard is
-                // synced, so an implementation that shares a file between
-                // the shards of an executor pays one `fsync` for the whole
-                // tick rather than one per shard. A failure of either pass
-                // is reported to the sink and retried on the next tick; see
-                // `ReplicationLog::flush` for why a failed write keeps its
-                // bytes.
-                for (offset, state) in states.iter_mut().enumerate() {
-                    if let Err(error) = state.log.flush() {
-                        trace.fault(shard_at(offset), LogFault::Write, &error);
-                    }
-                }
-                for (offset, state) in states.iter_mut().enumerate() {
-                    if let Err(error) = state.log.sync() {
-                        trace.fault(shard_at(offset), LogFault::Sync, &error);
-                    }
-                }
+                durability_passes(&mut states, &trace, shard_at);
                 // The checkpoint, after both passes: its bases are read at a
                 // point where every shard's buffer has been offered to the
                 // disk, and its budget is the last thing the tick spends.
@@ -532,6 +512,33 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
                     &trace,
                 );
             }
+        }
+    }
+}
+
+/// The tick's durability point, and the only place in a shard that can
+/// afford one: `append` runs inside a handler that cannot `await`, so it
+/// buffers; the tick arm is already async and may block on the disk.
+///
+/// Two passes rather than one: every shard's buffer is written first, then
+/// every shard is synced, so an implementation that shares a file between
+/// the shards of an executor pays one `fsync` for the whole tick rather
+/// than one per shard. A failure of either pass is reported to the sink and
+/// retried on the next tick; see `ReplicationLog::flush` for why a failed
+/// write keeps its bytes.
+fn durability_passes<T: TraceSink, L: ReplicationLog>(
+    states: &mut [ShardState<L>],
+    trace: &T,
+    shard_at: impl Fn(usize) -> u16,
+) {
+    for (offset, state) in states.iter_mut().enumerate() {
+        if let Err(error) = state.log.flush() {
+            trace.fault(shard_at(offset), LogFault::Write, &error);
+        }
+    }
+    for (offset, state) in states.iter_mut().enumerate() {
+        if let Err(error) = state.log.sync() {
+            trace.fault(shard_at(offset), LogFault::Sync, &error);
         }
     }
 }
