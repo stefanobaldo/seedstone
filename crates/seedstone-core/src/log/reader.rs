@@ -2,6 +2,11 @@
 //! byte at a time, and the end of a segment trusted only at a boundary
 //! reached by whole records.
 //!
+//! Even there, an end marker is taken at its word only if nothing intact
+//! follows it. The writer never writes one, so a zero where a record should
+//! start is a zeroed range as often as it is the end, and the reader looks
+//! past it: records after it are recovered and it is counted as a hole.
+//!
 //! The rule was born in `log.rs`'s tests: the simulator tears each
 //! pending write independently, so a crashed segment
 //! is not a prefix of what was written but what was written with holes in
@@ -91,6 +96,11 @@ pub struct Reader<R: Read> {
     /// short: the damage count at that moment, so the hole can be
     /// reclassified as a truncated tail if nothing intact follows it.
     hole_at_tail: Option<u64>,
+    /// Set when the current hole began at an end marker read at a trusted
+    /// boundary: the damage as it stood. The writer never writes the
+    /// marker, so it ends the segment honestly only if nothing intact
+    /// follows it; then the damage is put back as it was.
+    hole_at_end: Option<Damage>,
     /// Bytes this hole may still checksum; see [`RESYNC_CAP`].
     budget: u64,
     damage: Damage,
@@ -117,6 +127,7 @@ impl<R: Read> Reader<R> {
             mode,
             resynchronising: false,
             hole_at_tail: None,
+            hole_at_end: None,
             budget: RESYNC_CAP,
             damage: Damage::default(),
         }
@@ -161,12 +172,20 @@ impl<R: Read> Reader<R> {
                     self.at += consumed;
                     self.resynchronising = false;
                     self.hole_at_tail = None;
+                    self.hole_at_end = None;
                     self.budget = RESYNC_CAP;
                     return Ok(Some(item));
                 }
                 Decoded::EndOfLog => {
                     if !self.resynchronising {
-                        return Ok(None);
+                        // A zeroed range reads as the marker too. Only
+                        // looking tells them apart: step over it, and if
+                        // nothing intact follows, it was the end.
+                        if self.mode == ReaderMode::PrefixScan {
+                            return Ok(None);
+                        }
+                        self.hole_at_end = Some(self.damage);
+                        self.enter_hole();
                     }
                     self.step(1);
                 }
@@ -224,10 +243,16 @@ impl<R: Read> Reader<R> {
         }
     }
 
-    /// The segment ran out. A hole that began at a candidate cut short by
-    /// the segment's end, with nothing intact after it, was a truncated
+    /// The segment ran out. A hole that began at an end marker, with
+    /// nothing intact after it, was the end: its damage is undone. One that
+    /// began at a candidate cut short by the segment's end was a truncated
     /// tail after all: its bytes move from damage to the tail.
     const fn end_of_segment(&mut self) {
+        if let Some(before) = self.hole_at_end.take() {
+            self.damage = before;
+            self.hole_at_tail = None;
+            return;
+        }
         if let Some(start) = self.hole_at_tail.take() {
             let tail = self.damage.bytes - start;
             self.damage.bytes = start;
@@ -405,6 +430,37 @@ mod tests {
         assert!(!damage.abandoned);
     }
 
+    /// The writer never writes the end marker, so a zero where a record
+    /// should start is damage when intact records follow it — a zeroed
+    /// range, say — and the honest end of the segment only when nothing does.
+    #[test]
+    fn a_zeroed_record_is_a_hole_when_intact_records_follow_it() {
+        let mut buf = record(1, 0, b"before");
+        let zeroed = record(1, 1, b"zeroed by the disk");
+        let at = buf.len();
+        buf.extend(vec![0u8; zeroed.len()]);
+        buf.extend(record(1, 2, b"after"));
+        for chunk in [1, 8, 4096] {
+            let (items, damage) = scan(&buf, ReaderMode::Resynchronising, chunk);
+            assert_eq!(
+                items,
+                vec![(1, 0, b"before".to_vec()), (1, 2, b"after".to_vec())],
+                "chunk {chunk}"
+            );
+            assert_eq!(damage.holes, 1, "chunk {chunk}");
+            assert_eq!(
+                usize::try_from(damage.bytes).unwrap(),
+                buf.len() - at - record(1, 2, b"after").len()
+            );
+        }
+        // Zeros to the end, with nothing intact after them: the end.
+        let mut tail = record(1, 0, b"before");
+        tail.extend([0u8; 40]);
+        let (items, damage) = scan(&tail, ReaderMode::Resynchronising, 8);
+        assert_eq!(items.len(), 1);
+        assert_eq!(damage, Damage::default());
+    }
+
     #[test]
     fn a_prefix_scan_stops_silently_at_the_first_damage() {
         let mut buf = record(1, 1, b"first");
@@ -437,18 +493,19 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_run_at_a_trusted_boundary_ends_the_read() {
-        // The limit of an explicit marker, pinned so nobody expects more of
-        // it: a torn write that leaves zeroes exactly at a record boundary is
-        // indistinguishable from a log that ended there, and the read stops.
-        // Records after such a hole are lost — which is why the marker is
-        // only ever trusted at a boundary, never during resynchronisation.
+    fn a_zero_run_at_a_trusted_boundary_is_stepped_over_when_records_follow() {
+        // A torn write or a zeroed range that leaves zeroes exactly at a
+        // record boundary reads as the end marker. The writer never writes
+        // one, so the reader looks past it: records after the run are
+        // recovered and the run is a hole; a run with nothing intact after
+        // it is the end, and costs nothing.
         let mut buf = vec![0u8; 24];
         buf.extend(record(4, 8, b"after the hole"));
         buf.push(END_OF_LOG);
         assert_eq!(decode_record(&buf), Decoded::EndOfLog);
-        let (items, _) = scan(&buf, ReaderMode::Resynchronising, 64);
-        assert!(items.is_empty());
+        let (items, damage) = scan(&buf, ReaderMode::Resynchronising, 64);
+        assert_eq!(items, vec![(4, 8, b"after the hole".to_vec())]);
+        assert_eq!((damage.holes, damage.bytes), (1, 24));
     }
 
     #[test]
