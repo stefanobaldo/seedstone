@@ -149,7 +149,7 @@ impl CrashSchedule {
     ///
     /// # Panics
     ///
-    /// Never: [`CRASH_WINDOW`] is a constant well inside a `u64` of
+    /// Never: the crash window is a constant well inside a `u64` of
     /// milliseconds.
     #[must_use]
     pub fn draw(plan: CrashPlan, sim_seed: u64) -> Self {
@@ -169,6 +169,19 @@ impl CrashSchedule {
             .collect();
         instants.sort_unstable();
         Self { instants, next: 0 }
+    }
+
+    /// How many crashes the schedule holds: what a test that wants a seed
+    /// with a crash in it filters on, without running the seed.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.instants.len()
+    }
+
+    /// Whether the schedule crashes nothing.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.instants.is_empty()
     }
 
     /// Every instant, in order. Only a test asks: the driver consumes them
