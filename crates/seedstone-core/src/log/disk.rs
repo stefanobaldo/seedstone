@@ -195,6 +195,7 @@ pub(crate) mod mem {
         dirs: BTreeSet<PathBuf>,
         files: BTreeMap<PathBuf, Vec<u8>>,
         fail_writes: bool,
+        fail_syncs: bool,
         fail_removes: bool,
     }
 
@@ -228,6 +229,12 @@ pub(crate) mod mem {
             self.lock().fail_writes = fail;
         }
 
+        /// Whether every file sync from now on fails, writes still landing:
+        /// how a test fails a sync alone.
+        pub fn fail_syncs(&self, fail: bool) {
+            self.lock().fail_syncs = fail;
+        }
+
         /// Whether every removal from now on fails.
         pub fn fail_removes(&self, fail: bool) {
             self.lock().fail_removes = fail;
@@ -249,7 +256,10 @@ pub(crate) mod mem {
         }
 
         fn sync_data(&mut self) -> io::Result<()> {
-            if self.disk.lock().fail_writes {
+            let fs = self.disk.lock();
+            let failing = fs.fail_writes || fs.fail_syncs;
+            drop(fs);
+            if failing {
                 return Err(io::Error::other("injected sync failure"));
             }
             Ok(())
