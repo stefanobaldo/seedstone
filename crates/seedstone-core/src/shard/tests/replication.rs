@@ -446,6 +446,100 @@ async fn replay_applies_effects_and_resolves_absolute_deadlines() {
     );
 }
 
+/// A deadline that has passed by the time of the replay is not the key's
+/// fate when a later record in the prefix moved it: the node served the key
+/// under the later deadline, so the replay must too. Both shapes — a `Put`
+/// whose own deadline passed, then an `EXPIRE` that reached it first; and a
+/// `Deadline` that passed, then another that extended it.
+#[tokio::test(start_paused = true)]
+async fn a_passed_deadline_that_a_later_record_extended_keeps_the_key() {
+    use crate::dict::Dict;
+    use crate::log::NoopLog;
+    use crate::log::effect::Owned;
+    use crate::shard::Now;
+    use crate::shard::executor::ShardState;
+
+    let key = |k: &'static [u8]| Bytes::from_static(k);
+    let mut state = ShardState::new(Dict::with_seed(DictSeed { k0: 1, k1: 2 }), NoopLog);
+    let now = Now {
+        instant: tokio::time::Instant::now(),
+        unix_millis: 1_000_000,
+    };
+    state.replay(
+        vec![
+            (
+                0,
+                Owned::Put {
+                    key: key(b"put"),
+                    value: key(b"v"),
+                    deadline: Some(999_000),
+                },
+            ),
+            (
+                1,
+                Owned::Deadline {
+                    key: key(b"put"),
+                    deadline: Some(1_010_000),
+                },
+            ),
+            (
+                2,
+                Owned::Put {
+                    key: key(b"moved"),
+                    value: key(b"w"),
+                    deadline: None,
+                },
+            ),
+            (
+                3,
+                Owned::Deadline {
+                    key: key(b"moved"),
+                    deadline: Some(999_500),
+                },
+            ),
+            (
+                4,
+                Owned::Deadline {
+                    key: key(b"moved"),
+                    deadline: Some(1_020_000),
+                },
+            ),
+            (
+                5,
+                Owned::Put {
+                    key: key(b"gone"),
+                    value: key(b"x"),
+                    deadline: Some(1_040_000),
+                },
+            ),
+            (
+                6,
+                Owned::Deadline {
+                    key: key(b"gone"),
+                    deadline: Some(999_900),
+                },
+            ),
+        ],
+        now,
+    );
+    let put = state.dict.get(b"put").expect("extended before it expired");
+    assert_eq!(&put.value[..], b"v");
+    assert_eq!(put.expires_at, Some(now.instant + Duration::from_secs(10)));
+    let moved = state
+        .dict
+        .get(b"moved")
+        .expect("extended after a passed deadline");
+    assert_eq!(
+        moved.expires_at,
+        Some(now.instant + Duration::from_secs(20))
+    );
+    assert!(
+        state.dict.get(b"gone").is_none(),
+        "the key's last deadline passed: it is dead"
+    );
+    assert_eq!(state.seq, 7);
+}
+
 /// The log `replay_applies_effects_and_resolves_absolute_deadlines` replays,
 /// against a wall clock reading 1 000 000.
 fn replayed_log() -> Vec<(u64, crate::log::effect::Owned)> {
