@@ -186,7 +186,19 @@ fn the_trace_hash_is_pinned_across_processes_and_builds() {
     // that arrived beside them moved nothing: on this seed, and on every
     // seed of the swept shapes, no connection ever sheds — measured, not
     // assumed. `expected_sum` and the four counts held still.
-    const MINI_1_42: u64 = 0x875c_7fdc_6aab_a209;
+    //
+    // And then for the checkpoint, twice over — a folded field and a
+    // schedule change, neither a change to the workload. The node's sink
+    // now folds every completed snapshot cycle and every compaction, so a
+    // run that snapshotted at a different tick is a different run; and the
+    // tick itself does more, since the checkpoint writes a budget of
+    // entries after the log's two passes, which moves when each
+    // executor's tick returns. The shed probe was run again on the
+    // re-cut sweeps: no connection shed on 275 `standard` seeds, 24
+    // `eviction`, 24 `hostile`, nor on this seed, so the shed path is
+    // still held to a clock, not to a schedule. `expected_sum` and the
+    // four counts held still.
+    const MINI_1_42: u64 = 0xb4d6_404f_6745_8b57;
 
     let outcome = run_sim(&SimConfig::mini(1, 42));
     assert_eq!(
