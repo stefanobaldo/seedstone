@@ -290,11 +290,14 @@ pub const DISK_SLACK: u64 = 4096;
 
 /// What the directory may hold, from the design's bound.
 ///
-/// Per executor, twice the largest snapshot (the previous and the one in progress),
-/// plus the live log at the trigger, plus what one cycle saw written —
-/// doubled once if the run restarted, because the previous process's
-/// files stay until the new one's first round of snapshots — plus a slack
-/// for headers, `GENERATION` and `LOCK`.
+/// Per executor, twice the largest snapshot (the previous and the one in
+/// progress), plus the live log at the trigger, plus what one cycle saw
+/// written; that once per process the run started, plus a slack for
+/// headers, `GENERATION` and `LOCK`. Once per process because a process's
+/// files stay until a later one completes its first round of snapshots,
+/// and a crash can land before that round closes: the simulator measures
+/// seeds where a start completed no cycle at all between two crashes, and
+/// three generations' files then share the directory.
 #[must_use]
 pub fn disk_bound(
     executors: u16,
@@ -306,7 +309,7 @@ pub fn disk_bound(
     let per_executor = 2 * max_snapshot
         + config.floor.max(config.ratio.saturating_mul(max_snapshot))
         + max_written;
-    u64::from(executors) * per_executor * (1 + crashes.min(1)) + DISK_SLACK
+    u64::from(executors) * per_executor * (1 + crashes) + DISK_SLACK
 }
 
 /// A run that observed nothing.
