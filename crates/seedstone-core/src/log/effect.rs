@@ -18,6 +18,7 @@
 //! 2    Del:      u32 key len, key
 //! 3    Deadline: u32 key len, key, deadline
 //! 4    Flush
+//! 5    Rebase
 //!
 //! deadline: one byte, 0 for none, 1 followed by a u64 of Unix milliseconds
 //! ```
@@ -25,6 +26,11 @@
 //! A payload with trailing bytes, an unknown tag or a length that runs past
 //! its end is malformed, and recovery treats a malformed payload as the end
 //! of that shard's prefix.
+//!
+//! A `Rebase` changes no key. It is the first record a shard writes after a
+//! start whose recovery cut its log: the records an older generation left at
+//! or above its sequence were not replayed, and they must not be on any later
+//! start — see [`crate::log::recovery`].
 
 use bytes::Bytes;
 
@@ -32,6 +38,7 @@ const TAG_PUT: u8 = 1;
 const TAG_DEL: u8 = 2;
 const TAG_DEADLINE: u8 = 3;
 const TAG_FLUSH: u8 = 4;
+const TAG_REBASE: u8 = 5;
 
 /// The effect one mutation had, borrowed from the command that caused it.
 ///
@@ -55,6 +62,9 @@ pub enum Effect<'a> {
     },
     /// The shard's whole keyspace is gone.
     Flush,
+    /// The shard resumed here after a recovery that cut it: every record an
+    /// older generation wrote at or above this one's sequence is dead.
+    Rebase,
 }
 
 /// An [`Effect`] that owns its bytes: what recovery holds between reading a
@@ -74,6 +84,7 @@ pub enum Owned {
         deadline: Option<u64>,
     },
     Flush,
+    Rebase,
 }
 
 impl<'a> Effect<'a> {
@@ -100,6 +111,7 @@ impl<'a> Effect<'a> {
                 put_deadline(out, *deadline);
             }
             Self::Flush => out.push(TAG_FLUSH),
+            Self::Rebase => out.push(TAG_REBASE),
         }
     }
 
@@ -120,7 +132,7 @@ impl<'a> Effect<'a> {
             } => LEN + key.len() + LEN + value.len() + deadline_len(*deadline),
             Self::Del { key } => LEN + key.len(),
             Self::Deadline { key, deadline } => LEN + key.len() + deadline_len(*deadline),
-            Self::Flush => 0,
+            Self::Flush | Self::Rebase => 0,
         }
     }
 
@@ -148,6 +160,7 @@ impl<'a> Effect<'a> {
                 Self::Deadline { key, deadline }
             }
             TAG_FLUSH => Self::Flush,
+            TAG_REBASE => Self::Rebase,
             _ => return None,
         };
         // Trailing bytes are not a longer effect, they are a payload this
@@ -177,6 +190,7 @@ impl<'a> Effect<'a> {
                 deadline,
             },
             Self::Flush => Owned::Flush,
+            Self::Rebase => Owned::Rebase,
         }
     }
 }
@@ -255,6 +269,7 @@ mod tests {
                 deadline: None,
             },
             Effect::Flush,
+            Effect::Rebase,
         ];
         for effect in cases {
             let mut out = Vec::new();

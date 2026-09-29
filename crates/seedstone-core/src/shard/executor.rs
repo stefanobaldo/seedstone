@@ -281,6 +281,8 @@ impl<L> ShardState<L> {
                     }
                 }
                 Owned::Flush => self.dict.clear(),
+                // It changed no key; recovery has already used it.
+                Owned::Rebase => {}
             }
             self.seq = seq + 1;
         }
