@@ -24,6 +24,7 @@ use tokio::time::Instant;
 pub type Shard = ShardState<NoopLog>;
 
 impl Shard {
+    #[must_use]
     pub fn for_tests() -> Self {
         Self::new(Dict::with_seed(DictSeed { k0: 5, k1: 7 }), NoopLog)
     }
