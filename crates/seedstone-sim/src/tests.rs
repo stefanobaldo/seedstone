@@ -524,3 +524,20 @@ fn a_run_with_no_snapshot_cycle_exercised_nothing() {
     outcome.snapshot_cycles = 1;
     assert!(outcome.invariants_were_exercised());
 }
+
+/// The simulated node snapshots and compacts on every swept shape, and the
+/// directory stays inside the bound.
+#[test]
+fn the_simulated_node_cycles_on_the_mini_shape() {
+    let outcome = run_sim(&SimConfig::mini(1, 42));
+    assert!(outcome.snapshot_cycles >= 1, "{outcome:?}");
+    assert!(outcome.compactions >= 1, "{outcome:?}");
+    assert!(
+        outcome.disk_peak_bytes > 0 && outcome.disk_peak_bytes <= outcome.disk_bound_bytes,
+        "{outcome:?}"
+    );
+    assert!(
+        outcome.invariant_holds() && outcome.invariants_were_exercised(),
+        "{outcome:?}"
+    );
+}
