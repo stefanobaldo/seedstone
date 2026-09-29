@@ -12,10 +12,16 @@ SemVer and are `0.x` until the server persists data;
 - `--data-dir PATH`: the node keeps a write-ahead log under `PATH/wal/`,
   synced on its housekeeping tick, and replays it on the next start. A
   shard whose log has a gap is replayed up to the gap and reported. One
-  node per directory: a second one started on it is refused. The log only
-  grows for now, and a start reads all of it. Four new log events:
-  `recovery`, `recovery_truncated`, `recovery_failed`, `log_fault` — see
-  `docs/operations.md`.
+  node per directory: a second one started on it is refused. Six new log
+  events: `recovery`, `recovery_truncated`, `recovery_failed`, `log_fault`,
+  `snapshot`, `compaction` — see `docs/operations.md`.
+- Snapshots and compaction under `--data-dir`: past 64 MiB of log an
+  executor takes a snapshot of its shards without stopping them, then
+  removes the log the snapshot covers. An executor's files stay within
+  about three times its last snapshot plus 64 MiB, plus what is written
+  while a snapshot is taken, and a start reads the newest snapshot plus the log
+  since it rather than the whole history. `docs/operations.md` states the
+  bound, and what a restart keeps until it is reached again.
 
 ## [0.2.0] - 2026-09-22
 

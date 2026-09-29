@@ -63,11 +63,10 @@ with a level — and how it is operated are in
 
 **Persistence, first cut:** with `--data-dir PATH` every write is appended to a
 log and replayed on the next start; a write acknowledged before the log's
-last sync survives a crash. The log only grows for now — snapshots and
-compaction come next — so the flag is off by default. See
-[docs/operations.md](docs/operations.md).
+last sync survives a crash, and snapshots keep the log bounded. The flag is
+off by default. See [docs/operations.md](docs/operations.md).
 
-**What it does not have yet:** snapshots and compaction, RESP3, replication,
+**What it does not have yet:** RESP3, replication,
 clustering, and every data type except strings.
 
 **Performance:** measured on a 16-core ARM instance against Redis and Valkey at
