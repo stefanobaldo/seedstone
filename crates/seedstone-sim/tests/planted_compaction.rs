@@ -143,3 +143,20 @@ fn unrelated_plants_do_not_move_the_compaction_verdict() {
         assert!(outcome.snapshot_cycles >= 1, "{plant:?}: {outcome:?}");
     }
 }
+
+/// A seed whose crashes interrupt every executor's cycles, and whose last
+/// process ends the run before its own cycle finishes: no snapshot is ever
+/// reported. The bound is made of what the node reports, so there is
+/// nothing to hold the directory to — and the directory is not read
+/// against an empty bound.
+#[test]
+fn a_seed_that_never_completes_a_cycle_holds_its_invariants() {
+    const NO_CYCLE: u64 = 37;
+    let outcome = standard(NO_CYCLE, None);
+    assert_eq!(
+        outcome.snapshot_cycles, 0,
+        "seed {NO_CYCLE} completes a cycle now; find another that does not: {outcome:?}"
+    );
+    assert!(outcome.crashes > 0, "{outcome:?}");
+    assert!(outcome.invariant_holds(), "{outcome:?}");
+}

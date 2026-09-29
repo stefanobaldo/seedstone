@@ -689,13 +689,6 @@ fn start_log(
     let disk = SimDisk;
     let wal = Path::new(DATA_DIR).join("wal");
     disk.create_dir_all(&wal)?;
-    // The directory as the crash left it, before recovery removes anything:
-    // one of the instants the bound is read at.
-    let on_disk: u64 = disk
-        .list(&wal)?
-        .iter()
-        .filter_map(|name| disk.len(&wal.join(name)).ok())
-        .sum();
     let mode = if planted == Some(Plant::PrefixScanRecovery) {
         ReaderMode::PrefixScan
     } else {
@@ -717,7 +710,6 @@ fn start_log(
     })?;
     {
         let mut tally = lock(&shared.tally);
-        tally.disk_peak_bytes = tally.disk_peak_bytes.max(on_disk);
         tally.snapshots_refused_at_start += recovery.report.snapshots_refused;
         tally.files_removed_at_start += recovery.report.files_removed;
     }
