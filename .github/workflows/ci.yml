@@ -136,6 +136,14 @@ jobs:
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 24 --eviction --workload-seed 1
 
+      # The shape whose disk fails and lies, and the only one where the
+      # recovery machinery meets a hole inside the durable region: it is
+      # where a reader or a writer that loses records is visible at all.
+      # Seconds, not minutes — twenty-four seeds of the small shape.
+      - name: DST sweep, hostile disk
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 24 --hostile --workload-seed 1
+
   # Every gate in the job above is this project judging itself: our tests, our
   # simulator, our reading of the protocol. This one is four programs nobody
   # here wrote — `redis-cli`, `redis-benchmark`, a Python client and a Go
