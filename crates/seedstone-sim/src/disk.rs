@@ -50,6 +50,10 @@ impl Disk for SimDisk {
                 names.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
+        // turmoil gathers the entries into a `HashSet`, whose order is drawn
+        // per process; a listing a caller walks must be a function of the
+        // seed, so it is put in name order here.
+        names.sort_unstable();
         Ok(names)
     }
 
