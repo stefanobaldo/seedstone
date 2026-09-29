@@ -141,6 +141,9 @@ impl TraceSink for HashSink {
         match fault {
             LogFault::Write => tally.write_faults += 1,
             LogFault::Sync => tally.sync_faults += 1,
+            // The simulated node runs no checkpoint yet, so neither stage
+            // can fail here.
+            LogFault::Snapshot | LogFault::Remove => {}
         }
     }
 }

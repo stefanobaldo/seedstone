@@ -14,6 +14,12 @@ pub enum LogFault {
     Write,
     /// `sync` failed: what was flushed is on disk but not durable yet.
     Sync,
+    /// A snapshot could not be opened, written or made durable: the cycle
+    /// keeps its buffer and tries again on the next tick.
+    Snapshot,
+    /// A file a durable snapshot made redundant could not be removed: it is
+    /// tried again at the next cycle, and at the next start.
+    Remove,
 }
 
 /// An observer of every command a shard completes.

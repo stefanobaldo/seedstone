@@ -410,6 +410,15 @@ pub trait ReplicationLog: Send + 'static {
     /// point past a failure. The next tick syncs again.
     fn sync(&mut self) -> std::io::Result<Option<u64>>;
 
+    /// This shard's records up to `through` are durable by other means —
+    /// a snapshot whose image holds their effect is on disk and synced.
+    ///
+    /// A log that tracks a durable point raises it to `through` and never
+    /// lets a later [`sync`](ReplicationLog::sync) lower it; a log that
+    /// tracks nothing ignores it. Called by the checkpoint once per shard
+    /// when its snapshot becomes durable.
+    fn covered(&mut self, _through: u64) {}
+
     /// Whether [`append`](ReplicationLog::append) reads the record's
     /// payload. A log that keeps nothing says no, and the caller does not
     /// encode one: the default path — a node with no log — then pays for no
