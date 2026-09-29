@@ -248,7 +248,9 @@ fn every_plant_answers_whether_the_swept_shapes_catch_it() {
             Plant::LostUpdate
             | Plant::ServeExpired
             | Plant::SweepEatsAll
-            | Plant::EvictsBelowCeiling => assert_eq!(
+            | Plant::EvictsBelowCeiling
+            | Plant::DeletesBeforeDurable
+            | Plant::TrustsUnfinishedSnapshot => assert_eq!(
                 place,
                 None,
                 "{} is caught where it is swept, so it has no elsewhere to name",
@@ -540,4 +542,17 @@ fn the_simulated_node_cycles_on_the_mini_shape() {
         outcome.invariant_holds() && outcome.invariants_were_exercised(),
         "{outcome:?}"
     );
+}
+
+#[test]
+fn the_two_compaction_plants_are_selectable_by_name() {
+    assert_eq!(
+        Plant::from_name("deletes-before-durable"),
+        Some(Plant::DeletesBeforeDurable)
+    );
+    assert_eq!(
+        Plant::from_name("trusts-unfinished-snapshot"),
+        Some(Plant::TrustsUnfinishedSnapshot)
+    );
+    assert_eq!(Plant::ALL.len(), 11);
 }
