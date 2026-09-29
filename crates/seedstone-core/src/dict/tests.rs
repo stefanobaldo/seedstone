@@ -1323,3 +1323,11 @@ fn a_bytes_from_a_vec_keeps_the_vecs_allocation() {
 fn bytes_is_four_words() {
     assert_eq!(size_of::<bytes::Bytes>(), 32);
 }
+
+#[test]
+fn a_shards_seed_moves_k0_by_the_shard_and_keeps_k1() {
+    let root = DictSeed { k0: 0xF0, k1: 7 };
+    assert_eq!(shard_seed(root, 0), root);
+    assert_eq!(shard_seed(root, 3), DictSeed { k0: 0xF3, k1: 7 });
+    assert_ne!(shard_seed(root, 1).k0, shard_seed(root, 2).k0);
+}

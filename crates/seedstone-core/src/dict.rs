@@ -29,12 +29,23 @@ use tokio::time::Instant;
 /// replaying the same seed place the same key in the same bucket. It is
 /// carried as a value so a simulation can hand every shard a seed derived
 /// from the run's single root seed.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DictSeed {
     /// First SipHash key.
     pub k0: u64,
     /// Second SipHash key.
     pub k1: u64,
+}
+
+/// The seed shard `shard` hashes under, derived from the node's root seed:
+/// `k0` xored with the shard index, so one root fixes the whole node's
+/// placement while no two shards share a bucket layout.
+#[must_use]
+pub const fn shard_seed(seed: DictSeed, shard: u16) -> DictSeed {
+    DictSeed {
+        k0: seed.k0 ^ shard as u64,
+        k1: seed.k1,
+    }
 }
 
 /// What a key maps to: the bytes stored under it and, if it has one, the
