@@ -22,6 +22,32 @@ pub enum LogFault {
     Remove,
 }
 
+/// What one completed snapshot cycle amounts to, for the sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotReport {
+    pub executor: u16,
+    pub cycle: u32,
+    /// Keys in the image.
+    pub entries: u64,
+    /// The snapshot file's size, header and footer included.
+    pub bytes: u64,
+    /// Housekeeping ticks the cycle spanned.
+    pub ticks: u64,
+    /// Every file under `wal/`, summed, at the instant before compaction
+    /// removed what the snapshot made redundant: the directory's peak.
+    pub disk_bytes: u64,
+    /// Bytes of log written during the cycle — the `W` of the disk bound.
+    pub written_during: u64,
+}
+
+/// What one compaction removed, for the sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionReport {
+    pub executor: u16,
+    pub files: u64,
+    pub bytes: u64,
+}
+
 /// An observer of every command a shard completes.
 ///
 /// The simulator folds these calls into a trace hash. Calls arrive in each
@@ -62,6 +88,20 @@ pub trait TraceSink: Clone + Send + 'static {
     /// A default that does nothing: the tick has nowhere else to report to,
     /// and a sink that wants the line — the binary's — implements this.
     fn fault(&self, _shard: u16, _fault: LogFault, _error: &std::io::Error) {}
+
+    /// Called once per executor when a snapshot cycle completes: the
+    /// footer is synced, the directory is synced, and every record below
+    /// each shard's base is durable through the image.
+    ///
+    /// A default that does nothing; the binary's sink writes the line, the
+    /// simulator's folds it and holds the disk to its bound.
+    fn snapshot(&self, _report: &SnapshotReport) {}
+
+    /// Called once per executor after it removed the files a durable
+    /// snapshot made redundant — its own older rotations and snapshot, or
+    /// every older generation's files when it closed the generation's
+    /// first round.
+    fn compaction(&self, _report: &CompactionReport) {}
 }
 
 /// A [`TraceSink`] that observes nothing. Production's sink.

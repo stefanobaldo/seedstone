@@ -6,7 +6,8 @@ use super::support::{gathered, get, set};
 use crate::dict::{Dict, DictSeed, Entry};
 use crate::shard::apply::scan_step;
 use crate::shard::{
-    ChunkReply, Command, Deadlines, NoTrace, Reply, ReplyError, Route, Router, ShardPool,
+    ChunkReply, Command, CompactionReport, Deadlines, NoTrace, Reply, ReplyError, Route, Router,
+    ShardPool, SnapshotReport, TraceSink,
 };
 use crate::slot::{executor_of, shard_of};
 use bytes::Bytes;
@@ -491,4 +492,25 @@ async fn a_pool_of_no_executors_is_a_programming_error() {
 #[should_panic(expected = "executors must be in 1..=shards")]
 async fn a_pool_with_more_executors_than_shards_is_a_programming_error() {
     ShardPool::spawn(4, 5, DictSeed { k0: 0, k1: 0 }, NoTrace);
+}
+
+#[test]
+fn the_sink_hooks_for_snapshots_default_to_nothing() {
+    // A sink that folds commands need not know a checkpoint exists: the
+    // two hooks have empty defaults, and `NoTrace` inherits them.
+    let report = SnapshotReport {
+        executor: 0,
+        cycle: 1,
+        entries: 2,
+        bytes: 3,
+        ticks: 4,
+        disk_bytes: 5,
+        written_during: 6,
+    };
+    NoTrace.snapshot(&report);
+    NoTrace.compaction(&CompactionReport {
+        executor: 0,
+        files: 1,
+        bytes: 2,
+    });
 }
