@@ -6,20 +6,19 @@
 use crate::dict::{Dict, DictSeed, shard_seed};
 use crate::log::checkpoint::{Checkpoint, NoCheckpoint};
 use crate::log::effect::Effect;
-use crate::log::recovery::ShardRecords;
+use crate::log::recovery::RecoveredShard;
 use crate::log::{NoopLog, ReplicationLog};
 use crate::memory::{MemoryGauge, MemoryLimit};
 use crate::shard::apply::append;
 use crate::shard::executor::{ExecutorSpec, Memory, ShardState, frozen_clock, run_executor};
 use crate::shard::{
-    Command, Deadlines, KIND_SLOTS, LogFault, Now, Reply, ReplyError, Route, ShardPolicy, TraceSink,
+    Command, Deadlines, KIND_SLOTS, LogFault, Reply, ReplyError, Route, ShardPolicy, TraceSink,
 };
 use crate::slot::{executor_of, shard_of};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::{Notify, mpsc, oneshot};
-use tokio::time::Instant;
 
 /// One shard's counters, as [`Command::Stats`] reports them.
 ///
@@ -391,12 +390,8 @@ pub struct PoolSpec<T, F, P, G> {
     pub limit: MemoryLimit,
     /// The wall clock, injected. See [`Now`](crate::shard::Now).
     pub clock: fn() -> u64,
-    /// What recovery read for each shard, or empty for a fresh node.
-    ///
-    /// Replayed here, before the shard's state is moved onto its executor:
-    /// the dict is built on this thread anyway, and replaying it here
-    /// keeps the executor's start free of a second code path.
-    pub recovered: Vec<ShardRecords>,
+    /// What recovery rebuilt for each shard, or empty for a fresh node.
+    pub recovered: Vec<RecoveredShard>,
     /// Builds each executor's checkpoint, called once per executor with
     /// its index. [`NoCheckpoint`](crate::log::checkpoint::NoCheckpoint)
     /// for a node with no data directory.
@@ -616,7 +611,7 @@ impl ShardPool {
             policy,
             limit,
             clock,
-            mut recovered,
+            recovered,
             make_checkpoint,
         } = spec;
         assert!(
@@ -654,23 +649,22 @@ impl ShardPool {
         };
         let mut inboxes = Vec::with_capacity(usize::from(executors));
         let mut pending: Option<(u16, Vec<ShardState<L>>)> = None;
+        // In shard order, one per shard, or none at all — asserted above.
+        let mut recovered = recovered.into_iter();
         for shard in 0..shards {
-            let mut state =
-                ShardState::new(Dict::with_seed(shard_seed(seed, shard)), make_log(shard));
-            let (records, lossy, cut) =
-                recovered
-                    .get_mut(usize::from(shard))
-                    .map_or((Vec::new(), false, false), |shard| {
-                        let cut = shard.discarded > 0 || shard.lossy;
-                        (std::mem::take(&mut shard.records), shard.lossy, cut)
-                    });
-            state.replay(
-                records,
-                Now {
-                    instant: Instant::now(),
-                    unix_millis: clock(),
-                },
-            );
+            let fresh = || RecoveredShard {
+                dict: Dict::with_seed(shard_seed(seed, shard)),
+                seq: 0,
+                lossy: false,
+                cut: false,
+            };
+            let RecoveredShard {
+                dict,
+                seq,
+                lossy,
+                cut,
+            } = recovered.next().unwrap_or_else(fresh);
+            let mut state = ShardState::recovered(dict, seq, make_log(shard));
             trace.recovered(shard, state.seq, lossy);
             // The records the cut left on disk hold the sequence numbers this
             // shard is about to reuse: the rebase makes them dead on every
