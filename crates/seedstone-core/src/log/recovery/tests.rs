@@ -336,6 +336,29 @@ fn a_segment_with_a_bad_header_is_abandoned_and_every_shard_is_lossy() {
     assert_eq!(recovery.shards[1].seq, 1, "the good segment still counts");
 }
 
+/// A read can fail where the next one succeeds: a segment this start could
+/// not read is never removed as if nothing needed it.
+#[test]
+fn a_segment_that_could_not_be_read_is_kept_for_the_next_start() {
+    let disk = MemDisk::default();
+    let segments = wal(&disk, 1, 1);
+    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
+    write(&mut s0, 0, &put(b"a", b"1"));
+    let path = Path::new("/data/wal").join(segment_name(1, 0, 0));
+    let good = disk.contents(&path);
+    let mut bad = good.clone();
+    bad[0] ^= 0xFF;
+    disk.overwrite(&path, bad);
+    let recovery = recover(spec(&disk, 1)).unwrap();
+    assert_eq!(recovery.report.abandoned_segments, 1);
+    assert_eq!(recovery.report.files_removed, 0);
+    // The header reads again: the record is still there.
+    disk.overwrite(&path, good);
+    let recovery = recover(spec(&disk, 1)).unwrap();
+    assert_eq!(contents(&recovery.shards[0].dict), pairs(&[(b"a", b"1")]));
+    assert!(!recovery.shards[0].lossy);
+}
+
 #[test]
 fn a_malformed_payload_ends_that_shards_prefix() {
     let disk = MemDisk::default();
@@ -564,7 +587,11 @@ fn a_snapshot_whose_counts_do_not_match_falls_back_to_the_older_image() {
         "a finished image refused is damage that may explain a loss"
     );
     let names = disk.list(Path::new("/data/wal")).unwrap();
-    assert!(!names.contains(&snapshot_name(1, 0, 1)) && names.contains(&snapshot_name(1, 0, 0)));
+    assert!(
+        names.contains(&snapshot_name(1, 0, 1)) && names.contains(&snapshot_name(1, 0, 0)),
+        "a finished image refused for damage may read whole on the next start, \
+         and may be the only copy of what it covers: kept, {names:?}"
+    );
 }
 
 #[test]

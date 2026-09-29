@@ -24,7 +24,9 @@
 //!    same prefix rule as ever, starting at the base rather than at `0` —
 //!    replayed over the image.
 //! 5. **Garbage.** Every `.snap` no shard used and every `.seg` no kept
-//!    record came from is removed.
+//!    record came from is removed — unless damage was met reading it: a
+//!    read can fail where the next succeeds, and the file may be the only
+//!    copy of what it held.
 //!
 //! **The prefix rule.** A shard applies sequence `base, base+1, …` and
 //! stops at the first number that is missing; everything of that shard
@@ -190,9 +192,9 @@ pub fn recover<D: Disk>(spec: RecoverSpec<'_, D>) -> io::Result<Recovery> {
     let names = spec.disk.list(spec.wal)?;
     let mut report = Report::default();
     let (mut snaps, header_damage) = read_headers(&spec, &names, &mut report)?;
-    let mut scan = Scan::new(spec.shards);
-    scan.unattributed_loss |= header_damage;
     let segments = segment_files(&names);
+    let mut scan = Scan::new(spec.shards, segments.len());
+    scan.unattributed_loss |= header_damage;
     for (index, file) in segments.iter().enumerate() {
         scan.segment(spec.disk, spec.wal, spec.reader, file, index)?;
     }
@@ -204,8 +206,9 @@ pub fn recover<D: Disk>(spec: RecoverSpec<'_, D>) -> io::Result<Recovery> {
         due: vec![Vec::new(); usize::from(spec.shards)],
     };
     let chosen = read_images(&spec, &mut snaps, &rebases, &mut building, &mut report);
+    let unread = std::mem::take(&mut scan.unread);
     let (shards, kept) = replay_tails(&spec, scan, &chosen, building, segments.len(), &mut report);
-    remove_garbage(&spec, &snaps, &segments, &kept, &mut report);
+    remove_garbage(&spec, &snaps, &segments, &kept, &unread, &mut report);
     Ok(Recovery { shards, report })
 }
 
@@ -223,6 +226,9 @@ struct SnapFile {
     header: Option<SnapshotHeader>,
     /// Set in pass 3 when at least one shard took its image from here.
     used: bool,
+    /// Damage was met reading it — its header in pass 1, or its body in
+    /// pass 3. Such a file is never garbage: see [`remove_garbage`].
+    damaged: bool,
 }
 
 impl SnapFile {
@@ -252,6 +258,7 @@ fn read_headers<D: Disk>(
             .disk
             .open_read(&spec.wal.join(name))
             .map_or(0, |mut src| read_fully(&mut src, &mut chunk));
+        let mut unreadable = false;
         let header = match SnapshotHeader::decode(&chunk[..read]) {
             Ok(header) => Some(header).filter(|header| {
                 // Not this node's file, or damage the checksum happened to
@@ -272,15 +279,17 @@ fn read_headers<D: Disk>(
             Err(HeaderError::Short | HeaderError::BadMagic | HeaderError::BadChecksum) => {
                 // Synced before the file's name was: a header that does
                 // not read is damage, not a crash.
-                damage = true;
+                unreadable = true;
                 None
             }
         };
+        damage |= unreadable;
         if header.is_none() {
             report.snapshots_refused += 1;
         }
         snaps.push(SnapFile {
             name: name.clone(),
+            damaged: unreadable,
             header,
             used: false,
         });
@@ -331,15 +340,19 @@ struct Scan {
     damaged: Vec<bool>,
     /// A loss nobody can attribute to a shard: every shard may have paid.
     unattributed_loss: bool,
+    /// Per segment file: damage was met reading it. Such a file is never
+    /// garbage: see [`remove_garbage`].
+    unread: Vec<bool>,
 }
 
 impl Scan {
-    fn new(shards: u16) -> Self {
+    fn new(shards: u16, files: usize) -> Self {
         Self {
             report: Report::default(),
             buckets: (0..shards).map(|_| Vec::new()).collect(),
             damaged: vec![false; usize::from(shards)],
             unattributed_loss: false,
+            unread: vec![false; files],
         }
     }
 
@@ -355,7 +368,7 @@ impl Scan {
         self.report.segments += 1;
         let path = wal.join(&file.name);
         let (Ok(len), Ok(mut src)) = (disk.len(&path), disk.open_read(&path)) else {
-            self.abandon();
+            self.abandon(index);
             return Ok(());
         };
         let mut header = [0u8; SEGMENT_HEADER_LEN];
@@ -372,7 +385,7 @@ impl Scan {
                 ));
             }
             Err(HeaderError::Short | HeaderError::BadMagic | HeaderError::BadChecksum) => {
-                self.abandon();
+                self.abandon(index);
                 return Ok(());
             }
         }
@@ -383,7 +396,7 @@ impl Scan {
                 Ok(Some(item)) => self.item(&item, file.generation, index),
                 Ok(None) => break,
                 Err(_) => {
-                    self.abandon();
+                    self.abandon(index);
                     break;
                 }
             }
@@ -392,7 +405,10 @@ impl Scan {
         self.report.damage_bytes += damage.bytes + damage.truncated_tail;
         self.report.holes += damage.holes;
         if damage.abandoned {
-            self.abandon();
+            self.abandon(index);
+        }
+        if damage.bytes > 0 || damage.holes > 0 || damage.truncated_tail > 0 {
+            self.unread[index] = true;
         }
         // A hole can swallow a shard's last records, leaving no gap behind
         // to show for it; a cut tail can be a damaged length on the last
@@ -422,13 +438,15 @@ impl Scan {
             // bucket is exactly a gap, and one recovery knows the cause of.
             self.report.malformed += 1;
             self.damaged[usize::from(item.shard)] = true;
+            self.unread[file] = true;
         }
     }
 
     /// A segment, or the rest of one, that could not be read.
-    const fn abandon(&mut self) {
+    fn abandon(&mut self, index: usize) {
         self.report.abandoned_segments += 1;
         self.unattributed_loss = true;
+        self.unread[index] = true;
     }
 
     /// Per shard, every `(generation, seq)` a `Rebase` was read at.
@@ -509,6 +527,7 @@ fn read_images<D: Disk>(
                 building.due[usize::from(*shard)].clear();
                 chosen.refused[usize::from(*shard)] |= verdict == Verdict::Damaged;
             }
+            snap.damaged |= verdict == Verdict::Damaged;
             report.snapshots_refused += 1;
         }
     }
@@ -728,23 +747,33 @@ fn prefix(
 }
 
 /// Pass 5: remove every snapshot nothing used and every segment no kept
-/// record came from. A removal that fails is left for the next start.
+/// record came from — of the files read whole without damage. A removal
+/// that fails is left for the next start.
+///
+/// A file damage was met in stays: a read can fail where the next one
+/// succeeds, and what could not be read may be the only copy of records
+/// no other file holds — a finished image whose log a compaction already
+/// removed, a segment whose header failed this once. Removing it would
+/// turn a loss this start reported into one the next start cannot see.
+/// Once every executor of this process has a durable snapshot, the round
+/// removes every older generation's files, these among them.
 fn remove_garbage<D: Disk>(
     spec: &RecoverSpec<'_, D>,
     snaps: &[SnapFile],
     segments: &[SegmentFile],
     kept: &[bool],
+    unread: &[bool],
     report: &mut Report,
 ) {
     let garbage = snaps
         .iter()
-        .filter(|snap| !snap.used)
+        .filter(|snap| !snap.used && !snap.damaged)
         .map(|snap| snap.name.as_str())
         .chain(
             segments
                 .iter()
-                .zip(kept)
-                .filter(|(_, kept)| !**kept)
+                .zip(kept.iter().zip(unread))
+                .filter(|(_, (kept, unread))| !**kept && !**unread)
                 .map(|(file, _)| file.name.as_str()),
         );
     let mut removed = 0;
