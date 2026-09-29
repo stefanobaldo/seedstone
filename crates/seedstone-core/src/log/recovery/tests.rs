@@ -922,3 +922,24 @@ fn a_snapshot_from_a_newer_format_version_refuses_the_start() {
     let error = recover(spec(&disk, 1)).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 }
+
+/// Damage in a segment is charged to the shards of the executor that wrote
+/// it, and a start knows how many executors a generation ran only from the
+/// segments it finds. So every executor's newest rotation stays, even with
+/// nothing in it, until the round removes the whole generation: were the
+/// highest executor's to go, the next start would count one executor fewer
+/// and charge damage to the wrong shards.
+#[test]
+fn every_executors_newest_segment_stays_even_when_it_holds_nothing() {
+    let disk = MemDisk::default();
+    let segments = wal(&disk, 1, 2);
+    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
+    write(&mut s0, 0, &put(b"a", b"1"));
+    let recovery = recover(spec(&disk, 2)).unwrap();
+    assert_eq!(recovery.report.files_removed, 0);
+    let names = disk.list(Path::new("/data/wal")).unwrap();
+    assert!(
+        names.contains(&segment_name(1, 1, 0)),
+        "executor 1's only segment, empty, stays: {names:?}"
+    );
+}

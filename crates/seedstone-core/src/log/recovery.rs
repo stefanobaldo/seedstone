@@ -309,6 +309,9 @@ struct SegmentFile {
     generation: u64,
     executor: u16,
     executors: u16,
+    /// Whether it is its executor's newest rotation in its generation: the
+    /// file that says the executor existed, which pass 5 never removes.
+    newest: bool,
     name: String,
 }
 
@@ -320,16 +323,20 @@ fn segment_files(names: &[String]) -> Vec<SegmentFile> {
         .collect();
     parsed.sort();
     let mut executors_in: BTreeMap<u64, u16> = BTreeMap::new();
-    for (generation, executor, _, _) in &parsed {
+    let mut newest: BTreeMap<(u64, u16), u32> = BTreeMap::new();
+    for (generation, executor, rotation, _) in &parsed {
         let count = executors_in.entry(*generation).or_default();
         *count = (*count).max(executor.saturating_add(1));
+        let last = newest.entry((*generation, *executor)).or_default();
+        *last = (*last).max(*rotation);
     }
     parsed
         .into_iter()
-        .map(|(generation, executor, _, name)| SegmentFile {
+        .map(|(generation, executor, rotation, name)| SegmentFile {
             generation,
             executor,
             executors: executors_in.get(&generation).copied().unwrap_or(1),
+            newest: newest.get(&(generation, executor)) == Some(&rotation),
             name,
         })
         .collect()
@@ -770,6 +777,10 @@ fn prefix(
 /// turn a loss this start reported into one the next start cannot see.
 /// Once every executor of this process has a durable snapshot, the round
 /// removes every older generation's files, these among them.
+///
+/// Each executor's newest rotation stays too, even empty: a start counts a
+/// generation's executors from the segments it finds, and that count is
+/// what charges damage to the right shards.
 fn remove_garbage<D: Disk>(
     spec: &RecoverSpec<'_, D>,
     snaps: &[SnapFile],
@@ -786,7 +797,7 @@ fn remove_garbage<D: Disk>(
             segments
                 .iter()
                 .zip(kept.iter().zip(unread))
-                .filter(|(_, (kept, unread))| !**kept && !**unread)
+                .filter(|(file, (kept, unread))| !**kept && !**unread && !file.newest)
                 .map(|(file, _)| file.name.as_str()),
         );
     let mut removed = 0;
