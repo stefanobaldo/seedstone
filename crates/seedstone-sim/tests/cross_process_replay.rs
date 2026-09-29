@@ -33,7 +33,7 @@
 //! added, and the sentence before this one had been counting sixteen kinds
 //! for two kinds longer than that was true.
 
-use seedstone_sim::{SimConfig, run_sim};
+use seedstone_sim::{CrashSchedule, SimConfig, run_sim};
 
 /// How many eviction-shape seeds are replayed.
 ///
@@ -169,6 +169,43 @@ fn the_eviction_shape_replays_across_processes() {
                     Err("the ceiling was never reached, so nothing about eviction \
                          was replayed"
                         .to_owned())
+                }
+            },
+        );
+    }
+}
+
+/// The shape whose node crashes on a disk that fails and lies: a crash, a
+/// recovery through damage, and the reconnects after it are schedule like
+/// anything else, and replay the same in a fresh process.
+///
+/// The first [`SEEDS`] seeds that *draw* a crash, rather than seeds `1..=`
+/// it: a seed with none replays nothing about recovery, and skipping it
+/// silently would leave the count claiming more than it shows.
+#[test]
+fn the_hostile_shape_replays_across_processes() {
+    let crashing = (1..)
+        .filter(|sim_seed| {
+            !CrashSchedule::draw(
+                SimConfig::hostile(WORKLOAD_SEED, *sim_seed).crashes,
+                *sim_seed,
+            )
+            .is_empty()
+        })
+        .take(usize::try_from(SEEDS).expect("a small count"));
+    for sim_seed in crashing {
+        replays_across_processes(
+            "hostile",
+            Some("--hostile"),
+            sim_seed,
+            &SimConfig::hostile(WORKLOAD_SEED, sim_seed),
+            |outcome| {
+                // Calibration: the draw said this seed crashes, so a run
+                // with no recovery in it is a driver that did not.
+                if outcome.recoveries > 0 {
+                    Ok(())
+                } else {
+                    Err("the seed drew a crash and nothing recovered".to_owned())
                 }
             },
         );

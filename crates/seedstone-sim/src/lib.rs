@@ -157,7 +157,7 @@ mod workload;
 
 pub use config::{CrashPlan, DiskFaults, SimConfig};
 pub use disk::SimDisk;
-pub use durability::{sim_wall_clock, world_now};
+pub use durability::{CrashSchedule, sim_wall_clock, world_now};
 pub use outcome::SimOutcome;
 pub use plant::Plant;
 pub use routers::{PlantedRouter, SkippingRouter};
@@ -165,7 +165,7 @@ pub use sweep::{SweepReport, sweep};
 pub use trace::mix;
 
 use disk::SimFile;
-use durability::{CrashRecord, CrashSchedule, Observed, REST_SETTLE, increment_is_durable};
+use durability::{CrashRecord, Observed, REST_SETTLE, increment_is_durable};
 use model::Model;
 use outcome::{Shared, lock};
 use plant::{EvictsBelowCeiling, IgnoresCeiling, ScanMissesRehash, ServeExpired, SweepEatsAll};

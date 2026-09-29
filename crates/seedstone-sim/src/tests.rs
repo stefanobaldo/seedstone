@@ -173,7 +173,20 @@ fn the_trace_hash_is_pinned_across_processes_and_builds() {
     // records the order shards saw commands in, so this moved; the workload
     // did not, and `expected_sum` held still. One check count moved with
     // it, for a reason of the schedule's own — see beside the counts.
-    const MINI_1_42: u64 = 0x9734_f771_1820_8525;
+    //
+    // And then twice for the log, a folded field and a schedule change,
+    // neither a change to the workload. The node's start now folds every
+    // shard's recovered position — where it resumes, and whether recovery
+    // called it lossy — so a run that recovered a different prefix is a
+    // different run; this seed never crashes, and the fold still moves it,
+    // by construction. And the simulated node's connections now run on the
+    // host's local task set, so that a crash closes them in the order they
+    // were opened rather than in one set by the process's history; that
+    // moves when each connection's task is polled. The idle-shed threshold
+    // that arrived beside them moved nothing: on this seed, and on every
+    // seed of the swept shapes, no connection ever sheds — measured, not
+    // assumed. `expected_sum` and the four counts held still.
+    const MINI_1_42: u64 = 0x875c_7fdc_6aab_a209;
 
     let outcome = run_sim(&SimConfig::mini(1, 42));
     assert_eq!(
