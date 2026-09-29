@@ -489,9 +489,14 @@ fn the_disk_bound_is_the_formula_and_a_peak_past_it_is_a_violation() {
         4 * 30_500 + DISK_SLACK
     );
     assert_eq!(
-        disk_bound(4, config, 10_000, 500, 2),
+        disk_bound(4, config, 10_000, 500, 1),
         2 * 4 * 30_500 + DISK_SLACK,
-        "a restart doubles it once"
+        "a restart keeps the previous process's files beside the new one's"
+    );
+    assert_eq!(
+        disk_bound(4, config, 10_000, 500, 2),
+        3 * 4 * 30_500 + DISK_SLACK,
+        "a second restart before the first one's round closed keeps three"
     );
     assert_eq!(
         disk_bound(1, config, 100, 0, 0),
