@@ -197,9 +197,15 @@ impl CrashSchedule {
 /// Pruned as it grows: a write acknowledged before its shard's durable
 /// point is durable, and only the latest such needs keeping — it is the
 /// state the disk holds, and everything before it is unreachable.
+///
+/// A write whose reply never came is kept apart from one that was
+/// acknowledged: a sync after it covers it *if it landed*, and nothing says
+/// it did, so it never becomes the durable state — it stays one candidate
+/// beside the acknowledged write before it.
 #[derive(Debug, Default, Clone)]
 pub struct SlotHistory {
-    writes: Vec<(Known, Duration)>,
+    /// `(state, instant, acknowledged)`, in the order the owner wrote them.
+    writes: Vec<(Known, Duration, bool)>,
 }
 
 impl SlotHistory {
@@ -207,39 +213,50 @@ impl SlotHistory {
     /// shard's durable point as the observer last reported it — makes
     /// unreachable.
     pub fn record(&mut self, known: Known, acked: Duration, durable_at: Option<Duration>) {
-        self.writes.push((known, acked));
-        if let Some(durable_at) = durable_at {
-            let last_durable = self.writes.iter().rposition(|(_, at)| *at < durable_at);
-            if let Some(keep_from) = last_durable {
-                self.writes.drain(..keep_from);
-            }
+        self.writes.push((known, acked, true));
+        if let Some(durable_at) = durable_at
+            && let Some(keep_from) = self.base(durable_at)
+        {
+            self.writes.drain(..keep_from);
         }
+    }
+
+    /// Notes a write whose reply never came, as of `at`: it may or may not
+    /// have landed.
+    pub fn record_unacknowledged(&mut self, known: Known, at: Duration) {
+        self.writes.push((known, at, false));
+    }
+
+    /// The last acknowledged write strictly before `durable_at`, by index.
+    fn base(&self, durable_at: Duration) -> Option<usize> {
+        self.writes
+            .iter()
+            .rposition(|(_, at, acknowledged)| *acknowledged && *at < durable_at)
     }
 
     /// Every state the key may be in after a crash whose durable point for
     /// this slot's shard was `durable_at`: the durable value — the latest
     /// write acknowledged strictly before it, or `Absent` if none — then
-    /// every write acknowledged at or after it, in order.
+    /// every write after that one, in order: those acknowledged at or after
+    /// the durable point, and those whose reply never came.
     #[must_use]
     pub fn candidates(&self, durable_at: Option<Duration>) -> Vec<Known> {
-        let split = durable_at.map_or(0, |at| {
-            self.writes
-                .iter()
-                .take_while(|(_, acked)| *acked < at)
-                .count()
-        });
-        let durable = self.writes[..split]
-            .last()
-            .map_or(Known::Absent, |(known, _)| known.clone());
+        let base = durable_at.and_then(|at| self.base(at));
+        let durable = base.map_or(Known::Absent, |index| self.writes[index].0.clone());
+        let after = base.map_or(0, |index| index + 1);
         let mut candidates = vec![durable];
-        candidates.extend(self.writes[split..].iter().map(|(known, _)| known.clone()));
+        candidates.extend(
+            self.writes[after..]
+                .iter()
+                .map(|(known, _, _)| known.clone()),
+        );
         candidates
     }
 
     /// Forgets everything but `known`, which a read just confirmed at `at`.
     pub fn keep_only(&mut self, known: Known, at: Duration) {
         self.writes.clear();
-        self.writes.push((known, at));
+        self.writes.push((known, at, true));
     }
 }
 
@@ -295,6 +312,36 @@ mod tests {
         assert_eq!(slot.candidates(Some(ms(35))), vec![Known::Absent]);
         // A write acknowledged *at* the durable instant is not durable.
         assert_eq!(slot.candidates(Some(ms(30))).len(), 2);
+    }
+
+    #[test]
+    fn a_write_that_was_never_acknowledged_stays_a_candidate_under_a_later_sync() {
+        let mut slot = SlotHistory::default();
+        slot.record(Known::Value(b"1".to_vec()), ms(10), None);
+        // A burst whose replies never came: "2" may or may not have landed.
+        slot.record_unacknowledged(Known::Value(b"2".to_vec()), ms(20));
+        // A sync at 30 covers "2" if it landed, and proves nothing if it
+        // did not: the key holds either.
+        assert_eq!(
+            slot.candidates(Some(ms(30))),
+            vec![Known::Value(b"1".to_vec()), Known::Value(b"2".to_vec())]
+        );
+        // Pruning keeps the last acknowledged write under the durable point.
+        slot.record(Known::Value(b"3".to_vec()), ms(40), Some(ms(35)));
+        assert_eq!(
+            slot.candidates(Some(ms(45))),
+            vec![Known::Value(b"3".to_vec())]
+        );
+        slot.record_unacknowledged(Known::Absent, ms(50));
+        slot.record(Known::Value(b"4".to_vec()), ms(60), Some(ms(55)));
+        assert_eq!(
+            slot.candidates(Some(ms(55))),
+            vec![
+                Known::Value(b"3".to_vec()),
+                Known::Absent,
+                Known::Value(b"4".to_vec())
+            ]
+        );
     }
 
     #[test]
