@@ -133,6 +133,11 @@ pub static PASSWORD_RELOAD_SKIPPED: Event = Event {
 };
 
 /// The log was read on start-up. One line per start, before `listening`.
+///
+/// It says every way recovery can have cost records, not only a gap: a hole
+/// can swallow a shard's last records and leave no gap behind, and a
+/// segment given up whole loses whatever it held. `lossy_shards` counts the
+/// shards any of it may have touched.
 pub static RECOVERY: Event = Event {
     name: "recovery",
     level: Level::Info,
@@ -142,7 +147,11 @@ pub static RECOVERY: Event = Event {
         "applied",
         "discarded",
         "damage_bytes",
+        "holes",
+        "abandoned_segments",
+        "malformed",
         "truncated_shards",
+        "lossy_shards",
     ],
 };
 

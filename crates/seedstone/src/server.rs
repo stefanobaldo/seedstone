@@ -875,7 +875,11 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<ShardPool> {
             Field::Num(report.applied),
             Field::Num(report.discarded),
             Field::Num(report.damage_bytes),
+            Field::Num(report.holes),
+            Field::Num(report.abandoned_segments),
+            Field::Num(report.malformed),
             Field::Num(report.truncated.len() as u64),
+            Field::Num(recovery.shards.iter().filter(|shard| shard.lossy).count() as u64),
         ],
     );
     for cut in &report.truncated {

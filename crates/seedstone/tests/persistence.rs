@@ -146,6 +146,12 @@ async fn a_killed_node_serves_what_it_synced_when_it_is_started_again() {
         recovery.contains("\"evt\":\"recovery\"") && recovery.contains("\"applied\":5"),
         "five records replayed: {recovery}"
     );
+    assert!(
+        ["holes", "abandoned_segments", "malformed", "lossy_shards"]
+            .iter()
+            .all(|field| recovery.contains(&format!("\"{field}\":"))),
+        "the line says every way recovery can have cost records: {recovery}"
+    );
     {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         assert_eq!(
