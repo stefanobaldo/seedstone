@@ -1,6 +1,5 @@
 //! The replication log: the on-disk record format, the trait every mutating
-//! command passes through, and the no-op that stands in until persistence
-//! arrives.
+//! command passes through, and the no-op a node without `--data-dir` runs.
 //!
 //! # Why the format tolerates holes
 //!
@@ -72,19 +71,19 @@ pub(crate) const BODY_FIXED_LEN: usize = 2 + 8;
 /// a shard will ever log and far below what a corrupt field typically claims.
 /// [`encode_record`] debug-asserts that it never produces a record above it.
 ///
-/// Public so the crate that will one day build record payloads out of
-/// wire-sized values can hold its arithmetic against this ceiling in a test,
-/// instead of the two constants merely happening to be ordered. Today every
-/// payload is empty; the day that changes, the debug-assert above becomes
-/// reachable, and the ordering stops being anyone's coincidence to preserve.
+/// Public so the crate that builds record payloads out of wire-sized values
+/// can hold its arithmetic against this ceiling in a test, instead of the
+/// two constants merely happening to be ordered: a payload carries a key and
+/// a value, so the debug-assert above is reachable, and the ordering is not
+/// anyone's coincidence to preserve.
 pub const MAX_BODY_LEN: usize = 64 * 1024 * 1024;
 
 /// One entry in the log: a command applied to one shard, at one position in
 /// that shard's sequence.
 ///
 /// It borrows its payload because the caller — a shard task about to apply a
-/// mutating command — already holds those bytes and the log has no reason to
-/// take a copy on a path that, today, writes nothing at all.
+/// mutating command — has just encoded those bytes, and a log that buffers
+/// them copies them once, into its own buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Record<'a> {
     /// The shard this record belongs to.
@@ -335,9 +334,9 @@ pub fn decode_record(buf: &[u8]) -> Decoded<'_> {
 
 /// The seam every mutating command passes through before it is applied.
 ///
-/// The seam exists from day one even though nothing yet writes bytes, so that
-/// the call sits in the flow of every mutating command from the beginning
-/// rather than being threaded through later. A real log replaces the
+/// The seam existed before anything wrote bytes, so that the call sat in the
+/// flow of every mutating command from the beginning rather than being
+/// threaded through later. A real log replaces the
 /// implementation, not the callers: `ShardPool::spawn_with_log` takes a
 /// per-shard factory, so a real log arrives as an argument at one call site.
 ///
