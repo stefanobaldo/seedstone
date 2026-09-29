@@ -124,7 +124,7 @@ use seedstone_core::dict::DictSeed;
 // indistinguishable from the honest one except in its atomicity, and these
 // strings enter the trace hash — a private copy that drifted would make a
 // planted trace differ for a reason unrelated to the race.
-use seedstone_core::log::checkpoint::NoCheckpoint;
+use seedstone_core::log::checkpoint::{CheckpointConfig, NoCheckpoint};
 use seedstone_core::log::disk::Disk;
 use seedstone_core::log::file::{FileLog, SharedSegment, next_generation, open_segments};
 use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, RecoveredShard, Recovery, recover};
@@ -159,7 +159,7 @@ mod workload;
 pub use config::{CrashPlan, DiskFaults, SimConfig};
 pub use disk::SimDisk;
 pub use durability::{CrashSchedule, sim_wall_clock, world_now};
-pub use outcome::SimOutcome;
+pub use outcome::{DISK_SLACK, SimOutcome, disk_bound};
 pub use plant::Plant;
 pub use routers::{PlantedRouter, SkippingRouter};
 pub use sweep::{SweepReport, sweep};
@@ -291,6 +291,20 @@ const _: () = assert!(
     "the shed threshold must sit inside the nap range, or no nap ever crosses it"
 );
 
+/// The simulated node's checkpoint.
+///
+/// A floor of 2 KiB, so every swept seed
+/// cycles several times over a workload that writes tens of kilobytes per
+/// executor; 4 KiB per tick, so a cycle spans a few ticks and the crash
+/// window can fall inside one, and still finishes well inside a run.
+/// Calibrated by `tests/planted_compaction.rs`, which holds every swept
+/// shape to at least one completed cycle per seed.
+pub const SIM_CHECKPOINT: CheckpointConfig = CheckpointConfig {
+    floor: 2048,
+    ratio: 1,
+    bytes_per_tick: 4096,
+};
+
 /// The longest a client waits for its own deadlines before reading everything
 /// back.
 ///
@@ -373,6 +387,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
     drive(&mut sim, cfg, &shared);
 
     let tally = *lock(&shared.tally);
+    let crashes = lock(&shared.crashes).len() as u64;
     SimOutcome {
         trace_hash: *lock(&trace),
         expected_sum: tally.expected,
@@ -394,7 +409,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         evictable: cfg.maxmemory.is_some(),
         forms_emitted: lock(&shared.forms).clone(),
         recoveries: tally.recoveries,
-        crashes: lock(&shared.crashes).len() as u64,
+        crashes,
         counter_floor: tally.counter_floor,
         counter_ceiling: tally.counter_ceiling,
         lost_durable_prefixes: tally.lost_durable_prefixes,
@@ -408,6 +423,23 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         sync_faults: tally.sync_faults,
         start_failures: tally.start_failures,
         hostile: cfg.disk.corruption_permille > 0 || cfg.disk.io_error_permille > 0,
+        snapshot_cycles: tally.snapshot_cycles,
+        compactions: tally.compactions,
+        files_removed: tally.files_removed,
+        max_snapshot_bytes: tally.max_snapshot_bytes,
+        max_written_during: tally.max_written_during,
+        disk_peak_bytes: tally.disk_peak_bytes,
+        disk_bound_bytes: disk_bound(
+            cfg.executors,
+            SIM_CHECKPOINT,
+            tally.max_snapshot_bytes,
+            tally.max_written_during,
+            crashes,
+        ),
+        snapshot_faults: tally.snapshot_faults,
+        remove_faults: tally.remove_faults,
+        snapshots_refused_at_start: tally.snapshots_refused_at_start,
+        files_removed_at_start: tally.files_removed_at_start,
     }
 }
 

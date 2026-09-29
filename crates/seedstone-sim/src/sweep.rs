@@ -315,8 +315,8 @@ pub struct SweepReport {
 #[cfg(test)]
 mod tests {
     use super::{PENDING_LIMIT, sweep_with};
-    use crate::{SimConfig, SimOutcome};
-    use std::collections::BTreeSet;
+    use crate::SimConfig;
+    use crate::outcome::nothing_observed;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -340,50 +340,6 @@ mod tests {
                 break;
             }
             std::thread::sleep(HOLD_STEP);
-        }
-    }
-
-    /// A run that observed nothing.
-    ///
-    /// The question here is how many runs the sweep keeps in flight, not what
-    /// any of them found, and answering it takes several thousand seeds. That
-    /// many real simulations would answer it no better and never be run.
-    fn nothing_observed() -> SimOutcome {
-        SimOutcome {
-            trace_hash: 0,
-            expected_sum: 0,
-            actual_sum: 0,
-            stale_reads: 0,
-            spurious_deaths: 0,
-            plain_mismatches: 0,
-            dead_checks: 0,
-            alive_checks: 0,
-            plain_checks: 0,
-            walk_mismatches: 0,
-            walk_checks: 0,
-            evictions_observed: 0,
-            evicted_keys: 0,
-            executor_usec: 0,
-            executor_calls: 0,
-            ceiling_breaches: 0,
-            ceiling_checks: 0,
-            evictable: false,
-            forms_emitted: BTreeSet::new(),
-            recoveries: 0,
-            crashes: 0,
-            counter_floor: 0,
-            counter_ceiling: 0,
-            lost_durable_prefixes: 0,
-            unreported_losses: 0,
-            lost_durable_writes: 0,
-            excused_losses: 0,
-            durable_checks: 0,
-            phantom_writes: 0,
-            either_checks: 0,
-            write_faults: 0,
-            sync_faults: 0,
-            start_failures: 0,
-            hostile: false,
         }
     }
 
