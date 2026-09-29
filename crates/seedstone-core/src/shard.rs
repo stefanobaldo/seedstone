@@ -59,7 +59,8 @@ pub use apply::parse_i64;
 pub use command::{Command, Cond, Expiry, KIND_SLOTS, Route};
 pub use executor::{EVICTION_SAMPLES, HOUSEKEEPING_TICK, Now, Replayed, frozen_clock};
 pub use policy::{
-    Deadlines, EvictionPolicy, ExpiryPolicy, LogFault, NoTrace, ShardPolicy, TraceSink,
+    CompactionReport, Deadlines, EvictionPolicy, ExpiryPolicy, LogFault, NoTrace, ShardPolicy,
+    SnapshotReport, TraceSink,
 };
 pub use pool::{ChunkReply, Envelope, PoolSpec, ReplyTo, Router, ShardPool, ShardStats, Share};
 pub use reply::{Reply, ReplyError};
