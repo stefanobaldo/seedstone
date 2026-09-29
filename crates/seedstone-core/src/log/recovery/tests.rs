@@ -328,8 +328,12 @@ fn a_segment_with_a_bad_header_is_abandoned_and_every_shard_is_lossy() {
     let segments = wal(&disk, 1, 1);
     let mut s1 = FileLog::new(1, Arc::clone(&segments[0]));
     write(&mut s1, 0, &put(b"b", b"1"));
-    disk.write_file(&Path::new("/data/wal").join(segment_name(2, 0, 0)), b"junk")
-        .unwrap();
+    // A header's length of bytes that are not a header.
+    disk.write_file(
+        &Path::new("/data/wal").join(segment_name(2, 0, 0)),
+        &[b'j'; crate::log::file::SEGMENT_HEADER_LEN],
+    )
+    .unwrap();
     let recovery = recover(spec(&disk, 2)).unwrap();
     assert_eq!(recovery.report.abandoned_segments, 1);
     assert!(recovery.shards.iter().all(|shard| shard.lossy));
@@ -942,4 +946,31 @@ fn every_executors_newest_segment_stays_even_when_it_holds_nothing() {
         names.contains(&segment_name(1, 1, 0)),
         "executor 1's only segment, empty, stays: {names:?}"
     );
+}
+
+/// A segment shorter than its header is a creation that failed before the
+/// header was written whole: nothing is appended to a segment before its
+/// header is synced, so it never held a record, and no shard lost one.
+#[test]
+fn a_segment_shorter_than_its_header_held_nothing_and_is_not_damage() {
+    let disk = MemDisk::default();
+    let segments = wal(&disk, 1, 1);
+    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
+    write(&mut s0, 0, &put(b"a", b"1"));
+    let mut partial = Vec::new();
+    crate::log::file::encode_segment_header(1, 0, 1, &mut partial);
+    partial.truncate(7);
+    disk.write_file(
+        &Path::new("/data/wal").join(segment_name(1, 0, 1)),
+        &partial,
+    )
+    .unwrap();
+    let recovery = recover(spec(&disk, 2)).unwrap();
+    assert_eq!(
+        recovery.report.abandoned_segments, 0,
+        "{:?}",
+        recovery.report
+    );
+    assert!(recovery.shards.iter().all(|s| !s.lossy && !s.cut));
+    assert_eq!(contents(&recovery.shards[0].dict), pairs(&[(b"a", b"1")]));
 }

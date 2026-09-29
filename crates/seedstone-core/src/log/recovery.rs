@@ -383,6 +383,12 @@ impl Scan {
             self.abandon(index);
             return Ok(());
         };
+        // Shorter than a header: a creation that failed before its header
+        // was whole. Nothing is appended to a segment before its header is
+        // synced, so it never held a record — not damage, and nothing lost.
+        if len < SEGMENT_HEADER_LEN as u64 {
+            return Ok(());
+        }
         let mut header = [0u8; SEGMENT_HEADER_LEN];
         let read = read_fully(&mut src, &mut header);
         match decode_segment_header(&header[..read]) {
