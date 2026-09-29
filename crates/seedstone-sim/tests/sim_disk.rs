@@ -1,6 +1,6 @@
 //! The simulator's filesystem behind the seam: a segment written and
 //! synced on one host survives that host's crash, and one left pending
-//! does not.
+//! does not; and a directory lists the same way in every process.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -92,4 +92,34 @@ fn the_world_clock_is_the_same_on_every_host_and_moves() {
     };
     assert_eq!(at("a", 0), at("b", 0), "one world clock");
     assert!(at("a", 1) > at("a", 0), "and it moves");
+}
+
+/// turmoil gathers a directory's entries into a `HashSet`, whose order is
+/// drawn per process. Anything that walks a listing — compaction removing
+/// files one by one, on a disk where any one removal can fail — would then
+/// replay differently in another process. The seam's simulated side lists
+/// in name order, so a seed is a seed wherever it runs.
+#[test]
+fn a_directory_lists_in_name_order() {
+    let names: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = turmoil::Builder::new().rng_seed(1).build();
+    sim.client("lister", {
+        let names = Arc::clone(&names);
+        async move {
+            let disk = SimDisk;
+            let dir = Path::new("/data");
+            disk.create_dir_all(dir)?;
+            for i in (0..32).rev() {
+                disk.write_file(&dir.join(format!("f{i:02}")), b"x")?;
+            }
+            *names.lock().unwrap() = disk.list(dir)?;
+            Ok(())
+        }
+    });
+    sim.run().unwrap();
+    let names = names.lock().unwrap().clone();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names.len(), 32);
+    assert_eq!(names, sorted);
 }
