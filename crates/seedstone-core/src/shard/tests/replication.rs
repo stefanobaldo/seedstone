@@ -2,15 +2,18 @@
 //! and what a log that refuses a write does to the command that needed it.
 
 use super::support::{NoSweep, Recorder, get, set, set_ex};
-use crate::dict::DictSeed;
+use crate::dict::{Dict, DictSeed, Entry};
+use crate::log::effect::Owned;
 use crate::log::{Record, ReplicationLog};
 use crate::shard::{
-    Command, Expiry, HOUSEKEEPING_TICK, NoTrace, Reply, ReplyError, Router, ShardPool,
+    Command, Expiry, HOUSEKEEPING_TICK, NoTrace, Now, Reply, ReplyError, Router, ShardPool,
+    replay_into,
 };
 use crate::slot::shard_of;
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::time::Instant;
 
 /// What the sink's `seq` means when one command consumes two positions.
 ///
@@ -891,4 +894,45 @@ async fn the_checkpoint_is_ticked_once_per_executor_per_housekeeping_tick() {
         "each sees its own four shards"
     );
     drop(pool);
+}
+
+/// Recovery seeds the due list with image keys whose deadline had passed:
+/// they are removed after the tail, unless the tail moved them.
+#[tokio::test(start_paused = true)]
+async fn replay_into_removes_a_seeded_due_key_unless_the_tail_moved_it() {
+    let now = Now {
+        instant: Instant::now(),
+        unix_millis: 1_000_000,
+    };
+    let mut dict = Dict::with_seed(DictSeed { k0: 1, k1: 2 });
+    for key in [&b"stale"[..], b"moved"] {
+        dict.insert(
+            Bytes::copy_from_slice(key),
+            Entry {
+                value: Bytes::from_static(b"v"),
+                expires_at: Some(now.instant),
+                touched: 0,
+            },
+        );
+    }
+    let mut seq = 2;
+    replay_into(
+        &mut dict,
+        &mut seq,
+        vec![(
+            2,
+            Owned::Deadline {
+                key: Bytes::from_static(b"moved"),
+                deadline: Some(2_000_000),
+            },
+        )],
+        now,
+        vec![Bytes::from_static(b"stale"), Bytes::from_static(b"moved")],
+    );
+    assert_eq!(seq, 3);
+    assert!(
+        dict.get(b"stale").is_none(),
+        "its last word was a passed deadline"
+    );
+    assert!(dict.get(b"moved").is_some(), "the tail moved it");
 }

@@ -13,6 +13,7 @@ use crate::shard::{
     Command, Envelope, EvictionPolicy, ExpiryPolicy, KIND_SLOTS, LogFault, Reply, ReplyError,
     ReplyTo, Route, ShardPolicy, ShardStats, TraceSink,
 };
+use bytes::Bytes;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -221,9 +222,15 @@ impl<L> ShardState<L> {
     /// A shard's state at the moment it starts: an empty keyspace, a log at
     /// position zero, and every counter unspent.
     pub const fn new(dict: Dict, log: L) -> Self {
+        Self::recovered(dict, 0, log)
+    }
+
+    /// A shard's state as recovery rebuilt it: the dict holds the image
+    /// plus the tail, and `seq` is the position the shard resumes at.
+    pub const fn recovered(dict: Dict, seq: u64, log: L) -> Self {
         Self {
             dict,
-            seq: 0,
+            seq,
             log,
             expire_cursor: 0,
             evict_cursor: 0,
@@ -236,65 +243,77 @@ impl<L> ShardState<L> {
         }
     }
 
-    /// Applies a recovered prefix, record by record, as the node applied it.
-    ///
-    /// A deadline that has passed by now does not remove its key on the
-    /// spot: a later record in the prefix may have moved it — an `EXPIRE`
-    /// that reached the key before it died, say — and the node served the
-    /// key under that later deadline. So a passed deadline is held as due
-    /// *now*, and only the keys whose last word is still a passed deadline
-    /// are removed once the whole prefix is in.
+    /// Applies a recovered prefix to this shard's dict — see [`replay_into`].
     pub fn replay(&mut self, records: Vec<(u64, Owned)>, now: Now) {
-        let mut due = Vec::new();
-        let resolve = |millis: Option<u64>| match millis.map(|at| now.replay_deadline(at)) {
-            None => (None, false),
-            Some(Replayed::At(at)) => (at, false),
-            Some(Replayed::Past) => (Some(now.instant), true),
-        };
-        for (seq, effect) in records {
-            debug_assert_eq!(seq, self.seq, "recovery hands over a gapless prefix");
-            match effect {
-                Owned::Put {
+        replay_into(&mut self.dict, &mut self.seq, records, now, Vec::new());
+    }
+}
+
+/// Applies a recovered prefix to `dict`, record by record, as the node
+/// applied it, and advances `seq` past the last record.
+///
+/// A deadline that has passed by now does not remove its key on the
+/// spot: a later record in the prefix may have moved it — an `EXPIRE`
+/// that reached the key before it died, say — and the node served the
+/// key under that later deadline. So a passed deadline is held as due
+/// *now*, and only the keys whose last word is still a passed deadline
+/// are removed once the whole prefix is in. `due` seeds that list with
+/// keys the caller inserted before the prefix — recovery's image entries
+/// whose deadline had passed — so the same rule covers them.
+pub fn replay_into(
+    dict: &mut Dict,
+    seq: &mut u64,
+    records: Vec<(u64, Owned)>,
+    now: Now,
+    mut due: Vec<Bytes>,
+) {
+    let resolve = |millis: Option<u64>| match millis.map(|at| now.replay_deadline(at)) {
+        None => (None, false),
+        Some(Replayed::At(at)) => (at, false),
+        Some(Replayed::Past) => (Some(now.instant), true),
+    };
+    for (at, effect) in records {
+        debug_assert_eq!(at, *seq, "recovery hands over a gapless prefix");
+        match effect {
+            Owned::Put {
+                key,
+                value,
+                deadline,
+            } => {
+                let (expires_at, passed) = resolve(deadline);
+                if passed {
+                    due.push(key.clone());
+                }
+                dict.insert(
                     key,
-                    value,
-                    deadline,
-                } => {
-                    let (expires_at, passed) = resolve(deadline);
-                    if passed {
-                        due.push(key.clone());
-                    }
-                    self.dict.insert(
-                        key,
-                        Entry {
-                            value,
-                            expires_at,
-                            touched: 0,
-                        },
-                    );
-                }
-                Owned::Del { key } => {
-                    self.dict.remove(&key);
-                }
-                Owned::Deadline { key, deadline } => {
-                    let (expires_at, passed) = resolve(deadline);
-                    if self.dict.set_deadline(&key, expires_at) && passed {
-                        due.push(key);
-                    }
-                }
-                Owned::Flush => self.dict.clear(),
-                // It changed no key; recovery has already used it.
-                Owned::Rebase => {}
+                    Entry {
+                        value,
+                        expires_at,
+                        touched: 0,
+                    },
+                );
             }
-            self.seq = seq + 1;
+            Owned::Del { key } => {
+                dict.remove(&key);
+            }
+            Owned::Deadline { key, deadline } => {
+                let (expires_at, passed) = resolve(deadline);
+                if dict.set_deadline(&key, expires_at) && passed {
+                    due.push(key);
+                }
+            }
+            Owned::Flush => dict.clear(),
+            // It changed no key; recovery has already used it.
+            Owned::Rebase => {}
         }
-        for key in due {
-            let dead = self
-                .dict
-                .get(&key)
-                .is_some_and(|entry| entry.expires_at.is_some_and(|at| at <= now.instant));
-            if dead {
-                self.dict.remove(&key);
-            }
+        *seq = at + 1;
+    }
+    for key in due {
+        let dead = dict
+            .get(&key)
+            .is_some_and(|entry| entry.expires_at.is_some_and(|at| at <= now.instant));
+        if dead {
+            dict.remove(&key);
         }
     }
 }

@@ -3,7 +3,7 @@
 //! once. [`Envelope`] is what crosses the channel, and [`ReplyTo`] where its
 //! replies go; [`ShardStats`] is what comes back for `INFO`.
 
-use crate::dict::{Dict, DictSeed};
+use crate::dict::{Dict, DictSeed, shard_seed};
 use crate::log::checkpoint::{Checkpoint, NoCheckpoint};
 use crate::log::effect::Effect;
 use crate::log::recovery::ShardRecords;
@@ -655,13 +655,8 @@ impl ShardPool {
         let mut inboxes = Vec::with_capacity(usize::from(executors));
         let mut pending: Option<(u16, Vec<ShardState<L>>)> = None;
         for shard in 0..shards {
-            let mut state = ShardState::new(
-                Dict::with_seed(DictSeed {
-                    k0: seed.k0 ^ u64::from(shard),
-                    k1: seed.k1,
-                }),
-                make_log(shard),
-            );
+            let mut state =
+                ShardState::new(Dict::with_seed(shard_seed(seed, shard)), make_log(shard));
             let (records, lossy, cut) =
                 recovered
                     .get_mut(usize::from(shard))
