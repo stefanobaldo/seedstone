@@ -159,6 +159,10 @@ pub struct Segment<F: LogFile> {
     file: F,
     /// Which rotation of this executor's segment the file is.
     pub(crate) rotation: u32,
+    /// The highest rotation a rotation has tried to create. A rotation that
+    /// failed may have left a file under its name, so the next attempt takes
+    /// the name after it rather than appending a second header to that one.
+    attempted: u32,
     /// Bytes written to this rotation: the live log the checkpoint's
     /// trigger reads. Reset by a rotation, not by a deletion.
     pub(crate) bytes_written: u64,
@@ -352,6 +356,7 @@ pub fn open_segments<D: Disk>(
         segments.push(Arc::new(Mutex::new(Segment {
             file,
             rotation: 0,
+            attempted: 0,
             bytes_written: 0,
             dirty: false,
             sync_failed: false,
@@ -402,7 +407,11 @@ pub fn rotate_segment<D: Disk>(
     executor: u16,
     segment: &SharedSegment<D::File>,
 ) -> io::Result<u32> {
-    let next = lock(segment).rotation + 1;
+    let next = {
+        let mut guard = lock(segment);
+        guard.attempted += 1;
+        guard.attempted
+    };
     let file = create_segment(disk, wal, generation, executor, next)?;
     disk.sync_dir(wal)?;
     let mut guard = lock(segment);
