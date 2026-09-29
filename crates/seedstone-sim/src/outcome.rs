@@ -2,6 +2,7 @@
 //! the shared tallies the clients write into while it runs.
 
 use crate::durability::{CrashRecord, DurablePoint};
+use seedstone_core::log::checkpoint::CheckpointConfig;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -152,6 +153,32 @@ pub struct SimOutcome {
     /// Whether the run's disk could fail and lie, which is what decides
     /// whether a reported loss is excused.
     pub hostile: bool,
+    /// Snapshot cycles that reached a durable footer, over every executor
+    /// and every start.
+    pub snapshot_cycles: u64,
+    /// Compactions reported, over every executor and every start.
+    pub compactions: u64,
+    /// Files compaction removed at run time.
+    pub files_removed: u64,
+    /// The largest snapshot any executor made durable: the `S` of the bound.
+    pub max_snapshot_bytes: u64,
+    /// The most log any one cycle saw written during it: the `W` of the
+    /// bound.
+    pub max_written_during: u64,
+    /// The most bytes `wal/` held at any instant the node measured it: at
+    /// each snapshot's completion, before its compaction.
+    pub disk_peak_bytes: u64,
+    /// What [`disk_bound`] allows this run, from the node's own readings.
+    pub disk_bound_bytes: u64,
+    /// Snapshot writes, syncs and rotations that failed.
+    pub snapshot_faults: u64,
+    /// Removals that failed.
+    pub remove_faults: u64,
+    /// Snapshots a start refused: no footer (a crash mid-cycle), damage,
+    /// or counts that did not match.
+    pub snapshots_refused_at_start: u64,
+    /// Files a start removed because nothing used them.
+    pub files_removed_at_start: u64,
 }
 
 impl SimOutcome {
@@ -212,6 +239,9 @@ impl SimOutcome {
             // A value no acknowledged write produced is never excused, on
             // any disk: that is a replay that invented a record.
             && self.phantom_writes == 0
+            // The disk never exceeded what the formula allows it, from
+            // the node's own readings of its snapshots and its directory.
+            && self.disk_peak_bytes <= self.disk_bound_bytes
             && self.stale_reads == 0
             && self.spurious_deaths == 0
             && self.plain_mismatches == 0
@@ -248,6 +278,91 @@ impl SimOutcome {
             // back against what the crash left.
             && (self.crashes == 0
                 || (self.recoveries > 0 && self.durable_checks + self.either_checks > 0))
+            // A run whose node never completed a snapshot cycle measured
+            // nothing about compaction or the bound.
+            && self.snapshot_cycles > 0
+    }
+}
+
+/// Bytes the bound allows beyond the formula: segment and snapshot
+/// headers, `GENERATION`, `LOCK`.
+pub const DISK_SLACK: u64 = 4096;
+
+/// What the directory may hold, from the design's bound.
+///
+/// Per executor, twice the largest snapshot (the previous and the one in progress),
+/// plus the live log at the trigger, plus what one cycle saw written —
+/// doubled once if the run restarted, because the previous process's
+/// files stay until the new one's first round of snapshots — plus a slack
+/// for headers, `GENERATION` and `LOCK`.
+#[must_use]
+pub fn disk_bound(
+    executors: u16,
+    config: CheckpointConfig,
+    max_snapshot: u64,
+    max_written: u64,
+    crashes: u64,
+) -> u64 {
+    let per_executor = 2 * max_snapshot
+        + config.floor.max(config.ratio.saturating_mul(max_snapshot))
+        + max_written;
+    u64::from(executors) * per_executor * (1 + crashes.min(1)) + DISK_SLACK
+}
+
+/// A run that observed nothing.
+///
+/// The sweep's tests ask how many runs it keeps in flight, not what any of
+/// them found, and answering that takes several thousand seeds; that many
+/// real simulations would answer it no better and never be run. The
+/// verdict's tests start from it and set only the fields they judge.
+#[cfg(test)]
+pub const fn nothing_observed() -> SimOutcome {
+    SimOutcome {
+        trace_hash: 0,
+        expected_sum: 0,
+        actual_sum: 0,
+        stale_reads: 0,
+        spurious_deaths: 0,
+        plain_mismatches: 0,
+        dead_checks: 0,
+        alive_checks: 0,
+        plain_checks: 0,
+        walk_mismatches: 0,
+        walk_checks: 0,
+        evictions_observed: 0,
+        evicted_keys: 0,
+        executor_usec: 0,
+        executor_calls: 0,
+        ceiling_breaches: 0,
+        ceiling_checks: 0,
+        evictable: false,
+        forms_emitted: BTreeSet::new(),
+        recoveries: 0,
+        crashes: 0,
+        counter_floor: 0,
+        counter_ceiling: 0,
+        lost_durable_prefixes: 0,
+        unreported_losses: 0,
+        lost_durable_writes: 0,
+        excused_losses: 0,
+        durable_checks: 0,
+        phantom_writes: 0,
+        either_checks: 0,
+        write_faults: 0,
+        sync_faults: 0,
+        start_failures: 0,
+        hostile: false,
+        snapshot_cycles: 0,
+        compactions: 0,
+        files_removed: 0,
+        max_snapshot_bytes: 0,
+        max_written_during: 0,
+        disk_peak_bytes: 0,
+        disk_bound_bytes: DISK_SLACK,
+        snapshot_faults: 0,
+        remove_faults: 0,
+        snapshots_refused_at_start: 0,
+        files_removed_at_start: 0,
     }
 }
 
@@ -399,6 +514,18 @@ pub struct Tally {
     /// Reads decided against several candidates — the denominator of
     /// [`Tally::phantom_writes`].
     pub either_checks: u64,
+    /// The checkpoint's reports and faults, and what each start refused and
+    /// removed. See [`SimOutcome`], whose fields these become.
+    pub snapshot_cycles: u64,
+    pub compactions: u64,
+    pub files_removed: u64,
+    pub max_snapshot_bytes: u64,
+    pub max_written_during: u64,
+    pub disk_peak_bytes: u64,
+    pub snapshot_faults: u64,
+    pub remove_faults: u64,
+    pub snapshots_refused_at_start: u64,
+    pub files_removed_at_start: u64,
 }
 
 /// Takes a lock that cannot be contended, and says so if it was poisoned.

@@ -121,6 +121,18 @@ impl<F: LogFile> ReplicationLog for Observed<F> {
         }
         Ok(durable)
     }
+
+    /// The checkpoint covered this shard's records up to `through`: the
+    /// durable point rises to it, and the run learns when.
+    fn covered(&mut self, through: u64) {
+        self.inner.covered(through);
+        let mut durable = lock(&self.run.durable);
+        let slot = &mut durable[usize::from(self.shard)];
+        if slot.is_none_or(|(seq, _)| seq < through) {
+            *slot = Some((through, world_now()));
+        }
+        drop(durable);
+    }
 }
 
 /// How far into a run an under-load crash may fall.

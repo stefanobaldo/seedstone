@@ -475,3 +475,47 @@ fn a_client_that_meets_a_restarting_node_waits_for_it() {
     );
     assert!(outcome.invariant_holds(), "{outcome:?}");
 }
+
+#[test]
+fn the_disk_bound_is_the_formula_and_a_peak_past_it_is_a_violation() {
+    let config = CheckpointConfig {
+        floor: 2048,
+        ratio: 1,
+        bytes_per_tick: 4096,
+    };
+    // S = 10 000, W = 500: 2S + max(2048, S) + W = 30 500 per executor.
+    assert_eq!(
+        disk_bound(4, config, 10_000, 500, 0),
+        4 * 30_500 + DISK_SLACK
+    );
+    assert_eq!(
+        disk_bound(4, config, 10_000, 500, 2),
+        2 * 4 * 30_500 + DISK_SLACK,
+        "a restart doubles it once"
+    );
+    assert_eq!(
+        disk_bound(1, config, 100, 0, 0),
+        2 * 100 + 2048 + DISK_SLACK,
+        "the floor governs a small image"
+    );
+    let mut outcome = crate::outcome::nothing_observed();
+    outcome.disk_bound_bytes = 100;
+    outcome.disk_peak_bytes = 100;
+    assert!(outcome.invariant_holds());
+    outcome.disk_peak_bytes = 101;
+    assert!(!outcome.invariant_holds());
+}
+
+#[test]
+fn a_run_with_no_snapshot_cycle_exercised_nothing() {
+    let mut outcome = crate::outcome::nothing_observed();
+    // Everything else a run needs to have exercised, at one.
+    outcome.expected_sum = 1;
+    outcome.dead_checks = 1;
+    outcome.alive_checks = 1;
+    outcome.plain_checks = 1;
+    outcome.walk_checks = 1;
+    assert!(!outcome.invariants_were_exercised(), "no cycle ran");
+    outcome.snapshot_cycles = 1;
+    assert!(outcome.invariants_were_exercised());
+}

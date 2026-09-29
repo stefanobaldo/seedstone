@@ -3,7 +3,9 @@
 //!
 //! Changing anything here moves every pinned hash.
 
-use seedstone_core::shard::{Command, LogFault, Reply, Route, TraceSink};
+use seedstone_core::shard::{
+    Command, CompactionReport, LogFault, Reply, Route, SnapshotReport, TraceSink,
+};
 use std::sync::{Arc, Mutex};
 
 use crate::outcome::{Shared, lock};
@@ -136,14 +138,48 @@ impl TraceSink for HashSink {
         }
     }
 
+    /// Folded: which executor completed which cycle with how many entries.
+    /// The sizes are not folded — they are measurements the bound reads,
+    /// and a byte count that moved with a header change would move every
+    /// pinned hash for no schedule reason.
+    fn snapshot(&self, report: &SnapshotReport) {
+        {
+            let mut h = lock(&self.hash);
+            *h = mix(
+                mix(
+                    mix(mix(*h, 0x5EED_0000_0000_0002), u64::from(report.executor)),
+                    u64::from(report.cycle),
+                ),
+                report.entries,
+            );
+        }
+        let mut tally = lock(&self.shared.tally);
+        tally.snapshot_cycles += 1;
+        tally.max_snapshot_bytes = tally.max_snapshot_bytes.max(report.bytes);
+        tally.max_written_during = tally.max_written_during.max(report.written_during);
+        tally.disk_peak_bytes = tally.disk_peak_bytes.max(report.disk_bytes);
+    }
+
+    fn compaction(&self, report: &CompactionReport) {
+        {
+            let mut h = lock(&self.hash);
+            *h = mix(
+                mix(mix(*h, 0x5EED_0000_0000_0003), u64::from(report.executor)),
+                report.files,
+            );
+        }
+        let mut tally = lock(&self.shared.tally);
+        tally.compactions += 1;
+        tally.files_removed += report.files;
+    }
+
     fn fault(&self, _shard: u16, fault: LogFault, _error: &std::io::Error) {
         let mut tally = lock(&self.shared.tally);
         match fault {
             LogFault::Write => tally.write_faults += 1,
             LogFault::Sync => tally.sync_faults += 1,
-            // The simulated node runs no checkpoint yet, so neither stage
-            // can fail here.
-            LogFault::Snapshot | LogFault::Remove => {}
+            LogFault::Snapshot => tally.snapshot_faults += 1,
+            LogFault::Remove => tally.remove_faults += 1,
         }
     }
 }
