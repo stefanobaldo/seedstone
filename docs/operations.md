@@ -180,6 +180,11 @@ sync may not. On start the
 log is read back: a shard whose records have a gap is replayed up to the gap
 and reported with `recovery_truncated`, and the node serves what it has.
 
+One process at a time: the node takes an exclusive lock on `PATH/wal/LOCK`
+before it reads the log, and a second node started on the same directory
+writes `recovery_failed` and exits 1. The kernel releases the lock when the
+process dies, so a crashed node never leaves it behind.
+
 The log only grows. Until snapshots and compaction exist, the directory's
 size is bounded by nothing but the disk; a node that must run for long on a
 small disk should not yet be started with this flag.
