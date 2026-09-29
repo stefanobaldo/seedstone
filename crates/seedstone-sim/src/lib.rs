@@ -558,6 +558,7 @@ async fn server(
     // previous process's files.
     let round = Arc::new(AtomicU16::new(0));
     let checkpoint_segments = segments.clone();
+    let deletes = planted == Some(Plant::DeletesBeforeDurable);
     let parts = PoolParts {
         shards,
         executors,
@@ -579,7 +580,7 @@ async fn server(
             }
         },
         make_checkpoint: move |executor: u16| {
-            SegmentCheckpoint::new(CheckpointSpec {
+            let mut checkpoint = SegmentCheckpoint::new(CheckpointSpec {
                 disk: SimDisk,
                 wal: Path::new(DATA_DIR).join("wal"),
                 generation,
@@ -588,7 +589,9 @@ async fn server(
                 segment: Arc::clone(&checkpoint_segments[usize::from(executor)]),
                 round: Arc::clone(&round),
                 config: SIM_CHECKPOINT,
-            })
+            });
+            checkpoint.deletes_before_durable(deletes);
+            checkpoint
         },
     };
     let pool = match planted {
@@ -604,7 +607,9 @@ async fn server(
             Plant::LostUpdate
             | Plant::CrossingSkipsShard
             | Plant::PrefixScanRecovery
-            | Plant::DropsFailedWrite,
+            | Plant::DropsFailedWrite
+            | Plant::DeletesBeforeDurable
+            | Plant::TrustsUnfinishedSnapshot,
         ) => parts.spawn(Deadlines),
     };
     let listener = turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await?;
@@ -701,7 +706,7 @@ fn start_log(
         wal: &wal,
         shards,
         reader: mode,
-        trust_unfinished: false,
+        trust_unfinished: planted == Some(Plant::TrustsUnfinishedSnapshot),
         seed,
         // Inside the host, the simulated clock — the same reading the pool
         // took when it replayed the log itself.

@@ -122,6 +122,21 @@ pub enum Plant {
     /// under the durable point with no damage on disk to explain it.
     /// Observable only where a write can fail: `SimConfig::hostile`.
     DropsFailedWrite,
+    /// A checkpoint that deletes the segments it covers at the rotation,
+    /// when the cycle opens, instead of when the snapshot's footer is
+    /// synced. A crash anywhere inside the cycle then finds neither the
+    /// old segments nor an image, and every record between the previous
+    /// image's base and the new one is gone. Caught by
+    /// `lost_durable_writes` on the swept shape: a crash under load is
+    /// enough, no disk fault needed.
+    DeletesBeforeDurable,
+    /// A recovery that takes a snapshot with no footer at its word — the
+    /// keys scanned before the crash, and nothing after them — instead of
+    /// refusing it and reading the log the footer would have covered. A
+    /// crash mid-cycle then restores a partial image plus the tail from
+    /// the base, and every key not yet scanned is gone. Caught by
+    /// `lost_durable_writes` on the swept shape.
+    TrustsUnfinishedSnapshot,
 }
 
 impl Plant {
@@ -139,12 +154,14 @@ impl Plant {
             Self::CrossingSkipsShard => "crossing-skips-shard",
             Self::PrefixScanRecovery => "prefix-scan-recovery",
             Self::DropsFailedWrite => "drops-failed-write",
+            Self::DeletesBeforeDurable => "deletes-before-durable",
+            Self::TrustsUnfinishedSnapshot => "trusts-unfinished-snapshot",
         }
     }
 
     /// Every plant, so a caller listing or sweeping them cannot miss one
     /// added later.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::LostUpdate,
         Self::ServeExpired,
         Self::SweepEatsAll,
@@ -154,6 +171,8 @@ impl Plant {
         Self::CrossingSkipsShard,
         Self::PrefixScanRecovery,
         Self::DropsFailedWrite,
+        Self::DeletesBeforeDurable,
+        Self::TrustsUnfinishedSnapshot,
     ];
 
     /// The plant `name` selects, if it names one.
@@ -186,10 +205,16 @@ impl Plant {
             // including the ones with no ceiling, where the plain model is
             // exact and a vanished key is a mismatch with nothing to excuse
             // it.
+            // The two compaction plants too: a crash under load, which
+            // every swept seed has, is what makes them visible — the first
+            // loses records to a crash inside a cycle, the second to a crash
+            // inside a cycle followed by a start that trusts what it finds.
             Self::LostUpdate
             | Self::ServeExpired
             | Self::SweepEatsAll
-            | Self::EvictsBelowCeiling => None,
+            | Self::EvictsBelowCeiling
+            | Self::DeletesBeforeDurable
+            | Self::TrustsUnfinishedSnapshot => None,
             // Needs a cursor observed *between* steps of a table that is
             // growing under it, and no shape this harness can afford leaves one
             // there: a call spends the server's whole bucket ceiling, which
