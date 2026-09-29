@@ -4,12 +4,14 @@
 //! replies go; [`ShardStats`] is what comes back for `INFO`.
 
 use crate::dict::{Dict, DictSeed};
+use crate::log::effect::Effect;
 use crate::log::recovery::ShardRecords;
 use crate::log::{NoopLog, ReplicationLog};
 use crate::memory::{MemoryGauge, MemoryLimit};
+use crate::shard::apply::append;
 use crate::shard::executor::{Memory, ShardState, frozen_clock, run_executor};
 use crate::shard::{
-    Command, Deadlines, KIND_SLOTS, Now, Reply, ReplyError, Route, ShardPolicy, TraceSink,
+    Command, Deadlines, KIND_SLOTS, LogFault, Now, Reply, ReplyError, Route, ShardPolicy, TraceSink,
 };
 use crate::slot::{executor_of, shard_of};
 use std::future::Future;
@@ -635,11 +637,13 @@ impl ShardPool {
                 }),
                 make_log(shard),
             );
-            let (records, lossy) = recovered
-                .get_mut(usize::from(shard))
-                .map_or((Vec::new(), false), |shard| {
-                    (std::mem::take(&mut shard.records), shard.lossy)
-                });
+            let (records, lossy, cut) =
+                recovered
+                    .get_mut(usize::from(shard))
+                    .map_or((Vec::new(), false, false), |shard| {
+                        let cut = shard.discarded > 0 || shard.lossy;
+                        (std::mem::take(&mut shard.records), shard.lossy, cut)
+                    });
             state.replay(
                 records,
                 Now {
@@ -648,6 +652,15 @@ impl ShardPool {
                 },
             );
             trace.recovered(shard, state.seq, lossy);
+            // The records the cut left on disk hold the sequence numbers this
+            // shard is about to reuse: the rebase makes them dead on every
+            // later start. It is synced before the pool serves anything, so
+            // what a client reads after a cut is what the disk holds — a
+            // crash before the next tick must not bring back what this start
+            // said was gone. A log that refuses it is reported like any other.
+            if cut {
+                rebase(&mut state, shard, &trace);
+            }
             // A fresh dict already costs its table, and the gauge is the sum
             // of what the dicts account — so it starts at the sum of what
             // they hold after replay rather than at zero.
@@ -928,5 +941,23 @@ impl Router for ShardPool {
             );
             replies
         }
+    }
+}
+
+/// Writes and syncs a shard's `Rebase` at its resume point, reporting a log
+/// that refuses either half.
+fn rebase<L: ReplicationLog, T: TraceSink>(state: &mut ShardState<L>, shard: u16, trace: &T) {
+    if append(&mut state.log, &mut state.seq, shard, Effect::Rebase).is_err() {
+        trace.fault(
+            shard,
+            LogFault::Write,
+            &std::io::Error::other("the log refused the rebase after a cut recovery"),
+        );
+        return;
+    }
+    if let Err(error) = state.log.flush() {
+        trace.fault(shard, LogFault::Write, &error);
+    } else if let Err(error) = state.log.sync() {
+        trace.fault(shard, LogFault::Sync, &error);
     }
 }

@@ -15,6 +15,14 @@
 //! segment abandoned mid-way or read out of order must not turn into a
 //! wrong prefix.
 //!
+//! **A cut is not undone by a later start.** A shard cut at a gap resumes
+//! there, and the next generation reuses the sequence numbers of the records
+//! that were cut — which are still on disk. So the first record a shard
+//! writes after a cut is a `Rebase` at its resume point, and a record of an
+//! older generation at or above a newer generation's `Rebase` is dead: never
+//! replayed, never counted as a gap. Where two generations still hold the
+//! same sequence number, the newer one's record is the one kept.
+//!
 //! A segment whose header names a format version above this build's is
 //! refused, and the node does not start: that is not damage, it is a
 //! downgrade, and guessing at it would be worse than stopping. A header
@@ -119,7 +127,7 @@ pub fn recover<D: Disk>(
     };
     for (generation, executor, name) in names {
         let executors = executors_in.get(&generation).copied().unwrap_or(1);
-        scan.segment(disk, wal, &name, mode, (executor, executors))?;
+        scan.segment(disk, wal, &name, mode, generation, (executor, executors))?;
     }
     Ok(scan.finish())
 }
@@ -127,8 +135,9 @@ pub fn recover<D: Disk>(
 /// What recovery has read so far.
 struct Scan {
     report: Report,
-    /// Each shard's intact records, in the order they were read.
-    buckets: Vec<Vec<(u64, Owned)>>,
+    /// Each shard's intact records, in the order they were read, with the
+    /// generation of the segment each came from.
+    buckets: Vec<Vec<(u64, u64, Owned)>>,
     /// Per shard: damage sat in a segment its executor wrote.
     damaged: Vec<bool>,
     /// A loss nobody can attribute to a shard: every shard may have paid.
@@ -144,6 +153,7 @@ impl Scan {
         wal: &Path,
         name: &str,
         mode: ReaderMode,
+        generation: u64,
         writer: (u16, u16),
     ) -> io::Result<()> {
         self.report.segments += 1;
@@ -171,7 +181,7 @@ impl Scan {
         let mut reader = Reader::new(src, body_len, mode);
         loop {
             match reader.next_record() {
-                Ok(Some(item)) => self.item(&item),
+                Ok(Some(item)) => self.item(&item, generation),
                 Ok(None) => break,
                 Err(_) => {
                     self.abandon();
@@ -200,14 +210,14 @@ impl Scan {
     }
 
     /// One intact record, bucketed by shard.
-    fn item(&mut self, item: &Item) {
+    fn item(&mut self, item: &Item, generation: u64) {
         self.report.records += 1;
         let Some(bucket) = self.buckets.get_mut(usize::from(item.shard)) else {
             self.report.malformed += 1;
             return;
         };
         if let Some(effect) = Effect::decode(&item.payload) {
-            bucket.push((item.seq, effect.to_owned()));
+            bucket.push((item.seq, generation, effect.to_owned()));
         } else {
             // A well-checksummed record this build cannot read ends the
             // shard's prefix where it sits: leaving its sequence out of the
@@ -254,13 +264,29 @@ impl Scan {
 }
 
 /// A shard's records from `0` upwards up to the first missing sequence,
-/// and how many came after it.
-fn prefix(mut bucket: Vec<(u64, Owned)>) -> (Vec<(u64, Owned)>, u64) {
-    bucket.sort_by_key(|(seq, _)| *seq);
-    let mut records = Vec::with_capacity(bucket.len());
+/// and how many came after it — once every record a newer generation's
+/// `Rebase` made dead is gone.
+fn prefix(bucket: Vec<(u64, u64, Owned)>) -> (Vec<(u64, Owned)>, u64) {
+    let rebases: Vec<(u64, u64)> = bucket
+        .iter()
+        .filter(|(_, _, effect)| matches!(effect, Owned::Rebase))
+        .map(|(seq, generation, _)| (*seq, *generation))
+        .collect();
+    let mut live: Vec<(u64, u64, Owned)> = bucket
+        .into_iter()
+        .filter(|(seq, generation, _)| {
+            !rebases
+                .iter()
+                .any(|(from, newer)| newer > generation && seq >= from)
+        })
+        .collect();
+    // By sequence, the newest generation first within one: the duplicate
+    // below is then the older record, and it is the one skipped.
+    live.sort_by_key(|(seq, generation, _)| (*seq, std::cmp::Reverse(*generation)));
+    let mut records = Vec::with_capacity(live.len());
     let mut expected = 0u64;
     let mut discarded = 0u64;
-    for (seq, effect) in bucket {
+    for (seq, _, effect) in live {
         if discarded > 0 || seq > expected {
             discarded += 1;
         } else if seq == expected {
@@ -268,7 +294,8 @@ fn prefix(mut bucket: Vec<(u64, Owned)>) -> (Vec<(u64, Owned)>, u64) {
             expected += 1;
         }
         // Below `expected`: the same record written twice, by a write that
-        // failed part-way and was retried whole.
+        // failed part-way and was retried whole, or an older generation's
+        // record under a newer one's.
     }
     (records, discarded)
 }
@@ -294,6 +321,7 @@ mod tests {
         segment_name,
     };
     use crate::log::{Record, ReplicationLog};
+    use bytes::Bytes;
     use std::sync::Arc;
 
     fn put(key: &[u8], value: &[u8]) -> Vec<u8> {
@@ -368,6 +396,63 @@ mod tests {
         assert_eq!(seqs(1), [0, 1]);
         assert!(recovery.report.truncated.is_empty());
         assert!(!recovery.shards[0].lossy);
+    }
+
+    /// A start whose recovery cut a shard leaves the cut records on disk.
+    /// The next generation resumes at the cut and reuses those sequence
+    /// numbers, so on the start after it the old records must lose to the
+    /// new ones — or the node replays what it had discarded over writes it
+    /// acknowledged and synced.
+    #[test]
+    fn records_a_cut_left_behind_never_return_on_a_later_start() {
+        let disk = MemDisk::default();
+        let gen1 = wal(&disk, 1, 1);
+        let mut old = FileLog::new(0, Arc::clone(&gen1[0]));
+        write(&mut old, 0, &put(b"a", b"1"));
+        write(&mut old, 1, &put(b"a", b"2"));
+        write(&mut old, 3, &put(b"c", b"stale")); // seq 2 never written
+        write(&mut old, 4, &put(b"d", b"stale"));
+        let first = recover(
+            &disk,
+            Path::new("/data/wal"),
+            1,
+            ReaderMode::Resynchronising,
+        )
+        .unwrap();
+        assert_eq!(first.shards[0].records.len(), 2, "cut at the gap");
+
+        // The next generation resumes at 2, as the node does after a cut.
+        let gen2 = wal(&disk, 2, 1);
+        let mut new = FileLog::new(0, Arc::clone(&gen2[0]));
+        let mut rebase = Vec::new();
+        Effect::Rebase.encode(&mut rebase);
+        write(&mut new, 2, &rebase);
+        write(&mut new, 3, &put(b"b", b"new"));
+
+        let second = recover(
+            &disk,
+            Path::new("/data/wal"),
+            1,
+            ReaderMode::Resynchronising,
+        )
+        .unwrap();
+        let shard = &second.shards[0];
+        let seqs: Vec<u64> = shard.records.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(
+            seqs,
+            [0, 1, 2, 3],
+            "the new generation's prefix, and nothing past it"
+        );
+        assert_eq!(
+            shard.records[3].1,
+            Owned::Put {
+                key: Bytes::from_static(b"b"),
+                value: Bytes::from_static(b"new"),
+                deadline: None,
+            },
+            "the acknowledged write, not the record the first start discarded"
+        );
+        assert_eq!(shard.discarded, 0, "the dead records are not a gap");
     }
 
     #[test]

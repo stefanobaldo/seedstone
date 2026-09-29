@@ -682,3 +682,111 @@ async fn a_pool_spawned_from_a_recovery_serves_the_recovered_keys() {
     seen.sort_unstable();
     assert_eq!(seen, vec![(0, 0, true), (1, 1, false)]);
 }
+
+/// A shard whose recovery was cut writes a `Rebase` at its resume point
+/// before anything else, so the records the cut left on disk are dead on
+/// every later start; a shard recovered whole writes none.
+#[tokio::test]
+async fn a_shard_cut_by_its_recovery_rebases_before_its_first_write() {
+    use crate::log::effect::{Effect, Owned};
+    use crate::log::recovery::ShardRecords;
+    use crate::shard::PoolSpec;
+
+    /// `(shard, seq, payload)` of each append; a sync is `(u16::MAX, 0, "sync")`.
+    type Appended = (u16, u64, Vec<u8>);
+    #[derive(Clone, Default)]
+    struct Kept(Arc<Mutex<Vec<Appended>>>);
+    impl ReplicationLog for Kept {
+        fn append(&mut self, rec: Record<'_>) -> std::io::Result<()> {
+            self.0
+                .lock()
+                .expect("kept")
+                .push((rec.shard, rec.seq, rec.payload.to_vec()));
+            Ok(())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn sync(&mut self) -> std::io::Result<Option<u64>> {
+            self.0
+                .lock()
+                .expect("kept")
+                .push((u16::MAX, 0, b"sync".to_vec()));
+            Ok(None)
+        }
+    }
+
+    let key = (0..64)
+        .map(|i| format!("key{i}"))
+        .find(|key| shard_of(key.as_bytes(), 2) == 0)
+        .expect("some key lands on shard 0");
+    let put = |seq: u64| {
+        (
+            seq,
+            Owned::Put {
+                key: Bytes::from_static(b"x"),
+                value: Bytes::from_static(b"1"),
+                deadline: None,
+            },
+        )
+    };
+    let recovered = vec![
+        ShardRecords {
+            records: vec![put(0)],
+            discarded: 1,
+            lossy: false,
+        },
+        ShardRecords {
+            records: vec![put(0)],
+            discarded: 0,
+            lossy: false,
+        },
+    ];
+    let kept = Kept::default();
+    let pool = ShardPool::spawn_spec(PoolSpec {
+        shards: 2,
+        executors: 1,
+        seed: DictSeed { k0: 1, k1: 2 },
+        trace: super::support::Recorder::default(),
+        make_log: {
+            let kept = kept.clone();
+            move |_shard| kept.clone()
+        },
+        policy: crate::shard::Deadlines,
+        limit: crate::memory::MemoryLimit::default(),
+        clock: crate::shard::frozen_clock,
+        recovered,
+    });
+    let mut rebase = Vec::new();
+    Effect::Rebase.encode(&mut rebase);
+    let at_start = kept.0.lock().expect("kept").clone();
+    assert_eq!(
+        at_start,
+        [(0, 1, rebase.clone()), (u16::MAX, 0, b"sync".to_vec())],
+        "the rebase is synced before the pool serves anything: the state a client reads \
+         after a cut must be the one the disk holds"
+    );
+    pool.dispatch(set(key.as_bytes(), b"v")).await;
+
+    let seen: Vec<_> = kept
+        .0
+        .lock()
+        .expect("kept")
+        .iter()
+        .filter(|(shard, _, _)| *shard != u16::MAX)
+        .cloned()
+        .collect();
+    assert_eq!(
+        seen.first(),
+        Some(&(0, 1, rebase)),
+        "the cut shard's first record is its rebase, at the resume point: {seen:?}"
+    );
+    assert_eq!(
+        seen.get(1).map(|(shard, seq, _)| (*shard, *seq)),
+        Some((0, 2))
+    );
+    assert!(
+        seen.iter().all(|(shard, _, _)| *shard == 0),
+        "the shard recovered whole writes no rebase: {seen:?}"
+    );
+}
