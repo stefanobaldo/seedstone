@@ -210,3 +210,42 @@ async fn a_node_without_the_flag_writes_no_log() {
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::remove_file(&stderr).unwrap();
 }
+
+/// Two processes on one data directory would each take a generation and
+/// interleave two histories into one log. The second is refused before it
+/// reads a byte, and says why; the first keeps serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_process_on_the_same_directory_is_refused() {
+    let dir = scratch();
+    let (mut first, _) = start(&dir, &dir.join("first.err")).await;
+
+    let second_err = dir.join("second.err");
+    let mut second = spawn(&dir, &["--data-dir".as_ref(), dir.as_os_str()], &second_err);
+    let status = {
+        let mut waited = None;
+        for _ in 0..500 {
+            if let Some(status) = second.try_wait().expect("try_wait") {
+                waited = Some(status);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        waited
+    };
+    let text = std::fs::read_to_string(&second_err).unwrap_or_default();
+    if status.is_none() {
+        second.kill().ok();
+    }
+    first.kill().ok();
+    first.wait().ok();
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(1),
+        "the second process exits 1: {text}"
+    );
+    assert!(
+        text.contains("\"evt\":\"recovery_failed\"") && text.contains("another process"),
+        "and says the directory is in use: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

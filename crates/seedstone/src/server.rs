@@ -404,6 +404,10 @@ pub struct Server {
     /// What this run of the process calls itself in `INFO`. Drawn where the
     /// keyspace seed is drawn, for the reason stated there.
     run_id: String,
+    /// The lock on the data directory, held for as long as the server
+    /// lives, or `None` without one: dropping it is what lets another
+    /// process open the log.
+    _data_lock: Option<std::fs::File>,
 }
 
 impl Server {
@@ -425,7 +429,7 @@ impl Server {
         // Before the listener, so no client can reach a keyspace that is
         // still being rebuilt, and a log that cannot be read is refused
         // before an address is taken.
-        let pool = spawn_pool(&cfg, seed)?;
+        let (pool, data_lock) = spawn_pool(&cfg, seed)?;
         let listener = TcpListener::bind(cfg.bind).await?;
         // Asked of the socket rather than copied from the config: with port 0
         // the kernel chose, and the caller needs to learn what it chose.
@@ -438,6 +442,7 @@ impl Server {
             passwords: PasswordStore::new(cfg.passwords),
             source: cfg.source,
             run_id,
+            _data_lock: data_lock,
         })
     }
 
@@ -839,27 +844,23 @@ pub fn is_recovery_failure(error: &std::io::Error) -> bool {
 ///
 /// Whatever recovery or opening the segments reports, marked for
 /// [`is_recovery_failure`]; `recovery_failed` is written first.
-fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<ShardPool> {
+fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Option<std::fs::File>)> {
     let Some(dir) = &cfg.data_dir else {
-        return Ok(ShardPool::spawn_limited(
-            SHARDS,
-            executors(),
-            seed,
-            NoTrace,
-            cfg.limit,
-        ));
+        let pool = ShardPool::spawn_limited(SHARDS, executors(), seed, NoTrace, cfg.limit);
+        return Ok((pool, None));
     };
     let disk = StdDisk;
     let wal = dir.join("wal");
     let executors = executors();
     let started = (|| {
         disk.create_dir_all(&wal)?;
+        let lock = lock_data_dir(&wal)?;
         let recovery = recover(&disk, &wal, SHARDS, ReaderMode::Resynchronising)?;
         let generation = next_generation(&disk, &wal)?;
         let segments = open_segments(&disk, &wal, generation, executors)?;
-        Ok::<_, std::io::Error>((recovery, segments))
+        Ok::<_, std::io::Error>((recovery, segments, lock))
     })();
-    let (recovery, segments) = match started {
+    let (recovery, segments, lock) = match started {
         Ok(started) => started,
         Err(error) => {
             emit(&RECOVERY_FAILED, &[Field::Str(&error.to_string())]);
@@ -892,7 +893,7 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<ShardPool> {
             ],
         );
     }
-    Ok(ShardPool::spawn_spec(PoolSpec {
+    let pool = ShardPool::spawn_spec(PoolSpec {
         shards: SHARDS,
         executors,
         seed,
@@ -909,7 +910,35 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<ShardPool> {
         limit: cfg.limit,
         clock: wall_clock,
         recovered: recovery.shards,
-    }))
+    });
+    Ok((pool, Some(lock)))
+}
+
+/// Takes the data directory for this process alone: an exclusive lock on
+/// `wal/LOCK`, held until the returned file is dropped.
+///
+/// Two processes on one directory would each take a generation and write
+/// their own history into it, and the next start would replay both as one.
+/// The lock is advisory and released by the kernel when the process dies,
+/// so a crashed node never leaves it behind.
+fn lock_data_dir(wal: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let path = wal.join("LOCK");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "{}: the data directory is in use by another process",
+                path.display()
+            ),
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 #[cfg(test)]
