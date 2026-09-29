@@ -26,14 +26,15 @@
 //! that at three times the last snapshot plus 64 MiB plus one cycle's
 //! writes; a node's directory is the sum over its executors.
 //!
-//! **Failure.** A write that fails keeps its buffer and is retried on the
-//! next tick before any scanning: the cycle is never abandoned, and a disk
-//! that never writes again parks it — the bound holds on a disk that
-//! eventually writes. A footer sync that fails abandons the *file*: a
-//! filesystem may drop what a failed sync could not write and report the
-//! next one a success, so the scan restarts into a new file with the same
-//! bases, which are still correct. A removal that fails is reported and
-//! tried again at the next cycle; recovery removes it at the next start.
+//! **Failure.** Any write or sync of the snapshot file that fails — its
+//! header, its entries, its footer — abandons the *file*, never the cycle:
+//! part of a failed write may have landed, and a filesystem may drop what a
+//! failed sync could not write and report the next one a success, so
+//! nothing more is written to that file. The scan restarts into a new file
+//! with the same bases, which are still correct, and the abandoned one is
+//! removed. A disk that never writes again parks the cycle — the bound
+//! holds on a disk that eventually writes. A removal that fails is reported
+//! and tried again at the next cycle; recovery removes it at the next start.
 
 use std::io;
 use std::path::PathBuf;
@@ -188,7 +189,7 @@ struct Cycle<F> {
     /// Per owned shard: the scan cursor, or `None` once it came back to 0.
     cursors: Vec<Option<u64>>,
     counts: Vec<u64>,
-    /// Encoded entries not yet written; kept across a failed write.
+    /// Encoded entries not yet written, drained on the tick that scanned them.
     buffer: Vec<u8>,
     scratch: Vec<u8>,
     /// Bytes written to the file so far, header included.
@@ -341,7 +342,35 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         Ok(())
     }
 
-    /// Writes whatever the buffer holds; on failure the buffer is kept.
+    /// Gives up on the cycle's file and restarts the scan into a new one,
+    /// with the same bases, which are still right.
+    ///
+    /// The file is never written to again, because what a failed write or
+    /// sync left in it is unknown: part of a write may have landed, or a
+    /// filesystem may drop the pages a failed sync could not write. Writing
+    /// on after it — a second header, or a retried buffer behind a partial
+    /// one — would leave a finished image that recovery must refuse, once
+    /// compaction had already deleted the log it covers. The file is removed
+    /// if it can be; one that stays is an older snapshot of this executor,
+    /// which the next compaction removes.
+    fn restart(&mut self, cycle: &mut Cycle<D::File>) {
+        let abandoned = self
+            .wal
+            .join(snapshot_name(self.generation, self.executor, cycle.number));
+        let mut restarted = Cycle::fresh(
+            self.cycle,
+            std::mem::take(&mut cycle.bases),
+            cycle.overshoot,
+        );
+        restarted.ticks = cycle.ticks;
+        self.cycle += 1;
+        *cycle = restarted;
+        // Best effort, and not reported: a failure here leaves a file the
+        // next compaction removes, and reports then if it fails again.
+        let _ = self.disk.remove_file(&abandoned);
+    }
+
+    /// Writes whatever the buffer holds.
     fn drain(cycle: &mut Cycle<D::File>) -> io::Result<()> {
         if cycle.buffer.is_empty() {
             return Ok(());
@@ -427,12 +456,9 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         cycle: &mut Cycle<D::File>,
     ) -> io::Result<bool> {
         cycle.ticks += 1;
-        self.ensure_file(first_shard, cycle)?;
-        // A kept buffer goes first, and nothing is scanned behind it: the
-        // budget was spent on it already.
-        if !cycle.buffer.is_empty() {
-            Self::drain(cycle)?;
-            return Ok(false);
+        if let Err(error) = self.ensure_file(first_shard, cycle) {
+            self.restart(cycle);
+            return Err(error);
         }
         if cycle.dir_pending {
             self.disk.sync_dir(&self.wal)?;
@@ -461,7 +487,10 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
             cycle.buffer.push(crate::log::END_OF_LOG);
             cycle.footer_written = true;
         }
-        Self::drain(cycle)?;
+        if let Err(error) = Self::drain(cycle) {
+            self.restart(cycle);
+            return Err(error);
+        }
         if cycle.footer_written {
             return self.sync_footer(cycle);
         }
@@ -474,13 +503,7 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
     fn sync_footer(&mut self, cycle: &mut Cycle<D::File>) -> io::Result<bool> {
         let file = cycle.file.as_mut().expect("the footer was written");
         if let Err(error) = file.sync_data() {
-            let restarted = Cycle::fresh(
-                self.cycle,
-                std::mem::take(&mut cycle.bases),
-                cycle.overshoot,
-            );
-            self.cycle += 1;
-            *cycle = restarted;
+            self.restart(cycle);
             return Err(error);
         }
         cycle.dir_pending = true;
