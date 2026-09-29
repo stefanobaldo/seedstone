@@ -5,6 +5,7 @@
 
 use crate::dict::{Dict, Entry};
 use crate::log::ReplicationLog;
+use crate::log::checkpoint::Checkpoint;
 use crate::log::effect::{Effect, Owned};
 use crate::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use crate::shard::apply::{append, apply};
@@ -298,6 +299,22 @@ impl<L> ShardState<L> {
     }
 }
 
+/// What one executor task is built from.
+///
+/// A struct rather than a parameter list, for the reason [`PoolSpec`](crate::shard::PoolSpec)
+/// is one: the list had reached the count where the next argument is one
+/// nobody reads, and a caller that names fields cannot swap a clock for a
+/// checkpoint by position.
+pub struct ExecutorSpec<T, L, P, C> {
+    pub first_shard: u16,
+    pub states: Vec<ShardState<L>>,
+    pub trace: T,
+    pub policy: P,
+    pub memory: Memory,
+    pub clock: fn() -> u64,
+    pub checkpoint: C,
+}
+
 /// One executor task: own a contiguous range of shards, answer the inbox,
 /// keep every owned rehash moving.
 ///
@@ -306,15 +323,19 @@ impl<L> ShardState<L> {
 ///
 /// Returns when the inbox closes, which happens once the last [`ShardPool`]
 /// handle is dropped.
-pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
-    first_shard: u16,
-    mut states: Vec<ShardState<L>>,
-    trace: T,
-    policy: P,
-    memory: Memory,
-    clock: fn() -> u64,
+pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint>(
+    spec: ExecutorSpec<T, L, P, C>,
     mut inbox: mpsc::UnboundedReceiver<Envelope>,
 ) {
+    let ExecutorSpec {
+        first_shard,
+        mut states,
+        trace,
+        policy,
+        memory,
+        clock,
+        mut checkpoint,
+    } = spec;
     let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
     // A shard that fell behind resumes at its normal spacing instead of firing
     // a burst of catch-up ticks. The default is that burst, and it is the last
@@ -498,6 +519,18 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy>(
                         trace.fault(shard_at(offset), LogFault::Sync, &error);
                     }
                 }
+                // The checkpoint, after both passes: its bases are read at a
+                // point where every shard's buffer has been offered to the
+                // disk, and its budget is the last thing the tick spends.
+                checkpoint.tick(
+                    first_shard,
+                    &mut states,
+                    Now {
+                        instant: now,
+                        unix_millis: clock(),
+                    },
+                    &trace,
+                );
             }
         }
     }
