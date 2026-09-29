@@ -32,4 +32,12 @@ fn a_node_crashed_at_rest_serves_every_acknowledged_write_afterwards() {
         outcome.expected_sum, outcome.actual_sum,
         "every increment was synced before the crash: {outcome:?}"
     );
+    assert!(
+        outcome.snapshot_cycles >= 1,
+        "the settle is long enough for a cycle to complete before the crash: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.snapshots_refused_at_start, 0,
+        "nothing was mid-cycle at rest: {outcome:?}"
+    );
 }

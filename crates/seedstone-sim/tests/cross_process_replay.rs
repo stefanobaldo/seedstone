@@ -138,6 +138,11 @@ fn the_standard_shape_replays_across_processes() {
             sim_seed,
             &SimConfig::standard(WORKLOAD_SEED, sim_seed),
             |outcome| {
+                if outcome.snapshot_cycles == 0 {
+                    return Err("the seed completed no snapshot cycle, so the checkpoint's \
+                                fold is untested here"
+                        .to_owned());
+                }
                 // The standard shape's distinguishing machinery is that it
                 // decides anything at all: a seed whose workload never
                 // exercised an invariant replays an empty claim.
@@ -149,6 +154,31 @@ fn the_standard_shape_replays_across_processes() {
             },
         );
     }
+}
+
+/// A standard seed whose node completed snapshot cycles and was then
+/// crashed inside one: the start that followed met an unfinished snapshot
+/// and refused it. Seed 1 draws no crash, so it cannot say this.
+#[test]
+fn a_standard_seed_crashed_inside_a_cycle_replays_across_processes() {
+    const CRASHED_INSIDE: u64 = 3;
+    replays_across_processes(
+        "standard",
+        None,
+        CRASHED_INSIDE,
+        &SimConfig::standard(WORKLOAD_SEED, CRASHED_INSIDE),
+        |outcome| {
+            if outcome.snapshot_cycles == 0 || outcome.crashes == 0 {
+                return Err("the seed no longer cycles and crashes".to_owned());
+            }
+            if outcome.snapshots_refused_at_start == 0 {
+                return Err("no crash landed inside a cycle any more: pick a seed that \
+                            refuses a snapshot at its start"
+                    .to_owned());
+            }
+            Ok(())
+        },
+    );
 }
 
 #[test]
