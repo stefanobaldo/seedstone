@@ -404,7 +404,10 @@ pub trait ReplicationLog: Send + 'static {
     /// # Errors
     ///
     /// Whatever the store reports. Nothing flushed since the last successful
-    /// sync may be assumed durable afterwards; the next tick syncs again.
+    /// sync may be assumed durable afterwards, and a filesystem may drop
+    /// what a failed sync could not write and succeed on the next one — so
+    /// an implementation that cannot tell must not advance the durable
+    /// point past a failure. The next tick syncs again.
     fn sync(&mut self) -> std::io::Result<Option<u64>>;
 
     /// Whether [`append`](ReplicationLog::append) reads the record's
