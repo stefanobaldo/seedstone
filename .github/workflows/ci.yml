@@ -110,13 +110,16 @@ jobs:
       # one workload — the one whose simulated clients each walk their own keys
       # with `SCAN` under churn — and to no other: a rate whose workload goes
       # unstated is exactly how this comment went stale once already. The most
-      # recent run here swept 275 seeds in 475 s, 1.73 s per seed, the seeds
+      # recent run here swept 275 seeds in 403 s, 1.47 s per seed, the seeds
       # running in parallel across the runner's four cores, after the workload
-      # last changed: the node is now crashed up to twice per seed, under load,
-      # and its clients reconnect and read back against a model widened to
-      # what each crash leaves open. The budget this step was given is ~7
-      # minutes, so 475 s is over it and still inside the job's own 20-minute
-      # timeout — the whole job ran 15 min 15 s. The count stays at 275
+      # last changed: the node now snapshots its shards a budget per tick and
+      # deletes the log the snapshot covers, and every seed completes at least
+      # one cycle under its crashes (up to two per seed, under load, its
+      # clients reading back against a model widened to what each crash
+      # leaves open). The budget this step was given is ~7 minutes, so 403 s
+      # is inside it; the whole job ran 18 min 42 s of its 20-minute timeout,
+      # the tests before this step having grown with the snapshot simulations.
+      # The count stays at 275
       # because buying that margin back is paid in seeds, and seeds are
       # detection power. Do not
       # recalibrate this from a developer machine: adding the walk took the same
