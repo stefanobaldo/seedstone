@@ -207,10 +207,11 @@ little writing may take a long time to reach 64 MiB, and until it does the
 directory holds the previous process's files beside the new one's. A
 second restart before then adds a third process's files, and so on: each
 process's share is within the bound above, and all of them are removed
-together by the first process whose executors all complete a snapshot. A start
-reads the newest snapshot of each shard and the log still on disk, so both
-the time a start takes and the memory it needs grow with the keyspace plus
-that log — which the bound above limits — not with the whole write history.
+together by the first process whose executors all complete a snapshot. A
+start reads the newest snapshot of each shard and the log still on disk, so
+both the time a start takes and the memory it needs grow with the keyspace
+plus that log — which the bound above limits — not with the whole write
+history.
 
 The bound holds on a disk that eventually writes. A disk that refuses every
 write parks the snapshot (`log_fault` with `stage` `snapshot`, retried on

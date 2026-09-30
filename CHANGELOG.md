@@ -19,9 +19,10 @@ SemVer and are `0.x` until the server persists data;
   executor takes a snapshot of its shards without stopping them, then
   removes the log the snapshot covers. An executor's files stay within
   about three times its last snapshot plus 64 MiB, plus what is written
-  from the log crossing its threshold until the snapshot is durable, and a start reads the newest snapshot plus the log
-  since it rather than the whole history. `docs/operations.md` states the
-  bound, and what a restart keeps until it is reached again.
+  from the log crossing its threshold until the snapshot is durable, and a
+  start reads the newest snapshot plus the log since it rather than the
+  whole history. `docs/operations.md` states the bound, and what a restart
+  keeps until it is reached again.
 
 ## [0.2.0] - 2026-09-22
 
