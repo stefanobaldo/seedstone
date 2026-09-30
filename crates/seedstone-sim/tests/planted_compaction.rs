@@ -13,8 +13,15 @@
 
 use seedstone_sim::{Plant, SimConfig, SimOutcome, run_sim};
 
-/// How many standard seeds each claim is given.
+/// How many standard seeds each plant is given.
 const SEEDS: u64 = 12;
+
+/// How many the honest node is held to on its own. Fewer than the plants
+/// are given, because each costs a whole `standard` run in the test build
+/// and the per-PR job's budget is shared: seeds 2 to 5 already crash inside
+/// a cycle, the 275-seed sweep holds every seed to the invariants, and a
+/// plant's catching seed is run clean again beside it.
+const HONEST_SEEDS: u64 = 6;
 
 fn standard(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
     let mut cfg = SimConfig::standard(1, sim_seed);
@@ -29,7 +36,7 @@ fn standard(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
 #[test]
 fn the_honest_node_cycles_on_every_seed_and_is_crashed_inside_a_cycle_on_some() {
     let mut crashed_inside = false;
-    for sim_seed in 1..=SEEDS {
+    for sim_seed in 1..=HONEST_SEEDS {
         let outcome = standard(sim_seed, None);
         assert!(
             outcome.invariant_holds(),
@@ -55,7 +62,7 @@ fn the_honest_node_cycles_on_every_seed_and_is_crashed_inside_a_cycle_on_some() 
     }
     assert!(
         crashed_inside,
-        "no seed in 1..={SEEDS} crashed inside a cycle: the crash window and the cycle's \
+        "no seed in 1..={HONEST_SEEDS} crashed inside a cycle: the crash window and the cycle's \
          length no longer overlap; lower SIM_CHECKPOINT.bytes_per_tick, do not widen"
     );
 }
