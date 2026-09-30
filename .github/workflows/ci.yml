@@ -60,7 +60,15 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
-      - run: cargo test --workspace
+      # The simulator's tests run in release, in a step of their own. Each is
+      # a whole simulated run, and in the test build the snapshot simulations
+      # alone took `cargo test --workspace` from ~420 s to 600–700 s, which
+      # left the job over its timeout on a slow runner. Everything else runs in
+      # the test build as before, and the local gate still runs all of it
+      # there, `debug_assert!`s included.
+      - run: cargo test --workspace --exclude seedstone-sim
+      - name: the simulator's tests, in release
+        run: cargo test -p seedstone-sim --release
       # Linkage, a different axis from the feature unification the step above
       # covers: neither subsumes the other, and both are load-bearing.
       - name: no simulator crate in the production dependency graph
