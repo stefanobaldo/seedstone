@@ -374,6 +374,16 @@ async fn an_expiry_is_logged_exactly_as_a_delete_is() {
         fn sync(&mut self) -> std::io::Result<Option<u64>> {
             Ok(None)
         }
+        fn flushed_through(&self) -> Option<u64> {
+            None
+        }
+        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+            None
+        }
+        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
+            None
+        }
+        fn sync_failed(&mut self) {}
     }
 
     let log = Recording::default();
@@ -635,6 +645,16 @@ async fn a_sweep_whose_record_cannot_be_written_leaves_the_key() {
         fn sync(&mut self) -> std::io::Result<Option<u64>> {
             Ok(None)
         }
+        fn flushed_through(&self) -> Option<u64> {
+            None
+        }
+        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+            None
+        }
+        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
+            None
+        }
+        fn sync_failed(&mut self) {}
     }
 
     let log = Breakable::default();
