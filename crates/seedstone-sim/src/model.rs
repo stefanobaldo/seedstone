@@ -638,7 +638,7 @@ impl Model {
             seen.push(*slot);
         }
 
-        if predictable {
+        if predictable && !matches!(reply, Frame::Error(_)) {
             let agrees = if self.evictable {
                 matches!(reply, Frame::Integer(n) if (0..=counted).contains(n))
             } else {
