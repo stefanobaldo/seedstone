@@ -107,6 +107,18 @@ page was written. One shape covers all of them — `ERR unknown command
   used when the request named a parameter exactly, and its own when the request
   was a glob.
 
+- **A log the disk refuses answers `MISCONF` to every write.** When a write
+  or a sync of the log under `--data-dir` fails, each write on the shards of
+  the executor that saw it is answered `MISCONF Errors writing to the log:
+  writes are refused until a snapshot is durable`, and reads are served.
+  6.2.24 and 8.10.1, with `appendfsync everysec` and the AOF on a full disk,
+  answer every write `MISCONF Errors writing to the AOF file: No space left on
+  device`, serve reads, and resume once a write succeeds again; with
+  `appendfsync always` both exit on the failed write. This server exits under
+  no setting: it resumes when a snapshot of the refusing executor's memory is
+  durable, and only that executor's shards refuse meanwhile — see
+  [operations.md](operations.md).
+
 - **Authentication** is one password for the `default` user, sent as `AUTH
   password`, `AUTH default password` or `HELLO 2 AUTH default password`. There
   are no ACL users. A `HELLO` that names a version this server does not speak,
