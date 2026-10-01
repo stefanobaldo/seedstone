@@ -739,7 +739,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         // the last thing the tick spends. It may rotate with a sync in
         // flight: the rotation syncs what the old file holds unsynced, and
         // the sync in flight keeps its own handle on that file.
-        self.checkpoint.tick(
+        let _completed = self.checkpoint.tick(
             self.first_shard,
             &mut self.states,
             Now {

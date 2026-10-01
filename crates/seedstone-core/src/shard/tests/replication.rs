@@ -910,10 +910,11 @@ async fn the_checkpoint_is_ticked_once_per_executor_per_housekeeping_tick() {
             states: &mut [ShardState<L>],
             _now: Now,
             _trace: &T,
-        ) {
+        ) -> bool {
             self.ticks.fetch_add(1, Ordering::SeqCst);
             self.shards_seen
                 .fetch_max(states.len() as u64, Ordering::SeqCst);
+            false
         }
     }
 

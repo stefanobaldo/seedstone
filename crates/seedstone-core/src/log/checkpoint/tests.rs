@@ -884,3 +884,70 @@ fn a_failed_rotation_is_retried_under_a_new_name_and_the_start_reads_no_damage()
     let keys: usize = recovery.shards.iter().map(|s| s.dict.len()).sum();
     assert_eq!(keys, 9);
 }
+
+/// A forced checkpoint opens on the next tick below the threshold, on a
+/// fresh rotation, and `tick` says when its snapshot is durable.
+#[test]
+fn force_opens_a_cycle_below_the_threshold_and_tick_reports_the_completion() {
+    let mut b = bench(1, FLOOR_ONLY);
+    put(&mut b.states[0], b"a", b"1");
+    flush_and_sync(&mut b.states);
+    assert!(live_log_bytes(&b.segment) < FLOOR_ONLY.floor);
+    assert!(
+        !b.checkpoint.tick(0, &mut b.states, now(), &NoTrace),
+        "below the threshold: nothing"
+    );
+    assert!(!b.checkpoint.is_open());
+    b.checkpoint.force();
+    let mut completed = b.checkpoint.tick(0, &mut b.states, now(), &NoTrace);
+    assert_eq!(lock(&b.segment).rotation, 1, "a fresh rotation");
+    for _ in 0..8 {
+        if completed {
+            break;
+        }
+        completed = b.checkpoint.tick(0, &mut b.states, now(), &NoTrace);
+    }
+    assert!(completed, "the forced cycle completes");
+    assert_eq!(b.checkpoint.cycles_completed(), 1);
+    assert!(!b.checkpoint.is_open());
+    assert!(
+        !b.checkpoint.tick(0, &mut b.states, now(), &NoTrace),
+        "forced once: below the threshold again, nothing opens"
+    );
+    assert_eq!(lock(&b.segment).rotation, 1);
+}
+
+/// Forcing while a cycle is open abandons it: its bases predate the
+/// failure that forced it, so the image plus a tail with a hole would
+/// lose records. The new cycle takes the bases of now.
+#[test]
+fn force_while_open_abandons_the_cycle_and_takes_fresh_bases() {
+    let mut b = bench(
+        2,
+        CheckpointConfig {
+            bytes_per_tick: 1,
+            ..FLOOR_ONLY
+        },
+    );
+    eight_keys_past_the_floor(&mut b);
+    assert!(!b.checkpoint.tick(0, &mut b.states, now(), &NoTrace));
+    assert!(b.checkpoint.is_open());
+    let first_file = snapshot_name(1, 0, 0);
+    assert!(b.disk.list(Path::new(WAL)).unwrap().contains(&first_file));
+    // The records a failed sync would lose.
+    put(&mut b.states[0], b"late", b"1");
+    put(&mut b.states[1], b"late2", b"1");
+    b.checkpoint.force();
+    assert!(!b.checkpoint.is_open(), "abandoned");
+    assert!(
+        !b.disk.list(Path::new(WAL)).unwrap().contains(&first_file),
+        "its file removed"
+    );
+    b.checkpoint.tick(0, &mut b.states, now(), &NoTrace);
+    assert_eq!(lock(&b.segment).rotation, 2, "rotated again");
+    assert_eq!(
+        b.checkpoint.open_bases(),
+        vec![b.states[0].seq, b.states[1].seq],
+        "the bases of now"
+    );
+}
