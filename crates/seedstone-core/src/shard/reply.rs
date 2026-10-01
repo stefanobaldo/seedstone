@@ -30,7 +30,18 @@ pub enum ReplyError {
     /// an executor task only stops when its inbox closes. It exists so the
     /// dispatch path has no `unwrap`.
     ShardUnavailable,
-    /// A mutation whose log record could not be written.
+    /// A mutation whose log record could not be written, or a write refused
+    /// because its executor's log could not be kept: a write or a sync of
+    /// it failed, and writes stay refused until a snapshot of the
+    /// executor's memory is durable. Reads are served meanwhile.
+    ///
+    /// The text opens as Redis's answer to a write it cannot append to its
+    /// AOF. Read on `redis:6-alpine` (6.2.24) and `redis:8.10.1` on
+    /// 2026-10-01, with the AOF on a full tmpfs: under `appendfsync
+    /// everysec` both answer every write `-MISCONF Errors writing to the
+    /// AOF file: No space left on device`, serve reads, count it as
+    /// `errorstat_MISCONF`, and resume on their own once a write succeeds
+    /// again; under `appendfsync always` both exit on the failed write.
     ///
     /// **A read can answer this too, and that is new.** A command meeting a
     /// key whose deadline has passed must log the eviction before removing it,
@@ -61,7 +72,11 @@ impl ReplyError {
             Self::NotAnInteger => "ERR value is not an integer or out of range",
             Self::WouldOverflow => "ERR increment or decrement would overflow",
             Self::ShardUnavailable => "ERR shard is unavailable",
-            Self::LogWriteFailed => "ERR replication log write failed",
+            // Redis's code and opening words, our own reason: see the
+            // variant for the reading.
+            Self::LogWriteFailed => {
+                "MISCONF Errors writing to the log: writes are refused until a snapshot is durable"
+            }
             // Redis's text, trailing full stop and all: clients match on it.
             Self::OutOfMemory => "OOM command not allowed when used memory > 'maxmemory'.",
         }
@@ -130,4 +145,19 @@ pub enum Reply {
     /// The command failed. See [`ReplyError`] — a closed set of
     /// server-authored failures, none of whose texts can split a frame.
     Error(ReplyError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refused write opens with the code Redis gives a write it cannot
+    /// append to its AOF, which is what a client matches on — and what the
+    /// simulator's model reads a refusal by.
+    #[test]
+    fn a_refused_write_opens_with_redis_s_code_for_a_failed_aof_write() {
+        let text = ReplyError::LogWriteFailed.wire_text();
+        assert_eq!(text.split(' ').next(), Some("MISCONF"));
+        assert!(text.starts_with("MISCONF Errors writing to the "));
+    }
 }
