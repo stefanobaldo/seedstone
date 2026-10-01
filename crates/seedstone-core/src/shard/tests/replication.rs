@@ -369,10 +369,11 @@ async fn every_mutation_logs_its_effect_with_an_absolute_deadline() {
     );
 }
 
-/// The tick flushes every shard's log, then syncs it, and a failure of
-/// either reaches the trace sink as a fault rather than vanishing.
+/// A write is flushed with its envelope and a sync issued after it; the
+/// tick retries a flush that failed; and every failure reaches the trace
+/// sink as a fault rather than vanishing.
 #[tokio::test(start_paused = true)]
-async fn the_tick_flushes_then_syncs_and_reports_a_failure() {
+async fn a_write_flushes_then_issues_a_sync_and_reports_a_failure() {
     use crate::shard::{HOUSEKEEPING_TICK, LogFault, PoolSpec, TraceSink};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -442,14 +443,16 @@ async fn the_tick_flushes_then_syncs_and_reports_a_failure() {
     tokio::task::yield_now().await;
 
     let seen = journal.0.lock().expect("journal").clone();
-    assert!(
-        seen.starts_with(&["append", "flush", "sync"]),
-        "flush precedes sync on the tick, and the failed flush does not stop the sync: {seen:?}"
+    assert_eq!(
+        seen,
+        ["append", "flush", "begin_sync", "flush", "begin_sync"],
+        "the envelope flushes and issues; the tick retries the flush and issues again; \
+         a failed flush stops neither"
     );
     assert_eq!(
         faults.0.load(Ordering::SeqCst),
-        1,
-        "one flush failed, one fault reported"
+        2,
+        "the envelope's flush and the tick's retry failed, each reported"
     );
 }
 
