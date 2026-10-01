@@ -8,7 +8,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use seedstone_core::log::disk::{Disk, LogFile};
+use seedstone_core::log::disk::{Disk, LogFile, SyncFuture};
 use turmoil::fs::shim::std::fs::{self as sim_fs, File, OpenOptions};
 
 /// The simulated filesystem of the current host.
@@ -27,6 +27,11 @@ impl LogFile for SimFile {
 
     fn sync_data(&mut self) -> io::Result<()> {
         self.0.sync_data()
+    }
+
+    /// turmoil's sync, taken at the call and answered at once.
+    fn sync_later(&self) -> SyncFuture {
+        Box::pin(std::future::ready(self.0.sync_data()))
     }
 }
 
