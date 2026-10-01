@@ -37,7 +37,7 @@
 //! and tried again at the next cycle; recovery removes it at the next start.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 
@@ -110,14 +110,21 @@ impl CheckpointConfig {
 /// real one over its own disk.
 pub trait Checkpoint: Send + 'static {
     /// One tick's work over the executor's shards, with `first_shard` the
-    /// id of `states[0]` and `now` the tick's one clock reading.
+    /// id of `states[0]` and `now` the tick's one clock reading. `true` on
+    /// the tick a snapshot became durable.
     fn tick<L: ReplicationLog, T: TraceSink>(
         &mut self,
         first_shard: u16,
         states: &mut [ShardState<L>],
         now: Now,
         trace: &T,
-    );
+    ) -> bool;
+
+    /// Open a cycle on the next tick whatever the live log — the way out of
+    /// a log the disk refused: everything in memory, imaged on a fresh
+    /// rotation. A cycle already open is abandoned, because its bases
+    /// predate the refusal.
+    fn force(&mut self) {}
 }
 
 /// The checkpoint of a node with no data directory: nothing.
@@ -131,7 +138,8 @@ impl Checkpoint for NoCheckpoint {
         _states: &mut [ShardState<L>],
         _now: Now,
         _trace: &T,
-    ) {
+    ) -> bool {
+        false
     }
 }
 
@@ -174,6 +182,9 @@ pub struct SegmentCheckpoint<D: Disk> {
     rounded: bool,
     /// The planted defect: delete before the footer is durable.
     deletes_before_durable: bool,
+    /// The next tick opens a cycle whatever the live log: see
+    /// [`Checkpoint::force`].
+    forced: bool,
     open: Option<Cycle<D::File>>,
 }
 
@@ -245,6 +256,7 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
             last_snapshot: 0,
             rounded: false,
             deletes_before_durable: false,
+            forced: false,
             open: None,
         }
     }
@@ -264,6 +276,20 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
     #[must_use]
     pub const fn cycles_completed(&self) -> u32 {
         self.completed
+    }
+
+    /// Whether a cycle is open.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// The open cycle's bases, per owned shard.
+    #[cfg(test)]
+    fn open_bases(&self) -> Vec<u64> {
+        self.open
+            .as_ref()
+            .map_or_else(Vec::new, |cycle| cycle.bases.clone())
     }
 
     /// Bytes of live log at which the next cycle opens.
@@ -365,9 +391,13 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         restarted.ticks = cycle.ticks;
         self.cycle += 1;
         *cycle = restarted;
-        // Best effort, and not reported: a failure here leaves a file the
-        // next compaction removes, and reports then if it fails again.
-        let _ = self.disk.remove_file(&abandoned);
+        self.remove_abandoned(&abandoned);
+    }
+
+    /// Best effort, and not reported: a failure here leaves a file the
+    /// next compaction removes, and reports then if it fails again.
+    fn remove_abandoned(&self, path: &Path) {
+        let _ = self.disk.remove_file(path);
     }
 
     /// Writes whatever the buffer holds.
@@ -651,21 +681,42 @@ impl<D: Disk + Send + 'static> Checkpoint for SegmentCheckpoint<D> {
         states: &mut [ShardState<L>],
         now: Now,
         trace: &T,
-    ) {
+    ) -> bool {
         if self.open.is_none() {
-            if live_log_bytes(&self.segment) < self.threshold() {
-                return;
+            if !self.forced && live_log_bytes(&self.segment) < self.threshold() {
+                return false;
             }
             if let Err(error) = self.open_cycle(first_shard, states, trace) {
                 trace.fault(first_shard, LogFault::Snapshot, &error);
-                return;
+                return false;
             }
+            self.forced = false;
         }
         match self.step(first_shard, states, now) {
-            Ok(false) => {}
-            Ok(true) => self.finish(first_shard, states, trace),
-            Err(error) => trace.fault(first_shard, LogFault::Snapshot, &error),
+            Ok(false) => false,
+            Ok(true) => {
+                self.finish(first_shard, states, trace);
+                true
+            }
+            Err(error) => {
+                trace.fault(first_shard, LogFault::Snapshot, &error);
+                false
+            }
         }
+    }
+
+    fn force(&mut self) {
+        if let Some(cycle) = self.open.take() {
+            // Its file, if it has one, is never finished: whatever it holds
+            // was scanned against bases the refusal made wrong.
+            if cycle.file.is_some() {
+                let abandoned =
+                    self.wal
+                        .join(snapshot_name(self.generation, self.executor, cycle.number));
+                self.remove_abandoned(&abandoned);
+            }
+        }
+        self.forced = true;
     }
 }
 
