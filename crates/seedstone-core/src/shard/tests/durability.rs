@@ -3,16 +3,21 @@
 
 use super::support::{get, set};
 use crate::dict::DictSeed;
-use crate::log::checkpoint::NoCheckpoint;
-use crate::log::disk::SyncFuture;
+use crate::log::checkpoint::{CheckpointConfig, CheckpointSpec, NoCheckpoint, SegmentCheckpoint};
+use crate::log::disk::mem::MemDisk;
+use crate::log::disk::{Disk, SyncFuture};
+use crate::log::file::{FileLog, open_segments};
 use crate::log::{Record, ReplicationLog};
 use crate::memory::MemoryLimit;
 use crate::shard::{
-    Deadlines, ExecutorPlants, HOUSEKEEPING_TICK, NoTrace, PoolSpec, Reply, Router, SHUTDOWN_GRACE,
-    ShardPool, Shutdown, SyncPolicy, frozen_clock,
+    Command, Deadlines, ExecutorPlants, HOUSEKEEPING_TICK, LogFault, NoTrace, PoolSpec,
+    RefusalReport, Reply, ReplyError, Router, SHUTDOWN_GRACE, ShardPool, Shutdown, SyncPolicy,
+    TraceSink, frozen_clock,
 };
 use bytes::Bytes;
 use std::collections::VecDeque;
+use std::path::Path;
+use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -259,4 +264,219 @@ async fn shutdown_gives_up_after_the_grace_period() {
     });
     tokio::time::advance(SHUTDOWN_GRACE + Duration::from_millis(1)).await;
     assert_eq!(stopping.await.unwrap(), Shutdown::TimedOut);
+}
+
+/// The faults and the refusals an executor reported.
+#[derive(Clone, Default)]
+struct Story {
+    faults: Arc<Mutex<Vec<LogFault>>>,
+    ended: Arc<Mutex<Vec<RefusalReport>>>,
+}
+
+impl Story {
+    fn faults_of(&self, fault: LogFault) -> usize {
+        let faults = self.faults.lock().expect("story");
+        faults.iter().filter(|seen| **seen == fault).count()
+    }
+
+    fn refusals_ended(&self) -> Vec<RefusalReport> {
+        self.ended.lock().expect("story").clone()
+    }
+}
+
+impl TraceSink for Story {
+    fn record(&self, _: u16, _: u64, _: &Command, _: &Reply) {}
+    fn fault(&self, _shard: u16, fault: LogFault, _error: &std::io::Error) {
+        self.faults.lock().expect("story").push(fault);
+    }
+    fn refusal_ended(&self, report: &RefusalReport) {
+        self.ended.lock().expect("story").push(*report);
+    }
+}
+
+const WAL: &str = "/data/wal";
+
+/// A pool of one executor over the in-memory disk, with the real log and
+/// the real checkpoint, whose floor no write reaches: only a forced cycle
+/// opens.
+fn disk_pool(policy: SyncPolicy, story: &Story) -> (MemDisk, ShardPool) {
+    let disk = MemDisk::default();
+    let wal = Path::new(WAL);
+    disk.create_dir_all(wal).unwrap();
+    let segments = open_segments(&disk, wal, 1, 1).unwrap();
+    let round = Arc::new(AtomicU16::new(0));
+    let (log_segment, cp_segment) = (Arc::clone(&segments[0]), Arc::clone(&segments[0]));
+    let cp_disk = disk.clone();
+    let pool = ShardPool::spawn_spec(PoolSpec {
+        shards: 2,
+        executors: 1,
+        seed: DictSeed { k0: 1, k1: 2 },
+        trace: story.clone(),
+        make_log: move |shard| FileLog::new(shard, Arc::clone(&log_segment)),
+        policy: Deadlines,
+        limit: MemoryLimit::default(),
+        clock: frozen_clock,
+        recovered: Vec::new(),
+        make_checkpoint: move |executor| {
+            SegmentCheckpoint::new(CheckpointSpec {
+                disk: cp_disk.clone(),
+                wal: wal.to_path_buf(),
+                generation: 1,
+                executor,
+                executors: 1,
+                segment: Arc::clone(&cp_segment),
+                round: Arc::clone(&round),
+                config: CheckpointConfig {
+                    floor: u64::MAX,
+                    ratio: 1,
+                    bytes_per_tick: 1 << 20,
+                },
+            })
+        },
+        sync: policy,
+        plants: ExecutorPlants::default(),
+    });
+    (disk, pool)
+}
+
+/// `ticks` housekeeping ticks, each let run.
+async fn tick(ticks: u32) {
+    for _ in 0..ticks {
+        tokio::time::advance(HOUSEKEEPING_TICK).await;
+        settle().await;
+    }
+}
+
+fn refused() -> Reply {
+    Reply::Error(ReplyError::LogWriteFailed)
+}
+
+/// A sync that fails under `always` answers the held batch with the
+/// refusal, refuses every later write, serves reads — and the refused
+/// write that was applied is in memory, where a reader sees it.
+#[tokio::test(start_paused = true)]
+async fn a_failed_sync_refuses_writes_until_a_snapshot_lands() {
+    let story = Story::default();
+    let (disk, pool) = disk_pool(SyncPolicy::ALWAYS, &story);
+    disk.fail_syncs(true);
+    assert_eq!(
+        pool.dispatch(set(b"k", b"1")).await,
+        refused(),
+        "the held batch is answered with the refusal"
+    );
+    assert_eq!(
+        pool.dispatch(set(b"k", b"2")).await,
+        refused(),
+        "and every write after it"
+    );
+    assert_eq!(
+        pool.dispatch(get(b"k")).await,
+        Reply::Bulk(Some(Bytes::from_static(b"1"))),
+        "reads are served, and the applied write is what memory holds"
+    );
+    assert_eq!(
+        pool.dispatch(Command::Del {
+            key: Bytes::from_static(b"k")
+        })
+        .await,
+        refused(),
+        "a delete is a write"
+    );
+    assert_eq!(story.faults_of(LogFault::Sync), 1);
+    disk.fail_syncs(false);
+    // The way out: the forced cycle runs on the ticks, and lands.
+    tick(6).await;
+    assert_eq!(
+        pool.dispatch(set(b"k", b"3")).await,
+        Reply::Ok,
+        "serving again"
+    );
+    let ended = story.refusals_ended();
+    assert_eq!(ended.len(), 1);
+    assert_eq!(
+        ended[0].refused, 2,
+        "the writes refused meanwhile, not the held one"
+    );
+    assert_eq!(ended[0].executor_first_shard, 0);
+    assert!(ended[0].ticks >= 1);
+    assert!(
+        disk.list(Path::new(WAL))
+            .unwrap()
+            .iter()
+            .any(|name| Path::new(name).extension().is_some_and(|ext| ext == "snap")),
+        "the snapshot that ended it"
+    );
+}
+
+/// A write that fails — a full disk — refuses the same way under
+/// `interval`, where nothing was held: the next write is refused, and the
+/// recovery snapshot covers what was acknowledged before.
+#[tokio::test(start_paused = true)]
+async fn a_full_disk_refuses_writes_and_a_snapshot_resumes_them() {
+    let story = Story::default();
+    let (disk, pool) = disk_pool(SyncPolicy::INTERVAL, &story);
+    assert_eq!(pool.dispatch(set(b"before", b"v")).await, Reply::Ok);
+    disk.fail_writes_with(std::io::ErrorKind::StorageFull);
+    assert_eq!(
+        pool.dispatch(set(b"k", b"1")).await,
+        Reply::Ok,
+        "acknowledged: the flush fails after apply, and interval holds nothing"
+    );
+    assert_eq!(pool.dispatch(set(b"k", b"2")).await, refused());
+    assert_eq!(
+        pool.dispatch(get(b"before")).await,
+        Reply::Bulk(Some(Bytes::from_static(b"v")))
+    );
+    tick(3).await;
+    assert_eq!(
+        pool.dispatch(set(b"k", b"3")).await,
+        refused(),
+        "a full disk fails the snapshot too: still refusing"
+    );
+    assert!(story.faults_of(LogFault::Snapshot) >= 1);
+    assert!(story.refusals_ended().is_empty());
+    disk.fail_writes(false);
+    tick(6).await;
+    assert_eq!(pool.dispatch(set(b"k", b"3")).await, Reply::Ok);
+    assert_eq!(
+        pool.dispatch(get(b"k")).await,
+        Reply::Bulk(Some(Bytes::from_static(b"3")))
+    );
+    assert_eq!(story.refusals_ended().len(), 1);
+}
+
+/// A stop whose final sync fails answers what it held with the refusal,
+/// not as a success no sync stands behind.
+#[tokio::test(start_paused = true)]
+async fn a_stop_whose_last_sync_fails_answers_its_held_writes_with_the_refusal() {
+    let log = Latent::default();
+    let pool = pool(SyncPolicy::ALWAYS, &log);
+    let first = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.dispatch(set(b"k", b"1")).await }
+    });
+    settle().await;
+    let second = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.dispatch(set(b"k", b"2")).await }
+    });
+    settle().await;
+    assert_eq!(
+        log.issued(),
+        1,
+        "the second write waits behind the first sync"
+    );
+    let stopping = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.shutdown().await }
+    });
+    settle().await;
+    log.complete_next(Ok(()));
+    settle().await;
+    assert_eq!(first.await.unwrap(), Reply::Ok);
+    assert_eq!(log.issued(), 2, "the stop's own sync, for the second write");
+    log.complete_next(Err(std::io::Error::other("injected")));
+    assert_eq!(second.await.unwrap(), refused());
+    assert_eq!(stopping.await.unwrap(), Shutdown::Clean);
+    assert_eq!(log.state().failed, 1);
 }

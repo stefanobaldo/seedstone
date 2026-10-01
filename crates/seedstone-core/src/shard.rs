@@ -60,7 +60,7 @@ mod reply;
 
 pub use apply::parse_i64;
 pub use command::{Command, Cond, Expiry, KIND_SLOTS, Route};
-pub use durability::{ExecutorPlants, SyncPolicy};
+pub use durability::{ExecutorPlants, RefusalReport, SyncPolicy};
 pub use executor::{
     EVICTION_SAMPLES, HOUSEKEEPING_TICK, Now, Replayed, ShardState, frozen_clock, replay_into,
 };

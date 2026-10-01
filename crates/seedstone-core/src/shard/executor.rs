@@ -10,10 +10,10 @@ use crate::log::disk::SyncFuture;
 use crate::log::effect::{Effect, Owned};
 use crate::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use crate::shard::apply::{append, apply};
-use crate::shard::durability::{Held, SyncState, send};
+use crate::shard::durability::{Held, Mode, SyncState, send};
 use crate::shard::{
-    Command, Envelope, EvictionPolicy, ExecutorPlants, ExpiryPolicy, KIND_SLOTS, LogFault, Reply,
-    ReplyError, Route, ShardPolicy, ShardStats, SyncPolicy, TraceSink,
+    Command, Envelope, EvictionPolicy, ExecutorPlants, ExpiryPolicy, KIND_SLOTS, LogFault,
+    RefusalReport, Reply, ReplyError, Route, ShardPolicy, ShardStats, SyncPolicy, TraceSink,
 };
 use bytes::Bytes;
 use std::io;
@@ -481,11 +481,8 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             let result = in_flight(&mut self.sync.in_flight).await;
             self.sync_done(result);
         }
-        for offset in 0..self.states.len() {
-            if let Err(error) = self.states[offset].log.flush() {
-                self.trace
-                    .fault(self.shard_at(offset), LogFault::Write, &error);
-            }
+        if self.flush_all() {
+            self.refuse();
         }
         if let Some(sync) = self.states[0].log.begin_sync() {
             let through: Vec<_> = self
@@ -500,12 +497,53 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
                     }
                 }
                 Err(error) => {
-                    self.states[0].log.sync_failed();
                     self.trace.fault(self.first_shard, LogFault::Sync, &error);
+                    self.refuse();
                 }
             }
         }
         self.sync.release_through(self.sync.batch);
+    }
+
+    /// Flushes every owned shard, tracing each failure; whether any failed.
+    /// A failed flush keeps its bytes: see `ReplicationLog::flush`.
+    fn flush_all(&mut self) -> bool {
+        let mut failed = false;
+        for offset in 0..self.states.len() {
+            if let Err(error) = self.states[offset].log.flush() {
+                self.trace
+                    .fault(self.shard_at(offset), LogFault::Write, &error);
+                failed = true;
+            }
+        }
+        failed
+    }
+
+    /// A write or a sync of the log failed, and the fault is traced: from
+    /// here this executor refuses writes until a snapshot of its memory is
+    /// durable.
+    ///
+    /// The segment is marked failed whichever it was — a write that failed
+    /// may have left part of itself in the file, and a later sync would
+    /// otherwise claim the records written after it. What was held is
+    /// answered with the refusal: applied, and not acknowledged. The sync
+    /// in flight is let go — no completion of it could raise a durable
+    /// point now. The checkpoint is forced, abandoning an open cycle whose
+    /// bases predate the failure; its next tick rotates and images memory.
+    /// A failure while already refusing does all of it again, because the
+    /// cycle that was running can no longer be trusted to end the refusal.
+    fn refuse(&mut self) {
+        self.states[0].log.sync_failed();
+        self.sync
+            .fail_all(&Reply::Error(ReplyError::LogWriteFailed));
+        self.sync.in_flight = None;
+        if !self.sync.is_refusing() {
+            self.sync.mode = Mode::Refusing {
+                refused: 0,
+                ticks: 0,
+            };
+        }
+        self.checkpoint.force();
     }
 
     /// The inverse of the envelope's `shard - first_shard`: these states
@@ -547,6 +585,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             wrote |= appended;
             replies.push(answer);
         }
+        let mut failed = false;
         if wrote {
             // Into the page cache, now: the bytes a sync issued after this
             // envelope covers. A shard named twice flushes an empty buffer
@@ -555,6 +594,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
                 let offset = usize::from(*shard - self.first_shard);
                 if let Err(error) = self.states[offset].log.flush() {
                     self.trace.fault(*shard, LogFault::Write, &error);
+                    failed = true;
                 }
             }
             self.sync.dirty = true;
@@ -567,6 +607,12 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             });
         } else {
             send(reply, replies);
+        }
+        // After the batch is placed, so that a held one is answered with
+        // the refusal; one sent at once was acknowledged, as the policy
+        // that sends at once promises nothing more.
+        if failed {
+            self.refuse();
         }
     }
 
@@ -585,6 +631,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             trace,
             policy,
             memory,
+            sync,
             ..
         } = self;
         let state = &mut states[usize::from(shard - *first_shard)];
@@ -598,12 +645,19 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         // could only ever answer half the fields would be an arm
         // whose answer is wrong.
         //
-        // The refusal is here for the same reason in the other
-        // direction: whether a write is over the ceiling is a
-        // question about the node, and `apply` is deliberately a
-        // function of one shard's own state.
+        // The two refusals are here for the same reason in the other
+        // direction: whether the log can be kept, or a write is over
+        // the ceiling, is a question about the executor or the node,
+        // and `apply` is deliberately a function of one shard's own
+        // state. A write refused for the log is not applied.
         let answer = if matches!(cmd, Command::Stats) {
             Reply::Stats(Box::new(stats_of(state)))
+        } else if let Mode::Refusing { refused, .. } = &mut sync.mode
+            && cmd.writes_the_log()
+            && !sync.plants.acks_while_refusing
+        {
+            *refused += 1;
+            Reply::Error(ReplyError::LogWriteFailed)
         } else if memory.limit.mode == EvictionMode::NoEviction
             && cmd.denied_when_full()
             && memory.limit.exceeded(memory.gauge.used())
@@ -618,7 +672,8 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             let before = state.dict.used_bytes();
             let answer = apply(state, shard, cmd, now, policy);
             memory.gauge.apply(before, state.dict.used_bytes());
-            if memory.limit.mode == EvictionMode::AllKeysLru {
+            // Not while refusing: an eviction is a write of its own.
+            if memory.limit.mode == EvictionMode::AllKeysLru && !sync.is_refusing() {
                 // The command's key survives this. `apply` takes
                 // a command's value but never its key — the trace
                 // reads it after — so the route still names it.
@@ -697,8 +752,9 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
                 }
             }
             Err(error) => {
-                self.states[0].log.sync_failed();
                 self.trace.fault(self.first_shard, LogFault::Sync, &error);
+                self.refuse();
+                return;
             }
         }
         self.sync.release_through(batch);
@@ -713,6 +769,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         // executor should not disagree about which keys this tick found
         // expired.
         let now = Instant::now();
+        let refusing = self.sync.is_refusing();
         for offset in 0..self.states.len() {
             let shard = self.shard_at(offset);
             let state = &mut self.states[offset];
@@ -722,13 +779,20 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             // about the sum.
             let before = state.dict.used_bytes();
             state.dict.rehash_step(REHASH_BUCKETS_PER_TICK);
-            sweep_expired(state, shard, &self.trace, now, &self.policy);
-            self.memory.gauge.apply(before, state.dict.used_bytes());
-            // What the sweep appended, and what an earlier failed flush
-            // kept: see `ReplicationLog::flush` for why it keeps its bytes.
-            if let Err(error) = state.log.flush() {
-                self.trace.fault(shard, LogFault::Write, &error);
+            // A refusing executor writes nothing of its own accord: the
+            // sweep's deletions wait, and a read still answers "no key"
+            // for whatever has expired, as it does between two sweeps.
+            if !refusing {
+                sweep_expired(state, shard, &self.trace, now, &self.policy);
             }
+            self.memory.gauge.apply(before, state.dict.used_bytes());
+        }
+        // What the sweep appended, and what an earlier failed flush kept.
+        if self.flush_all() {
+            self.refuse();
+        }
+        if let Mode::Refusing { ticks, .. } = &mut self.sync.mode {
+            *ticks += 1;
         }
         // Whether the flushes wrote anything is the segment's to say; a
         // due sync asks it, and finds nothing when nothing was written.
@@ -739,7 +803,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         // the last thing the tick spends. It may rotate with a sync in
         // flight: the rotation syncs what the old file holds unsynced, and
         // the sync in flight keeps its own handle on that file.
-        let _completed = self.checkpoint.tick(
+        let completed = self.checkpoint.tick(
             self.first_shard,
             &mut self.states,
             Now {
@@ -748,6 +812,16 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             },
             &self.trace,
         );
+        if let (true, Mode::Refusing { refused, ticks }) = (completed, self.sync.mode) {
+            // Forced at the failure, so the snapshot is of memory after
+            // it: everything the failed log held is covered.
+            self.trace.refusal_ended(&RefusalReport {
+                executor_first_shard: self.first_shard,
+                refused,
+                ticks,
+            });
+            self.sync.mode = Mode::Serving;
+        }
     }
 }
 

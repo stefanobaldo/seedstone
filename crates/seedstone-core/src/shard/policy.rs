@@ -4,7 +4,7 @@
 //! can replace.
 
 use crate::dict::WalkOrder;
-use crate::shard::{Command, Reply};
+use crate::shard::{Command, RefusalReport, Reply};
 use tokio::time::Instant;
 
 /// Which half of the tick's durability work failed.
@@ -105,6 +105,11 @@ pub trait TraceSink: Clone + Send + 'static {
     /// every older generation's files when it closed the generation's
     /// first round.
     fn compaction(&self, _report: &CompactionReport) {}
+
+    /// Called once per executor when it serves writes again after refusing
+    /// them: the snapshot of its memory that followed the failure is
+    /// durable. The `fault` that began the refusal came before it.
+    fn refusal_ended(&self, _report: &RefusalReport) {}
 }
 
 /// A [`TraceSink`] that observes nothing. Production's sink.
