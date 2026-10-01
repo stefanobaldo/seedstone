@@ -18,15 +18,15 @@ use seedstone_core::log::file::{FileLog, next_generation, open_segments};
 use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, recover};
 use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{
-    Command, CompactionReport, Deadlines, ExecutorPlants, LogFault, NoTrace, Now, PoolSpec, Reply,
-    ShardPool, Shutdown, SnapshotReport, SyncPolicy, TraceSink,
+    Command, CompactionReport, Deadlines, ExecutorPlants, LogFault, NoTrace, Now, PoolSpec,
+    RefusalReport, Reply, ShardPool, Shutdown, SnapshotReport, SyncPolicy, TraceSink,
 };
 use seedstone_core::slot::executor_of;
 use seedstone_resp::{Frame, encode};
 use seedstone_service::log::{
-    COMPACTION, Event, Field, LOG_FAULT, PASSWORD_RELOAD_FAILED, PASSWORD_RELOAD_SKIPPED,
-    PASSWORD_RELOADED, RECOVERY, RECOVERY_FAILED, RECOVERY_TRUNCATED, SHUTDOWN_TIMEOUT, SNAPSHOT,
-    STOPPING, line,
+    COMPACTION, Event, FSYNC_IGNORED, Field, LOG_FAULT, PASSWORD_RELOAD_FAILED,
+    PASSWORD_RELOAD_SKIPPED, PASSWORD_RELOADED, RECOVERY, RECOVERY_FAILED, RECOVERY_TRUNCATED,
+    REFUSAL_ENDED, SHUTDOWN_TIMEOUT, SNAPSHOT, STOPPING, line,
 };
 use seedstone_service::{NodeInfo, PasswordStore, Passwords, Secret, serve_connection};
 use tokio::io::AsyncWriteExt;
@@ -82,7 +82,8 @@ pub const MAX_CLIENTS_REACHED: &str = "ERR max number of clients reached";
 /// takes is a binary someone has to read the source of.
 pub const USAGE: &str = "usage: seedstone [--bind ADDR:PORT] [--max-clients N] [--maxmemory SIZE] \
                      [--maxmemory-policy allkeys-lru|noeviction] [--requirepass-file PATH] \
-                     [--no-auth] [--data-dir PATH]\n       seedstone --version | --help\n\
+                     [--no-auth] [--data-dir PATH] [--fsync always|interval|never]\n       \
+                     seedstone --version | --help\n\
                      env: SEEDSTONE_REQUIREPASS";
 
 /// The environment variable the password may arrive in instead of a file.
@@ -138,6 +139,13 @@ pub struct Config {
     /// a restart — today's default, and the only mode the node had before
     /// the flag existed.
     pub data_dir: Option<std::path::PathBuf>,
+    /// The durability policy the log is synced under: `interval` unless
+    /// `--fsync` names another. Meaningless without
+    /// [`data_dir`](Self::data_dir).
+    pub fsync: SyncPolicy,
+    /// Whether `--fsync` was given, so that a node with no log can say it
+    /// ignored it.
+    pub fsync_given: bool,
 }
 
 impl Default for Config {
@@ -150,6 +158,8 @@ impl Default for Config {
             source: PasswordSource::None,
             no_auth: false,
             data_dir: None,
+            fsync: SyncPolicy::INTERVAL,
+            fsync_given: false,
         }
     }
 }
@@ -262,6 +272,15 @@ impl Config {
                 "--requirepass-file" => password_file = Some(value_for(&flag, &mut args)?),
                 "--no-auth" => cfg.no_auth = true,
                 "--data-dir" => cfg.data_dir = Some(value_for(&flag, &mut args)?.into()),
+                "--fsync" => {
+                    let value = value_for(&flag, &mut args)?;
+                    cfg.fsync = SyncPolicy::from_name(&value).ok_or_else(|| {
+                        refused(&format!(
+                            "--fsync: not a setting: {value} (always, interval or never)"
+                        ))
+                    })?;
+                    cfg.fsync_given = true;
+                }
                 other => return Err(refused(&format!("unknown argument: {other}"))),
             }
         }
@@ -833,6 +852,17 @@ impl TraceSink for FaultLines {
         );
     }
 
+    fn refusal_ended(&self, report: &RefusalReport) {
+        emit(
+            &REFUSAL_ENDED,
+            &[
+                Field::Num(u64::from(report.executor_first_shard)),
+                Field::Num(report.refused),
+                Field::Num(report.ticks),
+            ],
+        );
+    }
+
     fn compaction(&self, report: &CompactionReport) {
         emit(
             &COMPACTION,
@@ -883,6 +913,9 @@ pub fn is_recovery_failure(error: &std::io::Error) -> bool {
 /// [`is_recovery_failure`]; `recovery_failed` is written first.
 fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Option<std::fs::File>)> {
     let Some(dir) = &cfg.data_dir else {
+        if cfg.fsync_given {
+            emit(&FSYNC_IGNORED, &[]);
+        }
         let pool = ShardPool::spawn_limited(SHARDS, executors(), seed, NoTrace, cfg.limit);
         return Ok((pool, None));
     };
@@ -978,7 +1011,7 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
                 config: CheckpointConfig::PRODUCTION,
             })
         },
-        sync: SyncPolicy::INTERVAL,
+        sync: cfg.fsync,
         plants: ExecutorPlants::default(),
     });
     Ok((pool, Some(lock)))
@@ -1015,11 +1048,44 @@ fn lock_data_dir(wal: &std::path::Path) -> std::io::Result<std::fs::File> {
 mod tests {
     use super::{
         Config, DEFAULT_BIND, EvictionMode, MAX_CLIENTS_REACHED, MemoryLimit, PASSWORD_ENV,
-        PasswordSource, SHARDS, TcpListener, TcpStream, USAGE, configure_accepted, executors,
-        line_for, parse_password_file,
+        PasswordSource, SHARDS, SyncPolicy, TcpListener, TcpStream, USAGE, configure_accepted,
+        executors, line_for, parse_password_file,
     };
     use super::{DictSeed, Server, is_recovery_failure};
     use seedstone_service::log::{Field, STOPPING};
+
+    #[test]
+    fn fsync_is_parsed_and_defaults_to_interval() {
+        let cfg = Config::from_args(std::iter::empty()).unwrap();
+        assert_eq!(cfg.fsync, SyncPolicy::INTERVAL);
+        assert!(!cfg.fsync_given);
+        for (name, policy) in [
+            ("always", SyncPolicy::ALWAYS),
+            ("interval", SyncPolicy::INTERVAL),
+            ("never", SyncPolicy::NEVER),
+        ] {
+            let cfg = Config::from_args(
+                ["--data-dir", "/d", "--fsync", name]
+                    .into_iter()
+                    .map(String::from),
+            )
+            .unwrap();
+            assert_eq!(cfg.fsync, policy, "{name}");
+            assert!(cfg.fsync_given);
+        }
+        let given_alone = Config::from_args(["--fsync", "never"].into_iter().map(String::from));
+        assert!(
+            given_alone.is_ok_and(|cfg| cfg.fsync_given && cfg.data_dir.is_none()),
+            "accepted without --data-dir: the binary warns, and it does nothing"
+        );
+        let refused =
+            Config::from_args(["--fsync", "everysec"].into_iter().map(String::from)).unwrap_err();
+        assert!(
+            refused.contains("--fsync: not a setting: everysec"),
+            "{refused}"
+        );
+        assert!(USAGE.contains("[--fsync always|interval|never]"));
+    }
 
     #[test]
     fn data_dir_is_parsed_and_absent_by_default() {

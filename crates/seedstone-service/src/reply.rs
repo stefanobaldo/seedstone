@@ -21,7 +21,7 @@
 
 use crate::log::{ERROR_REPLY, Field, line};
 use crate::node::{EDGE_NAMES, KIND_NAMES, NodeInfo};
-use seedstone_core::shard::Reply;
+use seedstone_core::shard::{Reply, ReplyError};
 use seedstone_resp::{Frame, ParseError};
 use std::sync::atomic::Ordering;
 
@@ -118,6 +118,17 @@ pub fn error_reply_line(node: &NodeInfo, label: &CommandLabel, text: &str) -> St
 /// own lines take the same shape through the same function.
 pub fn log_error_reply(node: &NodeInfo, label: &CommandLabel, text: &str) {
     eprintln!("{}", error_reply_line(node, label, text));
+}
+
+/// Whether an error reply writes its `error_reply` line.
+///
+/// Every one does but a write refused because its executor's log failed: a
+/// node refusing under load would write one line per refused write, and the
+/// story is already told once — by `log_fault` when the refusal begins and
+/// `refusal_ended` when it ends. It is still counted, in `errorstats` and the
+/// total, like every other error reply.
+pub fn logs_a_line(text: &str) -> bool {
+    text != ReplyError::LogWriteFailed.wire_text()
 }
 
 /// Files one error reply under its code and in the total.
