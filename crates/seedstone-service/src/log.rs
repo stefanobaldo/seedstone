@@ -222,6 +222,26 @@ pub static COMPACTION: Event = Event {
     fields: &["executor", "files", "bytes"],
 };
 
+/// An executor serves writes again.
+///
+/// It refused them after its log failed (`log_fault` came first), and the
+/// snapshot of its memory that followed is durable. `shard` is the
+/// executor's first shard, `refused` the writes
+/// it refused, `ticks` the housekeeping ticks the refusal lasted.
+pub static REFUSAL_ENDED: Event = Event {
+    name: "refusal_ended",
+    level: Level::Info,
+    fields: &["shard", "refused", "ticks"],
+};
+
+/// `--fsync` was given without `--data-dir`: there is no log to sync, and
+/// the setting does nothing.
+pub static FSYNC_IGNORED: Event = Event {
+    name: "fsync_ignored",
+    level: Level::Warn,
+    fields: &[],
+};
+
 /// Every event the server can write, in the order the page lists them.
 pub static EVENTS: &[&Event] = &[
     &LISTENING,
@@ -236,8 +256,10 @@ pub static EVENTS: &[&Event] = &[
     &RECOVERY_TRUNCATED,
     &RECOVERY_FAILED,
     &LOG_FAULT,
+    &REFUSAL_ENDED,
     &SNAPSHOT,
     &COMPACTION,
+    &FSYNC_IGNORED,
 ];
 
 /// One line: the envelope, then `event`'s fields with `values` in order.

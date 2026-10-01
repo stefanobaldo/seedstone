@@ -26,6 +26,7 @@ seedstone --version | --help
 | `--requirepass-file PATH` | none | The password file: one password per line, one or two lines. See *Password and rotation*. |
 | `--no-auth` | off | Run with no password, on purpose. See *Running without a password*. |
 | `--data-dir PATH` | none | Where the node keeps its log. With it, every write is recorded and replayed on the next start; without it a restart is an empty keyspace. Snapshots keep it bounded; see *What `--data-dir` promises*. |
+| `--fsync always\|interval\|never` | `interval` | When the log is synced: `always` before a write is acknowledged, `interval` at least every 100 ms while there is anything to sync, `never` only at a clean stop. Only with `--data-dir`. |
 
 `--version` and `--help` answer on stdout and exit 0, in first position only.
 `SEEDSTONE_REQUIREPASS` in the environment is the other way to give a
@@ -80,8 +81,10 @@ as the server writes them:
 | `recovery_truncated` | `warn` | `shard`, `applied`, `discarded` | one shard's log had a gap: `applied` records before it were replayed, `discarded` after it were not; the node serves what it has |
 | `recovery_failed` | `error` | `error` | the log could not be read — the directory cannot be created or listed, or a segment is from a newer version; the process exits 1 after this line |
 | `log_fault` | `error` | `shard`, `stage`, `error` | a shard's log could not be written (`stage` `write`) or made durable (`sync`), the executor's snapshot could not be written or made durable (`snapshot`), or a file a durable snapshot made redundant could not be removed (`remove`), on a housekeeping tick; for those two, `shard` is the executor's first shard. A failed write keeps its records and the next tick retries it. A failed sync is retried too, but a filesystem may drop what it could not write and report the retry as a success, so writes acknowledged since the last successful sync may be lost until a snapshot covers them; the next start reads what the disk kept and reports any damage it finds. A failed snapshot write or sync starts that snapshot over in a new file; a failed removal is retried at the next snapshot and at the next start |
+| `refusal_ended` | `info` | `shard`, `refused`, `ticks` | the executor whose first shard is `shard` serves writes again: it refused them after its log could not be written or synced (`log_fault` came first), and a snapshot of its memory taken after the failure is durable; `refused` writes were refused over `ticks` housekeeping ticks |
 | `snapshot` | `info` | `executor`, `cycle`, `entries`, `bytes`, `ticks`, `disk_bytes` | one executor's snapshot became durable: `entries` keys in `bytes` bytes, taken over `ticks` housekeeping ticks; `disk_bytes` is the whole of `PATH/wal/` at that moment, before the compaction that follows — the directory's peak |
 | `compaction` | `info` | `executor`, `files`, `bytes` | one executor removed `files` files, `bytes` bytes, that its durable snapshot made redundant: its own older segments and snapshot, or every older process's files once every executor of this process has a durable snapshot |
+| `fsync_ignored` | `warn` | — | `--fsync` was given without `--data-dir`; there is no log to sync, and the setting does nothing |
 
 `error_reply` is `warn` and not `error` on purpose: an `ERR unknown command`
 is the client's mistake or the deployment's, and the server that reported it

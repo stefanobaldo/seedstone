@@ -5,11 +5,11 @@ use super::support::{connected, read_frames, req};
 use crate::connection::serve_connection;
 use crate::info::{errorstats_section, info};
 use crate::node::{NodeInfo, RUN_ID_HEX};
-use crate::reply::count_error_reply;
+use crate::reply::{count_error_reply, logs_a_line};
 use bytes::Bytes;
 use seedstone_core::dict::DictSeed;
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
-use seedstone_core::shard::{NoTrace, ShardPool};
+use seedstone_core::shard::{NoTrace, ReplyError, ShardPool};
 use seedstone_resp::{Frame, encode};
 use std::sync::atomic::Ordering;
 use tokio::io::AsyncWriteExt;
@@ -575,4 +575,20 @@ fn bulk_text(frame: &Frame) -> String {
         Frame::Bulk(bytes) => String::from_utf8(bytes.to_vec()).expect("INFO is not UTF-8"),
         other => panic!("expected a bulk reply, got {other:?}"),
     }
+}
+
+/// A refused write is counted like any error reply and writes no
+/// `error_reply` line: a node refusing under load would otherwise write one
+/// line per write, and `log_fault` and `refusal_ended` already tell it.
+#[test]
+fn a_refused_write_is_counted_and_writes_no_error_reply_line() {
+    let node = NodeInfo::for_tests();
+    let refusal = ReplyError::LogWriteFailed.wire_text();
+    assert!(!logs_a_line(refusal));
+    assert!(logs_a_line("ERR unknown command 'x'"));
+    assert!(logs_a_line(ReplyError::OutOfMemory.wire_text()));
+    count_error_reply(&node, refusal);
+    assert_eq!(node.error_replies.load(Ordering::Relaxed), 1);
+    let text = errorstats_section(&node);
+    assert!(text.contains("errorstat_MISCONF:count=1"), "{text}");
 }

@@ -18,8 +18,8 @@ use crate::dispatch::{Action, Fold, Unbatched, frame_to_action, gated, settle_au
 use crate::fan_out::fold_array;
 use crate::node::{NodeInfo, edge_slot, micros_since};
 use crate::reply::{
-    CommandLabel, UNRENDERABLE_REPLY, count_error_reply, log_error_reply, protocol_error,
-    reply_to_frame, safe_error,
+    CommandLabel, UNRENDERABLE_REPLY, count_error_reply, log_error_reply, logs_a_line,
+    protocol_error, reply_to_frame, safe_error,
 };
 use seedstone_core::shard::{Command, Reply, ReplyError, Router};
 use seedstone_resp::{Decoder, DecoderLimits, Frame, encode};
@@ -774,8 +774,12 @@ where
             count_error_reply(node, text);
             // Counted and named in the same breath, deliberately: a counter
             // that moves without a line beside it is the situation this was
-            // added to end.
-            log_error_reply(node, &label, text);
+            // added to end. The one exception is a refused write, whose
+            // story is told once rather than once per write — see
+            // `logs_a_line`.
+            if logs_a_line(text) {
+                log_error_reply(node, &label, text);
+            }
         }
         append_frame(out, &frame);
         // A chunk that has already earned a write's worth of replies takes it
