@@ -41,6 +41,8 @@
 //! - `reply` — what a shard answers, and every way it can refuse.
 //! - `policy` — the decisions production answers one way and the simulator
 //!   several: expiry, walk order, eviction, and the trace sink.
+//! - `durability` — how often the log is synced, and whether a write waits
+//!   for it.
 //! - `apply` — the interpreter: one command against one dictionary, its reply,
 //!   and the replication record it appends.
 //! - `executor` — one executor's state and the housekeeping it runs between
@@ -50,6 +52,7 @@
 
 mod apply;
 mod command;
+mod durability;
 pub(crate) mod executor;
 mod policy;
 mod pool;
@@ -57,6 +60,7 @@ mod reply;
 
 pub use apply::parse_i64;
 pub use command::{Command, Cond, Expiry, KIND_SLOTS, Route};
+pub use durability::{ExecutorPlants, SyncPolicy};
 pub use executor::{
     EVICTION_SAMPLES, HOUSEKEEPING_TICK, Now, Replayed, ShardState, frozen_clock, replay_into,
 };

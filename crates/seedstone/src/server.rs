@@ -18,8 +18,8 @@ use seedstone_core::log::file::{FileLog, next_generation, open_segments};
 use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, recover};
 use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{
-    Command, CompactionReport, Deadlines, LogFault, NoTrace, Now, PoolSpec, Reply, ShardPool,
-    SnapshotReport, TraceSink,
+    Command, CompactionReport, Deadlines, ExecutorPlants, LogFault, NoTrace, Now, PoolSpec, Reply,
+    ShardPool, SnapshotReport, SyncPolicy, TraceSink,
 };
 use seedstone_core::slot::executor_of;
 use seedstone_resp::{Frame, encode};
@@ -971,6 +971,8 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
                 config: CheckpointConfig::PRODUCTION,
             })
         },
+        sync: SyncPolicy::INTERVAL,
+        plants: ExecutorPlants::default(),
     });
     Ok((pool, Some(lock)))
 }

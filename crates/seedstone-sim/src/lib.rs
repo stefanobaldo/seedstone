@@ -129,7 +129,9 @@ use seedstone_core::log::disk::Disk;
 use seedstone_core::log::file::{FileLog, SharedSegment, next_generation, open_segments};
 use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, RecoveredShard, Recovery, recover};
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
-use seedstone_core::shard::{Deadlines, Now, PoolSpec, ShardPolicy, ShardPool, parse_i64};
+use seedstone_core::shard::{
+    Deadlines, ExecutorPlants, Now, PoolSpec, ShardPolicy, ShardPool, SyncPolicy, parse_i64,
+};
 use seedstone_core::slot::executor_of;
 use seedstone_resp::Frame;
 use seedstone_service::{NodeInfo, serve_connection};
@@ -747,6 +749,8 @@ where
             clock: sim_wall_clock,
             recovered: self.recovered,
             make_checkpoint: self.make_checkpoint,
+            sync: SyncPolicy::INTERVAL,
+            plants: ExecutorPlants::default(),
         })
     }
 }

@@ -12,7 +12,8 @@ use crate::memory::{MemoryGauge, MemoryLimit};
 use crate::shard::apply::append;
 use crate::shard::executor::{ExecutorSpec, Memory, ShardState, frozen_clock, run_executor};
 use crate::shard::{
-    Command, Deadlines, KIND_SLOTS, LogFault, Reply, ReplyError, Route, ShardPolicy, TraceSink,
+    Command, Deadlines, ExecutorPlants, KIND_SLOTS, LogFault, Reply, ReplyError, Route,
+    ShardPolicy, SyncPolicy, TraceSink,
 };
 use crate::slot::{executor_of, shard_of};
 use std::future::Future;
@@ -396,6 +397,10 @@ pub struct PoolSpec<T, F, P, G> {
     /// its index. [`NoCheckpoint`](crate::log::checkpoint::NoCheckpoint)
     /// for a node with no data directory.
     pub make_checkpoint: G,
+    /// How often the log is synced, and whether a write waits for it.
+    pub sync: SyncPolicy,
+    /// The executor's planted defects, all off outside the simulator.
+    pub plants: ExecutorPlants,
 }
 
 impl ShardPool {
@@ -426,6 +431,8 @@ impl ShardPool {
             clock: frozen_clock,
             recovered: Vec::new(),
             make_checkpoint: |_executor| NoCheckpoint,
+            sync: SyncPolicy::INTERVAL,
+            plants: ExecutorPlants::default(),
         })
     }
 
@@ -460,6 +467,8 @@ impl ShardPool {
             clock: frozen_clock,
             recovered: Vec::new(),
             make_checkpoint: |_executor| NoCheckpoint,
+            sync: SyncPolicy::INTERVAL,
+            plants: ExecutorPlants::default(),
         })
     }
 
@@ -504,6 +513,8 @@ impl ShardPool {
             clock: frozen_clock,
             recovered: Vec::new(),
             make_checkpoint: |_executor| NoCheckpoint,
+            sync: SyncPolicy::INTERVAL,
+            plants: ExecutorPlants::default(),
         })
     }
 
@@ -538,6 +549,8 @@ impl ShardPool {
             clock: frozen_clock,
             recovered: Vec::new(),
             make_checkpoint: |_executor| NoCheckpoint,
+            sync: SyncPolicy::INTERVAL,
+            plants: ExecutorPlants::default(),
         })
     }
 
@@ -576,6 +589,8 @@ impl ShardPool {
             clock: frozen_clock,
             recovered: Vec::new(),
             make_checkpoint: |_executor| NoCheckpoint,
+            sync: SyncPolicy::INTERVAL,
+            plants: ExecutorPlants::default(),
         })
     }
 
@@ -613,6 +628,8 @@ impl ShardPool {
             clock,
             recovered,
             make_checkpoint,
+            sync,
+            plants,
         } = spec;
         assert!(
             shards > 0,
@@ -645,6 +662,8 @@ impl ShardPool {
                 memory: memory.clone(),
                 clock,
                 checkpoint: make_checkpoint(executor_of(first_shard, shards, executors)),
+                sync,
+                plants,
             })
         };
         let mut inboxes = Vec::with_capacity(usize::from(executors));
