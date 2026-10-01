@@ -18,7 +18,7 @@ use crate::shard::{
 use bytes::Bytes;
 use std::io;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 /// How often a shard does the work no command asked it for: advancing an
@@ -337,6 +337,8 @@ pub struct ExecutorSpec<T, L, P, C> {
     pub checkpoint: C,
     pub sync: SyncPolicy,
     pub plants: ExecutorPlants,
+    /// Turns `true` when the pool is shut down.
+    pub stop: watch::Receiver<bool>,
 }
 
 /// One executor task: own a contiguous range of shards, answer the inbox,
@@ -345,13 +347,14 @@ pub struct ExecutorSpec<T, L, P, C> {
 /// `states` holds the range's shards in ascending order starting at
 /// `first_shard`, so a command's shard id indexes it by subtraction.
 ///
-/// Returns when the inbox closes, which happens once the last [`ShardPool`]
-/// handle is dropped.
+/// Returns when the pool is shut down or the inbox closes, which happens
+/// once the last [`ShardPool`] handle is dropped — after serving what was
+/// queued and syncing what was flushed, either way.
 pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint>(
     spec: ExecutorSpec<T, L, P, C>,
     mut inbox: mpsc::UnboundedReceiver<Envelope>,
 ) {
-    let mut this = Executor::new(spec);
+    let (mut this, mut stop) = Executor::new(spec);
     let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
     // A shard that fell behind resumes at its normal spacing instead of firing
     // a burst of catch-up ticks. The default is that burst, and it is the last
@@ -403,12 +406,16 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
                 this.sync_done(result);
                 this.maybe_issue(Instant::now());
             }
+            // A dropped sender is a dropped pool, which closes the inbox
+            // too: stopping on either is the same stop.
+            _ = stop.changed() => break,
             // One ticker per executor rather than one per shard, advancing
             // every owned dict by the same budget: the same per-dict drain
             // rate, and the same aggregate work, as independent tickers.
             _ = tick.tick() => this.housekeeping(),
         }
     }
+    this.stop(&mut inbox).await;
 }
 
 /// The sync in flight, polled in place. Only reached with one in flight —
@@ -434,7 +441,7 @@ struct Executor<T, L, P, C> {
 }
 
 impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T, L, P, C> {
-    fn new(spec: ExecutorSpec<T, L, P, C>) -> Self {
+    fn new(spec: ExecutorSpec<T, L, P, C>) -> (Self, watch::Receiver<bool>) {
         let ExecutorSpec {
             first_shard,
             states,
@@ -445,9 +452,10 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             checkpoint,
             sync,
             plants,
+            stop,
         } = spec;
         let sync = SyncState::new(sync, plants, states.len(), Instant::now());
-        Self {
+        let this = Self {
             first_shard,
             states,
             trace,
@@ -456,7 +464,48 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             clock,
             checkpoint,
             sync,
+        };
+        (this, stop)
+    }
+
+    /// The last thing an executor does: everything queued is served,
+    /// everything flushed is synced, nothing is held. Under every policy —
+    /// under `never`, this is the one sync the log ever gets.
+    async fn stop(&mut self, inbox: &mut mpsc::UnboundedReceiver<Envelope>) {
+        // Nothing new is accepted; what was already sent is answered.
+        inbox.close();
+        while let Ok(envelope) = inbox.try_recv() {
+            self.serve(envelope);
         }
+        if self.sync.in_flight.is_some() {
+            let result = in_flight(&mut self.sync.in_flight).await;
+            self.sync_done(result);
+        }
+        for offset in 0..self.states.len() {
+            if let Err(error) = self.states[offset].log.flush() {
+                self.trace
+                    .fault(self.shard_at(offset), LogFault::Write, &error);
+            }
+        }
+        if let Some(sync) = self.states[0].log.begin_sync() {
+            let through: Vec<_> = self
+                .states
+                .iter()
+                .map(|s| s.log.flushed_through())
+                .collect();
+            match sync.await {
+                Ok(()) => {
+                    for (state, through) in self.states.iter_mut().zip(through) {
+                        state.log.sync_completed(through);
+                    }
+                }
+                Err(error) => {
+                    self.states[0].log.sync_failed();
+                    self.trace.fault(self.first_shard, LogFault::Sync, &error);
+                }
+            }
+        }
+        self.sync.release_through(self.sync.batch);
     }
 
     /// The inverse of the envelope's `shard - first_shard`: these states
