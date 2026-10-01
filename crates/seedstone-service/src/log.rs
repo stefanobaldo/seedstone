@@ -106,6 +106,15 @@ pub static STOPPING: Event = Event {
     fields: &["signal"],
 };
 
+/// The executors did not finish within the stop's grace period — a disk
+/// that does not answer a sync; the process exits anyway. `warn`: what was
+/// written since the last sync may not be on disk.
+pub static SHUTDOWN_TIMEOUT: Event = Event {
+    name: "shutdown_timeout",
+    level: Level::Warn,
+    fields: &[],
+};
+
 /// `SIGHUP` re-read the password file and the new set is in force.
 pub static PASSWORD_RELOADED: Event = Event {
     name: "password_reloaded",
@@ -219,6 +228,7 @@ pub static EVENTS: &[&Event] = &[
     &BIND_FAILED,
     &ERROR_REPLY,
     &STOPPING,
+    &SHUTDOWN_TIMEOUT,
     &PASSWORD_RELOADED,
     &PASSWORD_RELOAD_FAILED,
     &PASSWORD_RELOAD_SKIPPED,

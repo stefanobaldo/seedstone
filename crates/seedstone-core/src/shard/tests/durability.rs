@@ -8,8 +8,8 @@ use crate::log::disk::SyncFuture;
 use crate::log::{Record, ReplicationLog};
 use crate::memory::MemoryLimit;
 use crate::shard::{
-    Deadlines, ExecutorPlants, HOUSEKEEPING_TICK, NoTrace, PoolSpec, Reply, Router, ShardPool,
-    SyncPolicy, frozen_clock,
+    Deadlines, ExecutorPlants, HOUSEKEEPING_TICK, NoTrace, PoolSpec, Reply, Router, SHUTDOWN_GRACE,
+    ShardPool, Shutdown, SyncPolicy, frozen_clock,
 };
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -203,4 +203,60 @@ async fn never_issues_no_sync() {
         settle().await;
     }
     assert_eq!(log.issued(), 0);
+}
+
+/// A stop drains what is queued, waits for the sync in flight, releases
+/// what it held, syncs what was flushed meanwhile, and only then ends —
+/// under every policy, `never` included.
+#[tokio::test(start_paused = true)]
+async fn shutdown_syncs_what_was_written_under_every_policy() {
+    for policy in [SyncPolicy::ALWAYS, SyncPolicy::INTERVAL, SyncPolicy::NEVER] {
+        let log = Latent::default();
+        let pool = pool(policy, &log);
+        let write = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.dispatch(set(b"k", b"v")).await }
+        });
+        settle().await;
+        let stopping = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.shutdown().await }
+        });
+        settle().await;
+        // Whatever was issued — the write's own sync under always or
+        // interval, the stop's under never — completes now.
+        while log.issued() > log.state().completed.len() as u64 {
+            log.complete_next(Ok(()));
+            settle().await;
+        }
+        assert_eq!(write.await.unwrap(), Reply::Ok, "{}", policy.name());
+        assert_eq!(
+            stopping.await.unwrap(),
+            Shutdown::Clean,
+            "{}",
+            policy.name()
+        );
+        assert!(log.issued() >= 1, "{}: the stop synced", policy.name());
+        assert_eq!(
+            log.state().completed.last().copied().flatten(),
+            Some(0),
+            "{}: the last sync covered the write",
+            policy.name()
+        );
+    }
+}
+
+/// A sync that never completes does not hold the process hostage: the
+/// stop gives up after the grace period and says so.
+#[tokio::test(start_paused = true)]
+async fn shutdown_gives_up_after_the_grace_period() {
+    let log = Latent::default();
+    let pool = pool(SyncPolicy::INTERVAL, &log);
+    assert_eq!(pool.dispatch(set(b"k", b"v")).await, Reply::Ok);
+    let stopping = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.shutdown().await }
+    });
+    tokio::time::advance(SHUTDOWN_GRACE + Duration::from_millis(1)).await;
+    assert_eq!(stopping.await.unwrap(), Shutdown::TimedOut);
 }

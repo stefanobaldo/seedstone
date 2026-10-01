@@ -19,13 +19,14 @@ use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, recover};
 use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{
     Command, CompactionReport, Deadlines, ExecutorPlants, LogFault, NoTrace, Now, PoolSpec, Reply,
-    ShardPool, SnapshotReport, SyncPolicy, TraceSink,
+    ShardPool, Shutdown, SnapshotReport, SyncPolicy, TraceSink,
 };
 use seedstone_core::slot::executor_of;
 use seedstone_resp::{Frame, encode};
 use seedstone_service::log::{
     COMPACTION, Event, Field, LOG_FAULT, PASSWORD_RELOAD_FAILED, PASSWORD_RELOAD_SKIPPED,
-    PASSWORD_RELOADED, RECOVERY, RECOVERY_FAILED, RECOVERY_TRUNCATED, SNAPSHOT, STOPPING, line,
+    PASSWORD_RELOADED, RECOVERY, RECOVERY_FAILED, RECOVERY_TRUNCATED, SHUTDOWN_TIMEOUT, SNAPSHOT,
+    STOPPING, line,
 };
 use seedstone_service::{NodeInfo, PasswordStore, Passwords, Secret, serve_connection};
 use tokio::io::AsyncWriteExt;
@@ -568,6 +569,12 @@ impl Server {
                     }
                 }
             }
+        }
+        // The executors answer what they had queued and sync the log before
+        // the runtime is dropped under them: a rollout must not lose what
+        // only a crash would.
+        if self.pool.shutdown().await == Shutdown::TimedOut {
+            emit(&SHUTDOWN_TIMEOUT, &[]);
         }
     }
 }

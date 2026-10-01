@@ -12,14 +12,30 @@ use crate::memory::{MemoryGauge, MemoryLimit};
 use crate::shard::apply::append;
 use crate::shard::executor::{ExecutorSpec, Memory, ShardState, frozen_clock, run_executor};
 use crate::shard::{
-    Command, Deadlines, ExecutorPlants, KIND_SLOTS, LogFault, Reply, ReplyError, Route,
-    ShardPolicy, SyncPolicy, TraceSink,
+    Command, Deadlines, ExecutorPlants, HOUSEKEEPING_TICK, KIND_SLOTS, LogFault, Reply, ReplyError,
+    Route, ShardPolicy, SyncPolicy, TraceSink,
 };
 use crate::slot::{executor_of, shard_of};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use tokio::sync::{Notify, mpsc, oneshot};
+use std::time::Duration;
+use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+
+/// How long [`ShardPool::shutdown`] waits for the executors before it gives
+/// up: ten housekeeping ticks. A disk that hangs must not hold a
+/// supervisor's termination grace period hostage.
+pub const SHUTDOWN_GRACE: Duration = HOUSEKEEPING_TICK.saturating_mul(10);
+
+/// How a [`ShardPool::shutdown`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shutdown {
+    /// Every executor served what was queued, synced its log and ended.
+    Clean,
+    /// [`SHUTDOWN_GRACE`] passed first; what was still unsynced may be lost.
+    TimedOut,
+}
 
 /// One shard's counters, as [`Command::Stats`] reports them.
 ///
@@ -365,6 +381,11 @@ pub struct ShardPool {
     /// it. Stored so that the edge can report it — `INFO` prints `maxmemory`
     /// and `maxmemory_policy` — from the same value the executors evict by.
     limit: MemoryLimit,
+    /// Set once, by [`shutdown`](ShardPool::shutdown): every executor
+    /// watches it.
+    stop: Arc<watch::Sender<bool>>,
+    /// The executor tasks, taken by the first `shutdown` to await them.
+    executors_done: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 /// Everything a pool is built from, with every seam exposed.
@@ -652,6 +673,7 @@ impl ShardPool {
             gauge: MemoryGauge::default(),
             limit,
         };
+        let (stop, stopped) = watch::channel(false);
         // Each executor gets its checkpoint by index, built as it spawns.
         let spawn = |first_shard: u16, states: Vec<ShardState<L>>, trace: T, policy: P| {
             spawn_executor(ExecutorSpec {
@@ -664,9 +686,11 @@ impl ShardPool {
                 checkpoint: make_checkpoint(executor_of(first_shard, shards, executors)),
                 sync,
                 plants,
+                stop: stopped.clone(),
             })
         };
         let mut inboxes = Vec::with_capacity(usize::from(executors));
+        let mut handles = Vec::with_capacity(usize::from(executors));
         let mut pending: Option<(u16, Vec<ShardState<L>>)> = None;
         // In shard order, one per shard, or none at all — asserted above.
         let mut recovered = recovered.into_iter();
@@ -707,14 +731,19 @@ impl ShardPool {
                 }
                 _ => {
                     if let Some((first_shard, states)) = pending.take() {
-                        inboxes.push(spawn(first_shard, states, trace.clone(), policy.clone()));
+                        let (inbox, handle) =
+                            spawn(first_shard, states, trace.clone(), policy.clone());
+                        inboxes.push(inbox);
+                        handles.push(handle);
                     }
                     pending = Some((shard, vec![state]));
                 }
             }
         }
         if let Some((first_shard, states)) = pending {
-            inboxes.push(spawn(first_shard, states, trace, policy));
+            let (inbox, handle) = spawn(first_shard, states, trace, policy);
+            inboxes.push(inbox);
+            handles.push(handle);
         }
 
         Self {
@@ -723,7 +752,33 @@ impl ShardPool {
             executors,
             memory: memory.gauge,
             limit,
+            stop: Arc::new(stop),
+            executors_done: Arc::new(Mutex::new(handles)),
         }
+    }
+
+    /// Asks every executor to stop, and waits for them: each drains what is
+    /// queued, waits for its sync in flight, syncs what was flushed since,
+    /// and ends. Bounded by [`SHUTDOWN_GRACE`]: a disk that hangs must not
+    /// hold a supervisor's termination grace period hostage.
+    ///
+    /// A second call, or one after a timeout, finds nothing left to wait
+    /// for and answers [`Shutdown::Clean`].
+    pub async fn shutdown(&self) -> Shutdown {
+        self.stop.send_replace(true);
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        let handles = std::mem::take(
+            &mut *self
+                .executors_done
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for handle in handles {
+            if tokio::time::timeout_at(deadline, handle).await.is_err() {
+                return Shutdown::TimedOut;
+            }
+        }
+        Shutdown::Clean
     }
 
     /// How many virtual shards this pool spans.
@@ -814,10 +869,10 @@ async fn one_reply(pending: Option<oneshot::Receiver<Vec<Reply>>>) -> Reply {
 /// Spawns one executor task and returns the inbox that reaches it.
 fn spawn_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint>(
     spec: ExecutorSpec<T, L, P, C>,
-) -> mpsc::UnboundedSender<Envelope> {
+) -> (mpsc::UnboundedSender<Envelope>, JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_executor(spec, rx));
-    tx
+    let handle = tokio::spawn(run_executor(spec, rx));
+    (tx, handle)
 }
 
 impl Router for ShardPool {

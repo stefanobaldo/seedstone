@@ -38,7 +38,8 @@ impl SyncPolicy {
         hold_acks: false,
     };
     /// The log is never synced; the kernel decides, and a crash keeps the
-    /// last durable snapshot plus whatever the kernel had written.
+    /// last durable snapshot plus whatever the kernel had written. A clean
+    /// stop is the one sync the log gets.
     pub const NEVER: Self = Self {
         min_interval: None,
         hold_acks: false,

@@ -68,7 +68,10 @@ pub use policy::{
     CompactionReport, Deadlines, EvictionPolicy, ExpiryPolicy, LogFault, NoTrace, ShardPolicy,
     SnapshotReport, TraceSink,
 };
-pub use pool::{ChunkReply, Envelope, PoolSpec, ReplyTo, Router, ShardPool, ShardStats, Share};
+pub use pool::{
+    ChunkReply, Envelope, PoolSpec, ReplyTo, Router, SHUTDOWN_GRACE, ShardPool, ShardStats, Share,
+    Shutdown,
+};
 pub use reply::{Reply, ReplyError};
 
 #[cfg(test)]
