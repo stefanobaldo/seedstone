@@ -436,6 +436,34 @@ impl Command {
                 | Self::IncrBy { .. }
         )
     }
+
+    /// Whether this command appends a log record on its own account — the
+    /// writes an executor refuses while its log cannot be kept.
+    ///
+    /// Every arm of `apply` that calls `append` for the command itself:
+    /// the five `denied_when_full` names, `Del`, the four expiry setters,
+    /// `Persist` and `FlushDb`. The lookups are not here, though one may
+    /// append the deletion of a key whose deadline has passed: that record
+    /// replays to what a reader already sees, and refusing a read over it
+    /// would turn a disk fault into an outage of reads too.
+    #[must_use]
+    pub const fn writes_the_log(&self) -> bool {
+        matches!(
+            self,
+            Self::Set { .. }
+                | Self::SetEx { .. }
+                | Self::SetNx { .. }
+                | Self::PSetEx { .. }
+                | Self::IncrBy { .. }
+                | Self::Del { .. }
+                | Self::Expire { .. }
+                | Self::PExpire { .. }
+                | Self::ExpireAt { .. }
+                | Self::PExpireAt { .. }
+                | Self::Persist { .. }
+                | Self::FlushDb
+        )
+    }
 }
 
 /// How many slots a per-kind array needs: one per tag, plus slot `0`, which
@@ -449,7 +477,7 @@ pub const KIND_SLOTS: usize = Command::KIND_MAX as usize + 1;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shard::tests::support::{set, setex};
+    use crate::shard::tests::support::{get, set, setex};
 
     /// Every `Command` variant's tag is inside the arrays indexed by it, and
     /// the tags are `1..=KIND_MAX` with none missing and none shared.
@@ -651,6 +679,43 @@ mod tests {
         ];
         for (cmd, route) in keyless {
             assert_eq!(cmd.route(), route, "{cmd:?} routes as it declares");
+        }
+    }
+
+    /// Every command that appends a record on its own account is a write
+    /// the refusal denies; `denied_when_full` is the smaller set that adds
+    /// bytes.
+    #[test]
+    fn the_writes_are_every_command_that_appends_on_its_own_account() {
+        let writes = |cmd: &Command| cmd.writes_the_log();
+        assert!(writes(&set(b"k", b"v")));
+        assert!(writes(&setex(b"k", 1, b"v")));
+        assert!(writes(&Command::Del {
+            key: Bytes::from_static(b"k")
+        }));
+        assert!(writes(&Command::Persist {
+            key: Bytes::from_static(b"k")
+        }));
+        assert!(writes(&Command::PExpireAt {
+            key: Bytes::from_static(b"k"),
+            millis: 1
+        }));
+        assert!(writes(&Command::FlushDb));
+        assert!(!writes(&get(b"k")));
+        assert!(!writes(&Command::Ttl {
+            key: Bytes::from_static(b"k")
+        }));
+        assert!(!writes(&Command::DbSize));
+        assert!(!writes(&Command::Stats));
+        // Everything refused when full is a write; not the other way round.
+        for cmd in [
+            set(b"k", b"v"),
+            Command::IncrBy {
+                key: Bytes::from_static(b"k"),
+                delta: 1,
+            },
+        ] {
+            assert!(cmd.denied_when_full() && cmd.writes_the_log());
         }
     }
 }
