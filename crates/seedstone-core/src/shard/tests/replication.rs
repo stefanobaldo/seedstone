@@ -393,6 +393,8 @@ async fn the_tick_flushes_then_syncs_and_reports_a_failure() {
         clock: crate::shard::frozen_clock,
         recovered: Vec::new(),
         make_checkpoint: |_executor| crate::log::checkpoint::NoCheckpoint,
+        sync: crate::shard::SyncPolicy::INTERVAL,
+        plants: crate::shard::ExecutorPlants::default(),
     });
     pool.dispatch(set(b"k", b"v")).await;
     tokio::time::advance(HOUSEKEEPING_TICK + Duration::from_millis(1)).await;
@@ -679,6 +681,8 @@ async fn a_pool_spawned_from_a_recovery_serves_the_recovered_keys() {
         clock: crate::shard::frozen_clock,
         recovered,
         make_checkpoint: |_executor| crate::log::checkpoint::NoCheckpoint,
+        sync: crate::shard::SyncPolicy::INTERVAL,
+        plants: crate::shard::ExecutorPlants::default(),
     });
     assert_eq!(
         pool.dispatch(Command::Get {
@@ -752,6 +756,8 @@ async fn a_shard_cut_by_its_recovery_rebases_before_its_first_write() {
         clock: crate::shard::frozen_clock,
         recovered,
         make_checkpoint: |_executor| crate::log::checkpoint::NoCheckpoint,
+        sync: crate::shard::SyncPolicy::INTERVAL,
+        plants: crate::shard::ExecutorPlants::default(),
     });
     let mut rebase = Vec::new();
     Effect::Rebase.encode(&mut rebase);
@@ -864,6 +870,8 @@ async fn the_checkpoint_is_ticked_once_per_executor_per_housekeeping_tick() {
         clock: crate::shard::frozen_clock,
         recovered: Vec::new(),
         make_checkpoint: move |_executor| counting.clone(),
+        sync: crate::shard::SyncPolicy::INTERVAL,
+        plants: crate::shard::ExecutorPlants::default(),
     });
     // Let both executors start their interval, then step the clock one
     // period at a time: a single jump of three periods would fire one tick,

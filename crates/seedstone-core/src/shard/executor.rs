@@ -10,8 +10,8 @@ use crate::log::effect::{Effect, Owned};
 use crate::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use crate::shard::apply::{append, apply};
 use crate::shard::{
-    Command, Envelope, EvictionPolicy, ExpiryPolicy, KIND_SLOTS, LogFault, Reply, ReplyError,
-    ReplyTo, Route, ShardPolicy, ShardStats, TraceSink,
+    Command, Envelope, EvictionPolicy, ExecutorPlants, ExpiryPolicy, KIND_SLOTS, LogFault, Reply,
+    ReplyError, ReplyTo, Route, ShardPolicy, ShardStats, SyncPolicy, TraceSink,
 };
 use bytes::Bytes;
 use std::time::Duration;
@@ -332,6 +332,8 @@ pub struct ExecutorSpec<T, L, P, C> {
     pub memory: Memory,
     pub clock: fn() -> u64,
     pub checkpoint: C,
+    pub sync: SyncPolicy,
+    pub plants: ExecutorPlants,
 }
 
 /// One executor task: own a contiguous range of shards, answer the inbox,
@@ -354,7 +356,11 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
         memory,
         clock,
         mut checkpoint,
+        sync,
+        plants,
     } = spec;
+    // Read by the sync in flight and the held replies; carried until then.
+    let _ = (sync, plants);
     let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
     // A shard that fell behind resumes at its normal spacing instead of firing
     // a burst of catch-up ticks. The default is that burst, and it is the last
