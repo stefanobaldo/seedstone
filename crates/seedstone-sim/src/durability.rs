@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use rand::rngs::ChaCha8Rng;
 use rand::{RngExt, SeedableRng};
-use seedstone_core::log::disk::LogFile;
+use seedstone_core::log::disk::{LogFile, SyncFuture};
 use seedstone_core::log::file::FileLog;
 use seedstone_core::log::{Record, ReplicationLog};
 use seedstone_core::shard::HOUSEKEEPING_TICK;
@@ -120,6 +120,31 @@ impl<F: LogFile> ReplicationLog for Observed<F> {
             lock(&self.run.durable)[usize::from(self.shard)] = Some((seq, world_now()));
         }
         Ok(durable)
+    }
+
+    fn flushed_through(&self) -> Option<u64> {
+        self.inner.flushed_through()
+    }
+
+    fn begin_sync(&mut self) -> Option<SyncFuture> {
+        self.inner.begin_sync()
+    }
+
+    /// Reports the durable point with the instant it was reached, under the
+    /// guard [`sync`](ReplicationLog::sync) keeps: only after a flush that
+    /// wrote everything.
+    fn sync_completed(&mut self, through: Option<u64>) -> Option<u64> {
+        let durable = self.inner.sync_completed(through);
+        if let Some(seq) = durable
+            && self.flushed
+        {
+            lock(&self.run.durable)[usize::from(self.shard)] = Some((seq, world_now()));
+        }
+        durable
+    }
+
+    fn sync_failed(&mut self) {
+        self.inner.sync_failed();
     }
 
     /// The checkpoint covered this shard's records up to `through`: the
