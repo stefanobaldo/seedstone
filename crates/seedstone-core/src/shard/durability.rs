@@ -77,6 +77,17 @@ pub struct ExecutorPlants {
     pub acks_while_refusing: bool,
 }
 
+/// An executor's refusal, at its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefusalReport {
+    /// The executor, named by its first shard, as a `fault` names it.
+    pub executor_first_shard: u16,
+    /// Writes refused while it lasted.
+    pub refused: u64,
+    /// Housekeeping ticks it lasted.
+    pub ticks: u64,
+}
+
 /// Sends a batch's replies to whoever is waiting for them. The caller may
 /// have gone away; its replies are then simply dropped.
 pub fn send(to: ReplyTo, replies: Vec<Reply>) {
@@ -93,6 +104,21 @@ pub struct Held {
     pub batch: u64,
     pub to: ReplyTo,
     pub replies: Vec<Reply>,
+}
+
+/// Whether an executor accepts writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Serving,
+    /// A write or a sync failed: writes are answered with the refusal and
+    /// not applied, reads are served, and a forced snapshot of memory is
+    /// the way out.
+    Refusing {
+        /// Writes refused so far.
+        refused: u64,
+        /// Housekeeping ticks spent refusing.
+        ticks: u64,
+    },
 }
 
 /// One executor's sync in flight, and everything waiting on it.
@@ -113,6 +139,7 @@ pub struct SyncState {
     pub held: VecDeque<Held>,
     /// The batch replies are being tagged with now: the next sync's.
     pub batch: u64,
+    pub mode: Mode,
 }
 
 impl SyncState {
@@ -130,6 +157,7 @@ impl SyncState {
             dirty: false,
             held: VecDeque::new(),
             batch: 0,
+            mode: Mode::Serving,
         }
     }
 
@@ -141,6 +169,29 @@ impl SyncState {
                 .policy
                 .min_interval
                 .is_some_and(|interval| now.saturating_duration_since(self.issued_at) >= interval)
+    }
+
+    /// Whether writes are being refused.
+    pub const fn is_refusing(&self) -> bool {
+        matches!(self.mode, Mode::Refusing { .. })
+    }
+
+    /// Answers every held batch with `error`: its writes were applied, and
+    /// no sync stands behind them. Every reply that was not already an
+    /// error becomes `error` — which command of a batch wrote is not kept,
+    /// and a dropped connection would have lost the batch's replies alike.
+    pub fn fail_all(&mut self, error: &Reply) {
+        for Held {
+            to, mut replies, ..
+        } in self.held.drain(..)
+        {
+            for reply in &mut replies {
+                if !matches!(reply, Reply::Error(_)) {
+                    reply.clone_from(error);
+                }
+            }
+            send(to, replies);
+        }
     }
 
     /// Releases every held batch up to and including `batch`, in order.
