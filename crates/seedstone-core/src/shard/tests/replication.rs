@@ -164,6 +164,16 @@ async fn a_supplied_log_receives_every_mutation() {
         fn sync(&mut self) -> std::io::Result<Option<u64>> {
             Ok(None)
         }
+        fn flushed_through(&self) -> Option<u64> {
+            None
+        }
+        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+            None
+        }
+        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
+            None
+        }
+        fn sync_failed(&mut self) {}
     }
 
     let log = Recording::default();
@@ -212,6 +222,16 @@ async fn a_log_that_cannot_write_refuses_the_mutation() {
         fn sync(&mut self) -> std::io::Result<Option<u64>> {
             Ok(None)
         }
+        fn flushed_through(&self) -> Option<u64> {
+            None
+        }
+        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+            None
+        }
+        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
+            None
+        }
+        fn sync_failed(&mut self) {}
     }
 
     let pool =
@@ -268,6 +288,16 @@ async fn every_mutation_logs_its_effect_with_an_absolute_deadline() {
         fn sync(&mut self) -> std::io::Result<Option<u64>> {
             Ok(None)
         }
+        fn flushed_through(&self) -> Option<u64> {
+            None
+        }
+        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+            None
+        }
+        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
+            None
+        }
+        fn sync_failed(&mut self) {}
     }
 
     let log = Recording::default();
@@ -362,6 +392,17 @@ async fn the_tick_flushes_then_syncs_and_reports_a_failure() {
             self.0.lock().expect("journal").push("sync");
             Ok(None)
         }
+        fn flushed_through(&self) -> Option<u64> {
+            None
+        }
+        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+            self.0.lock().expect("journal").push("begin_sync");
+            Some(Box::pin(std::future::ready(Ok(()))))
+        }
+        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
+            None
+        }
+        fn sync_failed(&mut self) {}
     }
 
     #[derive(Clone, Default)]
@@ -727,6 +768,16 @@ async fn a_shard_cut_by_its_recovery_rebases_before_its_first_write() {
                 .push((u16::MAX, 0, b"sync".to_vec()));
             Ok(None)
         }
+        fn flushed_through(&self) -> Option<u64> {
+            None
+        }
+        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+            None
+        }
+        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
+            None
+        }
+        fn sync_failed(&mut self) {}
     }
 
     let key = (0..64)
@@ -810,6 +861,16 @@ async fn a_log_that_keeps_no_payloads_is_handed_none() {
         fn sync(&mut self) -> std::io::Result<Option<u64>> {
             Ok(None)
         }
+        fn flushed_through(&self) -> Option<u64> {
+            None
+        }
+        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+            None
+        }
+        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
+            None
+        }
+        fn sync_failed(&mut self) {}
         fn keeps_payloads(&self) -> bool {
             false
         }

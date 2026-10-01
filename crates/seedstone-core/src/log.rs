@@ -47,6 +47,8 @@ pub mod reader;
 pub mod recovery;
 pub mod snapshot;
 
+use disk::SyncFuture;
+
 /// Magic byte that opens a record.
 ///
 /// Chosen with both nibbles set and alternating bits so that it is not a value
@@ -346,13 +348,15 @@ pub fn decode_record(buf: &[u8]) -> Decoded<'_> {
 ///
 /// `append` runs inside the shard's command handler, which is a plain `fn`
 /// that cannot `await` — so an implementation must keep it cheap. Buffering in
-/// memory is the shape this split anticipates. `sync` is called from the shard
-/// task's housekeeping tick, which is `async` and may block; that is the only
-/// place in a shard where durability can be paid for.
+/// memory is the shape this split anticipates. `flush` runs after every
+/// envelope that appended. The cadence of syncs is settled by the executor,
+/// not here: it issues a sync of its first shard's store through
+/// [`begin_sync`](ReplicationLog::begin_sync), awaits it beside the batches
+/// that follow, and accounts for its completion per shard through
+/// [`sync_completed`](ReplicationLog::sync_completed).
 ///
-/// What is *not* settled here, deliberately: whether `append` buffers or
-/// writes through, the fsync cadence, and whether shards sync independently or
-/// group-commit behind one shared writer. The factory admits all three — a
+/// What is *not* settled here, deliberately: whether shards group-commit
+/// behind one writer shared across executors. The factory admits it — a
 /// shared writer is a factory returning clones of one handle.
 ///
 /// `Send + 'static` because a shard task owns its log and is moved onto the
@@ -393,9 +397,11 @@ pub trait ReplicationLog: Send + 'static {
     /// fault and moves on.
     fn flush(&mut self) -> std::io::Result<()>;
 
-    /// Makes everything flushed so far durable.
+    /// Makes everything flushed so far durable, now, blocking.
     ///
-    /// Called from the tick after every shard's `flush`. Separate from
+    /// The start path's: `rebase` writes and syncs before the pool serves.
+    /// The executor never calls it; see
+    /// [`begin_sync`](ReplicationLog::begin_sync). Separate from
     /// `append` because syncing every append is what makes torn writes
     /// unobservable — precisely the fault the record format is built to
     /// survive.
@@ -411,6 +417,30 @@ pub trait ReplicationLog: Send + 'static {
     /// an implementation that cannot tell must not advance the durable
     /// point past a failure. The next tick syncs again.
     fn sync(&mut self) -> std::io::Result<Option<u64>>;
+
+    /// The highest sequence of this shard the store has been handed — what
+    /// a sync issued now would cover.
+    fn flushed_through(&self) -> Option<u64>;
+
+    /// Issues a sync of this log's store if anything was written to it
+    /// since the last issue; `None` otherwise.
+    ///
+    /// A store shared by an executor's shards answers once per issue: the
+    /// first shard asked takes the sync and the rest find nothing to issue,
+    /// which is why the executor asks its first shard only. The future
+    /// covers what was flushed before this call; what is flushed while it
+    /// is in flight is the next sync's.
+    fn begin_sync(&mut self) -> Option<SyncFuture>;
+
+    /// A sync issued when this shard's flushed point was `through`
+    /// completed: the durable point rises to `through` — never lowers —
+    /// unless a sync has failed on the store since, which keeps it where it
+    /// was until a snapshot covers the loss. Returns the durable point.
+    fn sync_completed(&mut self, through: Option<u64>) -> Option<u64>;
+
+    /// The issued sync failed: nothing it covered is durable, now or
+    /// later, until a snapshot covers it.
+    fn sync_failed(&mut self);
 
     /// This shard's records up to `through` are durable by other means —
     /// a snapshot whose image holds their effect is on disk and synced.
@@ -452,6 +482,20 @@ impl ReplicationLog for NoopLog {
     fn sync(&mut self) -> std::io::Result<Option<u64>> {
         Ok(None)
     }
+
+    fn flushed_through(&self) -> Option<u64> {
+        None
+    }
+
+    fn begin_sync(&mut self) -> Option<SyncFuture> {
+        None
+    }
+
+    fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
+        None
+    }
+
+    fn sync_failed(&mut self) {}
 
     fn keeps_payloads(&self) -> bool {
         false

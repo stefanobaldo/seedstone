@@ -33,7 +33,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::log::disk::{Disk, LogFile};
+use crate::log::disk::{Disk, LogFile, SyncFuture};
 use crate::log::{Record, ReplicationLog, crc32_iso_hdlc, encode_record};
 
 /// The four bytes every segment starts with.
@@ -291,6 +291,37 @@ impl<F: LogFile> ReplicationLog for FileLog<F> {
         Ok(self.durable)
     }
 
+    fn flushed_through(&self) -> Option<u64> {
+        self.flushed_through
+    }
+
+    fn begin_sync(&mut self) -> Option<SyncFuture> {
+        let mut segment = lock(&self.segment);
+        if !segment.dirty {
+            return None;
+        }
+        // Cleared at issue, not at completion: what is flushed from here on
+        // is the next sync's, and a sync that fails sets the sticky flag
+        // the rotation's assertion reads.
+        segment.dirty = false;
+        Some(segment.file.sync_later())
+    }
+
+    fn sync_completed(&mut self, through: Option<u64>) -> Option<u64> {
+        let segment = lock(&self.segment);
+        if !segment.sync_failed {
+            self.durable = self.durable.max(through);
+        }
+        drop(segment);
+        self.durable
+    }
+
+    fn sync_failed(&mut self) {
+        let mut segment = lock(&self.segment);
+        segment.sync_failed = true;
+        segment.failed_this_rotation = true;
+    }
+
     fn covered(&mut self, through: u64) {
         self.durable = self.durable.max(Some(through));
     }
@@ -394,8 +425,8 @@ pub fn create_segment<D: Disk>(
 /// before the swap, so a crash at any point leaves either the old rotation
 /// alone or both — never a writer on a file with no directory entry. The
 /// live-log counter restarts; the sticky sync failure does not, because the
-/// records it gates are in the old file. Called after the tick's sync pass,
-/// never before it.
+/// records it gates are in the old file. Called by the checkpoint, which the
+/// executor ticks only with no sync in flight (`run_executor` sequences it).
 ///
 /// # Errors
 ///
@@ -416,12 +447,13 @@ pub fn rotate_segment<D: Disk>(
     disk.sync_dir(wal)?;
     let mut guard = lock(segment);
     // Dropping the old file's dirty flag is safe only because a rotation
-    // follows the tick's sync pass: bytes still unsynced there are bytes a
-    // sync failed on, and the sticky failure keeps them out of every
-    // durable point until a snapshot covers them.
+    // happens with no sync in flight, after the executor issued one for
+    // everything flushed: bytes still unsynced there are bytes a sync
+    // failed on, and the sticky failure keeps them out of every durable
+    // point until a snapshot covers them.
     debug_assert!(
         !guard.dirty || guard.sync_failed,
-        "a rotation before the sync pass would abandon unsynced records"
+        "a rotation before the sync was issued would abandon unsynced records"
     );
     guard.file = file;
     guard.rotation = next;
@@ -894,6 +926,99 @@ mod tests {
             log.sync().unwrap(),
             Some(2),
             "the failure since the rotation stands"
+        );
+    }
+
+    /// The executor's sync: issued once per segment however many shards
+    /// share it, and on completion each shard's point rises to what it had
+    /// flushed when the sync was issued — not to what it flushed during it.
+    #[tokio::test]
+    async fn a_sync_is_issued_once_per_segment_and_completes_to_the_point_at_issue() {
+        let disk = MemDisk::default();
+        let wal = Path::new("/data/wal");
+        disk.create_dir_all(wal).unwrap();
+        let segments = open_segments(&disk, wal, 1, 1).unwrap();
+        let mut a = FileLog::new(0, Arc::clone(&segments[0]));
+        let mut b = FileLog::new(1, Arc::clone(&segments[0]));
+        assert!(a.begin_sync().is_none(), "nothing written, nothing to sync");
+        a.append(Record {
+            shard: 0,
+            seq: 0,
+            payload: b"a",
+        })
+        .unwrap();
+        b.append(Record {
+            shard: 1,
+            seq: 0,
+            payload: b"b",
+        })
+        .unwrap();
+        a.flush().unwrap();
+        b.flush().unwrap();
+        let (at_a, at_b) = (a.flushed_through(), b.flushed_through());
+        assert_eq!((at_a, at_b), (Some(0), Some(0)));
+        let pending = a.begin_sync().expect("dirty: issued");
+        assert!(b.begin_sync().is_none(), "the same segment, already issued");
+        // Flushed during the flight: covered by the next sync, not this one.
+        a.append(Record {
+            shard: 0,
+            seq: 1,
+            payload: b"late",
+        })
+        .unwrap();
+        a.flush().unwrap();
+        pending.await.unwrap();
+        assert_eq!(a.sync_completed(at_a), Some(0), "what was flushed at issue");
+        assert_eq!(b.sync_completed(at_b), Some(0));
+        let next = a.begin_sync().expect("the late flush made it dirty again");
+        next.await.unwrap();
+        assert_eq!(a.sync_completed(a.flushed_through()), Some(1));
+    }
+
+    /// A failed sync is sticky for the segment until a snapshot covers it,
+    /// through the deferred path as through the blocking one.
+    #[tokio::test]
+    async fn a_failed_deferred_sync_freezes_every_shard_of_the_segment() {
+        let disk = MemDisk::default();
+        let wal = Path::new("/data/wal");
+        disk.create_dir_all(wal).unwrap();
+        let segments = open_segments(&disk, wal, 1, 1).unwrap();
+        let mut log = FileLog::new(0, Arc::clone(&segments[0]));
+        write(&mut log, 0, b"x");
+        log.append(Record {
+            shard: 0,
+            seq: 1,
+            payload: b"y",
+        })
+        .unwrap();
+        log.flush().unwrap();
+        disk.fail_syncs(true);
+        let pending = log.begin_sync().unwrap();
+        assert!(pending.await.is_err());
+        log.sync_failed();
+        disk.fail_syncs(false);
+        assert_eq!(
+            log.sync_completed(Some(1)),
+            Some(0),
+            "nothing proven by a failed sync"
+        );
+        log.append(Record {
+            shard: 0,
+            seq: 2,
+            payload: b"z",
+        })
+        .unwrap();
+        log.flush().unwrap();
+        let again = log.begin_sync().unwrap();
+        again.await.unwrap();
+        assert_eq!(log.sync_completed(Some(2)), Some(0), "nor by a later one");
+        rotate_segment(&disk, wal, 1, 0, &segments[0]).unwrap();
+        log.covered(1);
+        segment_snapshot_covered(&segments[0]);
+        assert_eq!(
+            log.sync_completed(Some(2)),
+            Some(2),
+            "a snapshot past the failure heals it"
         );
     }
 }
