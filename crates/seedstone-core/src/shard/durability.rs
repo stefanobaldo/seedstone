@@ -1,9 +1,13 @@
 //! The durability policy: how often the log is synced, and whether a write
 //! waits for it. One mechanism, three presets.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::shard::HOUSEKEEPING_TICK;
+use tokio::time::Instant;
+
+use crate::log::disk::SyncFuture;
+use crate::shard::{HOUSEKEEPING_TICK, Reply, ReplyTo};
 
 /// When the executor issues a sync of its segment, and whether it holds a
 /// batch's replies until the sync covering them completes.
@@ -72,9 +76,143 @@ pub struct ExecutorPlants {
     pub acks_while_refusing: bool,
 }
 
+/// Sends a batch's replies to whoever is waiting for them. The caller may
+/// have gone away; its replies are then simply dropped.
+pub fn send(to: ReplyTo, replies: Vec<Reply>) {
+    match to {
+        ReplyTo::Once(tx) => {
+            let _ = tx.send(replies);
+        }
+        ReplyTo::Share(share) => share.deliver(replies),
+    }
+}
+
+/// A batch's replies, waiting for the sync that covers them.
+pub struct Held {
+    pub batch: u64,
+    pub to: ReplyTo,
+    pub replies: Vec<Reply>,
+}
+
+/// One executor's sync in flight, and everything waiting on it.
+pub struct SyncState {
+    pub policy: SyncPolicy,
+    pub plants: ExecutorPlants,
+    /// The batch the sync in flight covers, and the sync.
+    pub in_flight: Option<(u64, SyncFuture)>,
+    /// When the last sync was issued.
+    pub issued_at: Instant,
+    /// Per owned shard: `flushed_through` when the in-flight sync was issued.
+    pub flushed_at_issue: Vec<Option<u64>>,
+    /// Bytes flushed since the last issue — the executor's cheap mirror of
+    /// the segment's own flag, so that asking whether a sync is due takes
+    /// no lock. The log's `begin_sync` has the last word.
+    pub dirty: bool,
+    /// Replies waiting for a sync, in batch order.
+    pub held: VecDeque<Held>,
+    /// The batch replies are being tagged with now: the next sync's.
+    pub batch: u64,
+}
+
+impl SyncState {
+    /// Nothing in flight, nothing held. The last issue is placed one
+    /// interval before `now`, so that the first write after a start is
+    /// synced at once rather than an interval later.
+    pub fn new(policy: SyncPolicy, plants: ExecutorPlants, shards: usize, now: Instant) -> Self {
+        let interval = policy.min_interval.unwrap_or(Duration::ZERO);
+        Self {
+            policy,
+            plants,
+            in_flight: None,
+            issued_at: now.checked_sub(interval).unwrap_or(now),
+            flushed_at_issue: vec![None; shards],
+            dirty: false,
+            held: VecDeque::new(),
+            batch: 0,
+        }
+    }
+
+    /// Whether a sync should be issued now.
+    pub fn due(&self, now: Instant) -> bool {
+        self.dirty
+            && self.in_flight.is_none()
+            && self
+                .policy
+                .min_interval
+                .is_some_and(|interval| now.saturating_duration_since(self.issued_at) >= interval)
+    }
+
+    /// Releases every held batch up to and including `batch`, in order.
+    pub fn release_through(&mut self, batch: u64) {
+        while self.held.front().is_some_and(|held| held.batch <= batch) {
+            let Held { to, replies, .. } = self.held.pop_front().expect("checked above");
+            send(to, replies);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::oneshot;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sync_is_due_when_dirty_idle_and_past_the_interval() {
+        let now = Instant::now();
+        let mut state = SyncState::new(SyncPolicy::INTERVAL, ExecutorPlants::default(), 1, now);
+        assert!(!state.due(now), "nothing flushed");
+        state.dirty = true;
+        assert!(
+            state.due(now),
+            "the first write after a start is synced at once"
+        );
+        state.issued_at = now;
+        assert!(
+            !state.due(now + HOUSEKEEPING_TICK / 2),
+            "inside the interval"
+        );
+        assert!(state.due(now + HOUSEKEEPING_TICK));
+        state.in_flight = Some((0, Box::pin(std::future::ready(Ok(())))));
+        assert!(
+            !state.due(now + HOUSEKEEPING_TICK),
+            "one in flight at a time"
+        );
+        let never = SyncState {
+            dirty: true,
+            ..SyncState::new(SyncPolicy::NEVER, ExecutorPlants::default(), 1, now)
+        };
+        assert!(
+            !never.due(now + HOUSEKEEPING_TICK * 100),
+            "never is never due"
+        );
+    }
+
+    #[test]
+    fn release_through_answers_the_covered_batches_in_order_and_keeps_the_rest() {
+        let mut state = SyncState::new(
+            SyncPolicy::ALWAYS,
+            ExecutorPlants::default(),
+            1,
+            Instant::now(),
+        );
+        let mut receivers = Vec::new();
+        for batch in [0, 0, 1, 2] {
+            let (tx, rx) = oneshot::channel();
+            state.held.push_back(Held {
+                batch,
+                to: ReplyTo::Once(tx),
+                replies: vec![Reply::Ok],
+            });
+            receivers.push(rx);
+        }
+        state.release_through(1);
+        let answered: Vec<bool> = receivers
+            .iter_mut()
+            .map(|rx| rx.try_recv().is_ok())
+            .collect();
+        assert_eq!(answered, [true, true, true, false]);
+        assert_eq!(state.held.len(), 1);
+    }
 
     #[test]
     fn the_three_presets_round_trip_through_their_names() {

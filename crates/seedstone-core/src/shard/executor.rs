@@ -6,14 +6,17 @@
 use crate::dict::{Dict, Entry};
 use crate::log::ReplicationLog;
 use crate::log::checkpoint::Checkpoint;
+use crate::log::disk::SyncFuture;
 use crate::log::effect::{Effect, Owned};
 use crate::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use crate::shard::apply::{append, apply};
+use crate::shard::durability::{Held, SyncState, send};
 use crate::shard::{
     Command, Envelope, EvictionPolicy, ExecutorPlants, ExpiryPolicy, KIND_SLOTS, LogFault, Reply,
-    ReplyError, ReplyTo, Route, ShardPolicy, ShardStats, SyncPolicy, TraceSink,
+    ReplyError, Route, ShardPolicy, ShardStats, SyncPolicy, TraceSink,
 };
 use bytes::Bytes;
+use std::io;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -337,7 +340,7 @@ pub struct ExecutorSpec<T, L, P, C> {
 }
 
 /// One executor task: own a contiguous range of shards, answer the inbox,
-/// keep every owned rehash moving.
+/// keep every owned rehash moving, and keep one sync of the log in flight.
 ///
 /// `states` holds the range's shards in ascending order starting at
 /// `first_shard`, so a command's shard id indexes it by subtraction.
@@ -348,19 +351,7 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
     spec: ExecutorSpec<T, L, P, C>,
     mut inbox: mpsc::UnboundedReceiver<Envelope>,
 ) {
-    let ExecutorSpec {
-        first_shard,
-        mut states,
-        trace,
-        policy,
-        memory,
-        clock,
-        mut checkpoint,
-        sync,
-        plants,
-    } = spec;
-    // Read by the sync in flight and the held replies; carried until then.
-    let _ = (sync, plants);
+    let mut this = Executor::new(spec);
     let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
     // A shard that fell behind resumes at its normal spacing instead of firing
     // a burst of catch-up ticks. The default is that burst, and it is the last
@@ -396,175 +387,318 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
             //
             // Draining the inbox first is also the right priority on its own
             // merits: work the shard was asked for outranks housekeeping.
+            //
+            // Then the sync in flight, ahead of the tick: its completion
+            // releases held replies and lets the next sync be issued.
             biased;
 
             envelope = inbox.recv() => {
-                let Some(Envelope { mut cmds, reply }) = envelope else {
+                let Some(envelope) = envelope else {
                     break;
                 };
-                // No `await` inside this loop, so a batch is applied as a unit:
-                // nothing from another connection lands between its commands.
-                let mut replies = Vec::with_capacity(cmds.len());
-                // One clock reading for the whole envelope, taken here rather
-                // than inside a handler. A handler that read the clock itself
-                // would still be synchronous — this is not the no-await rule —
-                // but the commands of one batch would then expire keys against
-                // several different instants, which is a difference nothing
-                // about the batch justifies.
-                //
-                // It is also the first command's timing start — see
-                // `ShardStats::usec`, which spends one further reading per
-                // command and differences each against the one before it.
-                let now = Now {
-                    instant: Instant::now(),
-                    unix_millis: clock(),
-                };
-                let mut last = now.instant;
-                // By mutable reference, so a handler can move a command's value
-                // into the dict instead of copying it — see `apply`. The trace
-                // reads the command *after* the handler has had it, and reads
-                // only fields no handler takes.
-                for (shard, cmd) in &mut cmds {
-                    let state = &mut states[usize::from(*shard - first_shard)];
-                    let at = state.seq;
-                    // Three ways a command is answered, and only the last one
-                    // reaches a handler.
-                    //
-                    // `Stats` is answered here rather than in `apply` because
-                    // what it reports — the eviction count — lives beside the
-                    // dict and not in it, and giving `apply` an arm that
-                    // could only ever answer half the fields would be an arm
-                    // whose answer is wrong.
-                    //
-                    // The refusal is here for the same reason in the other
-                    // direction: whether a write is over the ceiling is a
-                    // question about the node, and `apply` is deliberately a
-                    // function of one shard's own state.
-                    let answer = if matches!(cmd, Command::Stats) {
-                        Reply::Stats(Box::new(stats_of(state)))
-                    } else if memory.limit.mode == EvictionMode::NoEviction
-                        && cmd.denied_when_full()
-                        && memory.limit.exceeded(memory.gauge.used())
-                    {
-                        Reply::Error(ReplyError::OutOfMemory)
-                    } else {
-                        // The gauge is the sum of what the dicts account, so
-                        // it is moved by the difference this command made to
-                        // one of them. Read either side of `apply` rather
-                        // than inside it: the handlers stay unaware there is
-                        // a gauge at all.
-                        let before = state.dict.used_bytes();
-                        let answer = apply(state, *shard, cmd, now, &policy);
-                        memory.gauge.apply(before, state.dict.used_bytes());
-                        if memory.limit.mode == EvictionMode::AllKeysLru {
-                            // The command's key survives this. `apply` takes
-                            // a command's value but never its key — the trace
-                            // reads it after — so the route still names it.
-                            let spared = match cmd.route() {
-                                Route::Key(key) => Some(key),
-                                Route::Shard(_) | Route::Every | Route::Unaddressed => None,
-                            };
-                            evict_until_fits(state, *shard, &memory, &trace, &policy, spared);
-                        }
-                        answer
-                    };
-                    // A reading per command, differenced against the one
-                    // before it, so a batch of `n` commands costs `n`
-                    // readings rather than `2n`.
-                    //
-                    // `saturating_duration_since` rather than a subtraction:
-                    // a monotonic clock is only promised not to go backwards,
-                    // and a reading that did would panic here rather than
-                    // report a zero microsecond nobody would miss.
-                    let spent = {
-                        let after = Instant::now();
-                        let spent = after.saturating_duration_since(last).as_micros();
-                        last = after;
-                        // A command that ran for half a million years would
-                        // saturate; the shard it ran on has other problems.
-                        u64::try_from(spent).unwrap_or(u64::MAX)
-                    };
-                    count_call(state, cmd, &answer, spent);
-                    trace.record(*shard, at, cmd, &answer);
-                    replies.push(answer);
-                }
-                match reply {
-                    // The caller may have gone away; its replies are simply dropped.
-                    ReplyTo::Once(tx) => {
-                        let _ = tx.send(replies);
-                    }
-                    ReplyTo::Share(share) => share.deliver(replies),
-                }
+                this.serve(envelope);
+                this.maybe_issue(Instant::now());
+            }
+            result = in_flight(&mut this.sync.in_flight), if this.sync.in_flight.is_some() => {
+                this.sync_done(result);
+                this.maybe_issue(Instant::now());
             }
             // One ticker per executor rather than one per shard, advancing
             // every owned dict by the same budget: the same per-dict drain
             // rate, and the same aggregate work, as independent tickers.
-            _ = tick.tick() => {
-                // One clock reading for the whole tick, for the reason the
-                // envelope arm takes one for the whole batch: the shards of an
-                // executor should not disagree about which keys this tick found
-                // expired.
-                let now = Instant::now();
-                // The inverse of the envelope arm's `shard - first_shard`:
-                // these states were built from a `0..shards` walk in
-                // ascending order, so a range's offsets are shard ids and fit
-                // the `u16` a shard id is.
-                let shard_at = |offset: usize| {
-                    first_shard
-                        + u16::try_from(offset).expect("a shard range is shorter than u16::MAX")
-                };
-                for (offset, state) in states.iter_mut().enumerate() {
-                    // One reading either side of the whole tick's work: the
-                    // rehash step changes what the tables cost and the sweep
-                    // changes what the entries do, and the gauge only cares
-                    // about the sum.
-                    let before = state.dict.used_bytes();
-                    state.dict.rehash_step(REHASH_BUCKETS_PER_TICK);
-                    sweep_expired(state, shard_at(offset), &trace, now, &policy);
-                    memory.gauge.apply(before, state.dict.used_bytes());
-                }
-                durability_passes(&mut states, &trace, shard_at);
-                // The checkpoint, after both passes: its bases are read at a
-                // point where every shard's buffer has been offered to the
-                // disk, and its budget is the last thing the tick spends.
-                checkpoint.tick(
-                    first_shard,
-                    &mut states,
-                    Now {
-                        instant: now,
-                        unix_millis: clock(),
-                    },
-                    &trace,
-                );
-            }
+            _ = tick.tick() => this.housekeeping(),
         }
     }
 }
 
-/// The tick's durability point, and the only place in a shard that can
-/// afford one: `append` runs inside a handler that cannot `await`, so it
-/// buffers; the tick arm is already async and may block on the disk.
-///
-/// Two passes rather than one: every shard's buffer is written first, then
-/// every shard is synced, so an implementation that shares a file between
-/// the shards of an executor pays one `fsync` for the whole tick rather
-/// than one per shard. A failure of either pass is reported to the sink and
-/// retried on the next tick; see `ReplicationLog::flush` for why a failed
-/// write keeps its bytes.
-fn durability_passes<T: TraceSink, L: ReplicationLog>(
-    states: &mut [ShardState<L>],
-    trace: &T,
-    shard_at: impl Fn(usize) -> u16,
-) {
-    for (offset, state) in states.iter_mut().enumerate() {
-        if let Err(error) = state.log.flush() {
-            trace.fault(shard_at(offset), LogFault::Write, &error);
+/// The sync in flight, polled in place. Only reached with one in flight —
+/// the `select!` arm's guard says so.
+async fn in_flight(slot: &mut Option<(u64, SyncFuture)>) -> io::Result<()> {
+    match slot {
+        Some((_, sync)) => sync.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// What the executor loop holds between arms: [`ExecutorSpec`]'s fields,
+/// plus the sync in flight and the replies waiting on it.
+struct Executor<T, L, P, C> {
+    first_shard: u16,
+    states: Vec<ShardState<L>>,
+    trace: T,
+    policy: P,
+    memory: Memory,
+    clock: fn() -> u64,
+    checkpoint: C,
+    sync: SyncState,
+}
+
+impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T, L, P, C> {
+    fn new(spec: ExecutorSpec<T, L, P, C>) -> Self {
+        let ExecutorSpec {
+            first_shard,
+            states,
+            trace,
+            policy,
+            memory,
+            clock,
+            checkpoint,
+            sync,
+            plants,
+        } = spec;
+        let sync = SyncState::new(sync, plants, states.len(), Instant::now());
+        Self {
+            first_shard,
+            states,
+            trace,
+            policy,
+            memory,
+            clock,
+            checkpoint,
+            sync,
         }
     }
-    for (offset, state) in states.iter_mut().enumerate() {
-        if let Err(error) = state.log.sync() {
-            trace.fault(shard_at(offset), LogFault::Sync, &error);
+
+    /// The inverse of the envelope's `shard - first_shard`: these states
+    /// were built from a `0..shards` walk in ascending order, so a range's
+    /// offsets are shard ids and fit the `u16` a shard id is.
+    fn shard_at(&self, offset: usize) -> u16 {
+        self.first_shard + u16::try_from(offset).expect("a shard range is shorter than u16::MAX")
+    }
+
+    /// Applies one envelope, flushes what it appended, and answers it — at
+    /// once, or once the sync covering it completes when the policy holds
+    /// a write's replies. A read-only envelope never waits.
+    fn serve(&mut self, Envelope { mut cmds, reply }: Envelope) {
+        // No `await` inside this loop, so a batch is applied as a unit:
+        // nothing from another connection lands between its commands.
+        let mut replies = Vec::with_capacity(cmds.len());
+        // One clock reading for the whole envelope, taken here rather
+        // than inside a handler. A handler that read the clock itself
+        // would still be synchronous — this is not the no-await rule —
+        // but the commands of one batch would then expire keys against
+        // several different instants, which is a difference nothing
+        // about the batch justifies.
+        //
+        // It is also the first command's timing start — see
+        // `ShardStats::usec`, which spends one further reading per
+        // command and differences each against the one before it.
+        let now = Now {
+            instant: Instant::now(),
+            unix_millis: (self.clock)(),
+        };
+        let mut last = now.instant;
+        let mut wrote = false;
+        // By mutable reference, so a handler can move a command's value
+        // into the dict instead of copying it — see `apply`. The trace
+        // reads the command *after* the handler has had it, and reads
+        // only fields no handler takes.
+        for (shard, cmd) in &mut cmds {
+            let (answer, appended) = self.answer(*shard, cmd, now, &mut last);
+            wrote |= appended;
+            replies.push(answer);
         }
+        if wrote {
+            // Into the page cache, now: the bytes a sync issued after this
+            // envelope covers. A shard named twice flushes an empty buffer
+            // the second time, which costs a length check.
+            for (shard, _) in &cmds {
+                let offset = usize::from(*shard - self.first_shard);
+                if let Err(error) = self.states[offset].log.flush() {
+                    self.trace.fault(*shard, LogFault::Write, &error);
+                }
+            }
+            self.sync.dirty = true;
+        }
+        if wrote && self.sync.policy.hold_acks {
+            self.sync.held.push_back(Held {
+                batch: self.sync.batch,
+                to: reply,
+                replies,
+            });
+        } else {
+            send(reply, replies);
+        }
+    }
+
+    /// One command of an envelope, answered and counted; and whether it
+    /// appended to the log.
+    fn answer(
+        &mut self,
+        shard: u16,
+        cmd: &mut Command,
+        now: Now,
+        last: &mut Instant,
+    ) -> (Reply, bool) {
+        let Self {
+            first_shard,
+            states,
+            trace,
+            policy,
+            memory,
+            ..
+        } = self;
+        let state = &mut states[usize::from(shard - *first_shard)];
+        let at = state.seq;
+        // Three ways a command is answered, and only the last one
+        // reaches a handler.
+        //
+        // `Stats` is answered here rather than in `apply` because
+        // what it reports — the eviction count — lives beside the
+        // dict and not in it, and giving `apply` an arm that
+        // could only ever answer half the fields would be an arm
+        // whose answer is wrong.
+        //
+        // The refusal is here for the same reason in the other
+        // direction: whether a write is over the ceiling is a
+        // question about the node, and `apply` is deliberately a
+        // function of one shard's own state.
+        let answer = if matches!(cmd, Command::Stats) {
+            Reply::Stats(Box::new(stats_of(state)))
+        } else if memory.limit.mode == EvictionMode::NoEviction
+            && cmd.denied_when_full()
+            && memory.limit.exceeded(memory.gauge.used())
+        {
+            Reply::Error(ReplyError::OutOfMemory)
+        } else {
+            // The gauge is the sum of what the dicts account, so
+            // it is moved by the difference this command made to
+            // one of them. Read either side of `apply` rather
+            // than inside it: the handlers stay unaware there is
+            // a gauge at all.
+            let before = state.dict.used_bytes();
+            let answer = apply(state, shard, cmd, now, policy);
+            memory.gauge.apply(before, state.dict.used_bytes());
+            if memory.limit.mode == EvictionMode::AllKeysLru {
+                // The command's key survives this. `apply` takes
+                // a command's value but never its key — the trace
+                // reads it after — so the route still names it.
+                let spared = match cmd.route() {
+                    Route::Key(key) => Some(key),
+                    Route::Shard(_) | Route::Every | Route::Unaddressed => None,
+                };
+                evict_until_fits(state, shard, memory, trace, policy, spared);
+            }
+            answer
+        };
+        // A reading per command, differenced against the one
+        // before it, so a batch of `n` commands costs `n`
+        // readings rather than `2n`.
+        //
+        // `saturating_duration_since` rather than a subtraction:
+        // a monotonic clock is only promised not to go backwards,
+        // and a reading that did would panic here rather than
+        // report a zero microsecond nobody would miss.
+        let spent = {
+            let after = Instant::now();
+            let spent = after.saturating_duration_since(*last).as_micros();
+            *last = after;
+            // A command that ran for half a million years would
+            // saturate; the shard it ran on has other problems.
+            u64::try_from(spent).unwrap_or(u64::MAX)
+        };
+        count_call(state, cmd, &answer, spent);
+        trace.record(shard, at, cmd, &answer);
+        let appended = state.seq != at;
+        (answer, appended)
+    }
+
+    /// Issues a sync of the segment if one is due, recording each shard's
+    /// flushed point at the issue: what the sync covers, and all its
+    /// completion may claim.
+    fn maybe_issue(&mut self, now: Instant) {
+        if !self.sync.due(now) {
+            return;
+        }
+        self.sync.dirty = false;
+        // The first shard's store is the executor's segment: every shard of
+        // it shares one, and the first asked takes the sync.
+        let Some(sync) = self.states[0].log.begin_sync() else {
+            // Nothing written since the last issue, and nothing in flight:
+            // every held batch was covered by a sync that has completed.
+            self.sync.release_through(self.sync.batch);
+            return;
+        };
+        for (at_issue, state) in self.sync.flushed_at_issue.iter_mut().zip(&self.states) {
+            *at_issue = state.log.flushed_through();
+        }
+        let batch = self.sync.batch;
+        self.sync.in_flight = Some((batch, sync));
+        self.sync.issued_at = now;
+        self.sync.batch += 1;
+        if self.sync.plants.releases_on_issue {
+            // The plant: a reply sent before the sync it waited for.
+            self.sync.release_through(batch);
+        }
+    }
+
+    /// The sync in flight finished: on success every shard's durable point
+    /// rises to what it had flushed at the issue — not to what it flushed
+    /// during the flight — and the batches it covered are answered.
+    fn sync_done(&mut self, result: io::Result<()>) {
+        let (batch, _) = self
+            .sync
+            .in_flight
+            .take()
+            .expect("a completion has a sync in flight");
+        match result {
+            Ok(()) => {
+                for (state, through) in self.states.iter_mut().zip(&self.sync.flushed_at_issue) {
+                    state.log.sync_completed(*through);
+                }
+            }
+            Err(error) => {
+                self.states[0].log.sync_failed();
+                self.trace.fault(self.first_shard, LogFault::Sync, &error);
+            }
+        }
+        self.sync.release_through(batch);
+    }
+
+    /// The work no command asked for: each shard's rehash step and sweep,
+    /// the flush of what the sweep appended, a sync if one is due, and the
+    /// checkpoint's budget.
+    fn housekeeping(&mut self) {
+        // One clock reading for the whole tick, for the reason the
+        // envelope arm takes one for the whole batch: the shards of an
+        // executor should not disagree about which keys this tick found
+        // expired.
+        let now = Instant::now();
+        for offset in 0..self.states.len() {
+            let shard = self.shard_at(offset);
+            let state = &mut self.states[offset];
+            // One reading either side of the whole tick's work: the
+            // rehash step changes what the tables cost and the sweep
+            // changes what the entries do, and the gauge only cares
+            // about the sum.
+            let before = state.dict.used_bytes();
+            state.dict.rehash_step(REHASH_BUCKETS_PER_TICK);
+            sweep_expired(state, shard, &self.trace, now, &self.policy);
+            self.memory.gauge.apply(before, state.dict.used_bytes());
+            // What the sweep appended, and what an earlier failed flush
+            // kept: see `ReplicationLog::flush` for why it keeps its bytes.
+            if let Err(error) = state.log.flush() {
+                self.trace.fault(shard, LogFault::Write, &error);
+            }
+        }
+        // Whether the flushes wrote anything is the segment's to say; a
+        // due sync asks it, and finds nothing when nothing was written.
+        self.sync.dirty = true;
+        self.maybe_issue(now);
+        // The checkpoint, last: its bases are read at a point where every
+        // shard's buffer has been offered to the disk, and its budget is
+        // the last thing the tick spends. It may rotate with a sync in
+        // flight: the rotation syncs what the old file holds unsynced, and
+        // the sync in flight keeps its own handle on that file.
+        self.checkpoint.tick(
+            self.first_shard,
+            &mut self.states,
+            Now {
+                instant: now,
+                unix_millis: (self.clock)(),
+            },
+            &self.trace,
+        );
     }
 }
 

@@ -5,6 +5,7 @@
 pub mod support;
 
 mod commands;
+mod durability;
 mod eviction;
 mod expiry;
 mod policy;
