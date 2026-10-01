@@ -10,8 +10,14 @@
 //! A verb added here is a review question: the seam is narrow so that a
 //! reader can hold in one sitting everything the log can do to a disk.
 
+use std::future::Future;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::pin::Pin;
+
+/// A sync that completes later: the executor's, issued and awaited beside
+/// the batches that follow it.
+pub type SyncFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'static>>;
 
 /// An open, append-only file the log writes records into.
 pub trait LogFile: Send + 'static {
@@ -22,13 +28,27 @@ pub trait LogFile: Send + 'static {
     /// Whatever the store reports; the caller keeps its bytes and retries.
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()>;
 
-    /// Makes every byte written so far durable.
+    /// Makes every byte written so far durable, now, on this thread. The
+    /// start path's and the checkpoint's: a few calls per cycle, never on
+    /// the request path.
     ///
     /// # Errors
     ///
     /// Whatever the store reports; nothing written since the last
     /// successful call may be assumed durable.
     fn sync_data(&mut self) -> io::Result<()>;
+
+    /// Makes every byte written *before this call* durable, on some other
+    /// thread or at some later instant, and says when it has. Bytes written
+    /// after the call may or may not be covered; the caller accounts only
+    /// for what was written before it.
+    ///
+    /// # Errors
+    ///
+    /// Through the future: whatever the store reports. The future itself is
+    /// infallible to create — a handle that could not be cloned reports it
+    /// as the sync's failure.
+    fn sync_later(&self) -> SyncFuture;
 }
 
 /// The verbs the log needs from a filesystem.
@@ -122,6 +142,22 @@ impl LogFile for std::fs::File {
     fn sync_data(&mut self) -> io::Result<()> {
         Self::sync_data(self)
     }
+
+    /// `fdatasync` on tokio's blocking pool, over a duplicate descriptor:
+    /// the executor keeps appending to the page cache through its own
+    /// while the kernel flushes, and a flush covers everything written
+    /// before it was asked for, which is all the caller accounts for.
+    fn sync_later(&self) -> SyncFuture {
+        let handle = self.try_clone();
+        Box::pin(async move {
+            let handle = handle?;
+            tokio::task::spawn_blocking(move || handle.sync_data())
+                .await
+                .map_err(|join| {
+                    io::Error::other(format!("the sync thread did not finish: {join}"))
+                })?
+        })
+    }
 }
 
 impl Disk for StdDisk {
@@ -184,7 +220,7 @@ impl Disk for StdDisk {
 /// writes, without a temporary directory and without the simulator.
 #[cfg(test)]
 pub(crate) mod mem {
-    use super::{Disk, LogFile};
+    use super::{Disk, LogFile, SyncFuture};
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::{self, Cursor};
     use std::path::{Path, PathBuf};
@@ -195,12 +231,35 @@ pub(crate) mod mem {
         dirs: BTreeSet<PathBuf>,
         files: BTreeMap<PathBuf, Vec<u8>>,
         fail_writes: bool,
+        /// The kind a failed write reports: `Other` unless a test names one.
+        write_kind: WriteKind,
         fail_syncs: bool,
         fail_removes: bool,
         /// File syncs to let through before one fails, once.
         sync_fails_after: Option<u32>,
         /// Directory syncs to let through before one fails, once.
         dir_sync_fails_after: Option<u32>,
+    }
+
+    /// `io::ErrorKind` with a default, so that `MemFs` can derive its own.
+    #[derive(Clone, Copy)]
+    struct WriteKind(io::ErrorKind);
+
+    impl Default for WriteKind {
+        fn default() -> Self {
+            Self(io::ErrorKind::Other)
+        }
+    }
+
+    impl MemFs {
+        fn write_failure(&self) -> io::Error {
+            io::Error::new(self.write_kind.0, "injected write failure")
+        }
+
+        /// Whether the next file sync fails, counting the one-shot down.
+        fn sync_fails(&mut self) -> bool {
+            self.fail_writes || self.fail_syncs || countdown(&mut self.sync_fails_after)
+        }
     }
 
     /// Counts a sync down: `true` when this is the one that fails.
@@ -245,7 +304,17 @@ pub(crate) mod mem {
 
         /// Whether every write from now on fails.
         pub fn fail_writes(&self, fail: bool) {
-            self.lock().fail_writes = fail;
+            let mut fs = self.lock();
+            fs.fail_writes = fail;
+            fs.write_kind = WriteKind::default();
+        }
+
+        /// Every write from now on fails with `kind`: how a test fills the
+        /// disk (`StorageFull`) rather than breaks it.
+        pub fn fail_writes_with(&self, kind: io::ErrorKind) {
+            let mut fs = self.lock();
+            fs.fail_writes = true;
+            fs.write_kind = WriteKind(kind);
         }
 
         /// Whether every file sync from now on fails, writes still landing:
@@ -275,7 +344,7 @@ pub(crate) mod mem {
         fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
             let mut fs = self.disk.lock();
             if fs.fail_writes {
-                return Err(io::Error::other("injected write failure"));
+                return Err(fs.write_failure());
             }
             fs.files
                 .entry(self.path.clone())
@@ -286,13 +355,23 @@ pub(crate) mod mem {
         }
 
         fn sync_data(&mut self) -> io::Result<()> {
-            let mut fs = self.disk.lock();
-            let failing = fs.fail_writes || fs.fail_syncs || countdown(&mut fs.sync_fails_after);
-            drop(fs);
+            let failing = self.disk.lock().sync_fails();
             if failing {
                 return Err(io::Error::other("injected sync failure"));
             }
             Ok(())
+        }
+
+        /// The same decision as [`sync_data`](LogFile::sync_data), taken at
+        /// the call, answered by a future that is already ready.
+        fn sync_later(&self) -> SyncFuture {
+            let failing = self.disk.lock().sync_fails();
+            let result = if failing {
+                Err(io::Error::other("injected sync failure"))
+            } else {
+                Ok(())
+            };
+            Box::pin(std::future::ready(result))
         }
     }
 
@@ -359,7 +438,7 @@ pub(crate) mod mem {
         fn write_file(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
             let mut fs = self.lock();
             if fs.fail_writes {
-                return Err(io::Error::other("injected write failure"));
+                return Err(fs.write_failure());
             }
             fs.files.insert(path.to_path_buf(), bytes.to_vec());
             drop(fs);
@@ -489,6 +568,43 @@ mod tests {
             disk.contents(&path),
             b"hellX world",
             "damage is planted in place"
+        );
+    }
+
+    /// The std disk's deferred sync runs off the caller's thread and
+    /// resolves; the file is still appendable while it does.
+    #[tokio::test]
+    async fn the_std_disk_syncs_later_and_the_file_stays_writable() {
+        let dir = std::env::temp_dir().join(format!("seedstone-sync-later-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut file = StdDisk.create_append(&dir.join("a.seg")).unwrap();
+        LogFile::write_all(&mut file, b"one").unwrap();
+        let pending = file.sync_later();
+        LogFile::write_all(&mut file, b"two").unwrap();
+        pending.await.unwrap();
+        assert_eq!(StdDisk.len(&dir.join("a.seg")).unwrap(), 6);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The mem disk's deferred sync answers what its blocking one would,
+    /// including the one-shot countdown.
+    #[tokio::test]
+    async fn the_mem_disk_syncs_later_with_the_same_failures() {
+        let disk = MemDisk::default();
+        let wal = Path::new("/data/wal");
+        disk.create_dir_all(wal).unwrap();
+        let file = disk.create_append(&wal.join("a.seg")).unwrap();
+        assert!(file.sync_later().await.is_ok());
+        disk.fail_one_sync_after(0);
+        assert!(file.sync_later().await.is_err(), "the one that fails");
+        assert!(file.sync_later().await.is_ok(), "and the next does not");
+        disk.fail_writes_with(io::ErrorKind::StorageFull);
+        let mut full = disk.create_append(&wal.join("b.seg")).unwrap();
+        assert_eq!(
+            full.write_all(b"x").unwrap_err().kind(),
+            io::ErrorKind::StorageFull,
+            "a full disk is a kind a test can name"
         );
     }
 }
