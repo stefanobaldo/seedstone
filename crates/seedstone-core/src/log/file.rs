@@ -166,9 +166,11 @@ pub struct Segment<F: LogFile> {
     /// Bytes written to this rotation: the live log the checkpoint's
     /// trigger reads. Reset by a rotation, not by a deletion.
     pub(crate) bytes_written: u64,
-    /// Whether anything was written since the last successful sync.
+    /// Whether anything was written since the last sync was issued —
+    /// cleared at the issue, so that what is flushed during a sync in
+    /// flight is the next one's.
     ///
-    /// Public to the crate so a test can see the one-sync-per-tick property
+    /// Public to the crate so a test can see the one-sync-per-issue property
     /// it exists for.
     pub(crate) dirty: bool,
     /// Whether a sync of this executor's segment has failed and nothing
@@ -425,8 +427,9 @@ pub fn create_segment<D: Disk>(
 /// before the swap, so a crash at any point leaves either the old rotation
 /// alone or both — never a writer on a file with no directory entry. The
 /// live-log counter restarts; the sticky sync failure does not, because the
-/// records it gates are in the old file. Called by the checkpoint, which the
-/// executor ticks only with no sync in flight (`run_executor` sequences it).
+/// records it gates are in the old file. Called by the checkpoint; the old
+/// file's unsynced bytes are synced here first, so the executor may rotate
+/// whatever its policy left unsynced, and with a sync in flight.
 ///
 /// # Errors
 ///
@@ -440,20 +443,36 @@ pub fn rotate_segment<D: Disk>(
 ) -> io::Result<u32> {
     let next = {
         let mut guard = lock(segment);
+        // What the old file holds unsynced is synced before the file is let
+        // go: the executor's policy may have left bytes there — `never`
+        // always does — and a later sync of the new file would otherwise
+        // raise a durable point past records the old one never made
+        // durable. One sync per rotation, a few per cycle. A failure is the
+        // sticky one; nothing is swapped, and the next attempt rotates
+        // without retrying, because the snapshot it opens is what covers
+        // those bytes.
+        if guard.dirty && !guard.sync_failed {
+            if let Err(error) = guard.file.sync_data() {
+                guard.sync_failed = true;
+                guard.failed_this_rotation = true;
+                return Err(error);
+            }
+            guard.dirty = false;
+        }
         guard.attempted += 1;
         guard.attempted
     };
     let file = create_segment(disk, wal, generation, executor, next)?;
     disk.sync_dir(wal)?;
     let mut guard = lock(segment);
-    // Dropping the old file's dirty flag is safe only because a rotation
-    // happens with no sync in flight, after the executor issued one for
-    // everything flushed: bytes still unsynced there are bytes a sync
+    // Dropping the old file's dirty flag is safe only because the old
+    // file was synced above: bytes still unsynced there are bytes a sync
     // failed on, and the sticky failure keeps them out of every durable
-    // point until a snapshot covers them.
+    // point until a snapshot covers them. A sync in flight on the old file
+    // finishes on its own handle and accounts only for what it covered.
     debug_assert!(
         !guard.dirty || guard.sync_failed,
-        "a rotation before the sync was issued would abandon unsynced records"
+        "a rotation that did not sync the old file would abandon unsynced records"
     );
     guard.file = file;
     guard.rotation = next;
@@ -1019,6 +1038,45 @@ mod tests {
             log.sync_completed(Some(2)),
             Some(2),
             "a snapshot past the failure heals it"
+        );
+    }
+
+    /// A rotation syncs what the old file holds unsynced before it lets
+    /// go of it: the executor rotates whatever its policy left unsynced,
+    /// and a later sync of the new file must not claim records the old one
+    /// never made durable. A failure there is the sticky one.
+    #[test]
+    fn a_rotation_syncs_the_old_file_first_and_a_failure_there_is_sticky() {
+        let disk = MemDisk::default();
+        let wal = Path::new("/data/wal");
+        disk.create_dir_all(wal).unwrap();
+        let segments = open_segments(&disk, wal, 1, 1).unwrap();
+        let mut log = FileLog::new(0, Arc::clone(&segments[0]));
+        write(&mut log, 0, b"synced");
+        log.append(Record {
+            shard: 0,
+            seq: 1,
+            payload: b"unsynced",
+        })
+        .unwrap();
+        log.flush().unwrap();
+        disk.fail_one_sync_after(0);
+        assert!(
+            rotate_segment(&disk, wal, 1, 0, &segments[0]).is_err(),
+            "the old file's sync is the rotation's first step, and it failed"
+        );
+        assert_eq!(
+            log.sync_completed(Some(1)),
+            Some(0),
+            "the failure is sticky: no later sync proves the record"
+        );
+        rotate_segment(&disk, wal, 1, 0, &segments[0]).unwrap();
+        log.covered(1);
+        segment_snapshot_covered(&segments[0]);
+        assert_eq!(
+            log.sync_completed(Some(1)),
+            Some(1),
+            "until a snapshot covers it"
         );
     }
 }
