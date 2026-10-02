@@ -123,3 +123,27 @@ fn a_directory_lists_in_name_order() {
     assert_eq!(names.len(), 32);
     assert_eq!(names, sorted);
 }
+
+/// A deferred sync of a file removed while the sync is in flight succeeds,
+/// as `fdatasync` on the descriptor of an unlinked file does — read on
+/// Linux 6.12.76 (`python:3.11-slim`) on 2026-10-02 — and not as turmoil's
+/// path-resolved sync, which fails on a path that is gone. The log removes
+/// a rotation the checkpoint covered whether or not a sync of it is still
+/// in flight.
+#[test]
+fn a_deferred_sync_of_a_removed_file_succeeds() {
+    let mut sim = turmoil::Builder::new().build();
+    sim.client("host", async {
+        let disk = SimDisk::default();
+        let dir = Path::new("/data");
+        disk.create_dir_all(dir)?;
+        let path = dir.join("f");
+        let mut file = disk.create_append(&path)?;
+        file.write_all(b"covered elsewhere")?;
+        let sync = file.sync_later();
+        disk.remove_file(&path)?;
+        sync.await?;
+        Ok(())
+    });
+    sim.run().unwrap();
+}
