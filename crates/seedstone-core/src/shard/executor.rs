@@ -567,7 +567,11 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         // No `await` inside this loop, so a batch is applied as a unit:
         // nothing from another connection lands between its commands.
         let mut replies = Vec::with_capacity(cmds.len());
-        let mut appended_each = Vec::with_capacity(cmds.len());
+        // Which commands appended, kept only where a batch can be held: a
+        // policy that answers at once never needs it, and an empty `Vec`
+        // allocates nothing.
+        let holds = self.sync.policy.hold_acks;
+        let mut appended_each = Vec::new();
         // One clock reading for the whole envelope, taken here rather
         // than inside a handler. A handler that read the clock itself
         // would still be synchronous — this is not the no-await rule —
@@ -592,7 +596,9 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             let (answer, appended) = self.answer(*shard, cmd, now, &mut last);
             wrote |= appended;
             replies.push(answer);
-            appended_each.push(appended);
+            if holds {
+                appended_each.push(appended);
+            }
         }
         let mut failed = false;
         if wrote {
