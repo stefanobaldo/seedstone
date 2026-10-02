@@ -432,3 +432,161 @@ async fn a_node_killed_at_its_snapshot_line_starts_again_clean() {
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::remove_file(&stderr).unwrap();
 }
+
+/// Starts the binary over `dir` as its data directory with `extra` after
+/// the flag, and returns the child and its port.
+async fn start_with(dir: &Path, stderr: &Path, extra: &[&str]) -> (Child, u16) {
+    let mut args: Vec<&std::ffi::OsStr> = vec!["--data-dir".as_ref(), dir.as_os_str()];
+    args.extend(extra.iter().map(|arg| std::ffi::OsStr::new(*arg)));
+    let child = spawn(dir, &args, stderr);
+    let lines = until_listening(stderr).await;
+    let port = port_of(lines.last().unwrap());
+    (child, port)
+}
+
+/// Writes every command in `commands` before reading a reply, then reads as
+/// many replies as there were commands, in the order they arrive.
+async fn pipelined(stream: &mut TcpStream, commands: &[&[&str]]) -> Vec<Frame> {
+    let mut out = Vec::new();
+    for parts in commands {
+        let frame = Frame::Array(
+            parts
+                .iter()
+                .map(|part| Frame::Bulk(part.as_bytes().to_vec().into()))
+                .collect(),
+        );
+        encode(&frame, &mut out);
+    }
+    stream.write_all(&out).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut replies = Vec::new();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while replies.len() < commands.len() {
+        if let Some((frame, used)) = parse(&buf).expect("a well-formed reply") {
+            buf.drain(..used);
+            replies.push(frame);
+            continue;
+        }
+        let got = stream.read(&mut chunk).await.unwrap();
+        assert!(got > 0, "the server closed the connection");
+        buf.extend_from_slice(&chunk[..got]);
+    }
+    replies
+}
+
+/// Sends `SIGTERM` to `child` and reaps it.
+fn terminate_and_wait(mut child: Child) {
+    let status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("kill runs");
+    assert!(status.success(), "kill -TERM was delivered");
+    child.wait().expect("reaped");
+}
+
+async fn set_many(port: u16, count: usize) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    for i in 0..count {
+        assert_eq!(
+            round_trip(&mut stream, &["SET", &format!("k{i}"), "v"]).await,
+            Frame::Simple("OK".into())
+        );
+    }
+}
+
+async fn dbsize(port: u16) -> Frame {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    round_trip(&mut stream, &["DBSIZE"]).await
+}
+
+/// Under `--fsync always`, a node killed right after its acknowledgements
+/// serves every one of them when it is started again — no tick between.
+///
+/// A `SIGKILL` keeps the kernel's page cache, so this pins that every
+/// acknowledged write reached the file and that recovery reads all of it;
+/// that the bytes reached the device before the acknowledgement is the
+/// simulator's to show, where a crash discards what no sync covered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_killed_right_after_acknowledging_under_always_keeps_every_write() {
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let (mut first, port) = start_with(&dir, &stderr, &["--fsync", "always"]).await;
+    set_many(port, 200).await;
+    first.kill().expect("SIGKILL");
+    first.wait().expect("reaped");
+    let (mut second, port) = start_with(&dir, &stderr, &["--fsync", "always"]).await;
+    assert_eq!(dbsize(port).await, Frame::Integer(200));
+    second.kill().expect("SIGKILL");
+    second.wait().expect("reaped");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}
+
+/// A pipelined `SET` then `GET` of one key under `always`: the `GET` runs
+/// at once against memory, yet its reply lands after the `SET`'s, which
+/// waits for its sync, and carries the value.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pipelined_read_behind_a_held_write_lands_after_it() {
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let (mut node, port) = start_with(&dir, &stderr, &["--fsync", "always"]).await;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let replies = pipelined(&mut stream, &[&["SET", "k", "v"], &["GET", "k"]]).await;
+    assert_eq!(
+        replies,
+        vec![Frame::Simple("OK".into()), Frame::Bulk("v".into())]
+    );
+    node.kill().expect("SIGKILL");
+    node.wait().expect("reaped");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}
+
+/// Under `--fsync never` a clean stop loses nothing: a `SIGTERM` after the
+/// writes, the stop completes within its grace period, and the next start
+/// serves all of them.
+///
+/// As above, the page cache outlives the process; that the stop's final
+/// sync covers what was flushed is the core's to show.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_stopped_cleanly_under_never_keeps_every_write() {
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let (first, port) = start_with(&dir, &stderr, &["--fsync", "never"]).await;
+    set_many(port, 200).await;
+    terminate_and_wait(first);
+    let stopped = std::fs::read_to_string(&stderr).unwrap();
+    assert!(stopped.contains("\"evt\":\"stopping\""), "{stopped}");
+    assert!(
+        !stopped.contains("\"evt\":\"shutdown_timeout\""),
+        "{stopped}"
+    );
+    let (mut second, port) = start_with(&dir, &stderr, &["--fsync", "never"]).await;
+    assert_eq!(dbsize(port).await, Frame::Integer(200));
+    second.kill().expect("SIGKILL");
+    second.wait().expect("reaped");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}
+
+/// `--fsync` without `--data-dir` is accepted, and says it does nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn fsync_without_a_data_dir_warns_once() {
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let mut node = spawn(&dir, &["--fsync".as_ref(), "always".as_ref()], &stderr);
+    let lines = until_listening(&stderr).await;
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("\"evt\":\"fsync_ignored\""))
+            .count(),
+        1,
+        "{lines:?}"
+    );
+    node.kill().expect("SIGKILL");
+    node.wait().expect("reaped");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}
