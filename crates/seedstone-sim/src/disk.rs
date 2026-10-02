@@ -6,7 +6,7 @@
 //! the seam is a handful of verbs and not a file abstraction.
 
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,9 +49,11 @@ impl SimDisk {
     }
 }
 
-/// A simulated file open for appending, and the disk it was opened on.
+/// A simulated file open for appending, where, and the disk it was opened
+/// on.
 pub struct SimFile {
     file: File,
+    path: PathBuf,
     disk: SimDisk,
 }
 
@@ -66,11 +68,21 @@ impl LogFile for SimFile {
 
     /// turmoil's sync, after the drawn latency, on a handle of its own: the
     /// log may rotate away from this file while the sync is in flight.
+    ///
+    /// A file removed meanwhile is synced successfully, as `fdatasync` on
+    /// the descriptor of an unlinked file is — read on Linux 6.12.76 on
+    /// 2026-10-02. turmoil resolves a handle to its path and fails a sync
+    /// of one that is gone, and the log removes a rotation the checkpoint
+    /// covered whether or not a sync of it is still in flight.
     fn sync_later(&self) -> SyncFuture {
         let latency = self.disk.draw();
         let handle = self.file.try_clone();
+        let path = self.path.clone();
         Box::pin(async move {
             tokio::time::sleep(latency).await;
+            if !sim_fs::exists(&path) {
+                return Ok(());
+            }
             handle?.sync_data()
         })
     }
@@ -110,6 +122,7 @@ impl Disk for SimDisk {
             .open(path)
             .map(|file| SimFile {
                 file,
+                path: path.to_path_buf(),
                 disk: self.clone(),
             })
     }
