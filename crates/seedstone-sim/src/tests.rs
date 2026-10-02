@@ -330,6 +330,7 @@ fn every_plant_answers_whether_the_swept_shapes_catch_it() {
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/planted_eviction.rs"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/planted_crossing.rs"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/planted_recovery.rs"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/planted_durability.rs"),
     ] {
         assert!(
             std::path::Path::new(path).exists(),
@@ -725,4 +726,55 @@ fn a_run_that_refused_is_held_to_the_counter_range() {
     assert!(outcome.invariant_holds(), "inside the range");
     outcome.actual_sum = 10;
     assert!(!outcome.invariant_holds(), "outside it");
+}
+
+/// After a log fault no write is done until the refusal it began is over.
+#[test]
+fn a_write_acknowledged_by_a_refusing_executor_is_a_violation() {
+    let mut outcome = crate::outcome::nothing_observed();
+    outcome.hostile = true;
+    outcome.write_faults = 1;
+    assert!(outcome.invariant_holds());
+    outcome.acked_while_refusing = 1;
+    assert!(!outcome.invariant_holds());
+}
+
+/// A run that refused writes owes no expiration check: its volatile writes
+/// may all have been refused. Everything else it still owes.
+#[test]
+fn a_run_that_refused_owes_no_expiration_check() {
+    let mut outcome = crate::outcome::nothing_observed();
+    outcome.expected_sum = 1;
+    outcome.plain_checks = 1;
+    outcome.walk_checks = 1;
+    outcome.snapshot_cycles = 1;
+    assert!(!outcome.invariants_were_exercised(), "no expiry decided");
+    outcome.refused = 1;
+    assert!(outcome.invariants_were_exercised());
+    outcome.plain_checks = 0;
+    assert!(
+        !outcome.invariants_were_exercised(),
+        "the plain family still owes"
+    );
+}
+
+/// A run whose crashes interrupt every cycle reports no snapshot, so the
+/// directory is never read: the peak is taken from what the snapshots
+/// report, and the bound made of nothing holds it.
+///
+/// A verdict test rather than a seed: since the log is flushed per
+/// envelope rather than per tick, no `standard` seed in 1..=700 completes
+/// fewer than three cycles, so no seed reaches this path end to end.
+#[test]
+fn a_run_that_never_completes_a_cycle_is_not_read_against_an_empty_bound() {
+    let mut outcome = crate::outcome::nothing_observed();
+    outcome.crashes = 2;
+    outcome.disk_bound_bytes = disk_bound(10, SIM_CHECKPOINT, 0, 0, 2);
+    assert_eq!(outcome.snapshot_cycles, 0);
+    assert_eq!(outcome.disk_peak_bytes, 0, "nothing reported, nothing read");
+    assert!(outcome.invariant_holds(), "{outcome:?}");
+    assert!(
+        !outcome.invariants_were_exercised(),
+        "and the run says it measured nothing about the bound"
+    );
 }

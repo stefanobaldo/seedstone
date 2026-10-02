@@ -9,6 +9,7 @@ use rand::SeedableRng;
 use rand::rngs::ChaCha8Rng;
 use seedstone_core::log::checkpoint::CheckpointConfig;
 use seedstone_core::shard::SyncPolicy;
+use seedstone_core::slot::executor_of;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -165,6 +166,10 @@ pub struct SimOutcome {
     /// Refusals that ended: an executor's snapshot of its memory became
     /// durable and it served writes again.
     pub refusals_ended: u64,
+    /// Writes an executor answered as done between a log fault and the end
+    /// of the refusal that fault began: each is a promise the refusal says
+    /// the node does not make.
+    pub acked_while_refusing: u64,
     /// Whether the run's disk could fail and lie, which is what decides
     /// whether a reported loss is excused.
     pub hostile: bool,
@@ -277,6 +282,9 @@ impl SimOutcome {
             // one that did, it follows a fault.
             && (self.hostile || self.refused == 0)
             && (self.refused == 0 || self.write_faults + self.sync_faults > 0)
+            // And the converse, read on the node's own answers: after a
+            // fault, no write is done until the refusal it began is over.
+            && self.acked_while_refusing == 0
     }
 
     /// Whether the run's invariants decided anything at all.
@@ -288,9 +296,13 @@ impl SimOutcome {
     /// the system.
     #[must_use]
     pub const fn invariants_were_exercised(&self) -> bool {
+        // A run that refused may have had every write to the volatile
+        // family refused, and a key with no deadline the server took has
+        // nothing to die by: the expiration checks are owed only by a run
+        // whose node never refused a write.
+        let expiry = self.refused > 0 || (self.dead_checks > 0 && self.alive_checks > 0);
         self.expected_sum != 0
-            && self.dead_checks > 0
-            && self.alive_checks > 0
+            && expiry
             && self.plain_checks > 0
             && self.walk_checks > 0
             // Only where there is a ceiling to check against. On a shape with
@@ -380,6 +392,7 @@ pub const fn nothing_observed() -> SimOutcome {
         crashes_in_flight: 0,
         refused: 0,
         refusals_ended: 0,
+        acked_while_refusing: 0,
         hostile: false,
         snapshot_cycles: 0,
         compactions: 0,
@@ -455,6 +468,13 @@ pub struct Shared {
     pub disk_lies: bool,
     /// The durability policy the node runs under.
     pub policy: SyncPolicy,
+    /// The node's shard and executor counts, for naming the executor a
+    /// shard belongs to.
+    pub shards: u16,
+    pub executors: u16,
+    /// Per executor, whether it is between a log fault and the end of the
+    /// refusal that fault began, as the trace reports it.
+    pub refusing: Arc<Mutex<Vec<bool>>>,
     /// Syncs issued, and syncs completed or failed, over the node's current
     /// process: a crash with the first ahead of the second landed with one
     /// in flight.
@@ -482,6 +502,19 @@ pub struct Increment {
 }
 
 impl Shared {
+    /// Marks the executor that owns `shard` as refusing, or not.
+    pub fn set_refusing(&self, shard: u16, refusing: bool) {
+        let executor = executor_of(shard, self.shards, self.executors);
+        lock(&self.refusing)[usize::from(executor)] = refusing;
+    }
+
+    /// Whether the executor that owns `shard` is refusing.
+    #[must_use]
+    pub fn is_refusing(&self, shard: u16) -> bool {
+        let executor = executor_of(shard, self.shards, self.executors);
+        lock(&self.refusing)[usize::from(executor)]
+    }
+
     /// Shared state for the node `cfg` describes.
     #[must_use]
     pub fn new(cfg: &SimConfig) -> Self {
@@ -500,6 +533,9 @@ impl Shared {
             disk: SimDisk::new(disk.sync_latency_ms, Some(Arc::new(Mutex::new(rng)))),
             disk_lies: disk.lies(),
             policy: cfg.policy(),
+            shards: cfg.shards,
+            executors: cfg.executors,
+            refusing: Arc::new(Mutex::new(vec![false; usize::from(cfg.executors)])),
             syncs: Arc::default(),
         }
     }
@@ -549,6 +585,8 @@ pub struct Tally {
     pub refused: u64,
     /// Refusals the node reported ended.
     pub refusals_ended: u64,
+    /// Writes answered as done by a refusing executor.
+    pub acked_while_refusing: u64,
     /// Client hosts that finished their bursts and are waiting, at rest,
     /// for the driver.
     pub paused: u32,

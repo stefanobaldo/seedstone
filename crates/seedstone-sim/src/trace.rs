@@ -91,6 +91,15 @@ impl TraceSink for HashSink {
         acc = fold_inputs(acc, cmd);
         acc = fold_reply(acc, reply);
         *h = acc;
+        drop(h);
+        // Read on the executor's own answer, before anything holds it for a
+        // sync: what it decided, not what reached the wire.
+        if cmd.writes_the_log()
+            && !matches!(reply, Reply::Error(_))
+            && self.shared.is_refusing(shard)
+        {
+            lock(&self.shared.tally).acked_while_refusing += 1;
+        }
     }
 
     /// Folded: two runs that recovered different prefixes are different
@@ -98,6 +107,8 @@ impl TraceSink for HashSink {
     /// durable when the node last crashed lost a durable record — the
     /// invariant the log makes, measured on the server's own numbers.
     fn recovered(&self, shard: u16, next_seq: u64, lossy: bool) {
+        // A new process: whatever its predecessor was refusing, it is not.
+        self.shared.set_refusing(shard, false);
         {
             let mut h = lock(&self.hash);
             *h = mix(
@@ -180,7 +191,11 @@ impl TraceSink for HashSink {
         tally.files_removed += report.files;
     }
 
-    fn fault(&self, _shard: u16, fault: LogFault, _error: &std::io::Error) {
+    fn fault(&self, shard: u16, fault: LogFault, _error: &std::io::Error) {
+        // A failed write or sync is where the executor's refusal begins.
+        if matches!(fault, LogFault::Write | LogFault::Sync) {
+            self.shared.set_refusing(shard, true);
+        }
         let mut tally = lock(&self.shared.tally);
         match fault {
             LogFault::Write => tally.write_faults += 1,
@@ -203,6 +218,7 @@ impl TraceSink for HashSink {
                 report.refused,
             );
         }
+        self.shared.set_refusing(report.executor_first_shard, false);
         lock(&self.shared.tally).refusals_ended += 1;
     }
 }

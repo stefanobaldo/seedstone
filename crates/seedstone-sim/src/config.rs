@@ -200,12 +200,14 @@ impl DiskFaults {
     /// A disk that tears pending writes on a crash and nothing else: the
     /// swept shape's disk, where the strong invariant is asserted.
     ///
-    /// On this node it tears nothing today: the log's tick writes and syncs
-    /// without yielding between the two, and a host is crashed only between
-    /// steps, so no write is ever pending when the crash lands. It stays
-    /// the swept disk so that a change which leaves one pending is torn by
-    /// the gate rather than by production; a torn record is otherwise met
-    /// on `hostile`, behind a failed sync, and in the reader's own tests.
+    /// What it tears is the unsynced tail: the log is flushed per envelope
+    /// and synced behind it, so a crash nearly always lands with bytes the
+    /// sync in flight, or the next one, had not yet covered. A deferred sync
+    /// takes 1–250 ms, drawn per sync: the top is past one housekeeping
+    /// tick, so a crash can land inside a flight. Read on `standard` seeds
+    /// 1–6 with the policy fixed, on 2026-10-02: under `always` and under
+    /// `interval` every crash of those seeds (5 of 5, on four seeds) landed
+    /// with a sync in flight; under `never`, which issues none, no crash did.
     pub const TORN: Self = Self {
         block_size: Some(32),
         io_error_permille: 0,

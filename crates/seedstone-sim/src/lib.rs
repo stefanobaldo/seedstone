@@ -432,6 +432,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         crashes_in_flight: tally.crashes_in_flight,
         refused: tally.refused,
         refusals_ended: tally.refusals_ended,
+        acked_while_refusing: tally.acked_while_refusing,
         hostile: cfg.disk.lies(),
         snapshot_cycles: tally.snapshot_cycles,
         compactions: tally.compactions,
