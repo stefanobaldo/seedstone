@@ -104,6 +104,9 @@ pub struct Held {
     pub batch: u64,
     pub to: ReplyTo,
     pub replies: Vec<Reply>,
+    /// Per reply, whether its command appended to the log: what the
+    /// refusal replaces if the sync behind the batch fails.
+    pub wrote: Vec<bool>,
 }
 
 /// Whether an executor accepts writes.
@@ -176,17 +179,19 @@ impl SyncState {
         matches!(self.mode, Mode::Refusing { .. })
     }
 
-    /// Answers every held batch with `error`: its writes were applied, and
-    /// no sync stands behind them. Every reply that was not already an
-    /// error becomes `error` — which command of a batch wrote is not kept,
-    /// and a dropped connection would have lost the batch's replies alike.
+    /// Answers every held batch's writes with `error`: they were applied,
+    /// and no sync stands behind them. A read beside them is served, as it
+    /// would have been in a batch of its own.
     pub fn fail_all(&mut self, error: &Reply) {
         for Held {
-            to, mut replies, ..
+            to,
+            mut replies,
+            wrote,
+            ..
         } in self.held.drain(..)
         {
-            for reply in &mut replies {
-                if !matches!(reply, Reply::Error(_)) {
+            for (reply, wrote) in replies.iter_mut().zip(wrote) {
+                if wrote && !matches!(reply, Reply::Error(_)) {
                     reply.clone_from(error);
                 }
             }
@@ -254,6 +259,7 @@ mod tests {
                 batch,
                 to: ReplyTo::Once(tx),
                 replies: vec![Reply::Ok],
+                wrote: vec![true],
             });
             receivers.push(rx);
         }
