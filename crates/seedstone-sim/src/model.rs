@@ -41,10 +41,9 @@ pub struct Model {
     volatile: KeyRange,
     /// What this client last wrote to each plain key it owns.
     plain_state: Vec<Known>,
-    /// The deadline it last asked for on each volatile key it owns, sampled
-    /// from its own clock *before* the request left — so the deadline the
-    /// server computed is this instant or later, never earlier.
-    deadlines: Vec<Option<Instant>>,
+    /// The deadline it last asked for on each volatile key it owns, as the
+    /// band the server's own must lie in.
+    deadlines: Vec<Option<Deadline>>,
     /// Whether the node this client is talking to has a ceiling.
     ///
     /// The one thing that weakens the plain family's model, and it is
@@ -85,6 +84,34 @@ pub struct Model {
     crashes_seen: usize,
     /// The node's shard count, for placing a counter key on its shard.
     shards: u16,
+}
+
+/// The band a volatile key's deadline lies in on the server.
+///
+/// The client samples its clock *before* the request leaves, so the server,
+/// which computed the deadline when the command ran, holds this instant or
+/// later. How much later is bounded by the reply: the command ran before
+/// its reply left. Under `--fsync always` that reply waits for a sync, and
+/// a pipelined write behind it waits for its turn — so the band is the
+/// write's own round trip wide, not one message latency.
+#[derive(Debug, Clone, Copy)]
+struct Deadline {
+    /// The earliest the server's deadline can be: what a key is certainly
+    /// alive before.
+    earliest: Instant,
+    /// The latest it can be: what a key is certainly dead after.
+    latest: Instant,
+}
+
+impl Deadline {
+    /// The band of a deadline asked for as `asked`, from a request sent at
+    /// `sent` whose reply arrived at `received`.
+    fn new(asked: Instant, sent: Instant, received: Instant) -> Self {
+        Self {
+            earliest: asked,
+            latest: asked + received.saturating_duration_since(sent),
+        }
+    }
 }
 
 impl Model {
@@ -518,7 +545,9 @@ impl Model {
                 }
                 Check::VolatileSet { slot, deadline } => {
                     self.deadlines[*slot as usize] = match reply {
-                        Frame::Simple(text) if text == "OK" => Some(*deadline),
+                        Frame::Simple(text) if text == "OK" => {
+                            Some(Deadline::new(*deadline, sent, received))
+                        }
                         _ => None,
                     };
                     self.volatile_acked[*slot as usize] = Some(acked);
@@ -529,7 +558,7 @@ impl Model {
                 // its owner writes it again.
                 Check::VolatileExpire { slot, deadline } => {
                     self.deadlines[*slot as usize] = match reply {
-                        Frame::Integer(1) => Some(*deadline),
+                        Frame::Integer(1) => Some(Deadline::new(*deadline, sent, received)),
                         _ => None,
                     };
                     self.volatile_acked[*slot as usize] = Some(acked);
@@ -853,18 +882,18 @@ impl Model {
             Frame::Null => false,
             _ => return,
         };
-        if self.evictable && !present && received + LIVE_SLACK < deadline {
+        if self.evictable && !present && received + LIVE_SLACK < deadline.earliest {
             self.deadlines[slot as usize] = None;
             lock(&self.shared.tally).evictions_observed += 1;
             return;
         }
         let mut tally = lock(&self.shared.tally);
-        if sent > deadline + STALE_SLACK {
+        if sent > deadline.latest + STALE_SLACK {
             tally.dead_checks += 1;
             if present {
                 tally.stale_reads += 1;
             }
-        } else if received + LIVE_SLACK < deadline {
+        } else if received + LIVE_SLACK < deadline.earliest {
             tally.alive_checks += 1;
             if !present {
                 tally.spurious_deaths += 1;
@@ -885,7 +914,10 @@ impl Model {
     /// that eats the living fails the second; a server that spares the dead
     /// fails the first.
     pub async fn settle(&mut self, conn: &mut Conn, depth: usize) -> turmoil::Result<()> {
-        if let Some(last) = self.deadlines.iter().flatten().max() {
+        // Waited out from each band's earliest end, as it was before the band
+        // had two: a key whose reply was slow is read inside its band and
+        // decides nothing, rather than every run's settle moving for it.
+        if let Some(last) = self.deadlines.iter().flatten().map(|d| d.earliest).max() {
             // A millisecond past the staleness band — this is a wait for
             // deadlines to pass, so it is that side's band it has to clear —
             // leaving a deadline waited out decidedly behind us and the read
@@ -893,7 +925,7 @@ impl Model {
             // whose documentation says what the wait costs and what capping it
             // gives up.
             let until =
-                (*last).min(Instant::now() + SETTLE_CAP) + STALE_SLACK + Duration::from_millis(1);
+                last.min(Instant::now() + SETTLE_CAP) + STALE_SLACK + Duration::from_millis(1);
             tokio::time::sleep_until(until).await;
         }
 
