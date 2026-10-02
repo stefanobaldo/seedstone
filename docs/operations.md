@@ -80,7 +80,7 @@ as the server writes them:
 | `recovery` | `info` | `segments`, `records`, `applied`, `discarded`, `damage_bytes`, `holes`, `abandoned_segments`, `malformed`, `truncated_shards`, `lossy_shards`, `snapshots_used`, `snapshots_refused`, `files_removed` | the log under `--data-dir` was read on start-up; `applied` records were replayed, `discarded` were cut after a gap, `damage_bytes` were stepped over in `holes` damaged regions, `abandoned_segments` could not be read past a point, `malformed` records were intact but unreadable by this build; `lossy_shards` is how many shards any of that may have cost records — a hole can take a shard's last records without leaving a gap; `snapshots_used` files gave a shard its image, `snapshots_refused` were refused (no footer, counts that did not match, damage inside), `files_removed` files nothing used were removed |
 | `recovery_truncated` | `warn` | `shard`, `applied`, `discarded` | one shard's log had a gap: `applied` records before it were replayed, `discarded` after it were not; the node serves what it has |
 | `recovery_failed` | `error` | `error` | the log could not be read — the directory cannot be created or listed, or a segment is from a newer version; the process exits 1 after this line |
-| `log_fault` | `error` | `shard`, `stage`, `error` | a shard's log could not be written (`stage` `write`) or made durable (`sync`), the executor's snapshot could not be written or made durable (`snapshot`), or a file a durable snapshot made redundant could not be removed (`remove`), on a housekeeping tick; for those two, `shard` is the executor's first shard. A failed write keeps its records and the next tick retries it. A failed sync is retried too, but a filesystem may drop what it could not write and report the retry as a success, so writes acknowledged since the last successful sync may be lost until a snapshot covers them; the next start reads what the disk kept and reports any damage it finds. A failed snapshot write or sync starts that snapshot over in a new file; a failed removal is retried at the next snapshot and at the next start |
+| `log_fault` | `error` | `shard`, `stage`, `error` | a shard's log could not be written (`stage` `write`) or made durable (`sync`), the executor's snapshot could not be written or made durable (`snapshot`), or a file a durable snapshot made redundant could not be removed (`remove`); for those two, `shard` is the executor's first shard. After a failed write or sync the executor whose log it was refuses writes, serves reads, and takes a snapshot of its memory in a fresh segment; it serves writes again once that snapshot is durable, on `refusal_ended` — see *What `--data-dir` promises*. A failed snapshot write or sync starts that snapshot over in a new file on a later housekeeping tick; a failed removal is retried at the next snapshot and at the next start. The next start reads what the disk kept and reports any damage it finds |
 | `refusal_ended` | `info` | `shard`, `refused`, `ticks` | the executor whose first shard is `shard` serves writes again: it refused them after its log could not be written or synced (`log_fault` came first), and a snapshot of its memory taken after the failure is durable; `refused` writes were refused over `ticks` housekeeping ticks |
 | `snapshot` | `info` | `executor`, `cycle`, `entries`, `bytes`, `ticks`, `disk_bytes` | one executor's snapshot became durable: `entries` keys in `bytes` bytes, taken over `ticks` housekeeping ticks; `disk_bytes` is the whole of `PATH/wal/` at that moment, before the compaction that follows — the directory's peak |
 | `compaction` | `info` | `executor`, `files`, `bytes` | one executor removed `files` files, `bytes` bytes, that its durable snapshot made redundant: its own older segments and snapshot, or every older process's files once every executor of this process has a durable snapshot |
@@ -104,7 +104,7 @@ notice, and nothing should match on it.
 
 | Signal | Effect | Writes |
 |---|---|---|
-| `SIGTERM`, `SIGINT` | The server stops accepting connections and exits when the connections it is serving end. | `stopping`, with the signal's name |
+| `SIGTERM`, `SIGINT` | The server stops accepting connections, answers what its executors had queued, syncs the log, and exits when the connections it is serving end. | `stopping`, with the signal's name; then `shutdown_timeout` if the disk did not answer in time |
 | `SIGHUP` | The password file is re-read; see *Password and rotation*. | `password_reloaded`, `password_reload_failed` or `password_reload_skipped` |
 
 In a container this binary is process 1, and process 1 ignores every signal
@@ -178,15 +178,55 @@ production evidence is the test suite's.
 
 ## What `--data-dir` promises
 
-The node appends every write to a log under `PATH/wal/` and syncs it on its
-housekeeping tick — every 100 ms on a node with room to spare, less often on
-one kept busy, since commands are served before housekeeping. A write
-acknowledged before a sync survives a crash; one acknowledged after the last
-sync may not — nor, once a sync has failed (`log_fault` with `stage` `sync`),
-may anything acknowledged since the last one that succeeded, until a
-snapshot covers it. On start the log is read back: a shard whose records
-have a gap is replayed up to the gap and reported with
-`recovery_truncated`, and the node serves what it has.
+The node appends every write to a log under `PATH/wal/`; `--fsync` says
+when the log is synced, and so what a crash can cost.
+
+- **`always`**: a write is acknowledged only once a sync covering its record
+  has completed, so every acknowledged write survives a crash. The sync runs
+  off the executor, one at a time, and covers every write that arrived while
+  the previous one was in flight. A read waits for one only behind a write
+  sent before it on its own connection, whose reply must go out first, or
+  when it finds its key expired and deletes it, which is a write.
+- **`interval`** (the default): a write is acknowledged at once, and the log
+  is synced once 100 ms have passed since the last sync, whenever there is
+  something to sync and no sync is in flight — on a busy node from the
+  request path, on an idle one from the housekeeping tick. A crash costs
+  what was acknowledged since the last sync that completed.
+- **`never`**: the node issues no sync of its own. The kernel writes the log
+  when it will; a snapshot syncs the segment it leaves behind. A crash keeps
+  the last durable snapshot, plus whatever of the log the kernel had written.
+
+Under every setting what survives of a shard is a prefix of what was
+acknowledged on it, and a clean stop (`SIGTERM`, `SIGINT`) syncs everything
+before the process ends, so a rollout never loses what only a crash would.
+`--fsync` without `--data-dir` is accepted, logged as `fsync_ignored`, and
+does nothing. On start the log is read back: a shard whose records have a
+gap is replayed up to the gap and reported with `recovery_truncated`, and
+the node serves what it has.
+
+**When the disk fails.** A write or a sync of the log that fails
+(`log_fault`) puts the executor whose log it was into refusal: every write
+to its shards is answered `MISCONF Errors writing to the log: writes are
+refused until a snapshot is durable` (the shape of the reply Redis 6.2.24
+and 8.10.1 give a failed AOF write under `appendfsync everysec` —
+[compatibility.md](compatibility.md) has the reading),
+its reads are served, and the other executors do not notice: a node of ten
+executors with one refusing serves nine tenths of its writes. The executor
+then moves to a fresh segment and takes a snapshot of its shards' memory;
+once the snapshot is durable it serves writes again, on the
+`refusal_ended` line. Under `interval` and `never`, writes acknowledged
+between the last good sync and the failure are in memory, and the snapshot
+covers them; what a crash before it lands would lose is what the setting
+already allowed. Under `always`, the writes of a batch whose sync failed are
+answered with the refusal, and a read in the same batch is answered as
+usual. Those writes were applied without being acknowledged, exactly as a
+client sees a dropped connection, and the snapshot makes them durable: a
+client that retries a `SET` gets the same value, and one that retries an
+`INCRBY` counts twice, as after any lost reply. A disk with no space fails
+the snapshot too (`log_fault` with `stage` `snapshot`, every tick), and the
+executor keeps refusing until space is freed; a start whose first write to
+the log fails begins refusing writes the same way. A full disk asks for
+space, not for a restart.
 
 The node runs one *executor* per available core, each serving a fixed
 range of the shards and keeping one log for them; the `snapshot` and
