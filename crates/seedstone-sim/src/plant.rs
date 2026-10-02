@@ -137,6 +137,29 @@ pub enum Plant {
     /// the base, and every key not yet scanned is gone. Caught by
     /// `lost_durable_writes` on the swept shape.
     TrustsUnfinishedSnapshot,
+    /// Held replies go out when the sync covering them is *issued*, not when
+    /// it completes.
+    ///
+    /// Under `always` that acknowledges a write no sync has covered yet, and
+    /// a crash inside the flight loses it: an acknowledged write that does
+    /// not come back. Caught by `lost_durable_writes`, on the seeds that draw
+    /// `always` and crash with a sync in flight.
+    ReleasesOnIssue,
+    /// An executor whose log failed applies and acknowledges writes while it
+    /// is refusing them.
+    ///
+    /// Each acknowledgement promises what the log did not take, and a crash
+    /// before the snapshot that ends the refusal is durable loses it. Caught
+    /// by `lost_durable_writes`, on the disk that fails, under `always`.
+    AcksWhileRefusing,
+    /// A completed sync raises the durable point to what is flushed when it
+    /// *completes*, rather than to what was flushed when it was issued.
+    ///
+    /// What was flushed during the flight is claimed durable without any
+    /// sync having covered it, and a crash before the next one loses it.
+    /// Caught by `lost_durable_writes` and `lost_durable_prefixes`, on the
+    /// seeds that draw `interval` with a sync latency above one tick.
+    SyncsFromFlushedNow,
 }
 
 impl Plant {
@@ -156,12 +179,15 @@ impl Plant {
             Self::DropsFailedWrite => "drops-failed-write",
             Self::DeletesBeforeDurable => "deletes-before-durable",
             Self::TrustsUnfinishedSnapshot => "trusts-unfinished-snapshot",
+            Self::ReleasesOnIssue => "releases-on-issue",
+            Self::AcksWhileRefusing => "acks-while-refusing",
+            Self::SyncsFromFlushedNow => "syncs-from-flushed-now",
         }
     }
 
     /// Every plant, so a caller listing or sweeping them cannot miss one
     /// added later.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 14] = [
         Self::LostUpdate,
         Self::ServeExpired,
         Self::SweepEatsAll,
@@ -173,6 +199,9 @@ impl Plant {
         Self::DropsFailedWrite,
         Self::DeletesBeforeDurable,
         Self::TrustsUnfinishedSnapshot,
+        Self::ReleasesOnIssue,
+        Self::AcksWhileRefusing,
+        Self::SyncsFromFlushedNow,
     ];
 
     /// The plant `name` selects, if it names one.
@@ -209,12 +238,17 @@ impl Plant {
             // every swept seed has, is what makes them visible — the first
             // loses records to a crash inside a cycle, the second to a crash
             // inside a cycle followed by a start that trusts what it finds.
+            // The two durability plants that break a promise of the policy
+            // a seed draws: the swept shape draws every policy, and
+            // `tests/planted_durability.rs` fixes the one each breaks.
             Self::LostUpdate
             | Self::ServeExpired
             | Self::SweepEatsAll
             | Self::EvictsBelowCeiling
             | Self::DeletesBeforeDurable
-            | Self::TrustsUnfinishedSnapshot => None,
+            | Self::TrustsUnfinishedSnapshot
+            | Self::ReleasesOnIssue
+            | Self::SyncsFromFlushedNow => None,
             // Needs a cursor observed *between* steps of a table that is
             // growing under it, and no shape this harness can afford leaves one
             // there: a call spends the server's whole bucket ceiling, which
@@ -247,6 +281,12 @@ impl Plant {
             Self::PrefixScanRecovery | Self::DropsFailedWrite => {
                 Some("SimConfig::hostile, swept by crates/seedstone-sim/tests/planted_recovery.rs")
             }
+            // A refusal needs a write or a sync that fails, which only the
+            // hostile disk draws.
+            Self::AcksWhileRefusing => Some(
+                "SimConfig::hostile at --fsync always, swept by \
+                 crates/seedstone-sim/tests/planted_durability.rs",
+            ),
         }
     }
 }

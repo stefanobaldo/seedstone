@@ -604,17 +604,14 @@ async fn server(
         recovered: recovery.shards,
         make_log: {
             let shared = shared.clone();
-            let drops = planted == Some(Plant::DropsFailedWrite);
+            let plants = observed_plants(planted);
             let issued_at: Vec<_> = segments.iter().map(|_| Arc::default()).collect();
             move |shard: u16| {
                 let executor = usize::from(executor_of(shard, shards, executors));
                 Observed::new(
                     shard,
                     FileLog::new(shard, Arc::clone(&segments[executor])),
-                    ObservedPlants {
-                        drops_failed_writes: drops,
-                        syncs_from_flushed_now: false,
-                    },
+                    plants,
                     Arc::clone(&issued_at[executor]),
                     shared.clone(),
                 )
@@ -635,7 +632,7 @@ async fn server(
             checkpoint
         },
         sync: shared.policy,
-        plants: ExecutorPlants::default(),
+        plants: executor_plants(planted),
     };
     let pool = match planted {
         Some(Plant::ServeExpired) => parts.spawn(ServeExpired),
@@ -652,7 +649,10 @@ async fn server(
             | Plant::PrefixScanRecovery
             | Plant::DropsFailedWrite
             | Plant::DeletesBeforeDurable
-            | Plant::TrustsUnfinishedSnapshot,
+            | Plant::TrustsUnfinishedSnapshot
+            | Plant::ReleasesOnIssue
+            | Plant::AcksWhileRefusing
+            | Plant::SyncsFromFlushedNow,
         ) => parts.spawn(Deadlines),
     };
     let listener = turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await?;
@@ -717,6 +717,22 @@ const START_RETRY: Duration = Duration::from_millis(10);
 
 /// Where the simulated node keeps its log, on its host's own filesystem.
 const DATA_DIR: &str = "/data";
+
+/// The defects the simulated log carries, of the one `planted`.
+const fn observed_plants(planted: Option<Plant>) -> ObservedPlants {
+    ObservedPlants {
+        drops_failed_writes: matches!(planted, Some(Plant::DropsFailedWrite)),
+        syncs_from_flushed_now: matches!(planted, Some(Plant::SyncsFromFlushedNow)),
+    }
+}
+
+/// The defects the executors carry, of the one `planted`.
+const fn executor_plants(planted: Option<Plant>) -> ExecutorPlants {
+    ExecutorPlants {
+        releases_on_issue: matches!(planted, Some(Plant::ReleasesOnIssue)),
+        acks_while_refusing: matches!(planted, Some(Plant::AcksWhileRefusing)),
+    }
+}
 
 /// Reads the log and opens this generation's segments.
 ///

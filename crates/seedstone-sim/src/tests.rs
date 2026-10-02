@@ -273,7 +273,9 @@ fn every_plant_answers_whether_the_swept_shapes_catch_it() {
             | Plant::SweepEatsAll
             | Plant::EvictsBelowCeiling
             | Plant::DeletesBeforeDurable
-            | Plant::TrustsUnfinishedSnapshot => assert_eq!(
+            | Plant::TrustsUnfinishedSnapshot
+            | Plant::ReleasesOnIssue
+            | Plant::SyncsFromFlushedNow => assert_eq!(
                 place,
                 None,
                 "{} is caught where it is swept, so it has no elsewhere to name",
@@ -312,6 +314,14 @@ fn every_plant_answers_whether_the_swept_shapes_catch_it() {
                     "a reader sent somewhere must be sent to a file: {place}"
                 );
             }
+            Plant::AcksWhileRefusing => {
+                let place =
+                    place.expect("a disk that raises no error cannot observe a refusal ignored");
+                assert!(
+                    place.contains("planted_durability.rs"),
+                    "a reader sent somewhere must be sent to a file: {place}"
+                );
+            }
         }
     }
     // The place is a string, so nothing but this stops it outliving the
@@ -335,7 +345,7 @@ fn every_plant_answers_whether_the_swept_shapes_catch_it() {
 /// are outside what the swept shapes reach, and one appearing or leaving
 /// that set is a change in what those shapes measure.
 #[test]
-fn the_plants_the_swept_shapes_cannot_catch_are_the_five_that_need_a_shape() {
+fn the_plants_the_swept_shapes_cannot_catch_are_the_six_that_need_a_shape() {
     let unobservable: Vec<&str> = Plant::ALL
         .into_iter()
         .filter(|plant| plant.unobservable_on_swept_shapes().is_some())
@@ -348,7 +358,8 @@ fn the_plants_the_swept_shapes_cannot_catch_are_the_five_that_need_a_shape() {
             "ignores-ceiling",
             "crossing-skips-shard",
             "prefix-scan-recovery",
-            "drops-failed-write"
+            "drops-failed-write",
+            "acks-while-refusing"
         ],
         "the plants a swept violation count says nothing about have changed"
     );
@@ -577,7 +588,7 @@ fn the_two_compaction_plants_are_selectable_by_name() {
         Plant::from_name("trusts-unfinished-snapshot"),
         Some(Plant::TrustsUnfinishedSnapshot)
     );
-    assert_eq!(Plant::ALL.len(), 11);
+    assert_eq!(Plant::ALL.len(), 14);
 }
 
 /// A sync on the simulated disk completes after a latency drawn from the
@@ -684,4 +695,20 @@ fn the_always_policy_decides_its_strong_claim_on_every_crashing_seed() {
             );
         }
     }
+}
+
+#[test]
+fn the_three_durability_plants_are_selectable_by_name() {
+    assert_eq!(
+        Plant::from_name("releases-on-issue"),
+        Some(Plant::ReleasesOnIssue)
+    );
+    assert_eq!(
+        Plant::from_name("acks-while-refusing"),
+        Some(Plant::AcksWhileRefusing)
+    );
+    assert_eq!(
+        Plant::from_name("syncs-from-flushed-now"),
+        Some(Plant::SyncsFromFlushedNow)
+    );
 }
