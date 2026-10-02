@@ -356,6 +356,18 @@ fn disk_pool_from(
     recovered: Vec<RecoveredShard>,
     failing: bool,
 ) -> (MemDisk, ShardPool) {
+    disk_pool_with_floor(policy, story, recovered, failing, u64::MAX)
+}
+
+/// [`disk_pool_from`], with a checkpoint that opens a cycle once the log
+/// has grown past `floor` bytes.
+fn disk_pool_with_floor(
+    policy: SyncPolicy,
+    story: &Story,
+    recovered: Vec<RecoveredShard>,
+    failing: bool,
+    floor: u64,
+) -> (MemDisk, ShardPool) {
     let disk = MemDisk::default();
     let wal = Path::new(WAL);
     disk.create_dir_all(wal).unwrap();
@@ -384,7 +396,7 @@ fn disk_pool_from(
                 segment: Arc::clone(&cp_segment),
                 round: Arc::clone(&round),
                 config: CheckpointConfig {
-                    floor: u64::MAX,
+                    floor,
                     ratio: 1,
                     bytes_per_tick: 1 << 20,
                 },
@@ -579,4 +591,30 @@ async fn a_stop_whose_last_sync_fails_answers_its_held_writes_with_the_refusal()
     assert_eq!(second.await.unwrap(), refused());
     assert_eq!(stopping.await.unwrap(), Shutdown::Clean);
     assert_eq!(log.state().failed, 1);
+}
+
+/// The sync a snapshot's rotation makes of the old segment is a sync of the
+/// log like any other: when it fails, the executor refuses writes, as it
+/// does when the deferred sync fails — not only the snapshot is retried.
+#[tokio::test(start_paused = true)]
+async fn a_rotation_whose_sync_fails_refuses_writes() {
+    let story = Story::default();
+    let (disk, pool) = disk_pool_with_floor(SyncPolicy::NEVER, &story, Vec::new(), false, 1);
+    assert_eq!(pool.dispatch(set(b"k", b"1")).await, Reply::Ok);
+    // Under `never` no deferred sync is issued: the next file sync is the
+    // rotation's, of the bytes the write left unsynced.
+    disk.fail_one_sync_after(0);
+    tick(1).await;
+    assert_eq!(story.faults_of(LogFault::Sync), 1, "reported as a sync");
+    assert_eq!(pool.dispatch(set(b"k", b"2")).await, refused());
+    assert_eq!(
+        pool.dispatch(get(b"k")).await,
+        Reply::Bulk(Some(Bytes::from_static(b"1"))),
+        "reads are served"
+    );
+    // The way out is the same: a snapshot of memory, durable on a fresh
+    // segment.
+    tick(4).await;
+    assert_eq!(story.refusals_ended().len(), 1, "the refusal ended");
+    assert_eq!(pool.dispatch(set(b"k", b"3")).await, Reply::Ok);
 }

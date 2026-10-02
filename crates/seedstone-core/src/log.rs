@@ -442,6 +442,14 @@ pub trait ReplicationLog: Send + 'static {
     /// later, until a snapshot covers it.
     fn sync_failed(&mut self);
 
+    /// Whether a sync of this shard's store has failed since a snapshot
+    /// last covered it — the one [`sync_failed`](ReplicationLog::sync_failed)
+    /// reports, or one the store made itself, such as a rotation's sync of
+    /// the segment it leaves. A log that syncs nothing never has.
+    fn has_failed(&self) -> bool {
+        false
+    }
+
     /// This shard's records up to `through` are durable by other means —
     /// a snapshot whose image holds their effect is on disk and synced.
     ///

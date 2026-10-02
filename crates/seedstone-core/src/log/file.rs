@@ -314,6 +314,10 @@ impl<F: LogFile> ReplicationLog for FileLog<F> {
         segment.failed_this_rotation = true;
     }
 
+    fn has_failed(&self) -> bool {
+        lock(&self.segment).sync_failed
+    }
+
     fn covered(&mut self, through: u64) {
         self.durable = self.durable.max(Some(through));
     }
