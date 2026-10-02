@@ -26,7 +26,7 @@ seedstone --version | --help
 | `--requirepass-file PATH` | none | The password file: one password per line, one or two lines. See *Password and rotation*. |
 | `--no-auth` | off | Run with no password, on purpose. See *Running without a password*. |
 | `--data-dir PATH` | none | Where the node keeps its log. With it, every write is recorded and replayed on the next start; without it a restart is an empty keyspace. Snapshots keep it bounded; see *What `--data-dir` promises*. |
-| `--fsync always\|interval\|never` | `interval` | When the log is synced: `always` before a write is acknowledged, `interval` at least every 100 ms while there is anything to sync, `never` only at a clean stop. Only with `--data-dir`. |
+| `--fsync always\|interval\|never` | `interval` | When the log is synced: `always` before a write is acknowledged, `interval` once 100 ms have passed since the last sync, while there is anything to sync, `never` only when a snapshot rotates the log and at a clean stop. Only with `--data-dir`. |
 
 `--version` and `--help` answer on stdout and exit 0, in first position only.
 `SEEDSTONE_REQUIREPASS` in the environment is the other way to give a
@@ -71,7 +71,7 @@ as the server writes them:
 |---|---|---|---|
 | `listening` | `info` | `version`, `bind`, `port` | the listener is bound; `bind` and `port` are what the kernel gave, as `CONFIG GET bind` reports them |
 | `bind_failed` | `error` | `bind`, `port`, `error` | the address could not be bound; the process exits 1 after this line |
-| `error_reply` | `warn` | `code`, `cmd`, `msg` | one error reply was sent to a client; `code` is the reply's first word, `cmd` the command it answered |
+| `error_reply` | `warn` | `code`, `cmd`, `msg` | one error reply was sent to a client; `code` is the reply's first word, `cmd` the command it answered. A write refused because the log failed writes no line: there is one per write under load, and `log_fault` and `refusal_ended` say what happened |
 | `stopping` | `info` | `signal` | the server is leaving on `SIGTERM` or `SIGINT` |
 | `shutdown_timeout` | `warn` | — | the stop that followed `stopping` gave up waiting for the log to be synced, after one second; the process exits anyway, and what was written since the last sync may not be on disk |
 | `password_reloaded` | `info` | `passwords` | `SIGHUP` re-read the password file; `passwords` is how many lines it holds now, 1 or 2 |
@@ -104,7 +104,7 @@ notice, and nothing should match on it.
 
 | Signal | Effect | Writes |
 |---|---|---|
-| `SIGTERM`, `SIGINT` | The server stops accepting connections, answers what its executors had queued, syncs the log, and exits when the connections it is serving end. | `stopping`, with the signal's name; then `shutdown_timeout` if the disk did not answer in time |
+| `SIGTERM`, `SIGINT` | The server stops accepting connections, answers what its executors had queued, syncs the log, and exits. | `stopping`, with the signal's name; then `shutdown_timeout` if the disk did not answer in time |
 | `SIGHUP` | The password file is re-read; see *Password and rotation*. | `password_reloaded`, `password_reload_failed` or `password_reload_skipped` |
 
 In a container this binary is process 1, and process 1 ignores every signal
@@ -184,9 +184,10 @@ when the log is synced, and so what a crash can cost.
 - **`always`**: a write is acknowledged only once a sync covering its record
   has completed, so every acknowledged write survives a crash. The sync runs
   off the executor, one at a time, and covers every write that arrived while
-  the previous one was in flight. A read waits for one only behind a write
-  sent before it on its own connection, whose reply must go out first, or
-  when it finds its key expired and deletes it, which is a write.
+  the previous one was in flight. A read waits for one only when its
+  connection pipelined it together with a write, whose reply goes out in
+  the order it was sent, or when it finds its key expired and deletes it,
+  which is a write; a read on any other connection is answered at once.
 - **`interval`** (the default): a write is acknowledged at once, and the log
   is synced once 100 ms have passed since the last sync, whenever there is
   something to sync and no sync is in flight — on a busy node from the
@@ -198,7 +199,9 @@ when the log is synced, and so what a crash can cost.
 
 Under every setting what survives of a shard is a prefix of what was
 acknowledged on it, and a clean stop (`SIGTERM`, `SIGINT`) syncs everything
-before the process ends, so a rollout never loses what only a crash would.
+before the process ends, so a rollout never loses what only a crash would —
+except on an executor that is refusing writes, whose failed log only the
+snapshot it was taking could have covered.
 `--fsync` without `--data-dir` is accepted, logged as `fsync_ignored`, and
 does nothing. On start the log is read back: a shard whose records have a
 gap is replayed up to the gap and reported with `recovery_truncated`, and
@@ -280,8 +283,9 @@ someone watching the server rather than the keyspace:
   was reached and closed. The refusals are counted here and not logged: they
   are as frequent as the load that causes them.
 - `errorstats` (a section of its own, not part of `stats`): one
-  `errorstat_<CODE>` line per error code answered, with a count — the same
-  population as the `error_reply` lines, in aggregate.
+  `errorstat_<CODE>` line per error code answered, with a count — the
+  `error_reply` lines in aggregate, plus the writes refused because the log
+  failed, which are counted here under `MISCONF` and not logged one by one.
 - `used_memory` and `maxmemory` (`memory`): the keyspace's size and the
   ceiling it is held under. There is no resident-set figure; this server does
   not read one.

@@ -21,8 +21,8 @@ SemVer and are `0.x` until the server persists data;
   a write only once it is on disk, `interval` (the default) syncs the log
   every 100 ms while there is anything to sync, busy or idle, and `never`
   leaves the log to the kernel and keeps the last snapshot. The sync runs
-  off the request path, and a read waits for one only behind a write on its
-  own connection. What each setting
+  off the request path, and a read waits for one only when it is pipelined
+  with a write on its own connection. What each setting
   promises is in `docs/operations.md`.
 - A disk that fails or fills under `--data-dir` is met with refusal, not
   with acknowledgements the node cannot keep: the executor whose log
