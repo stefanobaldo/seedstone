@@ -805,3 +805,16 @@ fn one_seed_per_durability_policy_is_pinned() {
         );
     }
 }
+
+/// Standard seeds the sweep once caught out, each for a reason now written
+/// into the model: a reply from the crashed process that arrived after the
+/// crash, read against the durable point of the process that replaced it,
+/// which pruned the write the crash had left (52, 91, both drawing
+/// `never`). The honest node holds on both.
+#[test]
+fn the_honest_node_holds_on_the_standard_seeds_that_once_caught_the_model_out() {
+    for sim_seed in [52, 91] {
+        let outcome = run_sim(&SimConfig::standard(1, sim_seed));
+        assert!(outcome.invariant_holds(), "seed {sim_seed}: {outcome:?}");
+    }
+}
