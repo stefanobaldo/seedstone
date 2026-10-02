@@ -21,8 +21,10 @@ permissions:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    # The most expensive step measures ~7 minutes. The default of six hours is
-    # what a hung simulation would burn before anyone noticed.
+    # The most expensive step, the simulator's tests in release, measured
+    # 504 s on the run that moved the sweeps to a job of their own. The
+    # default of six hours is what a hung simulation would burn before
+    # anyone noticed.
     timeout-minutes: 20
     steps:
       # Pinned to commit SHAs, not tags. A tag is a mutable pointer: whoever
@@ -94,6 +96,23 @@ jobs:
             echo "turmoil reached the production dependency graph" >&2
             exit 1
           fi
+
+  # The sweeps, in a job of their own beside the one above, so the two
+  # budgets are separate and a pull request waits for the slower of them,
+  # not their sum. Since a third of the seeds hold every write's reply for a
+  # sync whose latency the simulated disk draws, the simulator's tests and
+  # the 275-seed sweep no longer fit one job's timeout together.
+  sweep:
+    runs-on: ubuntu-latest
+    # The 275-seed step ran past 10 minutes on the run that moved it here,
+    # in the job above, before that job's timeout cancelled it. The default
+    # of six hours is what a hung simulation would burn before anyone
+    # noticed.
+    timeout-minutes: 20
+    steps:
+      # Pinned to commit SHAs for the reason the job above gives.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # An allowlist of the irrelevant, not a denylist of the relevant: a path
       # counts as code unless *every* pattern excludes it, so anything nobody
       # anticipated still runs the sweep.
@@ -114,6 +133,9 @@ jobs:
               - '!docs/**/*.md'
       # Pushes to `main` always sweep; a pull request skips only when it
       # touched nothing but prose.
+      #
+      # The figures below are this workload's before each seed drew its
+      # durability policy, and are re-read on this job's runs with it.
       # Recalibrated against this workflow's own runs. The rate below belongs to
       # one workload — the one whose simulated clients each walk their own keys
       # with `SCAN` under churn — and to no other: a rate whose workload goes
@@ -160,7 +182,7 @@ jobs:
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 24 --hostile --workload-seed 1
 
-  # Every gate in the job above is this project judging itself: our tests, our
+  # Every gate in the jobs above is this project judging itself: our tests, our
   # simulator, our reading of the protocol. This one is four programs nobody
   # here wrote — `redis-cli`, `redis-benchmark`, a Python client and a Go
   # client — and, behind them, a cache backend's own test suite: all of them
@@ -181,7 +203,7 @@ jobs:
     # not for what it costs today.
     timeout-minutes: 25
     steps:
-      # Same pinning policy as the job above, and the same three actions are
+      # Same pinning policy as the `ci` job above, and the same three actions are
       # pinned to the same SHAs there — see that job's comment for why a tag
       # is not a pin. All five run on Node 24.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
