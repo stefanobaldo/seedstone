@@ -7,31 +7,72 @@
 
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use rand::RngExt;
+use rand::rngs::ChaCha8Rng;
 use seedstone_core::log::disk::{Disk, LogFile, SyncFuture};
 use turmoil::fs::shim::std::fs::{self as sim_fs, File, OpenOptions};
 
-/// The simulated filesystem of the current host.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SimDisk;
+use crate::outcome::lock;
 
-/// A simulated file open for appending.
+/// The simulated filesystem of the current host.
 ///
-/// A newtype because the trait and the type both belong to other crates.
-pub struct SimFile(File);
+/// A deferred sync waits a latency drawn from the run's own stream before
+/// turmoil syncs the file, so that a crash can land while one is in
+/// flight; the inline sync and every other verb answer at once.
+#[derive(Debug, Clone, Default)]
+pub struct SimDisk {
+    /// The range a deferred sync's latency is drawn from, in milliseconds,
+    /// both ends included.
+    latency_ms: (u64, u64),
+    /// The stream the latencies are drawn from, or `None` for a disk whose
+    /// syncs take no time.
+    rng: Option<Arc<Mutex<ChaCha8Rng>>>,
+}
+
+impl SimDisk {
+    /// A disk whose deferred syncs take a latency in `latency_ms`, drawn
+    /// from `rng`; with no stream, they take none.
+    #[must_use]
+    pub const fn new(latency_ms: (u64, u64), rng: Option<Arc<Mutex<ChaCha8Rng>>>) -> Self {
+        Self { latency_ms, rng }
+    }
+
+    fn draw(&self) -> Duration {
+        let Some(rng) = &self.rng else {
+            return Duration::ZERO;
+        };
+        let (min, max) = self.latency_ms;
+        Duration::from_millis(lock(rng).random_range(min..=max))
+    }
+}
+
+/// A simulated file open for appending, and the disk it was opened on.
+pub struct SimFile {
+    file: File,
+    disk: SimDisk,
+}
 
 impl LogFile for SimFile {
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        Write::write_all(&mut self.0, bytes)
+        Write::write_all(&mut self.file, bytes)
     }
 
     fn sync_data(&mut self) -> io::Result<()> {
-        self.0.sync_data()
+        self.file.sync_data()
     }
 
-    /// turmoil's sync, taken at the call and answered at once.
+    /// turmoil's sync, after the drawn latency, on a handle of its own: the
+    /// log may rotate away from this file while the sync is in flight.
     fn sync_later(&self) -> SyncFuture {
-        Box::pin(std::future::ready(self.0.sync_data()))
+        let latency = self.disk.draw();
+        let handle = self.file.try_clone();
+        Box::pin(async move {
+            tokio::time::sleep(latency).await;
+            handle?.sync_data()
+        })
     }
 }
 
@@ -67,7 +108,10 @@ impl Disk for SimDisk {
             .append(true)
             .create(true)
             .open(path)
-            .map(SimFile)
+            .map(|file| SimFile {
+                file,
+                disk: self.clone(),
+            })
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Self::ReadFile> {

@@ -24,7 +24,7 @@ fn a_synced_write_survives_a_crash_and_a_pending_one_does_not() {
             let seen = Arc::clone(&seen);
             let starts = Arc::clone(&starts);
             async move {
-                let disk = SimDisk;
+                let disk = SimDisk::default();
                 let dir = Path::new("/data");
                 disk.create_dir_all(dir)?;
                 let path = dir.join("f");
@@ -106,7 +106,7 @@ fn a_directory_lists_in_name_order() {
     sim.client("lister", {
         let names = Arc::clone(&names);
         async move {
-            let disk = SimDisk;
+            let disk = SimDisk::default();
             let dir = Path::new("/data");
             disk.create_dir_all(dir)?;
             for i in (0..32).rev() {

@@ -162,6 +162,9 @@ pub struct DiskFaults {
     pub io_error_permille: u16,
     /// Probability, in permille, that a read returns corrupted bytes.
     pub corruption_permille: u16,
+    /// The range, in milliseconds and both ends included, that a deferred
+    /// sync's latency is drawn from; `(0, 0)` for syncs that take no time.
+    pub sync_latency_ms: (u64, u64),
 }
 
 impl DiskFaults {
@@ -170,6 +173,7 @@ impl DiskFaults {
         block_size: None,
         io_error_permille: 0,
         corruption_permille: 0,
+        sync_latency_ms: (0, 0),
     };
     /// A disk that tears pending writes on a crash and nothing else: the
     /// swept shape's disk, where the strong invariant is asserted.
@@ -184,6 +188,7 @@ impl DiskFaults {
         block_size: Some(32),
         io_error_permille: 0,
         corruption_permille: 0,
+        sync_latency_ms: (1, 250),
     };
     /// A disk that also fails and lies: the `hostile` shape's, where only
     /// the weak invariant can be asserted.
@@ -191,6 +196,7 @@ impl DiskFaults {
         block_size: Some(32),
         io_error_permille: 20,
         corruption_permille: 20,
+        sync_latency_ms: (1, 250),
     };
 }
 

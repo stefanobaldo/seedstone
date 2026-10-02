@@ -169,7 +169,7 @@ pub use sweep::{SweepReport, sweep};
 pub use trace::mix;
 
 use disk::SimFile;
-use durability::{CrashRecord, Observed, REST_SETTLE, increment_is_durable};
+use durability::{CrashRecord, Observed, increment_is_durable, rest_settle};
 use model::Model;
 use outcome::{Shared, lock};
 use plant::{EvictsBelowCeiling, IgnoresCeiling, ScanMissesRehash, ServeExpired, SweepEatsAll};
@@ -346,7 +346,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
     let mut sim = build_sim(cfg);
 
     let trace = Arc::new(Mutex::new(TRACE_INIT));
-    let shared = Shared::new(cfg.shards);
+    let shared = Shared::new(cfg.shards, cfg.sim_seed, &cfg.disk);
 
     // The dict seed is derived from the simulator seed so two seeds do not
     // share a bucket layout: a hash collision that only shows up under one
@@ -499,7 +499,14 @@ fn drive(sim: &mut turmoil::Sim<'_>, cfg: &SimConfig, shared: &Shared) {
                 }
                 match rest_since {
                     None => rest_since = Some(now),
-                    Some(since) if now >= since + REST_SETTLE => {
+                    Some(since)
+                        if now
+                            >= since
+                                + rest_settle(
+                                    cfg.disk.sync_latency_ms,
+                                    tally.max_snapshot_bytes,
+                                ) =>
+                    {
                         crash_and_restart(sim, shared, now);
                         lock(&shared.tally).rest_crashed = true;
                     }
@@ -560,6 +567,7 @@ async fn server(
     // previous process's files.
     let round = Arc::new(AtomicU16::new(0));
     let checkpoint_segments = segments.clone();
+    let disk = shared.disk.clone();
     let deletes = planted == Some(Plant::DeletesBeforeDurable);
     let parts = PoolParts {
         shards,
@@ -583,7 +591,7 @@ async fn server(
         },
         make_checkpoint: move |executor: u16| {
             let mut checkpoint = SegmentCheckpoint::new(CheckpointSpec {
-                disk: SimDisk,
+                disk: disk.clone(),
                 wal: Path::new(DATA_DIR).join("wal"),
                 generation,
                 executor,
@@ -688,7 +696,7 @@ fn start_log(
     planted: Option<Plant>,
     shared: &Shared,
 ) -> std::io::Result<(Recovery, u64, Vec<SharedSegment<SimFile>>)> {
-    let disk = SimDisk;
+    let disk = shared.disk.clone();
     let wal = Path::new(DATA_DIR).join("wal");
     disk.create_dir_all(&wal)?;
     let mode = if planted == Some(Plant::PrefixScanRecovery) {
