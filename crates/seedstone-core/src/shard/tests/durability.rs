@@ -411,6 +411,21 @@ async fn a_failed_sync_refuses_writes_until_a_snapshot_lands() {
 /// A write that fails — a full disk — refuses the same way under
 /// `interval`, where nothing was held: the next write is refused, and the
 /// recovery snapshot covers what was acknowledged before.
+/// A read in the same batch as a held write is served when the sync fails:
+/// only the write's reply becomes the refusal.
+#[tokio::test(start_paused = true)]
+async fn a_read_held_beside_a_write_is_served_when_the_sync_fails() {
+    let story = Story::default();
+    let (disk, pool) = disk_pool(SyncPolicy::ALWAYS, &story);
+    assert_eq!(pool.dispatch(set(b"r", b"0")).await, Reply::Ok);
+    disk.fail_syncs(true);
+    assert_eq!(
+        pool.dispatch_many(vec![set(b"k", b"1"), get(b"r")]).await,
+        vec![refused(), Reply::Bulk(Some(Bytes::from_static(b"0")))],
+        "the write is refused, the read beside it served"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_full_disk_refuses_writes_and_a_snapshot_resumes_them() {
     let story = Story::default();
