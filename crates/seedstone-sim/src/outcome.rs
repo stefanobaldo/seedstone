@@ -1,7 +1,12 @@
 //! What one simulation reports: the trace hash, the verifier's counts, and
 //! the shared tallies the clients write into while it runs.
 
+use crate::config::DiskFaults;
+use crate::disk::SimDisk;
 use crate::durability::{CrashRecord, DurablePoint};
+use crate::trace::GOLDEN;
+use rand::SeedableRng;
+use rand::rngs::ChaCha8Rng;
 use seedstone_core::log::checkpoint::CheckpointConfig;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -412,6 +417,14 @@ pub struct Shared {
     /// Every acknowledged increment — what the verifier needs to say which
     /// of them a crash could not have taken.
     pub increments: Arc<Mutex<Vec<Increment>>>,
+    /// The node's disk: the range its deferred syncs' latencies are drawn
+    /// from, and the stream they are drawn from — the run's own, apart from
+    /// the crash schedule's, so that drawing a latency moves no crash.
+    ///
+    /// Here and not built where the node opens its files because a
+    /// restarted node continues the same stream: two processes of one run
+    /// drawing from two copies of it would repeat each other's latencies.
+    pub disk: SimDisk,
 }
 
 /// An acknowledged increment, and what a crash would need to have found
@@ -435,9 +448,11 @@ pub struct Increment {
 }
 
 impl Shared {
-    /// Shared state for a node of `shards` shards.
+    /// Shared state for a node of `shards` shards, run under `sim_seed` on
+    /// a disk that does what `disk` says.
     #[must_use]
-    pub fn new(shards: u16) -> Self {
+    pub fn new(shards: u16, sim_seed: u64, disk: &DiskFaults) -> Self {
+        let rng = ChaCha8Rng::seed_from_u64(sim_seed ^ GOLDEN.rotate_left(29));
         Self {
             tally: Arc::default(),
             walk: Arc::default(),
@@ -446,6 +461,7 @@ impl Shared {
             crashes: Arc::default(),
             truncated: Arc::new(Mutex::new(vec![None; usize::from(shards)])),
             increments: Arc::default(),
+            disk: SimDisk::new(disk.sync_latency_ms, Some(Arc::new(Mutex::new(rng)))),
         }
     }
 }

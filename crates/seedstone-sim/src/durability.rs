@@ -18,6 +18,7 @@ use seedstone_core::log::{Record, ReplicationLog};
 use seedstone_core::shard::HOUSEKEEPING_TICK;
 use seedstone_service::FIXED_UNIX_MILLIS;
 
+use crate::SIM_CHECKPOINT;
 use crate::config::CrashPlan;
 use crate::outcome::{Shared, lock};
 use crate::trace::GOLDEN;
@@ -166,9 +167,23 @@ impl<F: LogFile> ReplicationLog for Observed<F> {
 /// client has finished is a crash nothing observes.
 pub const CRASH_WINDOW: Duration = Duration::from_millis(800);
 
-/// How long the driver lets a paused node sit before crashing it at rest:
-/// three ticks, so every executor has flushed and synced with margin.
-pub const REST_SETTLE: Duration = HOUSEKEEPING_TICK.saturating_mul(3);
+/// How long the driver lets a paused node sit before crashing it at rest,
+/// on a disk whose deferred syncs take up to `latency_ms`'s top, when the
+/// largest snapshot the run has written is `snapshot_bytes`.
+///
+/// Three ticks, so every executor has flushed and issued its sync with
+/// margin; two of the slowest syncs — the one in flight when the clients
+/// paused, and the one issued behind it to cover what it did not; and one
+/// whole cycle at the shape's budget, because the deletes active expiry
+/// writes while the clients are paused can open one, and a crash inside it
+/// is not a crash at rest.
+#[must_use]
+pub fn rest_settle(latency_ms: (u64, u64), snapshot_bytes: u64) -> Duration {
+    let cycle_ticks = snapshot_bytes.div_ceil(SIM_CHECKPOINT.bytes_per_tick.max(1));
+    HOUSEKEEPING_TICK
+        .saturating_mul(3 + u32::try_from(cycle_ticks).unwrap_or(u32::MAX - 3))
+        .saturating_add(Duration::from_millis(latency_ms.1.saturating_mul(2)))
+}
 
 /// The instants a run crashes at, drawn once from the simulator seed.
 ///

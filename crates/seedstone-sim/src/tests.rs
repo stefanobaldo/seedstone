@@ -568,3 +568,39 @@ fn the_two_compaction_plants_are_selectable_by_name() {
     );
     assert_eq!(Plant::ALL.len(), 11);
 }
+
+/// A sync on the simulated disk completes after a latency drawn from the
+/// seed, inside the configured range; the same seed draws the same
+/// latencies.
+#[test]
+fn a_simulated_sync_completes_after_a_drawn_latency() {
+    use seedstone_core::log::disk::LogFile;
+
+    fn draws(seed: u64) -> Vec<u64> {
+        let mut sim = turmoil::Builder::new().build();
+        let drawn = Arc::new(Mutex::new(Vec::new()));
+        let host = Arc::clone(&drawn);
+        sim.client("host", async move {
+            let rng = Arc::new(Mutex::new(ChaCha8Rng::seed_from_u64(seed)));
+            let disk = SimDisk::new((5, 40), Some(rng));
+            disk.create_dir_all(Path::new("/d")).unwrap();
+            let mut file = disk.create_append(Path::new("/d/f")).unwrap();
+            for _ in 0..4 {
+                file.write_all(b"x").unwrap();
+                let before = turmoil::sim_elapsed().unwrap();
+                file.sync_later().await.unwrap();
+                let took = turmoil::sim_elapsed().unwrap().checked_sub(before).unwrap();
+                host.lock()
+                    .unwrap()
+                    .push(u64::try_from(took.as_millis()).unwrap());
+            }
+            Ok(())
+        });
+        sim.run().unwrap();
+        drawn.lock().unwrap().clone()
+    }
+    let a = draws(7);
+    assert!(a.iter().all(|ms| (5..=40).contains(ms)), "{a:?}");
+    assert_eq!(a, draws(7), "replayable");
+    assert_ne!(a, draws(8), "and seeded");
+}
