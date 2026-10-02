@@ -39,6 +39,9 @@ SemVer and are `0.x` until the server persists data;
   start reads the newest snapshot plus the log since it rather than the
   whole history. `docs/operations.md` states the bound, and what a restart
   keeps until it is reached again.
+- `bench/campaign.sh durability`: `SET` at two pipeline depths under each
+  `--fsync` setting, against Redis with AOF at the matching `appendfsync`,
+  and `GET` with the log synced on every write against no log.
 
 ## [0.2.0] - 2026-09-22
 

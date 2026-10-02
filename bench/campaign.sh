@@ -22,6 +22,13 @@
 #              one prefix of 64 is matched per call, so every call answers the
 #              same ~109 keys. Depth 1 because a page cache does not pipeline
 #              KEYS; 20 000 calls per run because a call costs milliseconds.
+#   durability SET of 64-byte values at depths 64 and 1 under each durability
+#              setting: seedstone's --fsync never, interval and always against
+#              Redis with appendonly and appendfsync no, everysec and always,
+#              and each engine with no log at all; GET at depth 64 with the log
+#              synced on every write, against no log. Its own arm list,
+#              DURABILITY_ARMS; each arm writes into a directory of its own
+#              under DATA_ROOT, emptied before it starts.
 #
 # Discipline, every stage: one server up at a time, pinned to SERVER_CPUS, the
 # client pinned to CLIENT_CPUS; the keyspace populated before a read cell by
@@ -36,9 +43,13 @@
 # core; Garnet sizes its own threads. No allocator, hugepage or affinity
 # tuning, for any arm.
 #
-# Usage: campaign.sh <canary|calibrate|field|expiry|eviction|multikey|keys|all>
-#        WARMUP=<W> is required by field, expiry, eviction, multikey and keys.
+# Usage: campaign.sh <canary|calibrate|field|expiry|eviction|multikey|keys|durability|all>
+#        WARMUP=<W> is required by field, expiry, eviction, multikey, keys and
+#        durability.
 #        ARMS=<comma list> restricts the arms; the default is all seven.
+#        DURABILITY_ARMS=<comma list> does the same for the durability stage.
+#        DATA_ROOT=<dir> is where the durability stage's arms write (/tmp); every
+#        arm writes on the same disk, so the comparison is between engines.
 # Paths and cpusets are environment variables with the reference machine's
 # values as defaults, so the script runs elsewhere with none of them edited.
 set -uo pipefail
@@ -69,7 +80,10 @@ WARMUP=${WARMUP:-}
 CANARY_REFERENCE=2551021
 CANARY_TOLERANCE=5
 
-STAGE=${1:?usage: campaign.sh <canary|calibrate|field|expiry|eviction|multikey|keys|all>}
+DATA_ROOT=${DATA_ROOT:-/tmp}
+DURABILITY_ARMS=${DURABILITY_ARMS:-seedstone,seedstone-never,seedstone-interval,seedstone-always,redis-iot1,redis-aof-no,redis-aof-everysec,redis-aof-always}
+
+STAGE=${1:?usage: campaign.sh <canary|calibrate|field|expiry|eviction|multikey|keys|durability|all>}
 
 wait_port() {
   for _ in $(seq 1 150); do
@@ -138,6 +152,17 @@ start() {
 
 stop() { kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; sleep 2; echo; }
 
+config_get() { "$CLI" -p "$PORT" config get "$1" | tail -1 | tr -d '\r'; }
+
+# data_dir <arm>: the arm's own directory under DATA_ROOT, emptied, printed.
+data_dir() {
+  local dir=$DATA_ROOT/bench-data-$1
+  if ! { rm -rf "$dir" && mkdir -p "$dir"; }; then
+    echo "FATAL: cannot empty $dir" >&2; return 1
+  fi
+  echo "$dir"
+}
+
 # arm_start <arm> <populate|clean> <plain|ceiling>
 # Every start line lives here and nowhere else, so the configuration an arm
 # ran with is in one place and in the log.
@@ -148,11 +173,24 @@ arm_start() {
       need "$SEEDSTONE_BIN" seedstone; PORT=6390
       local extra=(); [[ $bound == ceiling ]] && extra=(--maxmemory "$CEILING" --maxmemory-policy allkeys-lru)
       start "$PORT" "$arm" "$mode" . -- "$SEEDSTONE_BIN" --bind "127.0.0.1:$PORT" --max-clients 2000 --no-auth "${extra[@]}";;
+    seedstone-never|seedstone-interval|seedstone-always)
+      need "$SEEDSTONE_BIN" seedstone; PORT=6390
+      local setting=${arm#seedstone-} dir
+      dir=$(data_dir "$arm") || exit 1
+      start "$PORT" "$arm" "$mode" . -- "$SEEDSTONE_BIN" --bind "127.0.0.1:$PORT" --max-clients 2000 --no-auth --data-dir "$dir" --fsync "$setting";;
     redis-iot1|redis-iot4)
       need "$REDIS_SERVER" redis; PORT=6391
       local io=${arm#redis-iot} extra=()
       [[ $bound == ceiling ]] && extra=(--maxmemory "$CEILING" --maxmemory-policy allkeys-lru)
       start "$PORT" "$arm" "$mode" . -- "$REDIS_SERVER" --port "$PORT" --save '' --appendonly no --io-threads "$io" "${extra[@]}";;
+    redis-aof-no|redis-aof-everysec|redis-aof-always)
+      need "$REDIS_SERVER" redis; PORT=6391
+      local setting=${arm#redis-aof-} dir
+      dir=$(data_dir "$arm") || exit 1
+      # AOF rewrite is left at its defaults; what they are is printed, and
+      # whether one ran is read from the log after the arm, not assumed.
+      start "$PORT" "$arm" "$mode" . -- "$REDIS_SERVER" --port "$PORT" --save '' --appendonly yes --appendfsync "$setting" --dir "$dir" --io-threads 1 || return 1
+      echo "    appendfsync=$(config_get appendfsync)  auto-aof-rewrite-percentage=$(config_get auto-aof-rewrite-percentage)  auto-aof-rewrite-min-size=$(config_get auto-aof-rewrite-min-size)";;
     valkey-iot1|valkey-iot4)
       need "$VALKEY_SERVER" valkey; PORT=6393
       local io=${arm#valkey-iot} extra=()
@@ -286,12 +324,33 @@ keys() {
   each_arm loadkeys plain keys_arm
 }
 
+durability() {
+  banner durability
+  echo "### durability: SET 64 B at depths 64 and 1 under each durability setting — seedstone's"
+  echo "### --fsync never/interval/always against Redis with appendonly and appendfsync"
+  echo "### no/everysec/always, plus each engine with no log at all; GET 64 B at depth 64 with"
+  echo "### the log synced on every write, against no log; 50 clients; 100 000 spread keys;"
+  echo "### populated; one directory per arm under $DATA_ROOT, emptied before it starts; W=$WARMUP"
+  echo "### data root: $(df -hP "$DATA_ROOT" 2>/dev/null | tail -1)"
+  durability_arm() {
+    runs "$PORT" "$1" set 64 -
+    runs "$PORT" "$1" set 1 -
+    case $1 in seedstone|seedstone-always) runs "$PORT" "$1" get 64 -;; esac
+    local dir=$DATA_ROOT/bench-data-$1
+    [[ -d $dir ]] && echo "    data: $(du -sh "$dir" | cut -f1) under $dir"
+    case $1 in redis-aof-*)
+      echo "    aof rewrites during the arm: $(grep -c 'Background append only file rewriting' "/tmp/bench-$PORT.log")";;
+    esac
+  }
+  ( ARMS=$DURABILITY_ARMS; each_arm populate plain durability_arm )
+}
+
 # A stage that fails must fail the script. The canary and the calibration are
 # gates: a caller that reads only the exit status has to be told, and the
 # trailing "stage done" echo below would otherwise make every stage exit 0.
 STATUS=0
 case "$STAGE" in
-  canary|calibrate|field|expiry|eviction|multikey|keys) "$STAGE" || STATUS=$?;;
+  canary|calibrate|field|expiry|eviction|multikey|keys|durability) "$STAGE" || STATUS=$?;;
   all)
     canary || { echo "### campaign stopped: the canary did not pass"; exit 1; }
     calibrate || STATUS=$?
@@ -302,6 +361,7 @@ case "$STAGE" in
     echo "###   WARMUP=<W> bash bench/campaign.sh eviction  > 05-eviction.log"
     echo "###   WARMUP=<W> bash bench/campaign.sh multikey  > 06-multikey.log"
     echo "###   WARMUP=<W> bash bench/campaign.sh keys      > 07-keys.log"
+    echo "###   WARMUP=<W> bash bench/campaign.sh durability > 08-durability.log"
     ;;
   *) echo "unknown stage: $STAGE" >&2; exit 2;;
 esac
