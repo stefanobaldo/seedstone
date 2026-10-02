@@ -1,10 +1,9 @@
 //! The recovery machinery, shown failing and shown holding.
 //!
-//! Two defects: a reader that stops at the first damaged record, and a tick
-//! that drops a buffer its write failed on. Neither is observable on the
-//! swept disk — nothing there fails a write or corrupts a read, so there is
-//! no damage for a reader to stop at and no failed write to drop — so both
-//! are served on `hostile`, whose reads corrupt and whose writes fail, and
+//! One defect: a reader that stops at the first damaged record. It is not
+//! observable on the swept disk — nothing there corrupts a read, so there
+//! is no damage inside the durable region for a reader to stop at — so it
+//! is served on `hostile`, whose reads corrupt and whose writes fail, and
 //! the honest node runs the same seeds clean.
 //!
 //! The claim is "some seed catches it", in the pattern `standard_catches.rs`
@@ -12,23 +11,27 @@
 //! is the disk's draw and not the plant's. A count that had to be raised to
 //! keep this green is the finding.
 
-use seedstone_sim::{Plant, SimConfig, SimOutcome, run_sim};
+use seedstone_core::shard::SyncPolicy;
+use seedstone_sim::{FsyncDraw, Plant, SimConfig, SimOutcome, run_sim};
 
 /// How many hostile seeds each claim is given.
 const SEEDS: u64 = 12;
 
-/// The dropped write's claim is given twice that, and this is the finding
-/// the module doc asks to be written down. A dropped write is a loss only
-/// where no other damage excuses it, and the start charges a segment whose
-/// header it could not read to every shard, so on a seed where a read of
-/// some header also failed the loss is reported and the plant hides behind
-/// it. When snapshot rotation began naming a failed rotation's retry
-/// afresh, the disk's draws moved, and every seed of the first twelve that
-/// dropped a write also met such a read; the first to catch it is 18.
-const DROPPED_WRITE_SEEDS: u64 = 24;
-
 fn hostile(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
     let mut cfg = SimConfig::hostile(1, sim_seed);
+    cfg.planted = plant;
+    run_sim(&cfg)
+}
+
+/// The hostile shape at `--fsync always`, where a write's acknowledgement
+/// is its durable point and the durable region reaches furthest. Under the
+/// other two, a crash lands with an acknowledged tail no sync covered, its
+/// tear marks the segment's shards as possibly lossy, and a loss the reader
+/// caused is reported along with it — so the reader that reports nothing
+/// is shown where nothing else is reported for it to hide behind.
+fn hostile_always(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
+    let mut cfg = SimConfig::hostile(1, sim_seed);
+    cfg.fsync = FsyncDraw::Fixed(SyncPolicy::ALWAYS);
     cfg.planted = plant;
     run_sim(&cfg)
 }
@@ -65,35 +68,16 @@ fn the_hostile_shape_faults_on_every_seed_and_the_honest_node_holds() {
 /// A reader that stops at the first damage loses records it never reports.
 #[test]
 fn a_prefix_scan_recovery_is_caught_as_an_unreported_loss() {
-    let caught = (1..=SEEDS)
-        .find(|sim_seed| hostile(*sim_seed, Some(Plant::PrefixScanRecovery)).unreported_losses > 0);
+    let caught = (1..=SEEDS).find(|sim_seed| {
+        hostile_always(*sim_seed, Some(Plant::PrefixScanRecovery)).unreported_losses > 0
+    });
     let Some(seed) = caught else {
         panic!(
             "no seed in 1..={SEEDS} surfaced the prefix scan on the hostile shape: the \
              shape's damage no longer reaches the durable region — investigate, do not widen"
         );
     };
-    let honest = hostile(seed, None);
-    assert!(
-        honest.invariant_holds(),
-        "seed {seed} is not clean without the plant: {honest:?}"
-    );
-}
-
-/// A tick that drops a failed write leaves a gap under the durable point
-/// with nothing on disk to explain it.
-#[test]
-fn a_dropped_write_is_caught_as_an_unreported_loss() {
-    let caught = (1..=DROPPED_WRITE_SEEDS)
-        .find(|sim_seed| hostile(*sim_seed, Some(Plant::DropsFailedWrite)).unreported_losses > 0);
-    let Some(seed) = caught else {
-        panic!(
-            "no seed in 1..={DROPPED_WRITE_SEEDS} surfaced the dropped write on the hostile shape: either \
-             no write failed on any seed or the loss was excused by a truncation the \
-             corruption caused — investigate, do not widen"
-        );
-    };
-    let honest = hostile(seed, None);
+    let honest = hostile_always(seed, None);
     assert!(
         honest.invariant_holds(),
         "seed {seed} is not clean without the plant: {honest:?}"

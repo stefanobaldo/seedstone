@@ -647,7 +647,6 @@ async fn server(
             Plant::LostUpdate
             | Plant::CrossingSkipsShard
             | Plant::PrefixScanRecovery
-            | Plant::DropsFailedWrite
             | Plant::DeletesBeforeDurable
             | Plant::TrustsUnfinishedSnapshot
             | Plant::ReleasesOnIssue
@@ -721,7 +720,6 @@ const DATA_DIR: &str = "/data";
 /// The defects the simulated log carries, of the one `planted`.
 const fn observed_plants(planted: Option<Plant>) -> ObservedPlants {
     ObservedPlants {
-        drops_failed_writes: matches!(planted, Some(Plant::DropsFailedWrite)),
         syncs_from_flushed_now: matches!(planted, Some(Plant::SyncsFromFlushedNow)),
     }
 }

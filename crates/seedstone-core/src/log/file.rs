@@ -227,16 +227,6 @@ impl<F: LogFile> FileLog<F> {
     pub const fn shard(&self) -> u16 {
         self.shard
     }
-
-    /// Discards what was appended and not yet flushed.
-    ///
-    /// What a log that drops a failed write would do — and this server
-    /// never does; it exists so the simulator can plant exactly that
-    /// defect and show it caught.
-    pub fn drop_pending(&mut self) {
-        self.pending.clear();
-        self.pending_through = None;
-    }
 }
 
 /// The segment's lock, taken through the field alone so the rest of the
@@ -751,24 +741,6 @@ mod tests {
         assert_eq!(a.sync().unwrap(), Some(0));
         assert!(!segments[0].lock().unwrap().dirty);
         assert_eq!(b.sync().unwrap(), Some(0), "covered by a's sync");
-    }
-
-    #[test]
-    fn drop_pending_discards_what_was_appended_and_not_flushed() {
-        let disk = MemDisk::default();
-        let wal = Path::new("/data/wal");
-        disk.create_dir_all(wal).unwrap();
-        let segments = open_segments(&disk, wal, 1, 1).unwrap();
-        let mut log = FileLog::new(0, Arc::clone(&segments[0]));
-        log.append(Record {
-            shard: 0,
-            seq: 0,
-            payload: b"x",
-        })
-        .unwrap();
-        log.drop_pending();
-        log.flush().unwrap();
-        assert_eq!(log.sync().unwrap(), None);
     }
 
     #[test]

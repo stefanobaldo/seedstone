@@ -68,8 +68,6 @@ pub struct CrashRecord {
 /// The defects an [`Observed`] log can be made to carry.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ObservedPlants {
-    /// A failed flush drops its buffer instead of keeping it.
-    pub drops_failed_writes: bool,
     /// A completed sync raises the durable point to what is flushed when
     /// it completes, rather than to what was flushed when it was issued.
     pub syncs_from_flushed_now: bool,
@@ -133,9 +131,6 @@ impl<F: LogFile> ReplicationLog for Observed<F> {
     fn flush(&mut self) -> std::io::Result<()> {
         let result = self.inner.flush();
         self.flushed = result.is_ok();
-        if result.is_err() && self.plants.drops_failed_writes {
-            self.inner.drop_pending();
-        }
         result
     }
 

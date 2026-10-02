@@ -117,11 +117,6 @@ pub enum Plant {
     /// durable region: read corruption, which `SimConfig::hostile` has and
     /// the swept shapes do not.
     PrefixScanRecovery,
-    /// A node whose tick drops a buffer its write failed on, instead of
-    /// keeping it for the next tick. The next successful write leaves a gap
-    /// under the durable point with no damage on disk to explain it.
-    /// Observable only where a write can fail: `SimConfig::hostile`.
-    DropsFailedWrite,
     /// A checkpoint that deletes the segments it covers at the rotation,
     /// when the cycle opens, instead of when the snapshot's footer is
     /// synced. A crash anywhere inside the cycle then finds neither the
@@ -176,7 +171,6 @@ impl Plant {
             Self::EvictsBelowCeiling => "evicts-below-ceiling",
             Self::CrossingSkipsShard => "crossing-skips-shard",
             Self::PrefixScanRecovery => "prefix-scan-recovery",
-            Self::DropsFailedWrite => "drops-failed-write",
             Self::DeletesBeforeDurable => "deletes-before-durable",
             Self::TrustsUnfinishedSnapshot => "trusts-unfinished-snapshot",
             Self::ReleasesOnIssue => "releases-on-issue",
@@ -187,7 +181,7 @@ impl Plant {
 
     /// Every plant, so a caller listing or sweeping them cannot miss one
     /// added later.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 13] = [
         Self::LostUpdate,
         Self::ServeExpired,
         Self::SweepEatsAll,
@@ -196,7 +190,6 @@ impl Plant {
         Self::EvictsBelowCeiling,
         Self::CrossingSkipsShard,
         Self::PrefixScanRecovery,
-        Self::DropsFailedWrite,
         Self::DeletesBeforeDurable,
         Self::TrustsUnfinishedSnapshot,
         Self::ReleasesOnIssue,
@@ -275,12 +268,12 @@ impl Plant {
             Self::CrossingSkipsShard => Some(
                 "SimConfig::crossing, walked by crates/seedstone-sim/tests/planted_crossing.rs",
             ),
-            // A hole inside the durable region needs read corruption, and a
-            // dropped buffer needs a write that fails: the swept shapes
-            // tear pending writes at a crash and do neither.
-            Self::PrefixScanRecovery | Self::DropsFailedWrite => {
-                Some("SimConfig::hostile, swept by crates/seedstone-sim/tests/planted_recovery.rs")
-            }
+            // A hole inside the durable region needs read corruption, which
+            // the swept shapes do not draw.
+            Self::PrefixScanRecovery => Some(
+                "SimConfig::hostile at --fsync always, swept by \
+                 crates/seedstone-sim/tests/planted_recovery.rs",
+            ),
             // A refusal needs a write or a sync that fails, which only the
             // hostile disk draws.
             Self::AcksWhileRefusing => Some(
