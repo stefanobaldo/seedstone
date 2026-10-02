@@ -901,6 +901,17 @@ pub fn is_recovery_failure(error: &std::io::Error) -> bool {
     matches!(error.get_ref(), Some(inner) if inner.is::<RecoveryFailed>())
 }
 
+/// Ends the process's runtime once the server has stopped, without waiting
+/// for the threads still inside a call to the disk.
+///
+/// The stop already waited what it will for the log's final sync, and said
+/// so with `shutdown_timeout` when it gave up. Dropping the runtime would
+/// wait again, for as long as a hung `fdatasync` takes, which is the wait the
+/// grace period exists to bound.
+pub fn leave(runtime: tokio::runtime::Runtime) {
+    runtime.shutdown_background();
+}
+
 /// The pool a node runs on: over a log on disk when `--data-dir` names one,
 /// over the no-op log otherwise.
 ///
@@ -1415,5 +1426,19 @@ mod tests {
 
         assert!(accepted.nodelay().unwrap(), "Nagle is still on");
         drop(client.await.unwrap());
+    }
+
+    /// A thread stuck in the disk does not keep the process from ending.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test of how long the process takes to end reads the wall clock"
+    )]
+    fn leaving_does_not_wait_for_a_thread_stuck_in_the_disk() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.spawn_blocking(|| std::thread::sleep(std::time::Duration::from_secs(5)));
+        let started = std::time::Instant::now();
+        super::leave(runtime);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }
