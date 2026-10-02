@@ -2,11 +2,12 @@
 //! sync is issued, and what a completed or failed sync does to the point.
 
 use super::support::{get, set};
-use crate::dict::DictSeed;
+use crate::dict::{Dict, DictSeed, shard_seed};
 use crate::log::checkpoint::{CheckpointConfig, CheckpointSpec, NoCheckpoint, SegmentCheckpoint};
 use crate::log::disk::mem::MemDisk;
 use crate::log::disk::{Disk, SyncFuture};
 use crate::log::file::{FileLog, open_segments};
+use crate::log::recovery::RecoveredShard;
 use crate::log::{Record, ReplicationLog};
 use crate::memory::MemoryLimit;
 use crate::shard::{
@@ -300,10 +301,22 @@ const WAL: &str = "/data/wal";
 /// the real checkpoint, whose floor no write reaches: only a forced cycle
 /// opens.
 fn disk_pool(policy: SyncPolicy, story: &Story) -> (MemDisk, ShardPool) {
+    disk_pool_from(policy, story, Vec::new(), false)
+}
+
+/// [`disk_pool`], starting from `recovered`, on a disk that fails writes
+/// from the moment the segments are open if `failing`.
+fn disk_pool_from(
+    policy: SyncPolicy,
+    story: &Story,
+    recovered: Vec<RecoveredShard>,
+    failing: bool,
+) -> (MemDisk, ShardPool) {
     let disk = MemDisk::default();
     let wal = Path::new(WAL);
     disk.create_dir_all(wal).unwrap();
     let segments = open_segments(&disk, wal, 1, 1).unwrap();
+    disk.fail_writes(failing);
     let round = Arc::new(AtomicU16::new(0));
     let (log_segment, cp_segment) = (Arc::clone(&segments[0]), Arc::clone(&segments[0]));
     let cp_disk = disk.clone();
@@ -316,7 +329,7 @@ fn disk_pool(policy: SyncPolicy, story: &Story) -> (MemDisk, ShardPool) {
         policy: Deadlines,
         limit: MemoryLimit::default(),
         clock: frozen_clock,
-        recovered: Vec::new(),
+        recovered,
         make_checkpoint: move |executor| {
             SegmentCheckpoint::new(CheckpointSpec {
                 disk: cp_disk.clone(),
@@ -411,6 +424,34 @@ async fn a_failed_sync_refuses_writes_until_a_snapshot_lands() {
 /// A write that fails — a full disk — refuses the same way under
 /// `interval`, where nothing was held: the next write is refused, and the
 /// recovery snapshot covers what was acknowledged before.
+/// A start whose recovery cut a shard writes a rebase before it serves; if
+/// that write fails, the executor starts refusing, as it would on any
+/// failed write, and serves writes again once a snapshot lands.
+#[tokio::test(start_paused = true)]
+async fn a_start_whose_rebase_fails_refuses_writes_until_a_snapshot_lands() {
+    let story = Story::default();
+    let root = DictSeed { k0: 1, k1: 2 };
+    let recovered = (0..2)
+        .map(|shard| RecoveredShard {
+            dict: Dict::with_seed(shard_seed(root, shard)),
+            seq: 0,
+            lossy: true,
+            cut: shard == 0,
+        })
+        .collect();
+    let (disk, pool) = disk_pool_from(SyncPolicy::INTERVAL, &story, recovered, true);
+    assert_eq!(story.faults_of(LogFault::Write), 1, "the rebase");
+    disk.fail_writes(false);
+    assert_eq!(
+        pool.dispatch(set(b"k", b"1")).await,
+        refused(),
+        "a node whose log just failed takes no write"
+    );
+    tick(6).await;
+    assert_eq!(pool.dispatch(set(b"k", b"2")).await, Reply::Ok);
+    assert_eq!(story.refusals_ended().len(), 1);
+}
+
 /// A read in the same batch as a held write is served when the sync fails:
 /// only the write's reply becomes the refusal.
 #[tokio::test(start_paused = true)]

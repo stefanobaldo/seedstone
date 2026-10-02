@@ -337,6 +337,9 @@ pub struct ExecutorSpec<T, L, P, C> {
     pub checkpoint: C,
     pub sync: SyncPolicy,
     pub plants: ExecutorPlants,
+    /// Whether a write of the log already failed before the executor ran:
+    /// it then starts refusing.
+    pub log_failed: bool,
     /// Turns `true` when the pool is shut down.
     pub stop: watch::Receiver<bool>,
 }
@@ -452,10 +455,11 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             checkpoint,
             sync,
             plants,
+            log_failed,
             stop,
         } = spec;
         let sync = SyncState::new(sync, plants, states.len(), Instant::now());
-        let this = Self {
+        let mut this = Self {
             first_shard,
             states,
             trace,
@@ -465,6 +469,9 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             checkpoint,
             sync,
         };
+        if log_failed {
+            this.refuse();
+        }
         (this, stop)
     }
 
