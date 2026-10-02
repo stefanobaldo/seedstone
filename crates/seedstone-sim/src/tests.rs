@@ -242,7 +242,18 @@ fn the_trace_hash_is_pinned_across_processes_and_builds() {
         // read that used to fall inside the live band now falls clear of
         // it and is decided. `dead_checks`,
         // `plain_checks`, `walk_checks` and `expected_sum` held still.
-        (51, 33, 149, 32),
+        //
+        // The durability policy moved `dead_checks` alone, by five, and
+        // the hash not at all: `mini` fixes `interval` and its disk draws
+        // no latency, so its schedule is the one it had. What moved is the
+        // judgement. A volatile key's deadline is now a band as wide as
+        // the write's own round trip — the server took its deadline when
+        // the command ran, any time before the reply arrived — and a read
+        // is decided dead only once it was sent past the band's far end.
+        // Five reads sent inside it no longer decide anything.
+        // `alive_checks`, `plain_checks`, `walk_checks` and `expected_sum`
+        // held still.
+        (46, 33, 149, 32),
         "the recorded workload decides a different number of checks"
     );
 }
