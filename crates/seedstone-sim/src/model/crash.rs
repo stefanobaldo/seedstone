@@ -36,8 +36,18 @@ impl Model {
         }
     }
 
-    /// The durable point of `shard` as the node last reported it.
+    /// The durable point of `shard` as the node last reported it — or none,
+    /// while a crash this client has not absorbed stands between them.
+    ///
+    /// A reply can arrive after the crash of the node that sent it, and the
+    /// node that replaced it may have reported a point of its own by then:
+    /// a point about the new process's records, which says nothing about
+    /// what the crash left of this client's writes to the old one. Pruning
+    /// the history by it would forget a state the crash may have restored.
     fn durable_at(&self, shard: u16) -> Option<Duration> {
+        if lock(&self.shared.crashes).len() > self.crashes_seen {
+            return None;
+        }
         lock(&self.shared.durable)[usize::from(shard)].map(|(_, at)| at)
     }
 
