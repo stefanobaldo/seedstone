@@ -7,7 +7,7 @@
 //! like logic belongs in [`seedstone::server`], where it can be tested without
 //! a process.
 
-use seedstone::server::{Config, Server, USAGE, emit, is_recovery_failure};
+use seedstone::server::{Config, Server, USAGE, emit, is_recovery_failure, leave};
 use seedstone_core::dict::DictSeed;
 use seedstone_service::RUN_ID_HEX;
 use seedstone_service::log::{BIND_FAILED, Field, LISTENING};
@@ -78,6 +78,7 @@ fn main() {
         );
         server.run().await;
     });
+    leave(runtime);
 }
 
 /// Everything this process asks the operating system for entropy.
