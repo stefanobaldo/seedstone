@@ -8,6 +8,8 @@
 //! (`tests/host_clocks.rs`), and that is still one millisecond too many for
 //! a durability judgement.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rand::rngs::ChaCha8Rng;
@@ -73,16 +75,28 @@ pub struct Observed<F: LogFile> {
     drops_failed_writes: bool,
     /// Whether the last flush wrote everything it had.
     flushed: bool,
+    /// When the segment's sync in flight was issued, on the world clock:
+    /// the instant its completion makes durable. A write acknowledged after
+    /// it was flushed after it too, and that sync does not cover it.
+    ///
+    /// Shared by every shard of the segment: the executor issues the sync
+    /// through one shard's log and reports its completion to all of them.
+    issued_at: Arc<Mutex<Duration>>,
+    /// Every record appended since the last durable point, with when, in
+    /// sequence order: what dates a point the checkpoint raises.
+    appended: VecDeque<(u64, Duration)>,
     /// The run's shared state, where each durable point is reported.
     run: Shared,
 }
 
 impl<F: LogFile> Observed<F> {
-    /// Wraps `inner`, the log of `shard`, reporting into `run`.
+    /// Wraps `inner`, the log of `shard`, reporting into `run`; `issued_at`
+    /// is shared by every shard of the segment `inner` writes to.
     pub const fn new(
         shard: u16,
         inner: FileLog<F>,
         drops_failed_writes: bool,
+        issued_at: Arc<Mutex<Duration>>,
         run: Shared,
     ) -> Self {
         Self {
@@ -90,6 +104,8 @@ impl<F: LogFile> Observed<F> {
             inner,
             drops_failed_writes,
             flushed: true,
+            issued_at,
+            appended: VecDeque::new(),
             run,
         }
     }
@@ -97,6 +113,7 @@ impl<F: LogFile> Observed<F> {
 
 impl<F: LogFile> ReplicationLog for Observed<F> {
     fn append(&mut self, rec: Record<'_>) -> std::io::Result<()> {
+        self.appended.push_back((rec.seq, world_now()));
         self.inner.append(rec)
     }
 
@@ -119,6 +136,7 @@ impl<F: LogFile> ReplicationLog for Observed<F> {
             && self.flushed
         {
             lock(&self.run.durable)[usize::from(self.shard)] = Some((seq, world_now()));
+            self.forget_through(seq);
         }
         Ok(durable)
     }
@@ -128,18 +146,25 @@ impl<F: LogFile> ReplicationLog for Observed<F> {
     }
 
     fn begin_sync(&mut self) -> Option<SyncFuture> {
-        self.inner.begin_sync()
+        let sync = self.inner.begin_sync();
+        if sync.is_some() {
+            *lock(&self.issued_at) = world_now();
+        }
+        sync
     }
 
-    /// Reports the durable point with the instant it was reached, under the
-    /// guard [`sync`](ReplicationLog::sync) keeps: only after a flush that
-    /// wrote everything.
+    /// Reports the durable point with the instant its sync was issued —
+    /// what was flushed by then is what it covered — under the guard
+    /// [`sync`](ReplicationLog::sync) keeps: only after a flush that wrote
+    /// everything.
     fn sync_completed(&mut self, through: Option<u64>) -> Option<u64> {
         let durable = self.inner.sync_completed(through);
         if let Some(seq) = durable
             && self.flushed
         {
-            lock(&self.run.durable)[usize::from(self.shard)] = Some((seq, world_now()));
+            let issued_at = *lock(&self.issued_at);
+            lock(&self.run.durable)[usize::from(self.shard)] = Some((seq, issued_at));
+            self.forget_through(seq);
         }
         durable
     }
@@ -149,15 +174,37 @@ impl<F: LogFile> ReplicationLog for Observed<F> {
     }
 
     /// The checkpoint covered this shard's records up to `through`: the
-    /// durable point rises to it, and the run learns when.
+    /// durable point rises to it, dated when the first record above it was
+    /// appended — or now, if none was. Not simply now: a write acknowledged
+    /// between that append and the snapshot's footer sits above `through`,
+    /// and no sync may have covered it yet.
     fn covered(&mut self, through: u64) {
         self.inner.covered(through);
+        let at = self
+            .appended
+            .iter()
+            .find(|(seq, _)| *seq > through)
+            .map_or_else(world_now, |(_, at)| *at);
         let mut durable = lock(&self.run.durable);
         let slot = &mut durable[usize::from(self.shard)];
         if slot.is_none_or(|(seq, _)| seq < through) {
-            *slot = Some((through, world_now()));
+            *slot = Some((through, at));
         }
         drop(durable);
+        self.forget_through(through);
+    }
+}
+
+impl<F: LogFile> Observed<F> {
+    /// Forgets the appends at or below `seq`, now durable.
+    fn forget_through(&mut self, seq: u64) {
+        while self
+            .appended
+            .front()
+            .is_some_and(|(appended, _)| *appended <= seq)
+        {
+            self.appended.pop_front();
+        }
     }
 }
 

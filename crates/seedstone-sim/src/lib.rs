@@ -579,12 +579,14 @@ async fn server(
         make_log: {
             let shared = shared.clone();
             let drops = planted == Some(Plant::DropsFailedWrite);
+            let issued_at: Vec<_> = segments.iter().map(|_| Arc::default()).collect();
             move |shard: u16| {
                 let executor = usize::from(executor_of(shard, shards, executors));
                 Observed::new(
                     shard,
                     FileLog::new(shard, Arc::clone(&segments[executor])),
                     drops,
+                    Arc::clone(&issued_at[executor]),
                     shared.clone(),
                 )
             }
