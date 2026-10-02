@@ -675,7 +675,8 @@ impl ShardPool {
         };
         let (stop, stopped) = watch::channel(false);
         // Each executor gets its checkpoint by index, built as it spawns.
-        let spawn = |first_shard: u16, states: Vec<ShardState<L>>, trace: T, policy: P| {
+        let spawn = |gathered: Gathered<L>, trace: T, policy: P| {
+            let (first_shard, states, log_failed) = gathered;
             spawn_executor(ExecutorSpec {
                 first_shard,
                 states,
@@ -686,12 +687,13 @@ impl ShardPool {
                 checkpoint: make_checkpoint(executor_of(first_shard, shards, executors)),
                 sync,
                 plants,
+                log_failed,
                 stop: stopped.clone(),
             })
         };
         let mut inboxes = Vec::with_capacity(usize::from(executors));
         let mut handles = Vec::with_capacity(usize::from(executors));
-        let mut pending: Option<(u16, Vec<ShardState<L>>)> = None;
+        let mut pending: Option<Gathered<L>> = None;
         // In shard order, one per shard, or none at all — asserted above.
         let mut recovered = recovered.into_iter();
         for shard in 0..shards {
@@ -714,34 +716,33 @@ impl ShardPool {
             // later start. It is synced before the pool serves anything, so
             // what a client reads after a cut is what the disk holds — a
             // crash before the next tick must not bring back what this start
-            // said was gone. A log that refuses it is reported like any other.
-            if cut {
-                rebase(&mut state, shard, &trace);
-            }
+            // said was gone. A log that refuses it is reported like any other,
+            // and its executor starts refusing, as on any failed log write.
+            let log_failed = cut && !rebase(&mut state, shard, &trace);
             // A fresh dict already costs its table, and the gauge is the sum
             // of what the dicts account — so it starts at the sum of what
             // they hold after replay rather than at zero.
             memory.gauge.apply(0, state.dict.used_bytes());
             match &mut pending {
-                Some((first_shard, states))
+                Some((first_shard, states, failed))
                     if executor_of(shard, shards, executors)
                         == executor_of(*first_shard, shards, executors) =>
                 {
                     states.push(state);
+                    *failed |= log_failed;
                 }
                 _ => {
-                    if let Some((first_shard, states)) = pending.take() {
-                        let (inbox, handle) =
-                            spawn(first_shard, states, trace.clone(), policy.clone());
+                    if let Some(gathered) = pending.take() {
+                        let (inbox, handle) = spawn(gathered, trace.clone(), policy.clone());
                         inboxes.push(inbox);
                         handles.push(handle);
                     }
-                    pending = Some((shard, vec![state]));
+                    pending = Some((shard, vec![state], log_failed));
                 }
             }
         }
-        if let Some((first_shard, states)) = pending {
-            let (inbox, handle) = spawn(first_shard, states, trace, policy);
+        if let Some(gathered) = pending {
+            let (inbox, handle) = spawn(gathered, trace, policy);
             inboxes.push(inbox);
             handles.push(handle);
         }
@@ -1005,20 +1006,32 @@ impl Router for ShardPool {
     }
 }
 
+/// An executor as the pool gathers it: its first shard, its states, and
+/// whether its log already failed a write.
+type Gathered<L> = (u16, Vec<ShardState<L>>, bool);
+
 /// Writes and syncs a shard's `Rebase` at its resume point, reporting a log
-/// that refuses either half.
-fn rebase<L: ReplicationLog, T: TraceSink>(state: &mut ShardState<L>, shard: u16, trace: &T) {
+/// that refuses either half; whether both took.
+fn rebase<L: ReplicationLog, T: TraceSink>(
+    state: &mut ShardState<L>,
+    shard: u16,
+    trace: &T,
+) -> bool {
     if append(&mut state.log, &mut state.seq, shard, Effect::Rebase).is_err() {
         trace.fault(
             shard,
             LogFault::Write,
             &std::io::Error::other("the log refused the rebase after a cut recovery"),
         );
-        return;
+        return false;
     }
     if let Err(error) = state.log.flush() {
         trace.fault(shard, LogFault::Write, &error);
+        false
     } else if let Err(error) = state.log.sync() {
         trace.fault(shard, LogFault::Sync, &error);
+        false
+    } else {
+        true
     }
 }
