@@ -28,6 +28,17 @@ from collections import defaultdict
 PRIMARY = ["seedstone", "redis-iot1", "redis-iot4", "valkey-iot1", "valkey-iot4"]
 OTHER = ["dragonfly", "garnet"]
 ORDER = PRIMARY + OTHER
+# The durability stage's pairs, each seedstone setting against Redis's AOF at
+# the matching one; the first pair is both engines with no log at all.
+DURABILITY = [("seedstone", "redis-iot1"),
+              ("seedstone-never", "redis-aof-no"),
+              ("seedstone-interval", "redis-aof-everysec"),
+              ("seedstone-always", "redis-aof-always")]
+DURABILITY_ARMS = [arm for pair in DURABILITY for arm in pair]
+# A row Redis does not take part in is a read under seedstone's log synced on
+# every write, against no log: what holding replies costs the replies it holds
+# none of.
+READ_PAIR = ("seedstone-always", "seedstone")
 TIE = 0.02
 
 FIELD = re.compile(r"(\w+)=(\S+)")
@@ -120,13 +131,14 @@ def summarise(rows):
     return out
 
 
-def table(arms, present, base):
+def table(arms, present, base, ratio="seedstone"):
     evict = any(present[a]["evicted_per_op"] is not None for a in arms if a in present)
     head = "| arm | ops/s | user µs/op | sys µs/op | total µs/op | server cores | client cores |"
     sep = "|---|---|---|---|---|---|---|"
     if evict:
         head += " evicted/op |"; sep += "---|"
-    head += " ×seedstone |"; sep += "---|"
+    if ratio:
+        head += f" ×{ratio} |"; sep += "---|"
     lines = [head, sep]
     for a in arms:
         if a not in present:
@@ -138,31 +150,48 @@ def table(arms, present, base):
             line += f" {c['evicted_per_op']:.3f} |" if c["evicted_per_op"] is not None else " - |"
         # No seedstone row, or a median of zero, is a missing ratio and says so.
         # Printed as 0.000 it would read as a measured hundredfold gap.
-        line += f" {base['ops'] / c['ops']:.3f} |" if base and c["ops"] else " - |"
+        if ratio:
+            line += f" {base['ops'] / c['ops']:.3f} |" if base and c["ops"] else " - |"
         lines.append(line)
     return "\n".join(lines)
 
 
+def reading(ours, base, a, c):
+    """One pair's line: `ours` (median columns `base`) against `a` (`c`)."""
+    s_ops = max(base["spread_ops"], c["spread_ops"])
+    s_cpu = max(base["spread_cpu"], c["spread_cpu"])
+    # A median of zero has no ratio. CPU per operation reads zero whenever a
+    # run is short enough that the clock tick swallows it, and dividing by it
+    # ends the report; the pair is unreadable, which is what is printed.
+    if not (base["ops"] and c["ops"] and base["total_us"] and c["total_us"]):
+        return (f"- {ours} vs {a}: no reading — a median is zero "
+                f"({ours} {base['ops']:.2f} ops/s at {base['total_us']:.3f} µs/op; "
+                f"{a} {c['ops']:.2f} ops/s at {c['total_us']:.3f} µs/op)")
+    r_ops = base["ops"] / c["ops"]
+    r_cpu = base["total_us"] / c["total_us"]
+    return (f"- {ours} vs {a}: {word(r_ops, s_ops, 'ops')} on throughput; "
+            f"{word(r_cpu, s_cpu, 'cpu')} (spreads {100*s_ops:.2f} % / {100*s_cpu:.2f} %)")
+
+
 def pairs(present, base):
+    return "\n".join(reading("seedstone", base, a, present[a])
+                     for a in ORDER if a != "seedstone" and a in present)
+
+
+def durability_pairs(present):
+    """Each setting's pair present on the row; a pair missing an arm says so."""
+    if not any(a.startswith("redis") for a in present):
+        ours, theirs = READ_PAIR
+        if ours in present and theirs in present:
+            return reading(ours, present[ours], theirs, present[theirs])
+        return f"- {ours} vs {theirs}: no reading — the row lacks one of them"
     out = []
-    for a in ORDER:
-        if a == "seedstone" or a not in present:
-            continue
-        c = present[a]
-        s_ops = max(base["spread_ops"], c["spread_ops"])
-        s_cpu = max(base["spread_cpu"], c["spread_cpu"])
-        # A median of zero has no ratio. CPU per operation reads zero whenever a
-        # run is short enough that the clock tick swallows it, and dividing by it
-        # ends the report; the pair is unreadable, which is what is printed.
-        if not (base["ops"] and c["ops"] and base["total_us"] and c["total_us"]):
-            out.append(f"- seedstone vs {a}: no reading — a median is zero "
-                       f"(seedstone {base['ops']:.2f} ops/s at {base['total_us']:.3f} µs/op; "
-                       f"{a} {c['ops']:.2f} ops/s at {c['total_us']:.3f} µs/op)")
-            continue
-        r_ops = base["ops"] / c["ops"]
-        r_cpu = base["total_us"] / c["total_us"]
-        out.append(f"- seedstone vs {a}: {word(r_ops, s_ops, 'ops')} on throughput; "
-                   f"{word(r_cpu, s_cpu, 'cpu')} (spreads {100*s_ops:.2f} % / {100*s_cpu:.2f} %)")
+    for ours, theirs in DURABILITY:
+        if ours in present and theirs in present:
+            out.append(reading(ours, present[ours], theirs, present[theirs]))
+        elif ours in present or theirs in present:
+            out.append(f"- {ours} vs {theirs}: no reading — "
+                       f"{theirs if ours in present else ours} has no row here")
     return "\n".join(out)
 
 
@@ -173,6 +202,12 @@ def report(path):
         present = summary[key]
         base = present.get("seedstone")
         print(f"### {describe(key)}\n")
+        # The durability stage's rows hold arms no other stage has; they are
+        # read by setting, each against its own pair, not against seedstone.
+        if any(a in present for a in DURABILITY_ARMS if a not in ORDER):
+            print(table(DURABILITY_ARMS, present, None, ratio=None))
+            print("\n" + durability_pairs(present) + "\n")
+            continue
         if key[0] == "keys":
             print("`ops/s` on these rows is `KEYS` calls per second; every call answers "
                   "the same prefix's keys, so the rows are comparable across arms.\n")
@@ -243,6 +278,19 @@ def selftest():
         "KEYS over 7\u202f000 keys of 10\u202f240 B, one prefix of 64 matched per call, "
         "depth 1, 50 clients")
     assert sortkey(("keys", "7", "1", "50", "7000", "10240")) == ("keys", 1, 7, "7")
+    row = {"ops": 100.0, "user_us": 0.5, "sys_us": 0.5, "total_us": 1.0, "cores": 1.0,
+           "client_cores": 0.5, "spread_ops": 0.01, "spread_cpu": 0.01, "evicted_per_op": None}
+    slow = dict(row, ops=50.0, total_us=2.0)
+    present = {"seedstone-always": slow, "redis-aof-always": row, "seedstone-never": row}
+    assert durability_pairs(present) == (
+        "- seedstone-never vs redis-aof-no: no reading — redis-aof-no has no row here\n"
+        "- seedstone-always vs redis-aof-always: behind 0.50x on throughput; "
+        "more expensive per operation 2.00x (spreads 1.00 % / 1.00 %)")
+    assert "×" not in table(DURABILITY_ARMS, present, None, ratio=None)
+    reads = {"seedstone-always": slow, "seedstone": row}
+    assert durability_pairs(reads) == (
+        "- seedstone-always vs seedstone: behind 0.50x on throughput; "
+        "more expensive per operation 2.00x (spreads 1.00 % / 1.00 %)")
     print("selftest ok")
 
 

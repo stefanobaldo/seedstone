@@ -8,7 +8,9 @@ this directory is what produced them.
   its cores, the client's cores, and every declaration the run was made under.
 - `campaign.sh` — the stages, in the only order that makes them readable:
   `canary` (a gate), `calibrate` (produces `W`), then `field`, `expiry`,
-  `eviction`, `multikey`, `keys`.
+  `eviction`, `multikey`, `keys`, and `durability` — `SET` under each
+  `--fsync` setting against Redis with AOF at the matching `appendfsync`,
+  each arm writing into an emptied directory of its own under `DATA_ROOT`.
 - `keys-load.sh` — the keyspace the `keys` stage walks: 7 000 keys shaped
   like a page cache's, 10 240-byte values, the same keys every run, loaded
   through `redis-cli --pipe`.
