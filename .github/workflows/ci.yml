@@ -104,8 +104,8 @@ jobs:
   # the 275-seed sweep no longer fit one job's timeout together.
   sweep:
     runs-on: ubuntu-latest
-    # The 275-seed step measured 985 s, the whole job 16 min 38 s; 30
-    # leaves the margin this workflow's runs have shown they vary by. The
+    # The 275-seed step measured 985-1057 s over three runs, the whole job
+    # up to 18 min 10 s; 30 leaves the margin those runs show they vary by. The
     # default of six hours is what a hung simulation would burn before
     # anyone noticed.
     timeout-minutes: 30
@@ -142,10 +142,10 @@ jobs:
       # changed: each seed now draws its durability policy, its disk draws a
       # latency of 1-250 ms for every sync, and about a third of the seeds
       # hold every write's reply for its sync, which stretches each of their
-      # runs by the latencies it waits. Before, three runs of the workload
-      # read 403 s, 420 s and 470 s; this one is a single reading, past the
-      # step's old ~7-minute budget, which is why the sweeps are a job of
-      # their own with a timeout to match. The latency's top is not the lever
+      # runs by the latencies it waits. Three runs of this workload read
+      # 985 s, 1012 s and 1057 s, against 403 s, 420 s and 470 s for the one
+      # before it: past the step's old ~7-minute budget, which is why the
+      # sweeps are a job of their own with a timeout to match. The latency's top is not the lever
       # it looks like: lowering it shortens only the third of the seeds that
       # wait, and it is what lets a crash land with a sync in flight.
       # The count stays at 275
