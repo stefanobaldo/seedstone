@@ -104,10 +104,11 @@ jobs:
   # the 275-seed sweep no longer fit one job's timeout together.
   sweep:
     runs-on: ubuntu-latest
-    # The 275-seed step measured 985-1057 s over three runs, the whole job
-    # up to 18 min 10 s; 30 leaves the margin those runs show they vary by. The
-    # default of six hours is what a hung simulation would burn before
-    # anyone noticed.
+    # The 275-seed step measured 608 s and 1054 s, the whole job 10 min 37 s
+    # and 18 min 5 s, on two runs of the same code; the five runs of the
+    # workload before it read 985-1322 s, the job up to 23 min 16 s. 30
+    # leaves the margin those runs show the runner varies by. The default of
+    # six hours is what a hung simulation would burn before anyone noticed.
     timeout-minutes: 30
     steps:
       # Pinned to commit SHAs for the reason the job above gives.
@@ -137,17 +138,21 @@ jobs:
       # Recalibrated against this workflow's own runs. The rate below belongs to
       # one workload, and to no other: a rate whose workload goes unstated is
       # exactly how this comment went stale once already. The most recent run
-      # here swept 275 seeds in 985 s, 3.58 s per seed, the seeds running in
-      # parallel across the runner's four cores, after the workload last
-      # changed: each seed now draws its durability policy, its disk draws a
-      # latency of 1-250 ms for every sync, and about a third of the seeds
-      # hold every write's reply for its sync, which stretches each of their
-      # runs by the latencies it waits. Three runs of this workload read
-      # 985 s, 1012 s and 1057 s, against 403 s, 420 s and 470 s for the one
-      # before it: past the step's old ~7-minute budget, which is why the
-      # sweeps are a job of their own with a timeout to match. The latency's top is not the lever
-      # it looks like: lowering it shortens only the third of the seeds that
-      # wait, and it is what lets a crash land with a sync in flight.
+      # here swept 275 seeds in 1054 s, 3.83 s per seed, the seeds running in
+      # parallel across the runner's four cores. The workload last changed
+      # when each executor began to notice a completed sync ahead of its
+      # queue, which moves when syncs are issued; the run before this one,
+      # of the same code, read 608 s, so the runner's own variance is wider
+      # than anything that change could be credited with. The workload
+      # before it — each seed drawing its durability policy, a latency of
+      # 1-250 ms for every sync, about a third of the seeds holding their
+      # replies for it — read 985 s, 1012 s, 1057 s, 1322 s and 1075 s,
+      # against 403 s, 420 s and 470 s before the policy was drawn at all:
+      # past the step's old ~7-minute budget, which is why the sweeps are a
+      # job of their own with a timeout to match. The
+      # latency's top is not the lever it looks like: lowering it shortens
+      # only the seeds that wait, and it is what lets a crash land with a
+      # sync in flight.
       # The count stays at 275
       # because buying that margin back is paid in seeds, and seeds are
       # detection power. Do not
