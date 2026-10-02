@@ -391,13 +391,24 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
             // the whole thing a seed is supposed to prevent. `biased` is
             // load-bearing here, not decorative; do not remove it.
             //
-            // Draining the inbox first is also the right priority on its own
-            // merits: work the shard was asked for outranks housekeeping.
-            //
-            // Then the sync in flight, ahead of the tick: its completion
-            // releases held replies and lets the next sync be issued.
+            // The order is the priority. The sync in flight comes first: its
+            // completion releases held replies and lets the next sync be
+            // issued, and it is ready at most once per sync. Behind the inbox
+            // it would be polled only when the inbox ran dry, so a busy
+            // executor would hold its writes' replies, and issue no further
+            // sync, for as long as the load lasted. The stop comes next for
+            // the same reason, and is ready once. Then the inbox: work the
+            // shard was asked for outranks housekeeping.
             biased;
 
+            result = in_flight(&mut this.sync.in_flight), if this.sync.in_flight.is_some() => {
+                this.sync_done(result);
+                this.maybe_issue(Instant::now());
+            }
+            // A dropped sender is a dropped pool, which closes the inbox
+            // too: stopping on either is the same stop. What is still
+            // queued is served by the stop itself.
+            _ = stop.changed() => break,
             envelope = inbox.recv() => {
                 let Some(envelope) = envelope else {
                     break;
@@ -405,13 +416,6 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
                 this.serve(envelope);
                 this.maybe_issue(Instant::now());
             }
-            result = in_flight(&mut this.sync.in_flight), if this.sync.in_flight.is_some() => {
-                this.sync_done(result);
-                this.maybe_issue(Instant::now());
-            }
-            // A dropped sender is a dropped pool, which closes the inbox
-            // too: stopping on either is the same stop.
-            _ = stop.changed() => break,
             // One ticker per executor rather than one per shard, advancing
             // every owned dict by the same budget: the same per-dict drain
             // rate, and the same aggregate work, as independent tickers.

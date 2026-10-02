@@ -177,6 +177,50 @@ async fn always_holds_a_write_until_its_sync_completes_and_never_a_read() {
     );
 }
 
+/// A completed sync is seen ahead of the inbox: under `always`, a write
+/// whose sync has completed is answered before a backlog of reads queued
+/// behind it is drained, not once the inbox happens to run dry.
+#[tokio::test(start_paused = true)]
+async fn a_completed_sync_releases_its_write_ahead_of_a_queued_backlog() {
+    const BACKLOG: usize = 5_000;
+    let log = Latent::default();
+    let pool = pool(SyncPolicy::ALWAYS, &log);
+    let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let write = tokio::spawn({
+        let pool = pool.clone();
+        let answered = Arc::clone(&answered);
+        async move {
+            let reply = pool.dispatch(set(b"k", b"v")).await;
+            (reply, answered.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    });
+    settle().await;
+    assert_eq!(log.issued(), 1, "the write's sync is in flight");
+    let reads: Vec<_> = (0..BACKLOG)
+        .map(|_| {
+            let pool = pool.clone();
+            let answered = Arc::clone(&answered);
+            tokio::spawn(async move {
+                let reply = pool.dispatch(get(b"other")).await;
+                answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                reply
+            })
+        })
+        .collect();
+    // Every read is queued before the executor next runs, and the sync
+    // completes in the same instant.
+    log.complete_next(Ok(()));
+    let (reply, reads_before) = write.await.unwrap();
+    assert_eq!(reply, Reply::Ok);
+    assert!(
+        reads_before < BACKLOG / 10,
+        "the write waited for {reads_before} of {BACKLOG} queued reads"
+    );
+    for read in reads {
+        assert_eq!(read.await.unwrap(), Reply::Bulk(None));
+    }
+}
+
 /// Under `interval` a write is acknowledged at once, and a sync is issued
 /// at most once per interval from the request path, and from the tick
 /// when traffic stops.
