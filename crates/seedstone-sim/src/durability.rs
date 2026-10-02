@@ -190,6 +190,10 @@ impl<F: LogFile> ReplicationLog for Observed<F> {
         self.inner.sync_failed();
     }
 
+    fn has_failed(&self) -> bool {
+        self.inner.has_failed()
+    }
+
     /// The checkpoint covered this shard's records up to `through`: the
     /// durable point rises to it, dated when the first record above it was
     /// appended — or now, if none was. Not simply now: a write acknowledged

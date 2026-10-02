@@ -842,6 +842,15 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             });
             self.sync.mode = Mode::Serving;
         }
+        // The checkpoint's rotation syncs the segment it leaves, and that
+        // sync failing is a failed sync of the log like the deferred one:
+        // the checkpoint reports its own stage, and the refusal follows.
+        if !self.sync.is_refusing() && self.states[0].log.has_failed() {
+            let error =
+                io::Error::other("the sync of the segment a snapshot rotated away from failed");
+            self.trace.fault(self.first_shard, LogFault::Sync, &error);
+            self.refuse();
+        }
     }
 }
 
