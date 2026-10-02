@@ -230,10 +230,11 @@ impl SimOutcome {
         // later crash found synced is owed; each of the others may add or
         // take away its own delta. Sound — every sum a crash can leave lies
         // in the range — and weaker than equality, which stays the claim on
-        // runs without one.
+        // runs without one. A refused increment widens it the same way: it
+        // may have been applied before its reply became the refusal.
         let counters = if self.evictable {
             true
-        } else if self.crashes == 0 {
+        } else if self.crashes == 0 && self.refused == 0 {
             self.expected_sum == self.actual_sum
         } else {
             self.counter_floor <= self.actual_sum && self.actual_sum <= self.counter_ceiling

@@ -709,3 +709,20 @@ fn the_three_durability_plants_are_selectable_by_name() {
         Some(Plant::SyncsFromFlushedNow)
     );
 }
+
+/// A refused increment may have been applied, so a run that refused is
+/// held to the counter range even without a crash.
+#[test]
+fn a_run_that_refused_is_held_to_the_counter_range() {
+    let mut outcome = crate::outcome::nothing_observed();
+    outcome.hostile = true;
+    outcome.write_faults = 1;
+    outcome.refused = 1;
+    outcome.expected_sum = 5;
+    outcome.actual_sum = 7;
+    outcome.counter_floor = 5;
+    outcome.counter_ceiling = 9;
+    assert!(outcome.invariant_holds(), "inside the range");
+    outcome.actual_sum = 10;
+    assert!(!outcome.invariant_holds(), "outside it");
+}
