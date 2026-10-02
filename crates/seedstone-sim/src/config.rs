@@ -168,6 +168,13 @@ pub struct DiskFaults {
 }
 
 impl DiskFaults {
+    /// Whether this disk fails or corrupts, rather than only tearing what
+    /// was never synced.
+    #[must_use]
+    pub const fn lies(&self) -> bool {
+        self.io_error_permille > 0 || self.corruption_permille > 0
+    }
+
     /// A disk that does what it is told.
     pub const NONE: Self = Self {
         block_size: None,

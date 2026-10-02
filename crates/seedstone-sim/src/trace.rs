@@ -121,7 +121,14 @@ impl TraceSink for HashSink {
         // Which crash's recovery last reported the shard: a later clean
         // restart does not clear it, because a client may read a key the
         // earlier one lost only after it.
-        if lossy {
+        //
+        // Only on a disk that fails or lies. On one that only tears, what a
+        // sync covered is intact by construction, and a crash nearly always
+        // lands with an unsynced tail the tear leaves holes in — which the
+        // recovery, knowing nothing of syncs, rightly reports as a possible
+        // loss for every shard of that segment. Honoured there, the report
+        // would excuse exactly the loss the strong invariant forbids.
+        if lossy && self.shared.disk_lies {
             lock(&self.shared.truncated)[usize::from(shard)] = Some(crash);
         }
         let mut tally = lock(&self.shared.tally);
