@@ -216,6 +216,14 @@ impl DiskFaults {
     };
     /// A disk that also fails and lies: the `hostile` shape's, where only
     /// the weak invariant can be asserted.
+    ///
+    /// A write or a read on it fails; a sync does not. Read on turmoil 0.7.2
+    /// on 2026-10-02: its sync checks no probability, and over `hostile`
+    /// seeds 1–24 at `--fsync always` the node met 0 sync faults and 582
+    /// write faults. So a refusal here always begins at a write; one that
+    /// begins at a sync is exercised by `MemDisk` in the core's tests
+    /// (`a_failed_sync_refuses_writes_until_a_snapshot_lands`) and by the
+    /// production path only.
     pub const HOSTILE: Self = Self {
         block_size: Some(32),
         io_error_permille: 20,
