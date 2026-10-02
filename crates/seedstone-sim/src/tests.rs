@@ -615,3 +615,22 @@ fn a_simulated_sync_completes_after_a_drawn_latency() {
     assert_eq!(a, draws(7), "replayable");
     assert_ne!(a, draws(8), "and seeded");
 }
+
+/// The two swept shapes draw the durability policy from the seed — all
+/// three reached within thirty seeds, and the draw belongs to the seed, not
+/// the shape — and every other shape fixes the default.
+#[test]
+fn the_swept_shapes_draw_a_policy_per_seed_and_the_others_fix_interval() {
+    let mut seen = BTreeSet::new();
+    for seed in 1..=30 {
+        seen.insert(SimConfig::standard(1, seed).policy().name());
+    }
+    assert_eq!(seen.len(), 3, "thirty seeds reach all three: {seen:?}");
+    assert_eq!(
+        SimConfig::standard(1, 5).policy(),
+        SimConfig::hostile(1, 5).policy(),
+        "the draw is the seed's, not the shape's"
+    );
+    assert_eq!(SimConfig::mini(1, 42).policy(), SyncPolicy::INTERVAL);
+    assert_eq!(SimConfig::eviction(1, 3).policy(), SyncPolicy::INTERVAL);
+}

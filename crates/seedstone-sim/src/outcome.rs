@@ -1,13 +1,14 @@
 //! What one simulation reports: the trace hash, the verifier's counts, and
 //! the shared tallies the clients write into while it runs.
 
-use crate::config::DiskFaults;
+use crate::config::SimConfig;
 use crate::disk::SimDisk;
 use crate::durability::{CrashRecord, DurablePoint};
 use crate::trace::GOLDEN;
 use rand::SeedableRng;
 use rand::rngs::ChaCha8Rng;
 use seedstone_core::log::checkpoint::CheckpointConfig;
+use seedstone_core::shard::SyncPolicy;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -184,6 +185,8 @@ pub struct SimOutcome {
     pub snapshots_refused_at_start: u64,
     /// Files a start removed because nothing used them.
     pub files_removed_at_start: u64,
+    /// The durability policy the node ran under.
+    pub fsync: SyncPolicy,
 }
 
 impl SimOutcome {
@@ -371,6 +374,7 @@ pub const fn nothing_observed() -> SimOutcome {
         remove_faults: 0,
         snapshots_refused_at_start: 0,
         files_removed_at_start: 0,
+        fsync: SyncPolicy::INTERVAL,
     }
 }
 
@@ -428,6 +432,8 @@ pub struct Shared {
     /// Whether the node's disk fails or corrupts — the only disk on which a
     /// recovery's report of a possible loss excuses one.
     pub disk_lies: bool,
+    /// The durability policy the node runs under.
+    pub policy: SyncPolicy,
 }
 
 /// An acknowledged increment, and what a crash would need to have found
@@ -451,11 +457,12 @@ pub struct Increment {
 }
 
 impl Shared {
-    /// Shared state for a node of `shards` shards, run under `sim_seed` on
-    /// a disk that does what `disk` says.
+    /// Shared state for the node `cfg` describes.
     #[must_use]
-    pub fn new(shards: u16, sim_seed: u64, disk: &DiskFaults) -> Self {
-        let rng = ChaCha8Rng::seed_from_u64(sim_seed ^ GOLDEN.rotate_left(29));
+    pub fn new(cfg: &SimConfig) -> Self {
+        let shards = cfg.shards;
+        let disk = &cfg.disk;
+        let rng = ChaCha8Rng::seed_from_u64(cfg.sim_seed ^ GOLDEN.rotate_left(29));
         Self {
             tally: Arc::default(),
             walk: Arc::default(),
@@ -466,6 +473,7 @@ impl Shared {
             increments: Arc::default(),
             disk: SimDisk::new(disk.sync_latency_ms, Some(Arc::new(Mutex::new(rng)))),
             disk_lies: disk.lies(),
+            policy: cfg.policy(),
         }
     }
 }

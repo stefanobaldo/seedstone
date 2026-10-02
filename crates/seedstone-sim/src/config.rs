@@ -4,7 +4,9 @@
 //! shape the pinned hash is taken on.
 
 use crate::Plant;
+use crate::trace::{GOLDEN, mix};
 use seedstone_core::dict::{BUCKET_OVERHEAD, ENTRY_OVERHEAD};
+use seedstone_core::shard::SyncPolicy;
 
 /// How a simulation run is shaped.
 ///
@@ -125,6 +127,19 @@ pub struct SimConfig {
     pub crashes: CrashPlan,
     /// What the disk does to the node's log.
     pub disk: DiskFaults,
+    /// Which durability policy the node runs under.
+    pub fsync: FsyncDraw,
+}
+
+/// How a run's durability policy is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsyncDraw {
+    /// This policy, whatever the seed.
+    Fixed(SyncPolicy),
+    /// One of the three, drawn from the simulator seed: the policy is a
+    /// dimension of the seed, so a sweep covers all three without a seed
+    /// more.
+    PerSeed,
 }
 
 /// When the driver crashes the server host.
@@ -256,6 +271,7 @@ impl SimConfig {
             maxmemory: None,
             crashes: CrashPlan::UnderLoad { max: 2 },
             disk: DiskFaults::TORN,
+            fsync: FsyncDraw::PerSeed,
         }
     }
 
@@ -303,6 +319,7 @@ impl SimConfig {
             maxmemory: None,
             crashes: CrashPlan::None,
             disk: DiskFaults::NONE,
+            fsync: FsyncDraw::Fixed(SyncPolicy::INTERVAL),
         }
     }
 
@@ -327,6 +344,7 @@ impl SimConfig {
             maxmemory: None,
             crashes: CrashPlan::None,
             disk: DiskFaults::NONE,
+            fsync: FsyncDraw::Fixed(SyncPolicy::INTERVAL),
         }
     }
 
@@ -364,6 +382,7 @@ impl SimConfig {
             maxmemory: Some(EVICTION_ENTRIES * EVICTION_ENTRY_BYTES),
             crashes: CrashPlan::None,
             disk: DiskFaults::NONE,
+            fsync: FsyncDraw::Fixed(SyncPolicy::INTERVAL),
         }
     }
 
@@ -408,6 +427,7 @@ impl SimConfig {
             maxmemory: None,
             crashes: CrashPlan::None,
             disk: DiskFaults::NONE,
+            fsync: FsyncDraw::Fixed(SyncPolicy::INTERVAL),
         }
     }
 
@@ -425,7 +445,24 @@ impl SimConfig {
         Self {
             crashes: CrashPlan::UnderLoad { max: 2 },
             disk: DiskFaults::HOSTILE,
+            fsync: FsyncDraw::PerSeed,
             ..Self::mini(workload_seed, sim_seed)
+        }
+    }
+
+    /// The durability policy this run's node runs under.
+    ///
+    /// Drawn from its own derivation of the simulator seed, so that the
+    /// draw moves nothing else the seed decides.
+    #[must_use]
+    pub const fn policy(&self) -> SyncPolicy {
+        match self.fsync {
+            FsyncDraw::Fixed(policy) => policy,
+            FsyncDraw::PerSeed => {
+                const POLICIES: [SyncPolicy; 3] =
+                    [SyncPolicy::ALWAYS, SyncPolicy::INTERVAL, SyncPolicy::NEVER];
+                POLICIES[(mix(GOLDEN.rotate_left(41), self.sim_seed) % 3) as usize]
+            }
         }
     }
 }
