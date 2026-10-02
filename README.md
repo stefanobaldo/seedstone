@@ -62,8 +62,9 @@ with a level — and how it is operated are in
 [docs/operations.md](docs/operations.md).
 
 **Persistence, first cut:** with `--data-dir PATH` every write is appended to a
-log and replayed on the next start; a write acknowledged before the log's
-last sync survives a crash, and snapshots keep the log bounded. The flag is
+log and replayed on the next start; `--fsync always|interval|never` says
+when the log is synced and what a crash can cost (`interval`, every
+100 ms, by default), and snapshots keep the log bounded. The flag is
 off by default. See [docs/operations.md](docs/operations.md).
 
 **What it does not have yet:** RESP3, replication,

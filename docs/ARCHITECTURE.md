@@ -110,13 +110,26 @@ a key now holds and the absolute deadline it carries, a deletion, a flush —
 rather than the command that caused it, so any prefix of a shard's log
 replays to a state the shard actually held. With `--data-dir` the records go
 to segment files, one per executor per process lifetime with the shards
-interleaved, flushed and synced on the housekeeping tick; on start every
-segment is read through a reader that steps over damage, and each shard
-replays the gapless prefix of its sequence. A shard whose prefix was cut
-resumes there behind a *rebase* record, synced before it serves, so the
-records the cut left on disk are never replayed by a later start. The same
-abstraction becomes a consensus log after that. Without the flag the log is
-a no-op, as it was, and a write encodes no record at all.
+interleaved; on start every segment is read through a reader that steps
+over damage, and each shard replays the gapless prefix of its sequence. A
+shard whose prefix was cut resumes there behind a *rebase* record, synced
+before it serves, so the records the cut left on disk are never replayed by
+a later start. The same abstraction becomes a consensus log after that.
+Without the flag the log is a no-op, as it was, and a write encodes no
+record at all.
+
+**The sync is in flight, never in the way.** An executor flushes what each
+batch appended before answering it, and keeps at most one sync of its
+segment in flight, issued on its own cadence (`--fsync`) on a blocking
+thread; the batches that arrive meanwhile are served and pipelined behind
+it, and the next sync covers all of them. Under `always` the replies of a
+batch that wrote are held until a sync covering it completes; a batch that
+only read is answered at once, and the connection's in-order emission keeps
+the wire ordered.
+A write or sync that fails puts that executor into refusal: writes are
+answered with an error, reads are served, and the checkpoint is forced to
+snapshot memory into a fresh segment; once the snapshot is durable the
+executor writes again. The other executors never notice.
 
 **Snapshots are fuzzy, and there is no fork.** When an executor's log has
 grown past a floor, or past the size of its last snapshot, it takes an
