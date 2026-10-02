@@ -169,7 +169,7 @@ pub use sweep::{SweepReport, sweep};
 pub use trace::mix;
 
 use disk::SimFile;
-use durability::{CrashRecord, Observed, increment_is_durable, rest_settle};
+use durability::{CrashRecord, Observed, ObservedPlants, increment_is_durable, rest_settle};
 use model::Model;
 use outcome::{Shared, lock};
 use plant::{EvictsBelowCeiling, IgnoresCeiling, ScanMissesRehash, ServeExpired, SweepEatsAll};
@@ -427,6 +427,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         write_faults: tally.write_faults,
         sync_faults: tally.sync_faults,
         start_failures: tally.start_failures,
+        crashes_in_flight: tally.crashes_in_flight,
         hostile: cfg.disk.lies(),
         snapshot_cycles: tally.snapshot_cycles,
         compactions: tally.compactions,
@@ -525,6 +526,17 @@ fn drive(sim: &mut turmoil::Sim<'_>, cfg: &SimConfig, shared: &Shared) {
 /// against.
 fn crash_and_restart(sim: &mut turmoil::Sim<'_>, shared: &Shared, now: Duration) {
     let durable = lock(&shared.durable).clone();
+    // The crashed process's flight is over whatever it was doing: the
+    // counts start level for the next one.
+    let in_flight = {
+        let mut syncs = lock(&shared.syncs);
+        let in_flight = syncs.0 > syncs.1;
+        syncs.1 = syncs.0;
+        in_flight
+    };
+    if in_flight {
+        lock(&shared.tally).crashes_in_flight += 1;
+    }
     lock(&shared.crashes).push(CrashRecord { at: now, durable });
     sim.crash(SERVER);
     // One step with the host down, so its connections are seen closed
@@ -586,7 +598,10 @@ async fn server(
                 Observed::new(
                     shard,
                     FileLog::new(shard, Arc::clone(&segments[executor])),
-                    drops,
+                    ObservedPlants {
+                        drops_failed_writes: drops,
+                        syncs_from_flushed_now: false,
+                    },
                     Arc::clone(&issued_at[executor]),
                     shared.clone(),
                 )

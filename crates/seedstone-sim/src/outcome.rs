@@ -156,6 +156,9 @@ pub struct SimOutcome {
     pub sync_faults: u64,
     /// Server host starts that failed on the disk and were retried.
     pub start_failures: u64,
+    /// Crashes that landed with a sync issued and not yet completed: the
+    /// ones that test what a flight's acknowledgements promised.
+    pub crashes_in_flight: u64,
     /// Whether the run's disk could fail and lie, which is what decides
     /// whether a reported loss is excused.
     pub hostile: bool,
@@ -362,6 +365,7 @@ pub const fn nothing_observed() -> SimOutcome {
         write_faults: 0,
         sync_faults: 0,
         start_failures: 0,
+        crashes_in_flight: 0,
         hostile: false,
         snapshot_cycles: 0,
         compactions: 0,
@@ -434,6 +438,10 @@ pub struct Shared {
     pub disk_lies: bool,
     /// The durability policy the node runs under.
     pub policy: SyncPolicy,
+    /// Syncs issued, and syncs completed or failed, over the node's current
+    /// process: a crash with the first ahead of the second landed with one
+    /// in flight.
+    pub syncs: Arc<Mutex<(u64, u64)>>,
 }
 
 /// An acknowledged increment, and what a crash would need to have found
@@ -474,6 +482,7 @@ impl Shared {
             disk: SimDisk::new(disk.sync_latency_ms, Some(Arc::new(Mutex::new(rng)))),
             disk_lies: disk.lies(),
             policy: cfg.policy(),
+            syncs: Arc::default(),
         }
     }
 }
@@ -516,6 +525,8 @@ pub struct Tally {
     pub sync_faults: u64,
     /// Server host starts that failed and were retried.
     pub start_failures: u64,
+    /// Crashes that landed with a sync in flight.
+    pub crashes_in_flight: u64,
     /// Client hosts that finished their bursts and are waiting, at rest,
     /// for the driver.
     pub paused: u32,

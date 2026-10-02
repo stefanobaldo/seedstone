@@ -634,3 +634,20 @@ fn the_swept_shapes_draw_a_policy_per_seed_and_the_others_fix_interval() {
     assert_eq!(SimConfig::mini(1, 42).policy(), SyncPolicy::INTERVAL);
     assert_eq!(SimConfig::eviction(1, 3).policy(), SyncPolicy::INTERVAL);
 }
+
+/// A crash knows whether it landed with a sync in flight; on the swept disk
+/// under `always`, some seed's does.
+#[test]
+fn a_crash_records_whether_a_sync_was_in_flight() {
+    let run = |sim_seed| {
+        let mut cfg = SimConfig::standard(1, sim_seed);
+        cfg.fsync = FsyncDraw::Fixed(SyncPolicy::ALWAYS);
+        run_sim(&cfg)
+    };
+    let outcome = run(2);
+    assert!(outcome.crashes_in_flight <= outcome.crashes, "{outcome:?}");
+    assert!(
+        (1..=12).any(|seed| run(seed).crashes_in_flight > 0),
+        "no seed in 1..=12 crashed with a sync in flight"
+    );
+}
