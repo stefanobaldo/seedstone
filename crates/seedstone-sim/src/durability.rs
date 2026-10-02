@@ -65,14 +65,26 @@ pub struct CrashRecord {
     pub durable: Vec<DurablePoint>,
 }
 
+/// The defects an [`Observed`] log can be made to carry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ObservedPlants {
+    /// A failed flush drops its buffer instead of keeping it.
+    pub drops_failed_writes: bool,
+    /// A completed sync raises the durable point to what is flushed when
+    /// it completes, rather than to what was flushed when it was issued.
+    pub syncs_from_flushed_now: bool,
+}
+
 /// The simulated node's log: the real one, with every successful sync
 /// reported into the run's shared state.
 pub struct Observed<F: LogFile> {
     shard: u16,
     inner: FileLog<F>,
-    /// The planted defect: a failed flush drops its buffer instead of
-    /// keeping it.
-    drops_failed_writes: bool,
+    /// The defects it was made to carry.
+    plants: ObservedPlants,
+    /// Whether the segment's sync in flight was issued through this
+    /// shard's log — the one of its shards that counts the flight.
+    issued_here: bool,
     /// Whether the last flush wrote everything it had.
     flushed: bool,
     /// When the segment's sync in flight was issued, on the world clock:
@@ -95,14 +107,15 @@ impl<F: LogFile> Observed<F> {
     pub const fn new(
         shard: u16,
         inner: FileLog<F>,
-        drops_failed_writes: bool,
+        plants: ObservedPlants,
         issued_at: Arc<Mutex<Duration>>,
         run: Shared,
     ) -> Self {
         Self {
             shard,
             inner,
-            drops_failed_writes,
+            plants,
+            issued_here: false,
             flushed: true,
             issued_at,
             appended: VecDeque::new(),
@@ -120,7 +133,7 @@ impl<F: LogFile> ReplicationLog for Observed<F> {
     fn flush(&mut self) -> std::io::Result<()> {
         let result = self.inner.flush();
         self.flushed = result.is_ok();
-        if result.is_err() && self.drops_failed_writes {
+        if result.is_err() && self.plants.drops_failed_writes {
             self.inner.drop_pending();
         }
         result
@@ -149,6 +162,8 @@ impl<F: LogFile> ReplicationLog for Observed<F> {
         let sync = self.inner.begin_sync();
         if sync.is_some() {
             *lock(&self.issued_at) = world_now();
+            lock(&self.run.syncs).0 += 1;
+            self.issued_here = true;
         }
         sync
     }
@@ -158,6 +173,12 @@ impl<F: LogFile> ReplicationLog for Observed<F> {
     /// [`sync`](ReplicationLog::sync) keeps: only after a flush that wrote
     /// everything.
     fn sync_completed(&mut self, through: Option<u64>) -> Option<u64> {
+        self.flight_over();
+        let through = if self.plants.syncs_from_flushed_now {
+            self.inner.flushed_through()
+        } else {
+            through
+        };
         let durable = self.inner.sync_completed(through);
         if let Some(seq) = durable
             && self.flushed
@@ -170,6 +191,7 @@ impl<F: LogFile> ReplicationLog for Observed<F> {
     }
 
     fn sync_failed(&mut self) {
+        self.flight_over();
         self.inner.sync_failed();
     }
 
@@ -196,6 +218,14 @@ impl<F: LogFile> ReplicationLog for Observed<F> {
 }
 
 impl<F: LogFile> Observed<F> {
+    /// Counts the end of the segment's flight, once: through the shard it
+    /// was issued through.
+    fn flight_over(&mut self) {
+        if std::mem::take(&mut self.issued_here) {
+            lock(&self.run.syncs).1 += 1;
+        }
+    }
+
     /// Forgets the appends at or below `seq`, now durable.
     fn forget_through(&mut self, seq: u64) {
         while self
