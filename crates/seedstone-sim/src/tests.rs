@@ -198,7 +198,14 @@ fn the_trace_hash_is_pinned_across_processes_and_builds() {
     // `eviction`, 24 `hostile`, nor on this seed, so the shed path is
     // still held to a clock, not to a schedule. `expected_sum` and the
     // four counts held still.
-    const MINI_1_42: u64 = 0xb4d6_404f_6745_8b57;
+    //
+    // And then a change to *when the executor looks at its sync*, with no
+    // change to the workload or to any reply: a completed sync now outranks
+    // the inbox in the executor's loop, where it used to be seen only once
+    // the inbox ran dry — which on a busy executor could be never. That
+    // moves when each sync is noticed and so when the next is issued, and
+    // the trace folds both. `expected_sum` and the four counts held still.
+    const MINI_1_42: u64 = 0x6d40_9fae_bec2_e3a6;
 
     let outcome = run_sim(&SimConfig::mini(1, 42));
     assert_eq!(
@@ -785,7 +792,10 @@ fn a_run_that_never_completes_a_cycle_is_not_read_against_an_empty_bound() {
 /// one and not the others is a change to what that policy does.
 #[test]
 fn one_seed_per_durability_policy_is_pinned() {
-    const HOSTILE_1_3_ALWAYS: u64 = 0x3bbc_beda_c4d4_6926;
+    // `always` moved alone when a completed sync began to outrank the
+    // inbox: the order changes when held replies leave, and only `always`
+    // holds any.
+    const HOSTILE_1_3_ALWAYS: u64 = 0x86f9_9a80_8807_2dd2;
     const HOSTILE_1_3_INTERVAL: u64 = 0x3234_f441_cdab_ad5b;
     const HOSTILE_1_3_NEVER: u64 = 0x71ba_5c7c_fbcc_a684;
     for (policy, pinned) in [
