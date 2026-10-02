@@ -9,12 +9,28 @@ SemVer and are `0.x` until the server persists data;
 
 ### Added
 
-- `--data-dir PATH`: the node keeps a write-ahead log under `PATH/wal/`,
-  synced on its housekeeping tick, and replays it on the next start. A
-  shard whose log has a gap is replayed up to the gap and reported. One
-  node per directory: a second one started on it is refused. Six new log
-  events: `recovery`, `recovery_truncated`, `recovery_failed`, `log_fault`,
-  `snapshot`, `compaction` — see `docs/operations.md`.
+- `--data-dir PATH`: the node keeps a write-ahead log under `PATH/wal/`
+  and replays it on the next start. A shard whose log has a gap is
+  replayed up to the gap and reported. One node per directory: a second
+  one started on it is refused. A clean stop (`SIGTERM`, `SIGINT`) syncs
+  the log before the process ends. Nine new log events: `recovery`,
+  `recovery_truncated`, `recovery_failed`, `log_fault`, `snapshot`,
+  `compaction`, `refusal_ended`, `shutdown_timeout`, `fsync_ignored` — see
+  `docs/operations.md`.
+- `--fsync always|interval|never` under `--data-dir`: `always` acknowledges
+  a write only once it is on disk, `interval` (the default) syncs the log
+  every 100 ms while there is anything to sync, busy or idle, and `never`
+  leaves the log to the kernel and keeps the last snapshot. The sync runs
+  off the request path, and a read waits for one only behind a write on its
+  own connection. What each setting
+  promises is in `docs/operations.md`.
+- A disk that fails or fills under `--data-dir` is met with refusal, not
+  with acknowledgements the node cannot keep: the executor whose log
+  failed answers its writes `MISCONF`, serves reads, and resumes on its own
+  once a snapshot of its memory is durable; the other executors carry on.
+  A start whose first write to the log fails begins the same way. The
+  reply, and how it compares with Redis's on a failed AOF write, is in
+  `docs/compatibility.md` (#72).
 - Snapshots and compaction under `--data-dir`: past 64 MiB of log an
   executor takes a snapshot of its shards without stopping them, then
   removes the log the snapshot covers. An executor's files stay within
