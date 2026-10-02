@@ -54,7 +54,7 @@ fn main() -> ExitCode {
     println!(
         "trace_hash=0x{:016x} expected={} actual={} stale={}/{} spurious={}/{} plain={}/{} \
          walk={}/{} invariant={} crashes={} recoveries={} durable={}/{} phantom={}/{} \
-         prefix_lost={} unreported={} faults={}/{} cycles={} compactions={} disk={}/{} refused={}",
+         prefix_lost={} unreported={} faults={}/{} cycles={} compactions={} disk={}/{} refused={} fsync={}",
         outcome.trace_hash,
         outcome.expected_sum,
         outcome.actual_sum,
@@ -82,6 +82,7 @@ fn main() -> ExitCode {
         outcome.disk_peak_bytes,
         outcome.disk_bound_bytes,
         outcome.snapshots_refused_at_start,
+        outcome.fsync.name(),
     );
 
     if held {

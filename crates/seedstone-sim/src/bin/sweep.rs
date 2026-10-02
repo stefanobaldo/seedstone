@@ -83,7 +83,7 @@ fn main() -> ExitCode {
                 println!(
                     "FAIL seed={} trace=0x{:016x} expected={} actual={} stale={} spurious={} \
                      plain={} walk={} breaches={} evicted={} observed={} crashes={} \
-                     durable_lost={} phantom={} prefix_lost={} unreported={}",
+                     durable_lost={} phantom={} prefix_lost={} unreported={} fsync={}",
                     sim_seed,
                     outcome.trace_hash,
                     outcome.expected_sum,
@@ -99,7 +99,8 @@ fn main() -> ExitCode {
                     outcome.lost_durable_writes,
                     outcome.phantom_writes,
                     outcome.lost_durable_prefixes,
-                    outcome.unreported_losses
+                    outcome.unreported_losses,
+                    outcome.fsync.name()
                 );
             }
         },

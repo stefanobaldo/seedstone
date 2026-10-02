@@ -159,7 +159,7 @@ mod trace;
 mod verify;
 mod workload;
 
-pub use config::{CrashPlan, DiskFaults, SimConfig};
+pub use config::{CrashPlan, DiskFaults, FsyncDraw, SimConfig};
 pub use disk::SimDisk;
 pub use durability::{CrashSchedule, sim_wall_clock, world_now};
 pub use outcome::{DISK_SLACK, SimOutcome, disk_bound};
@@ -346,7 +346,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
     let mut sim = build_sim(cfg);
 
     let trace = Arc::new(Mutex::new(TRACE_INIT));
-    let shared = Shared::new(cfg.shards, cfg.sim_seed, &cfg.disk);
+    let shared = Shared::new(cfg);
 
     // The dict seed is derived from the simulator seed so two seeds do not
     // share a bucket layout: a hash collision that only shows up under one
@@ -445,6 +445,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         remove_faults: tally.remove_faults,
         snapshots_refused_at_start: tally.snapshots_refused_at_start,
         files_removed_at_start: tally.files_removed_at_start,
+        fsync: cfg.policy(),
     }
 }
 
@@ -605,6 +606,8 @@ async fn server(
             checkpoint.deletes_before_durable(deletes);
             checkpoint
         },
+        sync: shared.policy,
+        plants: ExecutorPlants::default(),
     };
     let pool = match planted {
         Some(Plant::ServeExpired) => parts.spawn(ServeExpired),
@@ -740,6 +743,8 @@ struct PoolParts<F, G> {
     recovered: Vec<RecoveredShard>,
     make_log: F,
     make_checkpoint: G,
+    sync: SyncPolicy,
+    plants: ExecutorPlants,
 }
 
 impl<F, G> PoolParts<F, G>
@@ -759,8 +764,8 @@ where
             clock: sim_wall_clock,
             recovered: self.recovered,
             make_checkpoint: self.make_checkpoint,
-            sync: SyncPolicy::INTERVAL,
-            plants: ExecutorPlants::default(),
+            sync: self.sync,
+            plants: self.plants,
         })
     }
 }

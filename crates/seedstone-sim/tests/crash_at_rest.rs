@@ -5,14 +5,26 @@
 //! being exercised — every client is paused — so a hundred seeds prove what
 //! one does. It is the exact half of the durability claim; the sweep
 //! carries the half a schedule can move.
+//!
+//! Under the two policies that sync. Under `never` the log is never synced
+//! and a crash at rest keeps the last snapshot, which is the sweep's to
+//! judge, not an exact claim.
 
-use seedstone_sim::{CrashPlan, DiskFaults, SimConfig, run_sim};
+use seedstone_core::shard::SyncPolicy;
+use seedstone_sim::{CrashPlan, DiskFaults, FsyncDraw, SimConfig, run_sim};
 
 #[test]
 fn a_node_crashed_at_rest_serves_every_acknowledged_write_afterwards() {
+    for policy in [SyncPolicy::ALWAYS, SyncPolicy::INTERVAL] {
+        crashed_at_rest(policy);
+    }
+}
+
+fn crashed_at_rest(policy: SyncPolicy) {
     let mut cfg = SimConfig::standard(1, 1);
     cfg.crashes = CrashPlan::AtRest;
     cfg.disk = DiskFaults::TORN;
+    cfg.fsync = FsyncDraw::Fixed(policy);
     let outcome = run_sim(&cfg);
     assert!(outcome.invariant_holds(), "{outcome:?}");
     assert!(outcome.invariants_were_exercised(), "{outcome:?}");

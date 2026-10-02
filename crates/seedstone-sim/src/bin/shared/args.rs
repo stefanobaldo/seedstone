@@ -2,7 +2,7 @@
 //!
 //! Hand-parsed on purpose: a CLI crate would be the only dependency these two
 //! binaries have that is not the system under test, and the whole surface is
-//! five flags.
+//! a handful of flags.
 //!
 //! This file lives under `src/bin/shared/` rather than beside the binaries.
 //! Cargo turns every `src/bin/*.rs` into a binary target, and a directory
@@ -14,7 +14,8 @@
 //! that are not its own, so a typo like `sweep --sim-seed 3` fails loudly
 //! rather than sweeping some default.
 
-use seedstone_sim::{Plant, SimConfig};
+use seedstone_core::shard::SyncPolicy;
+use seedstone_sim::{FsyncDraw, Plant, SimConfig};
 
 /// Every option either binary accepts.
 #[derive(Clone)]
@@ -45,6 +46,10 @@ pub struct Args {
     /// to run a self-test that proves nothing about the counter it was
     /// pointed at.
     pub plant: Option<Plant>,
+    /// `--fsync NAME` — run under this durability policy rather than the
+    /// one the seed draws: how a failure found under one policy is replayed
+    /// under another.
+    pub fsync: Option<SyncPolicy>,
     /// `--hashes` — print every seed's trace hash, not just the failures'.
     /// `sweep` only.
     ///
@@ -106,6 +111,7 @@ impl Args {
             workload_seed: DEFAULT_WORKLOAD_SEED,
             shape: Shape::Standard,
             plant: None,
+            fsync: None,
             hashes: false,
             workers: None,
         };
@@ -121,6 +127,7 @@ impl Args {
                 "--eviction" => parsed.choose(Shape::Eviction)?,
                 "--hostile" => parsed.choose(Shape::Hostile)?,
                 "--plant" => parsed.plant = Some(plant(argv.next())?),
+                "--fsync" => parsed.fsync = Some(fsync(argv.next())?),
                 "--hashes" => parsed.hashes = true,
                 "--workers" => parsed.workers = Some(workers(&arg, argv.next())?),
                 other => return Err(format!("unknown argument `{other}`")),
@@ -150,6 +157,9 @@ impl Args {
             Shape::Standard => SimConfig::standard(self.workload_seed, sim_seed),
         };
         cfg.planted = self.plant;
+        if let Some(policy) = self.fsync {
+            cfg.fsync = FsyncDraw::Fixed(policy);
+        }
         cfg
     }
 }
@@ -173,6 +183,15 @@ fn plant(value: Option<String>) -> Result<Plant, String> {
             "--plant does not know `{value}`; it takes one of: {}",
             names()
         )
+    })
+}
+
+/// Reads the policy name that follows `--fsync`: one the server's own
+/// flag takes.
+fn fsync(value: Option<String>) -> Result<SyncPolicy, String> {
+    let value = value.ok_or("--fsync needs one of: always, interval, never")?;
+    SyncPolicy::from_name(&value).ok_or_else(|| {
+        format!("--fsync does not know `{value}`; it takes always, interval or never")
     })
 }
 
@@ -236,6 +255,17 @@ mod tests {
         let args = parse(&["--seeds", "10", "--plant", "serve-expired"]).expect("a name parses");
         assert_eq!(args.plant, Some(Plant::ServeExpired));
         assert_eq!(args.seeds, Some(10));
+    }
+
+    /// `--fsync` fixes the policy a seed would otherwise draw, and a name
+    /// the server does not take is refused.
+    #[test]
+    fn fsync_fixes_the_policy_by_its_name() {
+        let args = parse(&["--sim-seed", "3", "--fsync", "always"]).expect("a name parses");
+        assert_eq!(args.config(3).policy(), SyncPolicy::ALWAYS);
+        assert_eq!(args.sim_seed, Some(3));
+        assert!(parse(&["--sim-seed", "3", "--fsync", "sometimes"]).is_err());
+        assert!(parse(&["--sim-seed", "3", "--fsync"]).is_err());
     }
 
     /// A plant nobody planted is worse than no plant: the run would be honest
