@@ -159,6 +159,12 @@ pub struct SimOutcome {
     /// Crashes that landed with a sync issued and not yet completed: the
     /// ones that test what a flight's acknowledgements promised.
     pub crashes_in_flight: u64,
+    /// Writes the node refused because its log had failed: answered with
+    /// the refusal, a claim about nothing.
+    pub refused: u64,
+    /// Refusals that ended: an executor's snapshot of its memory became
+    /// durable and it served writes again.
+    pub refusals_ended: u64,
     /// Whether the run's disk could fail and lie, which is what decides
     /// whether a reported loss is excused.
     pub hostile: bool,
@@ -265,6 +271,11 @@ impl SimOutcome {
             // node evicts keys nobody reads back, and one client's reads are
             // a sample of what it took.
             && self.evicted_keys >= self.evictions_observed
+            // A refusal is the node keeping its promise on a log it cannot
+            // write: on a disk that raised no error it is a defect, and on
+            // one that did, it follows a fault.
+            && (self.hostile || self.refused == 0)
+            && (self.refused == 0 || self.write_faults + self.sync_faults > 0)
     }
 
     /// Whether the run's invariants decided anything at all.
@@ -366,6 +377,8 @@ pub const fn nothing_observed() -> SimOutcome {
         sync_faults: 0,
         start_failures: 0,
         crashes_in_flight: 0,
+        refused: 0,
+        refusals_ended: 0,
         hostile: false,
         snapshot_cycles: 0,
         compactions: 0,
@@ -400,6 +413,9 @@ pub struct Shared {
     /// clients publish what they were told took, and the verifier holds the
     /// server to exactly that.
     pub walk: Arc<Mutex<BTreeSet<Vec<u8>>>>,
+    /// Every walk key whose write or removal the server answered with the
+    /// refusal: the verifier lets each be listed or not.
+    pub walk_maybe: Arc<Mutex<BTreeSet<Vec<u8>>>>,
     /// Every form label the run's clients actually put on the wire.
     ///
     /// The observed half of the contract. A declaration alone can claim a
@@ -474,6 +490,7 @@ impl Shared {
         Self {
             tally: Arc::default(),
             walk: Arc::default(),
+            walk_maybe: Arc::default(),
             forms: Arc::default(),
             durable: Arc::new(Mutex::new(vec![None; usize::from(shards)])),
             crashes: Arc::default(),
@@ -527,6 +544,10 @@ pub struct Tally {
     pub start_failures: u64,
     /// Crashes that landed with a sync in flight.
     pub crashes_in_flight: u64,
+    /// Replies that were the refusal.
+    pub refused: u64,
+    /// Refusals the node reported ended.
+    pub refusals_ended: u64,
     /// Client hosts that finished their bursts and are waiting, at rest,
     /// for the driver.
     pub paused: u32,

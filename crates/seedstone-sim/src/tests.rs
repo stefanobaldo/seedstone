@@ -651,3 +651,37 @@ fn a_crash_records_whether_a_sync_was_in_flight() {
         "no seed in 1..=12 crashed with a sync in flight"
     );
 }
+
+/// No write is refused on a disk that raised no error; a refusal that
+/// follows a fault is the node keeping its promise.
+#[test]
+fn a_refusal_on_a_disk_that_raises_no_error_is_a_violation() {
+    let mut outcome = crate::outcome::nothing_observed();
+    outcome.refused = 1;
+    assert!(!outcome.invariant_holds(), "no fault, yet a refusal");
+    outcome.hostile = true;
+    assert!(
+        !outcome.invariant_holds(),
+        "hostile, but still no fault behind it"
+    );
+    outcome.write_faults = 1;
+    assert!(outcome.invariant_holds(), "a refusal that follows a fault");
+}
+
+/// Under `always` an acknowledgement is the proof of durability: every
+/// crashing seed decides durable reads, and holds.
+#[test]
+fn the_always_policy_decides_its_strong_claim_on_every_crashing_seed() {
+    for sim_seed in 1..=12 {
+        let mut cfg = SimConfig::standard(1, sim_seed);
+        cfg.fsync = FsyncDraw::Fixed(SyncPolicy::ALWAYS);
+        let outcome = run_sim(&cfg);
+        assert!(outcome.invariant_holds(), "seed {sim_seed}: {outcome:?}");
+        if outcome.crashes > 0 {
+            assert!(
+                outcome.durable_checks > 0,
+                "seed {sim_seed} crashed and decided nothing durable: {outcome:?}"
+            );
+        }
+    }
+}

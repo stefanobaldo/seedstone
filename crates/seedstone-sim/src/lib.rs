@@ -174,7 +174,9 @@ use model::Model;
 use outcome::{Shared, lock};
 use plant::{EvictsBelowCeiling, IgnoresCeiling, ScanMissesRehash, ServeExpired, SweepEatsAll};
 use trace::{GOLDEN, HashSink, TRACE_INIT};
-use verify::{check_ceiling, evicted_keys, executor_timing, listed_keys, parse_u64};
+use verify::{
+    agrees_but_for, check_ceiling, evicted_keys, executor_timing, listed_keys, parse_u64,
+};
 use workload::{
     Conn, WALK_ALL, WALK_CHURN_WRITES, WALK_KEYS, WALK_PREFIX_STEPS, WALK_SCAN_COUNT, command,
     counter_key,
@@ -428,6 +430,8 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         sync_faults: tally.sync_faults,
         start_failures: tally.start_failures,
         crashes_in_flight: tally.crashes_in_flight,
+        refused: tally.refused,
+        refusals_ended: tally.refusals_ended,
         hostile: cfg.disk.lies(),
         snapshot_cycles: tally.snapshot_cycles,
         compactions: tally.compactions,
@@ -525,7 +529,16 @@ fn drive(sim: &mut turmoil::Sim<'_>, cfg: &SimConfig, shared: &Shared) {
 /// again within a tick and would overwrite the points the crash is judged
 /// against.
 fn crash_and_restart(sim: &mut turmoil::Sim<'_>, shared: &Shared, now: Duration) {
-    let durable = lock(&shared.durable).clone();
+    let mut durable = lock(&shared.durable).clone();
+    // Under `always` a write's reply left only after a completed sync
+    // covered it, so its acknowledgement is the proof: everything
+    // acknowledged before the crash is durable. The sequence stays what the
+    // last completion reported, which is what the recovery is held to.
+    if shared.policy.hold_acks {
+        for (_, at) in durable.iter_mut().flatten() {
+            *at = now;
+        }
+    }
     // The crashed process's flight is over whatever it was doing: the
     // counts start level for the next one.
     let in_flight = {
@@ -999,6 +1012,7 @@ async fn walk_the_whole_family(
     shared: &Shared,
 ) -> turmoil::Result<()> {
     let expected = lock(&shared.walk).clone();
+    let maybe = lock(&shared.walk_maybe).clone();
     {
         let mut forms = lock(&shared.forms);
         forms.insert(contract::FORM_KEYS);
@@ -1009,8 +1023,8 @@ async fn walk_the_whole_family(
     let evictable = cfg.maxmemory.is_some();
     let reply = conn.request_many(&[command(&["KEYS", WALK_ALL])]).await?;
     let keys_agrees = match listed_keys(&reply[0]) {
-        Some((keys, false)) if evictable => keys.is_subset(&expected),
-        listed => listed == Some((expected.clone(), false)),
+        Some((keys, false)) => agrees_but_for(&keys, &expected, &maybe, evictable),
+        _ => false,
     };
 
     // Every shard costs a step even when it holds nothing, because a spent
@@ -1091,11 +1105,7 @@ async fn walk_the_whole_family(
         if !keys_agrees {
             tally.walk_mismatches += 1;
         }
-        let scan_set_agrees = if evictable {
-            seen.is_subset(&expected)
-        } else {
-            seen == expected
-        };
+        let scan_set_agrees = agrees_but_for(&seen, &expected, &maybe, evictable);
         if !scan_agrees || !scan_set_agrees {
             tally.walk_mismatches += 1;
         }
