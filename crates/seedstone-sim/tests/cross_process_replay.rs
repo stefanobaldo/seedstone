@@ -33,7 +33,8 @@
 //! added, and the sentence before this one had been counting sixteen kinds
 //! for two kinds longer than that was true.
 
-use seedstone_sim::{CrashSchedule, SimConfig, run_sim};
+use seedstone_core::shard::SyncPolicy;
+use seedstone_sim::{CrashSchedule, FsyncDraw, SimConfig, run_sim};
 
 /// How many eviction-shape seeds are replayed.
 ///
@@ -68,14 +69,14 @@ const WORKLOAD_SEED: u64 = 1;
 /// Runs one seed of `shape` in this process and twice more in fresh ones, and
 /// holds all three to the same line.
 ///
-/// `shape_flag` is what the `replay` binary is given; `None` is the default,
-/// which is the standard shape. `calibrate` is the shape's own proof that the
+/// `flags` are what the `replay` binary is given beside the seeds: none is
+/// the standard shape at the policy its seed draws. `calibrate` is the shape's own proof that the
 /// seed exercised what the shape exists for — a seed that replays a shape
 /// whose distinguishing machinery never ran agrees with itself for no reason
 /// worth having.
 fn replays_across_processes(
     shape: &str,
-    shape_flag: Option<&str>,
+    flags: &[&str],
     sim_seed: u64,
     config: &SimConfig,
     calibrate: impl Fn(&seedstone_sim::SimOutcome) -> Result<(), String>,
@@ -96,7 +97,7 @@ fn replays_across_processes(
             "--workload-seed".to_owned(),
             WORKLOAD_SEED.to_string(),
         ];
-        args.extend(shape_flag.map(ToOwned::to_owned));
+        args.extend(flags.iter().map(|flag| (*flag).to_owned()));
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_replay"))
             .args(&args)
             .output()
@@ -134,7 +135,7 @@ fn the_standard_shape_replays_across_processes() {
     for sim_seed in 1..=STANDARD_SEEDS {
         replays_across_processes(
             "standard",
-            None,
+            &[],
             sim_seed,
             &SimConfig::standard(WORKLOAD_SEED, sim_seed),
             |outcome| {
@@ -164,7 +165,7 @@ fn a_standard_seed_crashed_inside_a_cycle_replays_across_processes() {
     const CRASHED_INSIDE: u64 = 3;
     replays_across_processes(
         "standard",
-        None,
+        &[],
         CRASHED_INSIDE,
         &SimConfig::standard(WORKLOAD_SEED, CRASHED_INSIDE),
         |outcome| {
@@ -186,7 +187,7 @@ fn the_eviction_shape_replays_across_processes() {
     for sim_seed in 1..=SEEDS {
         replays_across_processes(
             "eviction",
-            Some("--eviction"),
+            &["--eviction"],
             sim_seed,
             &SimConfig::eviction(WORKLOAD_SEED, sim_seed),
             |outcome| {
@@ -226,7 +227,7 @@ fn the_hostile_shape_replays_across_processes() {
     for sim_seed in crashing {
         replays_across_processes(
             "hostile",
-            Some("--hostile"),
+            &["--hostile"],
             sim_seed,
             &SimConfig::hostile(WORKLOAD_SEED, sim_seed),
             |outcome| {
@@ -236,6 +237,35 @@ fn the_hostile_shape_replays_across_processes() {
                     Ok(())
                 } else {
                     Err("the seed drew a crash and nothing recovered".to_owned())
+                }
+            },
+        );
+    }
+}
+
+/// One hostile seed under each durability policy, fixed rather than drawn:
+/// what each policy holds back, issues and refuses is on the replayed path
+/// — a drawn sync latency, a reply held for its sync, a refusal — and each
+/// is a way for two runs of one seed to disagree.
+#[test]
+fn every_durability_policy_replays_across_processes() {
+    const SIM_SEED: u64 = 3;
+    for policy in [SyncPolicy::ALWAYS, SyncPolicy::INTERVAL, SyncPolicy::NEVER] {
+        let mut config = SimConfig::hostile(WORKLOAD_SEED, SIM_SEED);
+        config.fsync = FsyncDraw::Fixed(policy);
+        replays_across_processes(
+            &format!("hostile --fsync {}", policy.name()),
+            &["--hostile", "--fsync", policy.name()],
+            SIM_SEED,
+            &config,
+            |outcome| {
+                if outcome.fsync == policy && outcome.recoveries > 0 {
+                    Ok(())
+                } else {
+                    Err(
+                        "the run did not take the policy it was given, or never recovered"
+                            .to_owned(),
+                    )
                 }
             },
         );

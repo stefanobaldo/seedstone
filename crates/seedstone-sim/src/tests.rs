@@ -778,3 +778,30 @@ fn a_run_that_never_completes_a_cycle_is_not_read_against_an_empty_bound() {
         "and the run says it measured nothing about the bound"
     );
 }
+
+/// One pinned seed per durability policy, beside `MINI_1_42`: the schedule
+/// of a hostile run under that policy, sync latencies drawn and refusals
+/// possible. `hostile` is `mini`-sized, so the three cost little; a move in
+/// one and not the others is a change to what that policy does.
+#[test]
+fn one_seed_per_durability_policy_is_pinned() {
+    const HOSTILE_1_3_ALWAYS: u64 = 0x3bbc_beda_c4d4_6926;
+    const HOSTILE_1_3_INTERVAL: u64 = 0x3234_f441_cdab_ad5b;
+    const HOSTILE_1_3_NEVER: u64 = 0x71ba_5c7c_fbcc_a684;
+    for (policy, pinned) in [
+        (SyncPolicy::ALWAYS, HOSTILE_1_3_ALWAYS),
+        (SyncPolicy::INTERVAL, HOSTILE_1_3_INTERVAL),
+        (SyncPolicy::NEVER, HOSTILE_1_3_NEVER),
+    ] {
+        let mut cfg = SimConfig::hostile(1, 3);
+        cfg.fsync = FsyncDraw::Fixed(policy);
+        let outcome = run_sim(&cfg);
+        assert_eq!(
+            outcome.trace_hash,
+            pinned,
+            "hostile(1, 3) at --fsync {}: 0x{:016x}",
+            policy.name(),
+            outcome.trace_hash
+        );
+    }
+}
