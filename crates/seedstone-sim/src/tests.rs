@@ -304,11 +304,9 @@ fn every_plant_answers_whether_the_swept_shapes_catch_it() {
                     "a reader sent somewhere must be sent to a file: {place}"
                 );
             }
-            Plant::PrefixScanRecovery | Plant::DropsFailedWrite => {
-                let place = place.expect(
-                    "a shape with no read corruption or write errors cannot observe a reader \
-                     or a writer that loses records",
-                );
+            Plant::PrefixScanRecovery => {
+                let place = place
+                    .expect("a shape with no read corruption cannot observe a reader that cuts");
                 assert!(
                     place.contains("planted_recovery.rs"),
                     "a reader sent somewhere must be sent to a file: {place}"
@@ -345,7 +343,7 @@ fn every_plant_answers_whether_the_swept_shapes_catch_it() {
 /// are outside what the swept shapes reach, and one appearing or leaving
 /// that set is a change in what those shapes measure.
 #[test]
-fn the_plants_the_swept_shapes_cannot_catch_are_the_six_that_need_a_shape() {
+fn the_plants_the_swept_shapes_cannot_catch_are_the_five_that_need_a_shape() {
     let unobservable: Vec<&str> = Plant::ALL
         .into_iter()
         .filter(|plant| plant.unobservable_on_swept_shapes().is_some())
@@ -358,7 +356,6 @@ fn the_plants_the_swept_shapes_cannot_catch_are_the_six_that_need_a_shape() {
             "ignores-ceiling",
             "crossing-skips-shard",
             "prefix-scan-recovery",
-            "drops-failed-write",
             "acks-while-refusing"
         ],
         "the plants a swept violation count says nothing about have changed"
@@ -588,7 +585,7 @@ fn the_two_compaction_plants_are_selectable_by_name() {
         Plant::from_name("trusts-unfinished-snapshot"),
         Some(Plant::TrustsUnfinishedSnapshot)
     );
-    assert_eq!(Plant::ALL.len(), 14);
+    assert_eq!(Plant::ALL.len(), 13);
 }
 
 /// A sync on the simulated disk completes after a latency drawn from the
