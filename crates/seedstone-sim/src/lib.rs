@@ -427,7 +427,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         write_faults: tally.write_faults,
         sync_faults: tally.sync_faults,
         start_failures: tally.start_failures,
-        hostile: cfg.disk.corruption_permille > 0 || cfg.disk.io_error_permille > 0,
+        hostile: cfg.disk.lies(),
         snapshot_cycles: tally.snapshot_cycles,
         compactions: tally.compactions,
         files_removed: tally.files_removed,

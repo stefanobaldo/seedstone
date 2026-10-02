@@ -425,6 +425,9 @@ pub struct Shared {
     /// restarted node continues the same stream: two processes of one run
     /// drawing from two copies of it would repeat each other's latencies.
     pub disk: SimDisk,
+    /// Whether the node's disk fails or corrupts — the only disk on which a
+    /// recovery's report of a possible loss excuses one.
+    pub disk_lies: bool,
 }
 
 /// An acknowledged increment, and what a crash would need to have found
@@ -462,6 +465,7 @@ impl Shared {
             truncated: Arc::new(Mutex::new(vec![None; usize::from(shards)])),
             increments: Arc::default(),
             disk: SimDisk::new(disk.sync_latency_ms, Some(Arc::new(Mutex::new(rng)))),
+            disk_lies: disk.lies(),
         }
     }
 }
