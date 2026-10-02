@@ -15,7 +15,9 @@ use tokio::time::Instant;
 
 use crate::durability::{SlotHistory, world_now};
 use crate::outcome::{Increment, Shared, lock};
-use crate::verify::{WalkOutcome, check_ceiling, listed_keys, scan_reply};
+use crate::verify::{
+    WalkOutcome, agrees_but_for, check_ceiling, is_refusal, listed_keys, scan_reply,
+};
 use crate::workload::{
     COUNTER_OPS, Check, CondReply, Conn, DEADLINES, EXPIRE_SECONDS, KeyRange, Known, Op,
     PEXPIRE_MILLIS, PLAIN_END, Spelling, WALK_CHURN_DELETES, WALK_CHURN_WRITES,
@@ -469,6 +471,18 @@ impl Model {
         let acked = world_now();
         self.open_reported();
         for (reply, check) in replies.iter().zip(checks) {
+            // The node refusing a write its log cannot keep. Not the "no"
+            // every arm below reads an error as: a write held for its sync
+            // when the log failed was applied and answered with the refusal
+            // all the same, and the snapshot that ends the refusal makes it
+            // durable. So it is what a reply that never came is — a write
+            // that may or may not have landed — and it is counted so the
+            // verdict can ask what preceded it.
+            if is_refusal(reply) {
+                lock(&self.shared.tally).refused += 1;
+                self.in_flight(std::slice::from_ref(check));
+                continue;
+            }
             match check {
                 Check::Ignored => {}
                 // Only an acknowledged increment is owed to us. Anything else
@@ -1068,26 +1082,33 @@ impl Model {
         // this started at is the count it ends at.
         let crashes_at_start = lock(&self.shared.crashes).len();
         let mut stable = BTreeSet::new();
+        let mut maybe = BTreeSet::new();
         for (batch, burst) in writes.chunks(depth).enumerate() {
             let Some(replies) = conn.request_or_reconnect(burst).await? else {
                 return Ok(());
             };
             for (offset, reply) in replies.into_iter().enumerate() {
-                // Only an acknowledged write is a key we may insist on. A
-                // refusal is a key that is legitimately absent, and demanding
-                // it back would manufacture a violation.
+                // Only an acknowledged write is a key we may insist on. Any
+                // other answer is a key that is legitimately absent, and
+                // demanding it back would manufacture a violation — or, for
+                // the refusal, one that may be there or not.
+                let name = names[batch * depth + offset].clone().into_bytes();
                 if reply == Frame::Simple("OK".into()) {
-                    stable.insert(names[batch * depth + offset].clone().into_bytes());
+                    stable.insert(name);
+                } else if is_refusal(&reply) {
+                    maybe.insert(name);
                 }
             }
         }
 
-        let Some(walk) = self.walk_the_family(conn, cfg, &stable).await? else {
+        let Some(walk) = self.walk_the_family(conn, cfg, &stable, &maybe).await? else {
             return Ok(());
         };
         let mut present = stable;
         present.extend(walk.present.iter().cloned());
+        maybe.extend(walk.maybe.iter().cloned());
         lock(&self.shared.walk).extend(present.iter().cloned());
+        lock(&self.shared.walk_maybe).extend(maybe.iter().cloned());
 
         let Some(reply) = conn
             .request_or_reconnect(&[command(&["KEYS", &walk_pattern(self.id)])])
@@ -1114,8 +1135,8 @@ impl Model {
             // lost. What the check keeps is the half eviction cannot excuse —
             // no name that was never written, and no name returned twice.
             let agrees = match listed_keys(&reply[0]) {
-                Some((keys, false)) if self.evictable => keys.is_subset(&present),
-                listed => listed == Some((present, false)),
+                Some((keys, false)) => agrees_but_for(&keys, &present, &maybe, self.evictable),
+                _ => false,
             };
             if !agrees {
                 tally.walk_mismatches += 1;
@@ -1147,6 +1168,7 @@ impl Model {
         conn: &mut Conn,
         cfg: &SimConfig,
         stable: &BTreeSet<Vec<u8>>,
+        refused: &BTreeSet<Vec<u8>>,
     ) -> turmoil::Result<Option<WalkOutcome>> {
         let pattern = walk_pattern(self.id);
         let count = WALK_STEP_COUNT.to_string();
@@ -1160,6 +1182,8 @@ impl Model {
         let mut written: Vec<String> = Vec::new();
         let mut attempted = 0usize;
         let mut gone: BTreeSet<Vec<u8>> = BTreeSet::new();
+        // Churn keys whose write or removal was answered with the refusal.
+        let mut maybe: BTreeSet<Vec<u8>> = BTreeSet::new();
         // Every churn name this client has *sent*, acknowledged or not. The
         // no-phantom check is against this rather than against what was
         // acknowledged: a write whose reply said nothing may still have
@@ -1206,14 +1230,19 @@ impl Model {
                 sent.insert(name.clone().into_bytes());
                 if *reply == Frame::Simple("OK".into()) {
                     written.push(name.clone());
+                } else if is_refusal(reply) {
+                    maybe.insert(name.clone().into_bytes());
                 }
             }
             for (name, reply) in targets.iter().zip(&replies[fresh.len()..]) {
-                // A refusal removes nothing — the shard declines before it
-                // touches the keyspace — so a removal only counts once the
-                // server has said it happened.
+                // A removal only counts once the server has said it
+                // happened. Other errors remove nothing — the shard declines
+                // before it touches the keyspace — but the refusal may answer
+                // a removal that was applied and held for its sync.
                 if matches!(reply, Frame::Integer(_)) {
                     gone.insert(name.clone().into_bytes());
+                } else if is_refusal(reply) {
+                    maybe.insert(name.clone().into_bytes());
                 }
             }
 
@@ -1227,7 +1256,7 @@ impl Model {
             // finding here.
             if !keys
                 .iter()
-                .all(|key| stable.contains(key) || sent.contains(key))
+                .all(|key| stable.contains(key) || refused.contains(key) || sent.contains(key))
             {
                 holds = false;
             }
@@ -1275,6 +1304,7 @@ impl Model {
                 .map(String::into_bytes)
                 .filter(|name| !gone.contains(name))
                 .collect(),
+            maybe,
         }))
     }
 }

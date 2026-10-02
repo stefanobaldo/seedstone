@@ -4,7 +4,7 @@
 //! Changing anything here moves every pinned hash.
 
 use seedstone_core::shard::{
-    Command, CompactionReport, LogFault, Reply, Route, SnapshotReport, TraceSink,
+    Command, CompactionReport, LogFault, RefusalReport, Reply, Route, SnapshotReport, TraceSink,
 };
 use std::sync::{Arc, Mutex};
 
@@ -188,6 +188,22 @@ impl TraceSink for HashSink {
             LogFault::Snapshot => tally.snapshot_faults += 1,
             LogFault::Remove => tally.remove_faults += 1,
         }
+    }
+
+    /// Folded: a run whose executor resumed after a different number of
+    /// refusals is a different run.
+    fn refusal_ended(&self, report: &RefusalReport) {
+        {
+            let mut h = lock(&self.hash);
+            *h = mix(
+                mix(
+                    mix(*h, 0x5EED_0000_0000_0004),
+                    u64::from(report.executor_first_shard),
+                ),
+                report.refused,
+            );
+        }
+        lock(&self.shared.tally).refusals_ended += 1;
     }
 }
 

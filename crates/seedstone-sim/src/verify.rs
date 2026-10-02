@@ -1,6 +1,7 @@
 //! Reading the server's own account of itself — `INFO`, `SCAN` and `KEYS`
 //! replies — and checking it against what the model knows.
 
+use seedstone_core::shard::ReplyError;
 use seedstone_resp::Frame;
 use std::collections::BTreeSet;
 
@@ -13,6 +14,35 @@ pub struct WalkOutcome {
     /// The churn keys the client believes it left behind: written, and not
     /// removed since.
     pub present: BTreeSet<Vec<u8>>,
+    /// The churn keys whose write or removal the node answered with the
+    /// refusal: either may have happened.
+    pub maybe: BTreeSet<Vec<u8>>,
+}
+
+/// Whether `reply` is the node refusing a write its log cannot keep.
+///
+/// A claim about nothing: a write refused while the node refuses was never
+/// applied, but one whose reply was held for a sync when the log failed was
+/// applied and answered with the refusal all the same.
+pub fn is_refusal(reply: &Frame) -> bool {
+    matches!(reply, Frame::Error(text) if text == ReplyError::LogWriteFailed.wire_text())
+}
+
+/// Whether a listing of `keys` is the family `expected`, but for the names
+/// in `maybe`, which may be listed or not; under a ceiling, whether it names
+/// nothing outside the two.
+pub fn agrees_but_for(
+    keys: &BTreeSet<Vec<u8>>,
+    expected: &BTreeSet<Vec<u8>>,
+    maybe: &BTreeSet<Vec<u8>>,
+    evictable: bool,
+) -> bool {
+    if evictable {
+        return keys
+            .iter()
+            .all(|key| expected.contains(key) || maybe.contains(key));
+    }
+    keys.difference(maybe).eq(expected.difference(maybe))
 }
 
 /// The cursor and the keys a `SCAN` reply carries, or `None` for a reply that
