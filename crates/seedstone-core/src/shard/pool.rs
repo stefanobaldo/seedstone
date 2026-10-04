@@ -5,15 +5,14 @@
 
 use crate::dict::{Dict, DictSeed, shard_seed};
 use crate::log::checkpoint::{Checkpoint, NoCheckpoint};
-use crate::log::effect::Effect;
 use crate::log::recovery::RecoveredShard;
+use crate::log::writer::WriterLink;
 use crate::log::{NoopLog, ReplicationLog};
 use crate::memory::{MemoryGauge, MemoryLimit};
-use crate::shard::apply::append;
 use crate::shard::executor::{ExecutorSpec, Memory, ShardState, frozen_clock, run_executor};
 use crate::shard::{
-    Command, Deadlines, ExecutorPlants, HOUSEKEEPING_TICK, KIND_SLOTS, LogFault, Reply, ReplyError,
-    Route, ShardPolicy, SyncPolicy, TraceSink,
+    Command, Deadlines, ExecutorPlants, HOUSEKEEPING_TICK, KIND_SLOTS, Reply, ReplyError, Route,
+    ShardPolicy, SyncPolicy, TraceSink,
 };
 use crate::slot::{executor_of, shard_of};
 use std::future::Future;
@@ -422,6 +421,12 @@ pub struct PoolSpec<T, F, P, G> {
     pub sync: SyncPolicy,
     /// The executor's planted defects, all off outside the simulator.
     pub plants: ExecutorPlants,
+    /// One link per executor to the node's writer, in executor order; empty
+    /// on a node with no log.
+    pub writer_links: Vec<WriterLink>,
+    /// Whether the node's log failed before the pool served: a rebase the
+    /// writer could not write or sync. Every executor then starts refusing.
+    pub log_failed: bool,
 }
 
 impl ShardPool {
@@ -454,6 +459,8 @@ impl ShardPool {
             make_checkpoint: |_executor| NoCheckpoint,
             sync: SyncPolicy::INTERVAL,
             plants: ExecutorPlants::default(),
+            writer_links: Vec::new(),
+            log_failed: false,
         })
     }
 
@@ -490,6 +497,8 @@ impl ShardPool {
             make_checkpoint: |_executor| NoCheckpoint,
             sync: SyncPolicy::INTERVAL,
             plants: ExecutorPlants::default(),
+            writer_links: Vec::new(),
+            log_failed: false,
         })
     }
 
@@ -536,6 +545,8 @@ impl ShardPool {
             make_checkpoint: |_executor| NoCheckpoint,
             sync: SyncPolicy::INTERVAL,
             plants: ExecutorPlants::default(),
+            writer_links: Vec::new(),
+            log_failed: false,
         })
     }
 
@@ -572,6 +583,8 @@ impl ShardPool {
             make_checkpoint: |_executor| NoCheckpoint,
             sync: SyncPolicy::INTERVAL,
             plants: ExecutorPlants::default(),
+            writer_links: Vec::new(),
+            log_failed: false,
         })
     }
 
@@ -612,6 +625,8 @@ impl ShardPool {
             make_checkpoint: |_executor| NoCheckpoint,
             sync: SyncPolicy::INTERVAL,
             plants: ExecutorPlants::default(),
+            writer_links: Vec::new(),
+            log_failed: false,
         })
     }
 
@@ -621,7 +636,8 @@ impl ShardPool {
     /// # Panics
     ///
     /// As [`spawn`](ShardPool::spawn): if `shards` is zero, or if `executors`
-    /// is not in `1..=shards`.
+    /// is not in `1..=shards`; and if `recovered` or `writer_links` is
+    /// neither empty nor one per shard and one per executor.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "every executor gets a clone of the sink and of the policy and the \
@@ -651,19 +667,10 @@ impl ShardPool {
             make_checkpoint,
             sync,
             plants,
+            writer_links,
+            log_failed,
         } = spec;
-        assert!(
-            shards > 0,
-            "ShardPool::spawn: shards must be greater than zero"
-        );
-        assert!(
-            executors > 0 && executors <= shards,
-            "ShardPool::spawn: executors must be in 1..=shards"
-        );
-        assert!(
-            recovered.is_empty() || recovered.len() == usize::from(shards),
-            "ShardPool::spawn_spec: a recovery must describe every shard or none"
-        );
+        check_shape(shards, executors, recovered.len(), writer_links.len());
 
         // Built by walking the shards once in order: `executor_of` is monotone,
         // so each executor's states arrive contiguously and in ascending shard
@@ -675,8 +682,8 @@ impl ShardPool {
         };
         let (stop, stopped) = watch::channel(false);
         // Each executor gets its checkpoint by index, built as it spawns.
-        let spawn = |gathered: Gathered<L>, trace: T, policy: P| {
-            let (first_shard, states, log_failed) = gathered;
+        let spawn = |gathered: Gathered<L>, trace: T, policy: P, link: Option<WriterLink>| {
+            let (first_shard, states) = gathered;
             spawn_executor(ExecutorSpec {
                 first_shard,
                 states,
@@ -688,12 +695,15 @@ impl ShardPool {
                 sync,
                 plants,
                 log_failed,
+                link,
                 stop: stopped.clone(),
             })
         };
         let mut inboxes = Vec::with_capacity(usize::from(executors));
         let mut handles = Vec::with_capacity(usize::from(executors));
         let mut pending: Option<Gathered<L>> = None;
+        // In executor order, one per executor, or none at all.
+        let mut links = writer_links.into_iter();
         // In shard order, one per shard, or none at all — asserted above.
         let mut recovered = recovered.into_iter();
         for shard in 0..shards {
@@ -703,46 +713,37 @@ impl ShardPool {
                 lossy: false,
                 cut: false,
             };
+            // A cut shard's `Rebase` was written and synced through the
+            // node's writer before the pool was built: see `write_rebases`.
             let RecoveredShard {
-                dict,
-                seq,
-                lossy,
-                cut,
+                dict, seq, lossy, ..
             } = recovered.next().unwrap_or_else(fresh);
-            let mut state = ShardState::recovered(dict, seq, make_log(shard));
+            let state = ShardState::recovered(dict, seq, make_log(shard));
             trace.recovered(shard, state.seq, lossy);
-            // The records the cut left on disk hold the sequence numbers this
-            // shard is about to reuse: the rebase makes them dead on every
-            // later start. It is synced before the pool serves anything, so
-            // what a client reads after a cut is what the disk holds — a
-            // crash before the next tick must not bring back what this start
-            // said was gone. A log that refuses it is reported like any other,
-            // and its executor starts refusing, as on any failed log write.
-            let log_failed = cut && !rebase(&mut state, shard, &trace);
             // A fresh dict already costs its table, and the gauge is the sum
             // of what the dicts account — so it starts at the sum of what
             // they hold after replay rather than at zero.
             memory.gauge.apply(0, state.dict.used_bytes());
             match &mut pending {
-                Some((first_shard, states, failed))
+                Some((first_shard, states))
                     if executor_of(shard, shards, executors)
                         == executor_of(*first_shard, shards, executors) =>
                 {
                     states.push(state);
-                    *failed |= log_failed;
                 }
                 _ => {
                     if let Some(gathered) = pending.take() {
-                        let (inbox, handle) = spawn(gathered, trace.clone(), policy.clone());
+                        let (inbox, handle) =
+                            spawn(gathered, trace.clone(), policy.clone(), links.next());
                         inboxes.push(inbox);
                         handles.push(handle);
                     }
-                    pending = Some((shard, vec![state], log_failed));
+                    pending = Some((shard, vec![state]));
                 }
             }
         }
         if let Some(gathered) = pending {
-            let (inbox, handle) = spawn(gathered, trace, policy);
+            let (inbox, handle) = spawn(gathered, trace, policy, links.next());
             inboxes.push(inbox);
             handles.push(handle);
         }
@@ -759,7 +760,7 @@ impl ShardPool {
     }
 
     /// Asks every executor to stop, and waits for them: each drains what is
-    /// queued, waits for its sync in flight, syncs what was flushed since,
+    /// queued, hands it to the writer, waits for the writer's last sync,
     /// and ends. Bounded by [`SHUTDOWN_GRACE`]: a disk that hangs must not
     /// hold a supervisor's termination grace period hostage.
     ///
@@ -1006,32 +1007,26 @@ impl Router for ShardPool {
     }
 }
 
-/// An executor as the pool gathers it: its first shard, its states, and
-/// whether its log already failed a write.
-type Gathered<L> = (u16, Vec<ShardState<L>>, bool);
-
-/// Writes and syncs a shard's `Rebase` at its resume point, reporting a log
-/// that refuses either half; whether both took.
-fn rebase<L: ReplicationLog, T: TraceSink>(
-    state: &mut ShardState<L>,
-    shard: u16,
-    trace: &T,
-) -> bool {
-    if append(&mut state.log, &mut state.seq, shard, Effect::Rebase).is_err() {
-        trace.fault(
-            shard,
-            LogFault::Write,
-            &std::io::Error::other("the log refused the rebase after a cut recovery"),
-        );
-        return false;
-    }
-    if let Err(error) = state.log.flush() {
-        trace.fault(shard, LogFault::Write, &error);
-        false
-    } else if let Err(error) = state.log.sync() {
-        trace.fault(shard, LogFault::Sync, &error);
-        false
-    } else {
-        true
-    }
+/// The pool's shape, checked before anything is spawned: see
+/// [`ShardPool::spawn_spec`]'s panics.
+fn check_shape(shards: u16, executors: u16, recovered: usize, links: usize) {
+    assert!(
+        shards > 0,
+        "ShardPool::spawn: shards must be greater than zero"
+    );
+    assert!(
+        executors > 0 && executors <= shards,
+        "ShardPool::spawn: executors must be in 1..=shards"
+    );
+    assert!(
+        recovered == 0 || recovered == usize::from(shards),
+        "ShardPool::spawn_spec: a recovery must describe every shard or none"
+    );
+    assert!(
+        links == 0 || links == usize::from(executors),
+        "ShardPool::spawn_spec: one writer link per executor, or none"
+    );
 }
+
+/// An executor as the pool gathers it: its first shard and its states.
+type Gathered<L> = (u16, Vec<ShardState<L>>);

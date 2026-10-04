@@ -403,13 +403,12 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
             biased;
 
             progress = next_progress(&mut this.sync.link), if this.sync.link.is_some() => {
-                match progress {
-                    Some(message) => this.progress(message),
+                if let Some(message) = progress {
+                    this.progress(message);
+                } else {
                     // The writer is gone: nothing more will be proven.
-                    None => {
-                        this.sync.link = None;
-                        this.refuse();
-                    }
+                    this.sync.link = None;
+                    this.refuse();
                 }
             }
             // A dropped sender is a dropped pool, which closes the inbox
@@ -508,11 +507,8 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         if let Some(link) = &self.sync.link {
             let _ = link.to_writer.send(ToWriter::Stop { executor });
         }
-        loop {
-            let next = match self.sync.link.as_mut() {
-                Some(link) => link.progress.recv().await,
-                None => break,
-            };
+        while let Some(link) = self.sync.link.as_mut() {
+            let next = link.progress.recv().await;
             match next {
                 Some(Progress::Stopped) | None => break,
                 Some(message) => self.progress(message),

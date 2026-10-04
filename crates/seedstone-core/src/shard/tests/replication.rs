@@ -158,22 +158,14 @@ async fn a_supplied_log_receives_every_mutation() {
             self.0.lock().expect("log mutex").push((rec.shard, rec.seq));
             Ok(())
         }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn sync(&mut self) -> std::io::Result<Option<u64>> {
-            Ok(None)
-        }
+        fn flush_into(&mut self, _out: &mut Vec<u8>) {}
         fn flushed_through(&self) -> Option<u64> {
             None
         }
-        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+        fn sync_completed(&mut self, _through: Option<u64>, _round: u64) -> Option<u64> {
             None
         }
-        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
-            None
-        }
-        fn sync_failed(&mut self) {}
+        fn covered(&mut self, _through: u64) {}
     }
 
     let log = Recording::default();
@@ -216,22 +208,14 @@ async fn a_log_that_cannot_write_refuses_the_mutation() {
         fn append(&mut self, _rec: Record<'_>) -> std::io::Result<()> {
             Err(std::io::Error::other("the disk went away"))
         }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn sync(&mut self) -> std::io::Result<Option<u64>> {
-            Ok(None)
-        }
+        fn flush_into(&mut self, _out: &mut Vec<u8>) {}
         fn flushed_through(&self) -> Option<u64> {
             None
         }
-        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+        fn sync_completed(&mut self, _through: Option<u64>, _round: u64) -> Option<u64> {
             None
         }
-        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
-            None
-        }
-        fn sync_failed(&mut self) {}
+        fn covered(&mut self, _through: u64) {}
     }
 
     let pool =
@@ -282,22 +266,14 @@ async fn every_mutation_logs_its_effect_with_an_absolute_deadline() {
                 .push((rec.seq, effect.to_owned()));
             Ok(())
         }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn sync(&mut self) -> std::io::Result<Option<u64>> {
-            Ok(None)
-        }
+        fn flush_into(&mut self, _out: &mut Vec<u8>) {}
         fn flushed_through(&self) -> Option<u64> {
             None
         }
-        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+        fn sync_completed(&mut self, _through: Option<u64>, _round: u64) -> Option<u64> {
             None
         }
-        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
-            None
-        }
-        fn sync_failed(&mut self) {}
+        fn covered(&mut self, _through: u64) {}
     }
 
     let log = Recording::default();
@@ -369,63 +345,50 @@ async fn every_mutation_logs_its_effect_with_an_absolute_deadline() {
     );
 }
 
-/// A write is flushed with its envelope and a sync issued after it; the
-/// tick retries a flush that failed; and every failure reaches the trace
-/// sink as a fault rather than vanishing.
+/// A write hands its records to the writer with its envelope, in one
+/// submission; the tick asks every shard again and submits nothing when
+/// nothing was appended since.
 #[tokio::test(start_paused = true)]
-async fn a_write_flushes_then_issues_a_sync_and_reports_a_failure() {
-    use crate::shard::{HOUSEKEEPING_TICK, LogFault, PoolSpec, TraceSink};
-    use std::sync::atomic::{AtomicU64, Ordering};
+async fn a_write_hands_its_records_to_the_writer_in_one_submission() {
+    use crate::log::writer::ToWriter;
+    use crate::shard::PoolSpec;
 
     #[derive(Clone, Default)]
-    struct Journal(Arc<Mutex<Vec<&'static str>>>);
+    struct Journal(Arc<Mutex<(Vec<&'static str>, bool)>>);
 
     impl ReplicationLog for Journal {
         fn append(&mut self, _rec: Record<'_>) -> std::io::Result<()> {
-            self.0.lock().expect("journal").push("append");
+            let mut journal = self.0.lock().expect("journal");
+            journal.0.push("append");
+            journal.1 = true;
+            drop(journal);
             Ok(())
         }
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.0.lock().expect("journal").push("flush");
-            Err(std::io::Error::other("the disk went away"))
-        }
-        fn sync(&mut self) -> std::io::Result<Option<u64>> {
-            self.0.lock().expect("journal").push("sync");
-            Ok(None)
+        fn flush_into(&mut self, out: &mut Vec<u8>) {
+            let mut journal = self.0.lock().expect("journal");
+            journal.0.push("flush_into");
+            let pending = std::mem::take(&mut journal.1);
+            drop(journal);
+            if pending {
+                out.push(b'x');
+            }
         }
         fn flushed_through(&self) -> Option<u64> {
+            Some(0)
+        }
+        fn sync_completed(&mut self, _through: Option<u64>, _round: u64) -> Option<u64> {
             None
         }
-        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
-            self.0.lock().expect("journal").push("begin_sync");
-            Some(Box::pin(std::future::ready(Ok(()))))
-        }
-        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
-            None
-        }
-        fn sync_failed(&mut self) {}
-    }
-
-    #[derive(Clone, Default)]
-    struct Faults(Arc<AtomicU64>);
-
-    impl TraceSink for Faults {
-        fn record(&self, _shard: u16, _seq: u64, _cmd: &Command, _reply: &Reply) {}
-        fn fault(&self, shard: u16, fault: LogFault, error: &std::io::Error) {
-            assert_eq!(shard, 0);
-            assert_eq!(fault, LogFault::Write);
-            assert_eq!(error.to_string(), "the disk went away");
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
+        fn covered(&mut self, _through: u64) {}
     }
 
     let journal = Journal::default();
-    let faults = Faults::default();
+    let (links, mut to_writer, _progress) = super::support::fake_links(1);
     let pool = ShardPool::spawn_spec(PoolSpec {
         shards: 1,
         executors: 1,
         seed: DictSeed { k0: 1, k1: 2 },
-        trace: faults.clone(),
+        trace: NoTrace,
         make_log: {
             let journal = journal.clone();
             move |_shard| journal.clone()
@@ -437,22 +400,24 @@ async fn a_write_flushes_then_issues_a_sync_and_reports_a_failure() {
         make_checkpoint: |_executor| crate::log::checkpoint::NoCheckpoint,
         sync: crate::shard::SyncPolicy::INTERVAL,
         plants: crate::shard::ExecutorPlants::default(),
+        writer_links: links,
+        log_failed: false,
     });
-    pool.dispatch(set(b"k", b"v")).await;
+    assert_eq!(pool.dispatch(set(b"k", b"v")).await, Reply::Ok);
+    let Some(ToWriter::Submit { batch, bytes, .. }) = to_writer.recv().await else {
+        panic!("the write is submitted")
+    };
+    assert_eq!((batch, bytes), (0, b"x".to_vec()));
     tokio::time::advance(HOUSEKEEPING_TICK + Duration::from_millis(1)).await;
     tokio::task::yield_now().await;
-
-    let seen = journal.0.lock().expect("journal").clone();
     assert_eq!(
-        seen,
-        ["append", "flush", "begin_sync", "flush", "begin_sync"],
-        "the envelope flushes and issues; the tick retries the flush and issues again; \
-         a failed flush stops neither"
+        journal.0.lock().expect("journal").0,
+        ["append", "flush_into", "flush_into"],
+        "the envelope hands over what it appended; the tick asks again"
     );
-    assert_eq!(
-        faults.0.load(Ordering::SeqCst),
-        2,
-        "the envelope's flush and the tick's retry failed, each reported"
+    assert!(
+        to_writer.try_recv().is_err(),
+        "and nothing new is submitted"
     );
 }
 
@@ -727,6 +692,8 @@ async fn a_pool_spawned_from_a_recovery_serves_the_recovered_keys() {
         make_checkpoint: |_executor| crate::log::checkpoint::NoCheckpoint,
         sync: crate::shard::SyncPolicy::INTERVAL,
         plants: crate::shard::ExecutorPlants::default(),
+        writer_links: Vec::new(),
+        log_failed: false,
     });
     assert_eq!(
         pool.dispatch(Command::Get {
@@ -740,113 +707,6 @@ async fn a_pool_spawned_from_a_recovery_serves_the_recovered_keys() {
     assert_eq!(seen, vec![(0, 0, true), (1, 1, false)]);
 }
 
-/// A shard whose recovery was cut writes a `Rebase` at its resume point
-/// before anything else, so the records the cut left on disk are dead on
-/// every later start; a shard recovered whole writes none.
-#[tokio::test]
-async fn a_shard_cut_by_its_recovery_rebases_before_its_first_write() {
-    use crate::log::effect::Effect;
-    use crate::log::recovery::RecoveredShard;
-    use crate::shard::PoolSpec;
-
-    /// `(shard, seq, payload)` of each append; a sync is `(u16::MAX, 0, "sync")`.
-    type Appended = (u16, u64, Vec<u8>);
-    #[derive(Clone, Default)]
-    struct Kept(Arc<Mutex<Vec<Appended>>>);
-    impl ReplicationLog for Kept {
-        fn append(&mut self, rec: Record<'_>) -> std::io::Result<()> {
-            self.0
-                .lock()
-                .expect("kept")
-                .push((rec.shard, rec.seq, rec.payload.to_vec()));
-            Ok(())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn sync(&mut self) -> std::io::Result<Option<u64>> {
-            self.0
-                .lock()
-                .expect("kept")
-                .push((u16::MAX, 0, b"sync".to_vec()));
-            Ok(None)
-        }
-        fn flushed_through(&self) -> Option<u64> {
-            None
-        }
-        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
-            None
-        }
-        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
-            None
-        }
-        fn sync_failed(&mut self) {}
-    }
-
-    let key = (0..64)
-        .map(|i| format!("key{i}"))
-        .find(|key| shard_of(key.as_bytes(), 2) == 0)
-        .expect("some key lands on shard 0");
-    // Each shard resumes at 1; shard 0's recovery cut records after it.
-    let resumed = |shard: u16, cut: bool| RecoveredShard {
-        dict: Dict::with_seed(crate::dict::shard_seed(DictSeed { k0: 1, k1: 2 }, shard)),
-        seq: 1,
-        lossy: false,
-        cut,
-    };
-    let recovered = vec![resumed(0, true), resumed(1, false)];
-    let kept = Kept::default();
-    let pool = ShardPool::spawn_spec(PoolSpec {
-        shards: 2,
-        executors: 1,
-        seed: DictSeed { k0: 1, k1: 2 },
-        trace: super::support::Recorder::default(),
-        make_log: {
-            let kept = kept.clone();
-            move |_shard| kept.clone()
-        },
-        policy: crate::shard::Deadlines,
-        limit: crate::memory::MemoryLimit::default(),
-        clock: crate::shard::frozen_clock,
-        recovered,
-        make_checkpoint: |_executor| crate::log::checkpoint::NoCheckpoint,
-        sync: crate::shard::SyncPolicy::INTERVAL,
-        plants: crate::shard::ExecutorPlants::default(),
-    });
-    let mut rebase = Vec::new();
-    Effect::Rebase.encode(&mut rebase);
-    let at_start = kept.0.lock().expect("kept").clone();
-    assert_eq!(
-        at_start,
-        [(0, 1, rebase.clone()), (u16::MAX, 0, b"sync".to_vec())],
-        "the rebase is synced before the pool serves anything: the state a client reads \
-         after a cut must be the one the disk holds"
-    );
-    pool.dispatch(set(key.as_bytes(), b"v")).await;
-
-    let seen: Vec<_> = kept
-        .0
-        .lock()
-        .expect("kept")
-        .iter()
-        .filter(|(shard, _, _)| *shard != u16::MAX)
-        .cloned()
-        .collect();
-    assert_eq!(
-        seen.first(),
-        Some(&(0, 1, rebase)),
-        "the cut shard's first record is its rebase, at the resume point: {seen:?}"
-    );
-    assert_eq!(
-        seen.get(1).map(|(shard, seq, _)| (*shard, *seq)),
-        Some((0, 2))
-    );
-    assert!(
-        seen.iter().all(|(shard, _, _)| *shard == 0),
-        "the shard recovered whole writes no rebase: {seen:?}"
-    );
-}
-
 /// A log that keeps nothing is handed no payload: the node without a log
 /// encodes nothing on any write.
 #[tokio::test]
@@ -858,22 +718,14 @@ async fn a_log_that_keeps_no_payloads_is_handed_none() {
             self.0.lock().expect("lengths").push(rec.payload.len());
             Ok(())
         }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn sync(&mut self) -> std::io::Result<Option<u64>> {
-            Ok(None)
-        }
+        fn flush_into(&mut self, _out: &mut Vec<u8>) {}
         fn flushed_through(&self) -> Option<u64> {
             None
         }
-        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+        fn sync_completed(&mut self, _through: Option<u64>, _round: u64) -> Option<u64> {
             None
         }
-        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
-            None
-        }
-        fn sync_failed(&mut self) {}
+        fn covered(&mut self, _through: u64) {}
         fn keeps_payloads(&self) -> bool {
             false
         }
@@ -888,7 +740,7 @@ async fn a_log_that_keeps_no_payloads_is_handed_none() {
     assert_eq!(*lengths.0.lock().expect("lengths"), [0]);
 }
 
-/// The checkpoint runs in the tick, after the log's two passes, once per
+/// The checkpoint runs in the tick, after the shards' buffers are handed over, once per
 /// executor — it sees the executor's shards and the tick's clock.
 #[tokio::test(start_paused = true)]
 async fn the_checkpoint_is_ticked_once_per_executor_per_housekeeping_tick() {
@@ -910,11 +762,12 @@ async fn the_checkpoint_is_ticked_once_per_executor_per_housekeeping_tick() {
             states: &mut [ShardState<L>],
             _now: Now,
             _trace: &T,
-        ) -> bool {
+            _log: crate::log::checkpoint::LogPosition,
+        ) -> Option<crate::log::checkpoint::Completed> {
             self.ticks.fetch_add(1, Ordering::SeqCst);
             self.shards_seen
                 .fetch_max(states.len() as u64, Ordering::SeqCst);
-            false
+            None
         }
     }
 
@@ -937,6 +790,8 @@ async fn the_checkpoint_is_ticked_once_per_executor_per_housekeeping_tick() {
         make_checkpoint: move |_executor| counting.clone(),
         sync: crate::shard::SyncPolicy::INTERVAL,
         plants: crate::shard::ExecutorPlants::default(),
+        writer_links: Vec::new(),
+        log_failed: false,
     });
     // Let both executors start their interval, then step the clock one
     // period at a time: a single jump of three periods would fire one tick,

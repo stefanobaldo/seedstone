@@ -368,22 +368,14 @@ async fn an_expiry_is_logged_exactly_as_a_delete_is() {
             self.0.lock().expect("log mutex").push((rec.shard, rec.seq));
             Ok(())
         }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn sync(&mut self) -> std::io::Result<Option<u64>> {
-            Ok(None)
-        }
+        fn flush_into(&mut self, _out: &mut Vec<u8>) {}
         fn flushed_through(&self) -> Option<u64> {
             None
         }
-        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+        fn sync_completed(&mut self, _through: Option<u64>, _round: u64) -> Option<u64> {
             None
         }
-        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
-            None
-        }
-        fn sync_failed(&mut self) {}
+        fn covered(&mut self, _through: u64) {}
     }
 
     let log = Recording::default();
@@ -639,22 +631,14 @@ async fn a_sweep_whose_record_cannot_be_written_leaves_the_key() {
             }
             Ok(())
         }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn sync(&mut self) -> std::io::Result<Option<u64>> {
-            Ok(None)
-        }
+        fn flush_into(&mut self, _out: &mut Vec<u8>) {}
         fn flushed_through(&self) -> Option<u64> {
             None
         }
-        fn begin_sync(&mut self) -> Option<crate::log::disk::SyncFuture> {
+        fn sync_completed(&mut self, _through: Option<u64>, _round: u64) -> Option<u64> {
             None
         }
-        fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
-            None
-        }
-        fn sync_failed(&mut self) {}
+        fn covered(&mut self, _through: u64) {}
     }
 
     let log = Breakable::default();

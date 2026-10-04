@@ -625,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn the_noop_log_accepts_appends_and_syncs() {
+    fn the_noop_log_accepts_appends_and_hands_over_nothing() {
         let mut log = NoopLog;
         log.append(Record {
             shard: 0,
@@ -633,7 +633,10 @@ mod tests {
             payload: b"SET k v",
         })
         .expect("the no-op log never fails");
-        log.sync().expect("the no-op log never fails");
+        let mut out = Vec::new();
+        log.flush_into(&mut out);
+        assert!(out.is_empty());
+        assert_eq!(log.sync_completed(Some(0), 1), None);
     }
 
     #[test]
@@ -647,6 +650,6 @@ mod tests {
             payload: b"",
         })
         .expect("the no-op log never fails");
-        log.sync().expect("the no-op log never fails");
+        log.flush_into(&mut Vec::new());
     }
 }

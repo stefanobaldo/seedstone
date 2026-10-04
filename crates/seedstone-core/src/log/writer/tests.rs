@@ -5,12 +5,12 @@ use super::*;
 use crate::log::checkpoint::CheckpointConfig;
 use crate::log::disk::mem::MemDisk;
 use crate::log::file::{decode_segment_header, segment_name};
+use crate::log::snapshot::snapshot_name;
 use crate::log::{Decoded, decode_record};
 use crate::shard::{CompactionReport, LogFault, NoTrace, SyncPolicy, TraceSink};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
 
 const WAL: &str = "/data/wal";
 const SMALL: CheckpointConfig = CheckpointConfig {
@@ -442,7 +442,7 @@ async fn a_retry_that_fails_faults_only_the_executors_that_sent_bytes() {
 #[tokio::test(start_paused = true)]
 async fn the_segment_rotates_at_its_size_and_the_old_one_is_synced_first() {
     let disk = MemDisk::default();
-    let mut rig = open(&disk, 1, SyncPolicy::NEVER, 64, WriterPlants::default());
+    let rig = open(&disk, 1, SyncPolicy::NEVER, 64, WriterPlants::default());
     rig.submit(0, 0, vec![1u8; 70]);
     tokio::task::yield_now().await;
     rig.submit(0, 1, vec![2u8; 10]);
@@ -583,7 +583,7 @@ fn names(disk: &MemDisk) -> Vec<String> {
 #[tokio::test(start_paused = true)]
 async fn a_rotation_is_removed_once_every_executor_covered_its_batches_in_it() {
     let disk = MemDisk::default();
-    let mut rig = open(&disk, 2, SyncPolicy::NEVER, 64, WriterPlants::default());
+    let rig = open(&disk, 2, SyncPolicy::NEVER, 64, WriterPlants::default());
     rig.submit(0, 0, vec![1u8; 40]);
     rig.submit(1, 0, vec![2u8; 40]); // rotation 0 fills: 80 ≥ 64
     tokio::task::yield_now().await;
@@ -616,7 +616,7 @@ async fn an_executor_that_wrote_nothing_pins_nothing_and_still_closes_the_genera
     disk.create_dir_all(Path::new(WAL)).unwrap();
     disk.write_file(&Path::new(WAL).join(segment_name(0, 0)), &[0u8; 30])
         .unwrap(); // an older generation's file
-    let mut rig = open(&disk, 2, SyncPolicy::NEVER, 64, WriterPlants::default());
+    let rig = open(&disk, 2, SyncPolicy::NEVER, 64, WriterPlants::default());
     rig.submit(0, 0, vec![1u8; 70]);
     tokio::task::yield_now().await;
     rig.submit(0, 1, vec![1u8; 10]);
@@ -648,7 +648,6 @@ async fn an_executor_that_wrote_nothing_pins_nothing_and_still_closes_the_genera
 async fn a_covered_removes_that_executors_older_snapshots_and_reports_one_compaction() {
     let disk = MemDisk::default();
     disk.create_dir_all(Path::new(WAL)).unwrap();
-    use crate::log::snapshot::snapshot_name;
     disk.write_file(&Path::new(WAL).join(snapshot_name(1, 0, 0)), &[0u8; 10])
         .unwrap();
     disk.write_file(&Path::new(WAL).join(snapshot_name(1, 0, 1)), &[0u8; 10])
@@ -676,7 +675,7 @@ async fn a_covered_removes_that_executors_older_snapshots_and_reports_one_compac
         names.contains(&snapshot_name(1, 1, 0)),
         "another executor's snapshot is not this executor's to lose"
     );
-    let compactions = recorder.compactions.lock().unwrap();
+    let compactions = recorder.compactions.lock().unwrap().clone();
     assert_eq!(compactions.len(), 1);
     assert_eq!((compactions[0].files, compactions[0].bytes), (1, 10));
 }
@@ -684,7 +683,7 @@ async fn a_covered_removes_that_executors_older_snapshots_and_reports_one_compac
 #[tokio::test(start_paused = true)]
 async fn the_plant_removes_a_rotation_one_executor_covered_while_another_has_not() {
     let disk = MemDisk::default();
-    let mut rig = open(
+    let rig = open(
         &disk,
         2,
         SyncPolicy::NEVER,
@@ -719,7 +718,7 @@ async fn the_oldest_holder_is_nudged_once_the_retained_log_passes_its_bound() {
         rig.submit(0, batch, vec![1u8; 60]);
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
-        covered(&rig, 0, batch as u32, Some(batch), 100);
+        covered(&rig, 0, u32::try_from(batch).unwrap(), Some(batch), 100);
         tokio::task::yield_now().await;
     }
     // Rotations closed and retained on executor 1's account: past 64 bytes
@@ -753,4 +752,33 @@ async fn after_a_restart_the_older_generation_is_retained_log_and_its_holders_ar
     let mut rig = open(&disk, 2, SyncPolicy::NEVER, 64, WriterPlants::default());
     assert!(matches!(rig.next(0).await, Progress::Nudge));
     assert!(matches!(rig.next(1).await, Progress::Nudge));
+}
+
+/// A rotation whose directory sync failed may have left its file behind:
+/// the retry takes the name after it rather than appending a second header
+/// to that one, which the next start would read as damage.
+#[tokio::test(start_paused = true)]
+async fn a_rotation_whose_directory_sync_fails_is_retried_under_the_next_name() {
+    let disk = MemDisk::default();
+    let mut rig = open(&disk, 1, SyncPolicy::NEVER, 64, WriterPlants::default());
+    rig.submit(0, 0, vec![1u8; 70]);
+    tokio::task::yield_now().await;
+    disk.fail_one_dir_sync_after(0);
+    rig.submit(0, 1, vec![2u8; 10]);
+    assert!(matches!(rig.next(0).await, Progress::Fault));
+    rig.submit(0, 2, vec![3u8; 10]);
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        decode_segment_header(&rig.segment(1)),
+        Ok((1, 1)),
+        "the failed attempt's file holds its header alone"
+    );
+    assert_eq!(rig.segment(1).len(), crate::log::file::SEGMENT_HEADER_LEN);
+    assert_eq!(decode_segment_header(&rig.segment(2)), Ok((1, 2)));
+    assert_eq!(
+        rig.segment(2).len(),
+        crate::log::file::SEGMENT_HEADER_LEN + 10,
+        "the retry writes into the next name"
+    );
 }

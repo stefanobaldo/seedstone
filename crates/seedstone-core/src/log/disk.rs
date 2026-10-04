@@ -227,6 +227,10 @@ pub(crate) mod mem {
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
+    #[allow(
+        clippy::struct_excessive_bools,
+        reason = "one switch per kind of injected failure"
+    )]
     struct MemFs {
         dirs: BTreeSet<PathBuf>,
         files: BTreeMap<PathBuf, Vec<u8>>,
