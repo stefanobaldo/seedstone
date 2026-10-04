@@ -4,13 +4,11 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use tokio::time::Instant;
-
-use crate::log::disk::SyncFuture;
+use crate::log::writer::{WRITER_BUDGET, WriterLink};
 use crate::shard::{HOUSEKEEPING_TICK, Reply, ReplyTo};
 
-/// When the executor issues a sync of its segment, and whether it holds a
-/// batch's replies until the sync covering them completes.
+/// When the node's writer issues a sync of the segment, and whether an
+/// executor holds a batch's replies until the sync covering them completes.
 ///
 /// A sync is issued when the segment is dirty, none is in flight, and at
 /// least `min_interval` has passed since the last was issued; `None` never
@@ -71,8 +69,6 @@ impl SyncPolicy {
 /// simulator's invariants exists to find. All off in the binary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExecutorPlants {
-    /// Held replies go out when the sync is issued, not when it completes.
-    pub releases_on_issue: bool,
     /// Writes are applied and acknowledged while the executor is refusing.
     pub acks_while_refusing: bool,
 }
@@ -97,6 +93,13 @@ pub fn send(to: ReplyTo, replies: Vec<Reply>) {
         }
         ReplyTo::Share(share) => share.deliver(replies),
     }
+}
+
+/// A batch handed to the writer and not yet durable: per shard it touched,
+/// by offset, the shard's flushed point at that batch.
+pub struct Sent {
+    pub batch: u64,
+    pub shards: Vec<(usize, u64)>,
 }
 
 /// A batch's replies, waiting for the sync that covers them.
@@ -124,65 +127,71 @@ pub enum Mode {
     },
 }
 
-/// One executor's sync in flight, and everything waiting on it.
+/// One executor's side of its link to the writer, and everything waiting
+/// on it.
 pub struct SyncState {
     pub policy: SyncPolicy,
     pub plants: ExecutorPlants,
-    /// The batch the sync in flight covers, and the sync.
-    pub in_flight: Option<(u64, SyncFuture)>,
-    /// When the last sync was issued.
-    pub issued_at: Instant,
-    /// Per owned shard: `flushed_through` when the in-flight sync was issued.
-    pub flushed_at_issue: Vec<Option<u64>>,
-    /// Bytes flushed since the last issue — the executor's cheap mirror of
-    /// the segment's own flag, so that asking whether a sync is due takes
-    /// no lock. The log's `begin_sync` has the last word.
-    pub dirty: bool,
+    /// The link to the node's writer; `None` on a node with no log.
+    pub link: Option<WriterLink>,
+    /// What the batch being served handed over, not yet submitted.
+    pub staging: Vec<u8>,
+    /// Batches handed to the writer and not yet durable, in batch order.
+    pub sent: VecDeque<Sent>,
+    /// Bytes handed to the writer, cumulative.
+    pub sent_bytes: u64,
+    /// Bytes the writer reported written, cumulative.
+    pub acked_bytes: u64,
     /// Replies waiting for a sync, in batch order.
     pub held: VecDeque<Held>,
-    /// The batch replies are being tagged with now: the next sync's.
+    /// The number the next submission is tagged with.
     pub batch: u64,
     pub mode: Mode,
 }
 
 impl SyncState {
-    /// Nothing in flight, nothing held. The last issue is placed one
-    /// interval before `now`, so that the first write after a start is
-    /// synced at once rather than an interval later.
-    pub fn new(policy: SyncPolicy, plants: ExecutorPlants, shards: usize, now: Instant) -> Self {
-        let interval = policy.min_interval.unwrap_or(Duration::ZERO);
+    /// Nothing sent, nothing held.
+    #[must_use]
+    pub const fn new(policy: SyncPolicy, plants: ExecutorPlants, link: Option<WriterLink>) -> Self {
         Self {
             policy,
             plants,
-            in_flight: None,
-            issued_at: now.checked_sub(interval).unwrap_or(now),
-            flushed_at_issue: vec![None; shards],
-            dirty: false,
+            link,
+            staging: Vec::new(),
+            sent: VecDeque::new(),
+            sent_bytes: 0,
+            acked_bytes: 0,
             held: VecDeque::new(),
             batch: 0,
             mode: Mode::Serving,
         }
     }
 
-    /// Whether a sync should be issued now.
-    pub fn due(&self, now: Instant) -> bool {
-        self.dirty
-            && self.in_flight.is_none()
-            && self
-                .policy
-                .min_interval
-                .is_some_and(|interval| now.saturating_duration_since(self.issued_at) >= interval)
+    /// Whether more than [`WRITER_BUDGET`] bytes were handed to the writer
+    /// and not yet reported written: the inbox waits until they are.
+    #[must_use]
+    pub const fn over_budget(&self) -> bool {
+        self.sent_bytes.saturating_sub(self.acked_bytes) > WRITER_BUDGET
+    }
+
+    /// Whether a batch that wrote waits for its sync before it is answered.
+    #[must_use]
+    pub const fn holds(&self) -> bool {
+        self.policy.hold_acks && self.link.is_some()
     }
 
     /// Whether writes are being refused.
+    #[must_use]
     pub const fn is_refusing(&self) -> bool {
         matches!(self.mode, Mode::Refusing { .. })
     }
 
     /// Answers every held batch's writes with `error`: they were applied,
     /// and no sync stands behind them. A read beside them is served, as it
-    /// would have been in a batch of its own.
-    pub fn fail_all(&mut self, error: &Reply) {
+    /// would have been in a batch of its own. Returns how many writes it
+    /// answered.
+    pub fn fail_all(&mut self, error: &Reply) -> u64 {
+        let mut answered = 0;
         for Held {
             to,
             mut replies,
@@ -191,20 +200,30 @@ impl SyncState {
         } in self.held.drain(..)
         {
             for (reply, wrote) in replies.iter_mut().zip(wrote) {
-                if wrote && !matches!(reply, Reply::Error(_)) {
-                    reply.clone_from(error);
+                if wrote {
+                    answered += 1;
+                    if !matches!(reply, Reply::Error(_)) {
+                        reply.clone_from(error);
+                    }
                 }
             }
             send(to, replies);
         }
+        answered
     }
 
     /// Releases every held batch up to and including `batch`, in order.
-    pub fn release_through(&mut self, batch: u64) {
+    /// Returns how many of their commands had written.
+    pub fn release_through(&mut self, batch: u64) -> u64 {
+        let mut released = 0;
         while self.held.front().is_some_and(|held| held.batch <= batch) {
-            let Held { to, replies, .. } = self.held.pop_front().expect("checked above");
+            let Held {
+                to, replies, wrote, ..
+            } = self.held.pop_front().expect("checked above");
+            released += wrote.iter().filter(|wrote| **wrote).count() as u64;
             send(to, replies);
         }
+        released
     }
 }
 
@@ -213,45 +232,44 @@ mod tests {
     use super::*;
     use tokio::sync::oneshot;
 
-    #[tokio::test(start_paused = true)]
-    async fn a_sync_is_due_when_dirty_idle_and_past_the_interval() {
-        let now = Instant::now();
-        let mut state = SyncState::new(SyncPolicy::INTERVAL, ExecutorPlants::default(), 1, now);
-        assert!(!state.due(now), "nothing flushed");
-        state.dirty = true;
-        assert!(
-            state.due(now),
-            "the first write after a start is synced at once"
-        );
-        state.issued_at = now;
-        assert!(
-            !state.due(now + HOUSEKEEPING_TICK / 2),
-            "inside the interval"
-        );
-        assert!(state.due(now + HOUSEKEEPING_TICK));
-        state.in_flight = Some((0, Box::pin(std::future::ready(Ok(())))));
-        assert!(
-            !state.due(now + HOUSEKEEPING_TICK),
-            "one in flight at a time"
-        );
-        let never = SyncState {
-            dirty: true,
-            ..SyncState::new(SyncPolicy::NEVER, ExecutorPlants::default(), 1, now)
-        };
-        assert!(
-            !never.due(now + HOUSEKEEPING_TICK * 100),
-            "never is never due"
-        );
+    use crate::shard::ReplyError;
+
+    #[test]
+    fn the_budget_is_what_was_sent_and_not_yet_written() {
+        let mut state = SyncState::new(SyncPolicy::INTERVAL, ExecutorPlants::default(), None);
+        assert!(!state.over_budget());
+        state.sent_bytes = WRITER_BUDGET + 1;
+        assert!(state.over_budget());
+        state.acked_bytes = 1;
+        assert!(!state.over_budget(), "at the budget is not over it");
+    }
+
+    #[test]
+    fn nothing_is_held_without_a_writer() {
+        let state = SyncState::new(SyncPolicy::ALWAYS, ExecutorPlants::default(), None);
+        assert!(!state.holds(), "a node with no log has nothing to wait for");
+    }
+
+    #[test]
+    fn fail_all_and_release_count_the_writes_they_answered() {
+        let mut state = SyncState::new(SyncPolicy::ALWAYS, ExecutorPlants::default(), None);
+        for (batch, wrote) in [(0, vec![true, false]), (1, vec![true, true])] {
+            let (tx, _rx) = oneshot::channel();
+            state.held.push_back(Held {
+                batch,
+                to: ReplyTo::Once(tx),
+                replies: vec![Reply::Ok; wrote.len()],
+                wrote,
+            });
+        }
+        assert_eq!(state.release_through(0), 1);
+        assert_eq!(state.fail_all(&Reply::Error(ReplyError::LogWriteFailed)), 2);
+        assert!(state.held.is_empty());
     }
 
     #[test]
     fn release_through_answers_the_covered_batches_in_order_and_keeps_the_rest() {
-        let mut state = SyncState::new(
-            SyncPolicy::ALWAYS,
-            ExecutorPlants::default(),
-            1,
-            Instant::now(),
-        );
+        let mut state = SyncState::new(SyncPolicy::ALWAYS, ExecutorPlants::default(), None);
         let mut receivers = Vec::new();
         for batch in [0, 0, 1, 2] {
             let (tx, rx) = oneshot::channel();
