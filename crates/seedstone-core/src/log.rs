@@ -46,6 +46,7 @@ pub mod file;
 pub mod reader;
 pub mod recovery;
 pub mod snapshot;
+pub mod writer;
 
 /// Magic byte that opens a record.
 ///
