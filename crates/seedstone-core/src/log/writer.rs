@@ -38,11 +38,11 @@ use tokio::time::Instant;
 use crate::log::checkpoint::CheckpointConfig;
 use crate::log::disk::{Disk, LogFile, SyncFuture};
 use crate::log::effect::Effect;
-use crate::log::file::{Segment, create_segment, parse_segment_name};
+use crate::log::file::{Segment, create_segment, parse_segment_name, segment_name};
 use crate::log::recovery::RecoveredShard;
 use crate::log::snapshot::parse_snapshot_name;
 use crate::log::{Record, encode_record};
-use crate::shard::{HOUSEKEEPING_TICK, LogFault, SyncPolicy, TraceSink};
+use crate::shard::{CompactionReport, HOUSEKEEPING_TICK, LogFault, SyncPolicy, TraceSink};
 
 #[cfg(test)]
 mod tests;
@@ -580,20 +580,161 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         }
     }
 
-    // Stub: coverage and compaction.
-    #[allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)]
-    const fn covered(
+    fn covered(
         &mut self,
-        _executor: u16,
-        _cycle: u32,
-        _through_batch: Option<u64>,
-        _snapshot_bytes: u64,
+        executor: u16,
+        cycle: u32,
+        through_batch: Option<u64>,
+        snapshot_bytes: u64,
     ) {
+        let lane = &mut self.lanes[usize::from(executor)];
+        lane.covered = lane.covered.max(through_batch);
+        lane.reported = true;
+        lane.snapshot_bytes = snapshot_bytes;
+        lane.nudged = false;
+        self.compact(executor, cycle);
     }
 
-    // Stub: the nudge.
-    #[allow(clippy::unused_self)]
-    const fn nudge_if_due(&self) {}
+    /// Removes what is redundant now: every older generation's file once
+    /// every executor has reported a snapshot in this one (and on every
+    /// compaction after, so a removal that failed is tried again); the
+    /// reporting executor's older snapshots; and the closed rotations every
+    /// executor has covered, a prefix — except rotation 0 while any older
+    /// generation's file remains, because it holds the rebases that keep
+    /// those files' records above them dead. One report for all of it.
+    fn compact(&mut self, executor: u16, cycle: u32) {
+        let mut removed = CompactionReport { files: 0, bytes: 0 };
+        let names = self.disk.list(&self.wal).unwrap_or_default();
+        let round_closed = self.lanes.iter().all(|lane| lane.reported);
+        let mut older_left = false;
+        for name in names.iter().filter(|name| self.is_older(name)) {
+            if !round_closed {
+                older_left = true;
+                continue;
+            }
+            match self.remove(name) {
+                Ok(bytes) => {
+                    removed.files += 1;
+                    removed.bytes += bytes;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    older_left = true;
+                    self.trace.log_fault(LogFault::Remove, &error);
+                }
+            }
+        }
+        if !older_left {
+            self.older_bytes = 0;
+        }
+        for name in &names {
+            let Some((generation, owner, this)) = parse_snapshot_name(name) else {
+                continue;
+            };
+            if generation == self.generation && owner == executor && this < cycle {
+                match self.remove(name) {
+                    Ok(bytes) => {
+                        removed.files += 1;
+                        removed.bytes += bytes;
+                    }
+                    Err(error) => self.trace.log_fault(LogFault::Remove, &error),
+                }
+            }
+        }
+        let mut index = 0;
+        while index < self.closed.len() {
+            let closed = &self.closed[index];
+            let covered_by_all = self
+                .lanes
+                .iter()
+                .zip(&closed.last_batch)
+                .all(|(lane, last)| {
+                    last.is_none_or(|batch| lane.covered.is_some_and(|covered| covered >= batch))
+                });
+            let planted = self.plants.removes_uncovered
+                && self
+                    .lanes
+                    .iter()
+                    .zip(&closed.last_batch)
+                    .any(|(lane, last)| {
+                        last.is_some_and(|batch| {
+                            lane.covered.is_some_and(|covered| covered >= batch)
+                        })
+                    });
+            if !(covered_by_all || planted) {
+                break;
+            }
+            if closed.rotation == 0 && older_left {
+                index += 1;
+                continue;
+            }
+            match self.remove(&segment_name(self.generation, closed.rotation)) {
+                Ok(bytes) => {
+                    removed.files += 1;
+                    removed.bytes += bytes;
+                    self.closed.remove(index);
+                }
+                Err(error) => {
+                    self.trace.log_fault(LogFault::Remove, &error);
+                    break;
+                }
+            }
+        }
+        if let Err(error) = self.disk.sync_dir(&self.wal) {
+            self.trace.log_fault(LogFault::Remove, &error);
+        }
+        self.trace.compaction(&removed);
+    }
+
+    /// Removes `name`, and says how many bytes it held.
+    fn remove(&self, name: &str) -> io::Result<u64> {
+        let path = self.wal.join(name);
+        let bytes = self.disk.len(&path).unwrap_or(0);
+        self.disk.remove_file(&path)?;
+        Ok(bytes)
+    }
+
+    /// Whether `name` is a segment or snapshot of an older generation.
+    fn is_older(&self, name: &str) -> bool {
+        parse_segment_name(name)
+            .map(|(generation, _)| generation)
+            .or_else(|| parse_snapshot_name(name).map(|(generation, _, _)| generation))
+            .is_some_and(|generation| generation < self.generation)
+    }
+
+    /// The trigger's second leg. The retained log is every closed rotation
+    /// plus every older generation's file; an executor holds it back when
+    /// it has not covered its batches in the oldest rotation, or has not
+    /// reported at all while older generations remain. Such an executor is
+    /// nudged once the retained log passes `max(floor, ratio × S_e)` — the
+    /// same amortisation as its own trigger: a snapshot of `S_e` buys at
+    /// least `S_e` of log. Once per nudge; `Covered` re-arms it.
+    fn nudge_if_due(&mut self) {
+        let retained =
+            self.older_bytes + self.closed.iter().map(|closed| closed.bytes).sum::<u64>();
+        let front = self.closed.front().map(|closed| closed.last_batch.clone());
+        let older = self.older_bytes > 0;
+        for (index, lane) in self.lanes.iter_mut().enumerate() {
+            if lane.nudged {
+                continue;
+            }
+            let holds_older = older && !lane.reported;
+            let holds_front = front.as_ref().is_some_and(|last| {
+                last[index].is_some_and(|batch| lane.covered.is_none_or(|covered| covered < batch))
+            });
+            if !(holds_older || holds_front) {
+                continue;
+            }
+            let threshold = self
+                .checkpoint
+                .floor
+                .max(self.checkpoint.ratio.saturating_mul(lane.snapshot_bytes));
+            if retained > threshold {
+                lane.nudged = true;
+                let _ = lane.progress.send(Progress::Nudge);
+            }
+        }
+    }
 }
 
 /// The sync in flight, or a future that never completes when there is none
