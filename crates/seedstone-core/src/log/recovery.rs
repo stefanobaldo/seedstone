@@ -8,9 +8,10 @@
 //!    wrong magic or fails its checksum is damage, charged to every shard as
 //!    a bad segment header is; a version above this build's refuses the
 //!    start.
-//! 2. **Segments.** Every `.seg` in name order, every intact record
-//!    bucketed by shard — the whole of what is on disk, which compaction
-//!    keeps to about a snapshot's worth per executor. Not only the tail
+//! 2. **Segments.** Every `.seg` in name order — one per rotation of each
+//!    generation — every intact record bucketed by shard: the whole of what
+//!    is on disk, which compaction keeps to about a snapshot's worth per
+//!    executor. Not only the tail
 //!    from the newest image's base: whether that image is usable is not
 //!    known until this pass has found every `Rebase`, so a tail read
 //!    against an image that then proves dead would be a tail with a hole
@@ -66,13 +67,15 @@
 //!
 //! A segment whose header names a format version above this build's is
 //! refused, and the node does not start: that is not damage, it is a
-//! downgrade, and guessing at it would be worse than stopping. A header
+//! downgrade, and guessing at it would be worse than stopping. One whose
+//! version is below this build's is refused too: the directory was written
+//! by an earlier build, and reading its files as damage would charge a loss
+//! to every shard instead of saying what they are. A header
 //! that is short, carries the wrong magic or fails its checksum is damage:
 //! the segment is abandoned and counted, and every shard is marked lossy,
 //! because a loss nobody can attribute to a shard is a possible loss for
 //! all of them.
 
-use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
@@ -82,12 +85,11 @@ use crate::dict::{Dict, DictSeed, Entry, shard_seed};
 use crate::log::disk::Disk;
 use crate::log::effect::{Effect, Owned};
 use crate::log::file::{
-    HeaderError, SEGMENT_HEADER_LEN, decode_segment_header, parse_segment_name,
+    HeaderError, SEGMENT_HEADER_LEN, decode_segment_header, parse_name, parse_segment_name,
 };
 use crate::log::reader::{Item, Reader};
 use crate::log::snapshot::{FOOTER_SHARD, Footer, SnapshotHeader, parse_snapshot_name};
 use crate::shard::{Now, Replayed, replay_into};
-use crate::slot::executor_of;
 
 /// Re-exported: every caller of [`recover`] chooses one.
 pub use crate::log::reader::ReaderMode;
@@ -323,43 +325,36 @@ fn read_headers<D: Disk>(
     Ok((snaps, damage))
 }
 
-/// One `.seg`, and how many executors its generation ran — which is what
-/// lets damage in it be charged to the shards that wrote there.
+/// One `.seg`: the generation and rotation its name carries.
 struct SegmentFile {
     generation: u64,
-    executor: u16,
-    executors: u16,
-    /// Whether it is its executor's newest rotation in its generation: the
-    /// file that says the executor existed, which pass 5 never removes.
-    newest: bool,
+    rotation: u32,
     name: String,
 }
 
-/// Every `.seg`, sorted by name.
+/// Every `.seg`, sorted by generation and rotation.
+///
+/// The previous layout's names — `<generation>-<executor>-<rotation>.seg` —
+/// are listed too, and this is the one place that shape is still known: a
+/// start must read such a file's header and refuse the directory, not pass
+/// over a file it does not recognise and serve an empty node.
 fn segment_files(names: &[String]) -> Vec<SegmentFile> {
-    let mut parsed: Vec<(u64, u16, u32, String)> = names
+    let mut files: Vec<SegmentFile> = names
         .iter()
-        .filter_map(|name| parse_segment_name(name).map(|(g, e, r)| (g, e, r, name.clone())))
-        .collect();
-    parsed.sort();
-    let mut executors_in: BTreeMap<u64, u16> = BTreeMap::new();
-    let mut newest: BTreeMap<(u64, u16), u32> = BTreeMap::new();
-    for (generation, executor, rotation, _) in &parsed {
-        let count = executors_in.entry(*generation).or_default();
-        *count = (*count).max(executor.saturating_add(1));
-        let last = newest.entry((*generation, *executor)).or_default();
-        *last = (*last).max(*rotation);
-    }
-    parsed
-        .into_iter()
-        .map(|(generation, executor, rotation, name)| SegmentFile {
-            generation,
-            executor,
-            executors: executors_in.get(&generation).copied().unwrap_or(1),
-            newest: newest.get(&(generation, executor)) == Some(&rotation),
-            name,
+        .filter_map(|name| {
+            parse_segment_name(name)
+                .or_else(|| parse_name(name, ".seg").map(|(g, _, r)| (g, r)))
+                .map(|(generation, rotation)| SegmentFile {
+                    generation,
+                    rotation,
+                    name: name.clone(),
+                })
         })
-        .collect()
+        .collect();
+    files.sort_by(|a, b| {
+        (a.generation, a.rotation, &a.name).cmp(&(b.generation, b.rotation, &b.name))
+    });
+    files
 }
 
 /// What pass 2 has read: per shard, every intact record on disk, each
@@ -368,7 +363,8 @@ struct Scan {
     report: Report,
     /// Per shard: `(seq, generation, file index, effect)`.
     buckets: Vec<Vec<(u64, u64, usize, Owned)>>,
-    /// Per shard: damage sat in a segment its executor wrote.
+    /// Per shard: damage sat in a segment, which may have held any shard's
+    /// records.
     damaged: Vec<bool>,
     /// A loss nobody can attribute to a shard: every shard may have paid.
     unattributed_loss: bool,
@@ -460,12 +456,11 @@ impl Scan {
         }
         // A hole can swallow a shard's last records, leaving no gap behind
         // to show for it; a cut tail can be a damaged length on the last
-        // record rather than a crash. Either may have cost any shard this
-        // segment's executor hosted.
+        // record rather than a crash. One file holds every shard's records,
+        // so either may have cost any of them.
         if damage.holes > 0 || damage.truncated_tail > 0 {
-            let shards = u16::try_from(self.damaged.len()).unwrap_or(u16::MAX);
-            for (shard, hit) in (0..shards).zip(self.damaged.iter_mut()) {
-                *hit |= executor_of(shard, shards, file.executors) == file.executor;
+            for hit in &mut self.damaged {
+                *hit = true;
             }
         }
         Ok(())
@@ -814,12 +809,8 @@ fn prefix(
 /// no other file holds — a finished image whose log a compaction already
 /// removed, a segment whose header failed this once. Removing it would
 /// turn a loss this start reported into one the next start cannot see.
-/// Once every executor of this process has a durable snapshot, the round
-/// removes every older generation's files, these among them.
-///
-/// Each executor's newest rotation stays too, even empty: a start counts a
-/// generation's executors from the segments it finds, and that count is
-/// what charges damage to the right shards.
+/// Once every executor of this process has a durable snapshot, the
+/// writer removes every older generation's files, these among them.
 fn remove_garbage<D: Disk>(
     spec: &RecoverSpec<'_, D>,
     snaps: &[SnapFile],
@@ -836,7 +827,7 @@ fn remove_garbage<D: Disk>(
             segments
                 .iter()
                 .zip(kept.iter().zip(unread))
-                .filter(|(file, (kept, unread))| !**kept && !**unread && !file.newest)
+                .filter(|(_, (kept, unread))| !**kept && !**unread)
                 .map(|(file, _)| file.name.as_str()),
         );
     let mut removed = 0;
