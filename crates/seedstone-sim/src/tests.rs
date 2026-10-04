@@ -279,10 +279,11 @@ fn every_plant_answers_whether_the_swept_shapes_catch_it() {
             | Plant::ServeExpired
             | Plant::SweepEatsAll
             | Plant::EvictsBelowCeiling
-            | Plant::DeletesBeforeDurable
+            | Plant::ReportsCoveredAtOpen
             | Plant::TrustsUnfinishedSnapshot
-            | Plant::ReleasesOnIssue
-            | Plant::SyncsFromFlushedNow => assert_eq!(
+            | Plant::RemovesUncovered
+            | Plant::DurableOnIssue
+            | Plant::DurableFromWrittenNow => assert_eq!(
                 place,
                 None,
                 "{} is caught where it is swept, so it has no elsewhere to name",
@@ -584,16 +585,20 @@ fn the_simulated_node_cycles_on_the_mini_shape() {
 }
 
 #[test]
-fn the_two_compaction_plants_are_selectable_by_name() {
+fn the_three_compaction_plants_are_selectable_by_name() {
     assert_eq!(
-        Plant::from_name("deletes-before-durable"),
-        Some(Plant::DeletesBeforeDurable)
+        Plant::from_name("reports-covered-at-open"),
+        Some(Plant::ReportsCoveredAtOpen)
     );
     assert_eq!(
         Plant::from_name("trusts-unfinished-snapshot"),
         Some(Plant::TrustsUnfinishedSnapshot)
     );
-    assert_eq!(Plant::ALL.len(), 13);
+    assert_eq!(
+        Plant::from_name("removes-uncovered"),
+        Some(Plant::RemovesUncovered)
+    );
+    assert_eq!(Plant::ALL.len(), 14);
 }
 
 /// A sync on the simulated disk completes after a latency drawn from the
@@ -705,16 +710,16 @@ fn the_always_policy_decides_its_strong_claim_on_every_crashing_seed() {
 #[test]
 fn the_three_durability_plants_are_selectable_by_name() {
     assert_eq!(
-        Plant::from_name("releases-on-issue"),
-        Some(Plant::ReleasesOnIssue)
+        Plant::from_name("durable-on-issue"),
+        Some(Plant::DurableOnIssue)
     );
     assert_eq!(
         Plant::from_name("acks-while-refusing"),
         Some(Plant::AcksWhileRefusing)
     );
     assert_eq!(
-        Plant::from_name("syncs-from-flushed-now"),
-        Some(Plant::SyncsFromFlushedNow)
+        Plant::from_name("durable-from-written-now"),
+        Some(Plant::DurableFromWrittenNow)
     );
 }
 

@@ -70,13 +70,13 @@ fn the_honest_node_holds_under_every_policy_and_is_crashed_mid_flight_on_some_se
 #[test]
 fn releasing_before_the_sync_completes_is_caught() {
     let caught = (1..=SEEDS).find(|seed| {
-        let outcome = standard(*seed, SyncPolicy::ALWAYS, Some(Plant::ReleasesOnIssue));
+        let outcome = standard(*seed, SyncPolicy::ALWAYS, Some(Plant::DurableOnIssue));
         outcome.lost_durable_writes > 0
     });
     let Some(seed) = caught else {
         panic!("no seed in 1..={SEEDS} surfaced the early release — investigate, do not widen")
     };
-    eprintln!("releases-on-issue: first caught on seed {seed}");
+    eprintln!("durable-on-issue: first caught on seed {seed}");
     assert!(
         standard(seed, SyncPolicy::ALWAYS, None).invariant_holds(),
         "seed {seed} is not clean without the plant"
@@ -91,14 +91,14 @@ fn syncing_from_the_point_of_now_rather_than_of_issue_is_caught() {
         let outcome = standard(
             *seed,
             SyncPolicy::INTERVAL,
-            Some(Plant::SyncsFromFlushedNow),
+            Some(Plant::DurableFromWrittenNow),
         );
         outcome.lost_durable_writes > 0 || outcome.lost_durable_prefixes > 0
     });
     let Some(seed) = caught else {
         panic!("no seed in 1..={SEEDS} surfaced the point of now — investigate, do not widen")
     };
-    eprintln!("syncs-from-flushed-now: first caught on seed {seed}");
+    eprintln!("durable-from-written-now: first caught on seed {seed}");
     assert!(
         standard(seed, SyncPolicy::INTERVAL, None).invariant_holds(),
         "seed {seed} is not clean without the plant"

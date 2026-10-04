@@ -117,14 +117,15 @@ pub enum Plant {
     /// durable region: read corruption, which `SimConfig::hostile` has and
     /// the swept shapes do not.
     PrefixScanRecovery,
-    /// A checkpoint that deletes the segments it covers at the rotation,
-    /// when the cycle opens, instead of when the snapshot's footer is
-    /// synced. A crash anywhere inside the cycle then finds neither the
-    /// old segments nor an image, and every record between the previous
+    /// A checkpoint that reports its snapshot covered when the cycle opens,
+    /// as if the bases were the durable point, instead of when the footer
+    /// is synced. The writer then removes the rotations the executor's
+    /// batches sat in, and a crash anywhere inside the cycle finds neither
+    /// those rotations nor an image: every record between the previous
     /// image's base and the new one is gone. Caught by
     /// `lost_durable_writes` on the swept shape: a crash under load is
     /// enough, no disk fault needed.
-    DeletesBeforeDurable,
+    ReportsCoveredAtOpen,
     /// A recovery that takes a snapshot with no footer at its word — the
     /// keys scanned before the crash, and nothing after them — instead of
     /// refusing it and reading the log the footer would have covered. A
@@ -132,29 +133,36 @@ pub enum Plant {
     /// the base, and every key not yet scanned is gone. Caught by
     /// `lost_durable_writes` on the swept shape.
     TrustsUnfinishedSnapshot,
-    /// Held replies go out when the sync covering them is *issued*, not when
-    /// it completes.
+    /// The writer tells each executor `Durable` when a sync is *issued*, not
+    /// when it completes.
     ///
-    /// Under `always` that acknowledges a write no sync has covered yet, and
-    /// a crash inside the flight loses it: an acknowledged write that does
-    /// not come back. Caught by `lost_durable_writes`, on the seeds that draw
+    /// Under `always` that releases a write no sync has covered yet, and a
+    /// crash inside the flight loses it: an acknowledged write that does not
+    /// come back. Caught by `lost_durable_writes`, on the seeds that draw
     /// `always` and crash with a sync in flight.
-    ReleasesOnIssue,
-    /// An executor whose log failed applies and acknowledges writes while it
-    /// is refusing them.
+    DurableOnIssue,
+    /// An executor applies and acknowledges writes while it is refusing them
+    /// after the node's log failed.
     ///
     /// Each acknowledgement promises what the log did not take, and a crash
     /// before the snapshot that ends the refusal is durable loses it. Caught
     /// by `lost_durable_writes`, on the disk that fails, under `always`.
     AcksWhileRefusing,
-    /// A completed sync raises the durable point to what is flushed when it
-    /// *completes*, rather than to what was flushed when it was issued.
+    /// The writer's `Durable` names the last batch written when the sync
+    /// *completes*, rather than the one frozen when it was issued.
     ///
-    /// What was flushed during the flight is claimed durable without any
+    /// What was written during the flight is claimed durable without any
     /// sync having covered it, and a crash before the next one loses it.
     /// Caught by `lost_durable_writes` and `lost_durable_prefixes`, on the
     /// seeds that draw `interval` with a sync latency above one tick.
-    SyncsFromFlushedNow,
+    DurableFromWrittenNow,
+    /// The writer removes a rotation once *any* executor has covered its
+    /// batches in it, not once every one has.
+    ///
+    /// Caught by `lost_durable_writes` on the swept shape: a crash after the
+    /// removal and before the other executor's snapshot finds neither the
+    /// rotation nor an image of its records.
+    RemovesUncovered,
 }
 
 impl Plant {
@@ -171,17 +179,18 @@ impl Plant {
             Self::EvictsBelowCeiling => "evicts-below-ceiling",
             Self::CrossingSkipsShard => "crossing-skips-shard",
             Self::PrefixScanRecovery => "prefix-scan-recovery",
-            Self::DeletesBeforeDurable => "deletes-before-durable",
+            Self::ReportsCoveredAtOpen => "reports-covered-at-open",
             Self::TrustsUnfinishedSnapshot => "trusts-unfinished-snapshot",
-            Self::ReleasesOnIssue => "releases-on-issue",
+            Self::DurableOnIssue => "durable-on-issue",
             Self::AcksWhileRefusing => "acks-while-refusing",
-            Self::SyncsFromFlushedNow => "syncs-from-flushed-now",
+            Self::DurableFromWrittenNow => "durable-from-written-now",
+            Self::RemovesUncovered => "removes-uncovered",
         }
     }
 
     /// Every plant, so a caller listing or sweeping them cannot miss one
     /// added later.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::LostUpdate,
         Self::ServeExpired,
         Self::SweepEatsAll,
@@ -190,11 +199,12 @@ impl Plant {
         Self::EvictsBelowCeiling,
         Self::CrossingSkipsShard,
         Self::PrefixScanRecovery,
-        Self::DeletesBeforeDurable,
+        Self::ReportsCoveredAtOpen,
         Self::TrustsUnfinishedSnapshot,
-        Self::ReleasesOnIssue,
+        Self::DurableOnIssue,
         Self::AcksWhileRefusing,
-        Self::SyncsFromFlushedNow,
+        Self::DurableFromWrittenNow,
+        Self::RemovesUncovered,
     ];
 
     /// The plant `name` selects, if it names one.
@@ -227,10 +237,11 @@ impl Plant {
             // including the ones with no ceiling, where the plain model is
             // exact and a vanished key is a mismatch with nothing to excuse
             // it.
-            // The two compaction plants too: a crash under load, which
+            // The three compaction plants too: a crash under load, which
             // every swept seed has, is what makes them visible — the first
-            // loses records to a crash inside a cycle, the second to a crash
-            // inside a cycle followed by a start that trusts what it finds.
+            // and third lose records to a crash before the image that would
+            // cover them, the second to a crash inside a cycle followed by a
+            // start that trusts what it finds.
             // The two durability plants that break a promise of the policy
             // a seed draws: the swept shape draws every policy, and
             // `tests/planted_durability.rs` fixes the one each breaks.
@@ -238,10 +249,11 @@ impl Plant {
             | Self::ServeExpired
             | Self::SweepEatsAll
             | Self::EvictsBelowCeiling
-            | Self::DeletesBeforeDurable
+            | Self::ReportsCoveredAtOpen
             | Self::TrustsUnfinishedSnapshot
-            | Self::ReleasesOnIssue
-            | Self::SyncsFromFlushedNow => None,
+            | Self::RemovesUncovered
+            | Self::DurableOnIssue
+            | Self::DurableFromWrittenNow => None,
             // Needs a cursor observed *between* steps of a table that is
             // growing under it, and no shape this harness can afford leaves one
             // there: a call spends the server's whole bucket ceiling, which

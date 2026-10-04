@@ -72,7 +72,7 @@ fn the_honest_node_cycles_on_every_seed_and_is_crashed_inside_a_cycle_on_some() 
 #[test]
 fn deleting_before_the_snapshot_is_durable_is_caught() {
     let caught = (1..=SEEDS).find(|sim_seed| {
-        let outcome = standard(*sim_seed, Some(Plant::DeletesBeforeDurable));
+        let outcome = standard(*sim_seed, Some(Plant::ReportsCoveredAtOpen));
         outcome.lost_durable_writes > 0 || outcome.lost_durable_prefixes > 0
     });
     let Some(seed) = caught else {
