@@ -187,7 +187,7 @@ fn records_a_cut_left_behind_never_return_on_a_later_start() {
     let mut gen1 = wal(&disk, 1);
     write(&mut gen1, 0, 0, &put(b"a", b"1"));
     write(&mut gen1, 0, 1, &put(b"a", b"2"));
-    write(&mut old, 3, &put(b"c", b"stale")); // seq 2 never written
+    write(&mut gen1, 0, 3, &put(b"c", b"stale")); // seq 2 never written
     write(&mut gen1, 0, 4, &put(b"d", b"stale"));
     let first = recover(spec(&disk, 1)).unwrap();
     assert_eq!(first.shards[0].seq, 2, "cut at the gap");
@@ -224,7 +224,7 @@ fn a_gap_truncates_that_shard_and_nothing_else() {
     write(&mut seg, 0, 0, &put(b"a", b"1"));
     write(&mut seg, 0, 1, &put(b"a", b"2"));
     write(&mut seg, 1, 0, &put(b"b", b"1"));
-    write(&mut s0, 3, &put(b"a", b"4")); // seq 2 never written
+    write(&mut seg, 0, 3, &put(b"a", b"4")); // seq 2 never written
     write(&mut seg, 1, 1, &put(b"b", b"2"));
 
     let recovery = recover(spec(&disk, 2)).unwrap();
@@ -313,7 +313,7 @@ fn a_directory_from_the_previous_format_refuses_the_start() {
         &header,
     )
     .unwrap();
-    let error = recover(spec(&disk, 2)).err().expect("refused");
+    let error = recover(spec(&disk, 2)).expect_err("refused");
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
     assert!(error.to_string().contains("predates"), "{error}");
 }
@@ -381,7 +381,7 @@ fn a_malformed_payload_ends_that_shards_prefix() {
     let disk = MemDisk::default();
     let mut seg = wal(&disk, 1);
     write(&mut seg, 0, 0, &put(b"a", b"1"));
-    write(&mut s0, 1, &[99]); // no such tag
+    write(&mut seg, 0, 1, &[99]); // no such tag
     write(&mut seg, 0, 2, &put(b"a", b"3"));
     let recovery = recover(spec(&disk, 1)).unwrap();
     assert_eq!(recovery.report.malformed, 1);
@@ -660,8 +660,8 @@ fn a_snapshot_whose_counts_do_not_match_falls_back_to_the_older_image() {
 fn a_shard_whose_only_image_is_refused_and_whose_log_was_compacted_is_cut_lossy_and_reported() {
     let disk = MemDisk::default();
     // Rotation 0 was deleted by a compaction; rotation 1 holds 4 and 5.
-    let mut seg = wal(&disk, 1);
-    seg = rotate(&disk, 1, 1);
+    wal(&disk, 1);
+    let mut seg = rotate(&disk, 1, 1);
     disk.remove_file(&Path::new("/data/wal").join(segment_name(1, 0)))
         .unwrap();
     write(&mut seg, 0, 4, &put(b"x", b"4"));
@@ -855,7 +855,7 @@ fn an_executor_count_change_finds_a_shards_image_in_an_older_generations_file() 
 #[test]
 fn a_flush_in_the_tail_clears_the_image() {
     let disk = MemDisk::default();
-    let mut seg = wal(&disk, 1);
+    wal(&disk, 1);
     snapshot(
         &disk,
         1,
@@ -865,7 +865,7 @@ fn a_flush_in_the_tail_clears_the_image() {
         &[(0, b"a", b"1", None), (0, b"b", b"1", None)],
         true,
     );
-    seg = rotate(&disk, 1, 1);
+    let mut seg = rotate(&disk, 1, 1);
     let mut flush = Vec::new();
     Effect::Flush.encode(&mut flush);
     write(&mut seg, 0, 2, &flush);
@@ -877,7 +877,7 @@ fn a_flush_in_the_tail_clears_the_image() {
 #[test]
 fn a_passed_deadline_in_the_image_is_removed_unless_the_tail_moved_it() {
     let disk = MemDisk::default();
-    let mut seg = wal(&disk, 1);
+    wal(&disk, 1);
     snapshot(
         &disk,
         1,
@@ -891,7 +891,7 @@ fn a_passed_deadline_in_the_image_is_removed_unless_the_tail_moved_it() {
         ],
         true,
     );
-    seg = rotate(&disk, 1, 1);
+    let mut seg = rotate(&disk, 1, 1);
     let mut moved = Vec::new();
     Effect::Deadline {
         key: b"moved",
@@ -933,8 +933,8 @@ fn a_snapshot_from_a_newer_format_version_refuses_the_start() {
 #[test]
 fn an_unfinished_looking_snapshot_whose_log_is_gone_is_a_loss_and_is_kept() {
     let disk = MemDisk::default();
-    let mut seg = wal(&disk, 1);
-    seg = rotate(&disk, 1, 1);
+    wal(&disk, 1);
+    let mut seg = rotate(&disk, 1, 1);
     disk.remove_file(&Path::new("/data/wal").join(segment_name(1, 0)))
         .unwrap();
     write(&mut seg, 0, 4, &put(b"x", b"4"));

@@ -143,9 +143,11 @@ pub fn decode_segment_header(buf: &[u8]) -> Result<(u64, u32), HeaderError> {
         _ => {}
     }
     check_header_crc(header)?;
-    let generation = u64::from_le_bytes(header[5..13].try_into().expect("8 bytes"));
-    let rotation = u32::from_le_bytes(header[13..17].try_into().expect("4 bytes"));
-    Ok((generation, rotation))
+    let mut generation = [0; 8];
+    generation.copy_from_slice(&header[5..13]);
+    let mut rotation = [0; 4];
+    rotation.copy_from_slice(&header[13..17]);
+    Ok((u64::from_le_bytes(generation), u32::from_le_bytes(rotation)))
 }
 
 /// The last four bytes of `header` are the CRC of everything before them.

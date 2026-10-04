@@ -294,13 +294,18 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         })
     }
 
-    /// The start path's: appends `bytes` now, on this thread.
+    /// The start path's: appends `bytes` now, on this thread. A failure
+    /// marks the segment failed — part of the write may have landed — and
+    /// the first submission rotates away from it.
     ///
     /// # Errors
     ///
     /// Whatever the disk reports.
     pub fn append_now(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.segment.file.write_all(bytes)?;
+        if let Err(error) = self.segment.file.write_all(bytes) {
+            self.segment.sync_failed = true;
+            return Err(error);
+        }
         self.segment.bytes_written += bytes.len() as u64;
         self.segment.dirty = true;
         Ok(())
@@ -746,13 +751,19 @@ async fn in_flight(slot: &mut Option<(Vec<Option<u64>>, SyncFuture)>) -> io::Res
     }
 }
 
-/// Writes a `Rebase` for every cut shard at its resume position and syncs
-/// them, advancing each cut shard's `seq` past its record. Before the pool
-/// serves; a failure is the node's log failing at the start.
+/// Writes a `Rebase` for every cut shard at its resume position, and syncs.
+///
+/// Each cut shard's `seq` advances past its record. Before the pool serves;
+/// a failure is the node's log failing at the start.
 ///
 /// # Errors
 ///
 /// Whatever the disk reports for the write or the sync.
+///
+/// # Panics
+///
+/// If `shards` has more entries than a shard id can count, which no node
+/// has.
 pub fn write_rebases<D: Disk + Send + 'static, T: TraceSink>(
     writer: &mut Writer<D, T>,
     shards: &mut [RecoveredShard],

@@ -519,9 +519,32 @@ fn a_failed_footer_sync_abandons_the_file_and_restarts_with_the_same_bases() {
     assert_eq!(report.entries, 8);
 }
 
+/// Keys in `state`'s dict and not in its log: what the image scans, with
+/// nothing handed over, so a cycle spans several ticks of a small budget
+/// without the live log moving.
+fn pad(state: &mut ShardState<FileLog>, keys: u8) {
+    for i in 0..keys {
+        state.dict.insert(
+            Bytes::copy_from_slice(&[b'p', i]),
+            Entry {
+                value: Bytes::from_static(b"v"),
+                expires_at: None,
+                touched: 0,
+            },
+        );
+    }
+}
+
+/// A budget of one byte: one scan step a tick.
+const STEPWISE: CheckpointConfig = CheckpointConfig {
+    bytes_per_tick: 1,
+    ..SMALL
+};
+
 #[test]
 fn the_plant_reports_covered_at_the_open() {
-    let mut b = bench(1, SMALL);
+    let mut b = bench(1, STEPWISE);
+    pad(&mut b.states[0], 32);
     b.checkpoint.reports_covered_at_open(true);
     for i in 0..8u8 {
         put(&mut b.states[0], &[b'k', i], b"value-long-enough-to-cross");
@@ -534,8 +557,9 @@ fn the_plant_reports_covered_at_the_open() {
 
 #[test]
 fn a_nudge_opens_a_cycle_below_the_floor_and_a_force_abandons_an_open_one() {
-    let mut b = bench(2, SMALL);
+    let mut b = bench(2, STEPWISE);
     put(&mut b.states[0], b"a", b"1");
+    pad(&mut b.states[1], 32);
     let bytes = flush(&mut b.states);
     assert!(bytes < SMALL.floor);
     assert!(tick(&mut b, bytes, Some(0)).is_none());
