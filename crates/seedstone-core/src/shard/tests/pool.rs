@@ -508,9 +508,5 @@ fn the_sink_hooks_for_snapshots_default_to_nothing() {
         written_during: 6,
     };
     NoTrace.snapshot(&report);
-    NoTrace.compaction(&CompactionReport {
-        executor: 0,
-        files: 1,
-        bytes: 2,
-    });
+    NoTrace.compaction(&CompactionReport { files: 1, bytes: 2 });
 }

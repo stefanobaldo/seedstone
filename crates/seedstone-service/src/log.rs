@@ -213,13 +213,15 @@ pub static SNAPSHOT: Event = Event {
     ],
 };
 
-/// One executor removed what its durable snapshot made redundant — its
-/// own older segments and snapshot, or every older process's files when it
-/// closed this process's first round of snapshots.
+/// The node removed what durable snapshots made redundant.
+///
+/// Segments every executor has covered, superseded snapshots, or every
+/// older process's files once every executor of this one has a durable
+/// snapshot.
 pub static COMPACTION: Event = Event {
     name: "compaction",
     level: Level::Info,
-    fields: &["executor", "files", "bytes"],
+    fields: &["files", "bytes"],
 };
 
 /// An executor serves writes again.

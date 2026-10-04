@@ -181,10 +181,7 @@ impl TraceSink for HashSink {
     fn compaction(&self, report: &CompactionReport) {
         {
             let mut h = lock(&self.hash);
-            *h = mix(
-                mix(mix(*h, 0x5EED_0000_0000_0003), u64::from(report.executor)),
-                report.files,
-            );
+            *h = mix(mix(*h, 0x5EED_0000_0000_0003), report.files);
         }
         let mut tally = lock(&self.shared.tally);
         tally.compactions += 1;
@@ -202,6 +199,7 @@ impl TraceSink for HashSink {
             LogFault::Sync => tally.sync_faults += 1,
             LogFault::Snapshot => tally.snapshot_faults += 1,
             LogFault::Remove => tally.remove_faults += 1,
+            LogFault::Rotate => tally.rotate_faults += 1,
         }
     }
 

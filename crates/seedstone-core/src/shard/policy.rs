@@ -20,6 +20,9 @@ pub enum LogFault {
     /// A file a durable snapshot made redundant could not be removed: it is
     /// tried again at the next cycle, and at the next start.
     Remove,
+    /// The segment could not be rotated: the next file could not be
+    /// created, its header written or synced, or the directory synced.
+    Rotate,
 }
 
 /// What one completed snapshot cycle amounts to, for the sink.
@@ -43,10 +46,10 @@ pub struct SnapshotReport {
     pub written_during: u64,
 }
 
-/// What one compaction removed, for the sink.
+/// What one compaction removed, for the sink. The node's: the writer is the
+/// only thing that removes files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionReport {
-    pub executor: u16,
     pub files: u64,
     pub bytes: u64,
 }
@@ -91,6 +94,23 @@ pub trait TraceSink: Clone + Send + 'static {
     /// A default that does nothing: the tick has nowhere else to report to,
     /// and a sink that wants the line — the binary's — implements this.
     fn fault(&self, _shard: u16, _fault: LogFault, _error: &std::io::Error) {}
+
+    /// Called when the node's log could not be written, synced or rotated,
+    /// or a file it had made redundant could not be removed. One call per
+    /// failure, from the writer; `fault` stays for an executor's snapshot.
+    fn log_fault(&self, _fault: LogFault, _error: &std::io::Error) {}
+
+    /// Called when the writer issues a sync: `round` numbers them from 1.
+    /// What an executor's `sync_completed` later names by the same number.
+    fn sync_issued(&self, _round: u64) {}
+
+    /// Called when that sync completed or failed.
+    fn sync_settled(&self, _round: u64) {}
+
+    /// Called when an executor answers the batches it held: `wrote` is how
+    /// many of their commands appended to the log, `refused` whether they
+    /// went out as the refusal rather than as their replies.
+    fn held_answered(&self, _first_shard: u16, _wrote: u64, _refused: bool) {}
 
     /// Called once per executor when a snapshot cycle completes: the
     /// footer is synced, the directory is synced, and every record below
@@ -219,3 +239,37 @@ pub trait EvictionPolicy: Clone + Send + 'static {
 pub trait ShardPolicy: ExpiryPolicy + WalkOrder + EvictionPolicy {}
 
 impl<T: ExpiryPolicy + WalkOrder + EvictionPolicy> ShardPolicy for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_compaction_report_names_no_executor_and_the_new_fault_has_a_name() {
+        // The writer removes files for the node; a report that still named
+        // an executor would name the wrong thing.
+        let report = CompactionReport {
+            files: 2,
+            bytes: 40,
+        };
+        assert_eq!((report.files, report.bytes), (2, 40));
+        let faults = [
+            LogFault::Write,
+            LogFault::Sync,
+            LogFault::Snapshot,
+            LogFault::Remove,
+            LogFault::Rotate,
+        ];
+        assert_eq!(faults.len(), 5);
+    }
+
+    #[test]
+    fn the_sinks_new_hooks_default_to_nothing() {
+        // `NoTrace` must stay a zero-cost sink: every hook has a default.
+        let sink = NoTrace;
+        sink.log_fault(LogFault::Rotate, &std::io::Error::other("x"));
+        sink.sync_issued(1);
+        sink.sync_settled(1);
+        sink.held_answered(0, 3, false);
+    }
+}

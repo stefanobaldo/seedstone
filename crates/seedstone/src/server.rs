@@ -827,6 +827,7 @@ impl TraceSink for FaultLines {
             LogFault::Sync => "sync",
             LogFault::Snapshot => "snapshot",
             LogFault::Remove => "remove",
+            LogFault::Rotate => "rotate",
         };
         emit(
             &LOG_FAULT,
@@ -866,11 +867,7 @@ impl TraceSink for FaultLines {
     fn compaction(&self, report: &CompactionReport) {
         emit(
             &COMPACTION,
-            &[
-                Field::Num(u64::from(report.executor)),
-                Field::Num(report.files),
-                Field::Num(report.bytes),
-            ],
+            &[Field::Num(report.files), Field::Num(report.bytes)],
         );
     }
 }
