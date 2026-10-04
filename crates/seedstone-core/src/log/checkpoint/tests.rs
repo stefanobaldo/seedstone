@@ -2,25 +2,23 @@ use super::*;
 use crate::dict::{Dict, DictSeed, Entry};
 use crate::log::disk::mem::MemDisk;
 use crate::log::effect::Effect;
-use crate::log::file::{FileLog, open_segments, segment_name};
+use crate::log::file::FileLog;
 use crate::log::reader::{Item, Reader, ReaderMode};
 use crate::log::snapshot::{FOOTER_SHARD, Footer, SnapshotHeader, snapshot_name};
 use crate::log::{Record, ReplicationLog};
 use crate::shard::executor::ShardState;
-use crate::shard::{CompactionReport, NoTrace, Now, TraceSink};
+use crate::shard::{NoTrace, Now, TraceSink};
 use bytes::Bytes;
 use std::path::Path;
-use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
 
 /// One executor's worth of shards over a fresh wal, and its checkpoint.
+/// No writer: the checkpoint images memory, not the file.
 struct Bench {
     disk: MemDisk,
-    segment: SharedSegment<crate::log::disk::mem::MemFile>,
-    states: Vec<ShardState<FileLog<crate::log::disk::mem::MemFile>>>,
+    states: Vec<ShardState<FileLog>>,
     checkpoint: SegmentCheckpoint<MemDisk>,
-    round: Arc<AtomicU16>,
 }
 
 const WAL: &str = "/data/wal";
@@ -28,8 +26,6 @@ const WAL: &str = "/data/wal";
 fn bench(shards: u16, config: CheckpointConfig) -> Bench {
     let disk = MemDisk::default();
     disk.create_dir_all(Path::new(WAL)).unwrap();
-    let segments = open_segments(&disk, Path::new(WAL), 1, 1).unwrap();
-    let segment = Arc::clone(&segments[0]);
     let states = (0..shards)
         .map(|shard| {
             ShardState::new(
@@ -37,27 +33,40 @@ fn bench(shards: u16, config: CheckpointConfig) -> Bench {
                     k0: u64::from(shard),
                     k1: 7,
                 }),
-                FileLog::new(shard, Arc::clone(&segment)),
+                FileLog::new(shard),
             )
         })
         .collect();
-    let round = Arc::new(AtomicU16::new(0));
     let checkpoint = SegmentCheckpoint::new(CheckpointSpec {
         disk: disk.clone(),
         wal: Path::new(WAL).to_path_buf(),
         generation: 1,
         executor: 0,
-        executors: 1,
-        segment: Arc::clone(&segment),
-        round: Arc::clone(&round),
         config,
     });
     Bench {
         disk,
-        segment,
         states,
         checkpoint,
-        round,
+    }
+}
+
+/// One tick at `bytes` handed over, the last batch sent `batch`.
+fn tick(b: &mut Bench, bytes: u64, batch: Option<u64>) -> Option<Completed> {
+    b.checkpoint.tick(
+        0,
+        &mut b.states,
+        now(),
+        &NoTrace,
+        LogPosition { bytes, batch },
+    )
+}
+
+/// A position at `bytes`, the last batch sent the first.
+const fn at(bytes: u64) -> LogPosition {
+    LogPosition {
+        bytes,
+        batch: Some(0),
     }
 }
 
@@ -69,7 +78,7 @@ fn now() -> Now {
 }
 
 /// A `Put` applied the way the executor applies one: logged, then stored.
-fn put(state: &mut ShardState<FileLog<crate::log::disk::mem::MemFile>>, key: &[u8], value: &[u8]) {
+fn put(state: &mut ShardState<FileLog>, key: &[u8], value: &[u8]) {
     let mut payload = Vec::new();
     Effect::Put {
         key,
@@ -96,13 +105,14 @@ fn put(state: &mut ShardState<FileLog<crate::log::disk::mem::MemFile>>, key: &[u
     );
 }
 
-fn flush_and_sync(states: &mut [ShardState<FileLog<crate::log::disk::mem::MemFile>>]) {
+/// Hands every shard's buffer over, as the executor does, into a scratch
+/// buffer that is dropped; returns how many bytes that was.
+fn flush(states: &mut [ShardState<FileLog>]) -> u64 {
+    let mut out = Vec::new();
     for state in states.iter_mut() {
-        state.log.flush().unwrap();
+        state.log.flush_into(&mut out);
     }
-    for state in states.iter_mut() {
-        state.log.sync().unwrap();
-    }
+    out.len() as u64
 }
 
 /// Every record of `name`, read as recovery would.
@@ -129,7 +139,6 @@ fn records(
 #[derive(Clone, Default)]
 struct Recorder {
     snapshots: Arc<Mutex<Vec<SnapshotReport>>>,
-    compactions: Arc<Mutex<Vec<CompactionReport>>>,
     faults: Arc<Mutex<Vec<LogFault>>>,
 }
 
@@ -140,9 +149,6 @@ impl TraceSink for Recorder {
     }
     fn snapshot(&self, report: &SnapshotReport) {
         self.snapshots.lock().unwrap().push(*report);
-    }
-    fn compaction(&self, report: &CompactionReport) {
-        self.compactions.lock().unwrap().push(*report);
     }
 }
 
@@ -165,23 +171,22 @@ const SMALL: CheckpointConfig = CheckpointConfig {
 fn nothing_happens_below_the_floor() {
     let mut b = bench(2, SMALL);
     put(&mut b.states[0], b"a", b"1");
-    flush_and_sync(&mut b.states);
-    b.checkpoint.tick(0, &mut b.states, now(), &NoTrace);
+    let bytes = flush(&mut b.states);
+    assert!(tick(&mut b, bytes, Some(0)).is_none());
     let names = b.disk.list(Path::new(WAL)).unwrap();
-    assert_eq!(
-        names.len(),
-        1,
-        "GENERATION-less test wal: the segment and nothing else: {names:?}"
+    assert!(
+        names.iter().all(|n| {
+            std::path::Path::new(n)
+                .extension()
+                .is_none_or(|ext| ext != "snap")
+        }),
+        "no snapshot: {names:?}"
     );
-    assert!(names.iter().all(|n| {
-        std::path::Path::new(n)
-            .extension()
-            .is_none_or(|ext| ext != "snap")
-    }));
+    assert!(!b.checkpoint.is_open());
 }
 
 #[test]
-fn crossing_the_floor_rotates_the_segment_takes_the_bases_and_opens_a_snapshot() {
+fn crossing_the_floor_takes_the_bases_and_opens_a_snapshot() {
     let mut b = bench(2, SMALL);
     for i in 0..8u8 {
         put(
@@ -190,20 +195,13 @@ fn crossing_the_floor_rotates_the_segment_takes_the_bases_and_opens_a_snapshot()
             b"value-long-enough-to-cross",
         );
     }
-    flush_and_sync(&mut b.states);
-    assert!(live_log_bytes(&b.segment) >= SMALL.floor);
-    b.checkpoint.tick(0, &mut b.states, now(), &NoTrace);
-    let mut names = b.disk.list(Path::new(WAL)).unwrap();
-    names.sort();
-    assert!(names.contains(&segment_name(1, 0, 1)), "rotated: {names:?}");
+    let bytes = flush(&mut b.states);
+    assert!(bytes >= SMALL.floor);
+    tick(&mut b, bytes, Some(0));
+    let names = b.disk.list(Path::new(WAL)).unwrap();
     assert!(
         names.contains(&snapshot_name(1, 0, 0)),
         "a snapshot is open: {names:?}"
-    );
-    assert_eq!(
-        live_log_bytes(&b.segment),
-        0,
-        "the counter restarted with the rotation"
     );
     let header = SnapshotHeader::decode(
         &b.disk
@@ -213,7 +211,7 @@ fn crossing_the_floor_rotates_the_segment_takes_the_bases_and_opens_a_snapshot()
     assert_eq!(
         header.bases,
         vec![(0, 4), (1, 4)],
-        "each shard's sequence at the rotation"
+        "each shard's sequence at the open"
     );
 }
 
@@ -223,13 +221,23 @@ fn the_image_is_complete_after_enough_ticks_and_the_footer_counts_it() {
     for i in 0..20u8 {
         put(&mut b.states[usize::from(i % 2)], &[b'k', i], b"v");
     }
-    flush_and_sync(&mut b.states);
+    let bytes = flush(&mut b.states);
     let recorder = Recorder::default();
     // The first tick opens; a 1 KiB budget covers twenty small entries in
     // one more tick, and the footer lands on the tick after the last scan.
     let mut ticks = 0u64;
+    let mut done = None;
     while recorder.snapshots.lock().unwrap().is_empty() {
-        b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+        done = b.checkpoint.tick(
+            0,
+            &mut b.states,
+            now(),
+            &recorder,
+            LogPosition {
+                bytes,
+                batch: Some(7),
+            },
+        );
         ticks += 1;
         assert!(ticks < 10, "a twenty-key image should not take ten ticks");
     }
@@ -268,6 +276,15 @@ fn the_image_is_complete_after_enough_ticks_and_the_footer_counts_it() {
     assert_eq!((report.executor, report.cycle, report.entries), (0, 0, 20));
     assert_eq!(report.ticks, ticks);
     assert_eq!(b.checkpoint.cycles_completed(), 1);
+    assert_eq!(
+        done,
+        Some(Completed {
+            cycle: 0,
+            through_batch: Some(7),
+            bytes: report.bytes,
+        }),
+        "the completing tick names the last batch sent before the open"
+    );
 }
 
 #[test]
@@ -285,14 +302,16 @@ fn the_budget_bounds_a_tick_and_a_value_larger_than_it_still_goes_out() {
     for i in 0..30u8 {
         put(&mut b.states[0], &[b's', i], b"small");
     }
-    flush_and_sync(&mut b.states);
+    let bytes = flush(&mut b.states);
     let recorder = Recorder::default();
-    b.checkpoint.tick(0, &mut b.states, now(), &recorder); // opens
+    b.checkpoint
+        .tick(0, &mut b.states, now(), &recorder, at(bytes)); // opens
     let path = Path::new(WAL).join(snapshot_name(1, 0, 0));
     let mut sizes = vec![b.disk.contents(&path).len()];
     let mut ticks = 0;
     while recorder.snapshots.lock().unwrap().is_empty() {
-        b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+        b.checkpoint
+            .tick(0, &mut b.states, now(), &recorder, at(bytes));
         sizes.push(b.disk.contents(&path).len());
         ticks += 1;
         assert!(ticks < 200, "the cycle must finish");
@@ -326,10 +345,12 @@ fn a_flush_during_the_cycle_empties_the_shard_and_the_cycle_still_finishes() {
     for i in 0..30u8 {
         put(&mut b.states[0], &[b'k', i], b"v");
     }
-    flush_and_sync(&mut b.states);
+    let bytes = flush(&mut b.states);
     let recorder = Recorder::default();
-    b.checkpoint.tick(0, &mut b.states, now(), &recorder); // opens
-    b.checkpoint.tick(0, &mut b.states, now(), &recorder); // a few entries
+    b.checkpoint
+        .tick(0, &mut b.states, now(), &recorder, at(bytes)); // opens
+    b.checkpoint
+        .tick(0, &mut b.states, now(), &recorder, at(bytes)); // a few entries
     // FLUSHDB lands mid-cycle: logged in the tail (seq ≥ base) and applied.
     let mut payload = Vec::new();
     Effect::Flush.encode(&mut payload);
@@ -346,7 +367,8 @@ fn a_flush_during_the_cycle_empties_the_shard_and_the_cycle_still_finishes() {
     b.states[0].dict.clear();
     let mut ticks = 0;
     while recorder.snapshots.lock().unwrap().is_empty() {
-        b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+        b.checkpoint
+            .tick(0, &mut b.states, now(), &recorder, at(bytes));
         ticks += 1;
         assert!(ticks < 10, "an empty dict's scan returns 0 at once");
     }
@@ -368,10 +390,19 @@ fn a_deadline_goes_out_as_unix_milliseconds() {
     for i in 0..8u8 {
         put(&mut b.states[0], &[b'p', i], b"padding-to-cross-the-floor");
     }
-    flush_and_sync(&mut b.states);
+    let bytes = flush(&mut b.states);
     let recorder = Recorder::default();
     while recorder.snapshots.lock().unwrap().is_empty() {
-        b.checkpoint.tick(0, &mut b.states, at, &recorder);
+        b.checkpoint.tick(
+            0,
+            &mut b.states,
+            at,
+            &recorder,
+            LogPosition {
+                bytes,
+                batch: Some(0),
+            },
+        );
     }
     let bytes = b
         .disk
@@ -396,209 +427,6 @@ fn a_deadline_goes_out_as_unix_milliseconds() {
 }
 
 #[test]
-fn a_durable_snapshot_deletes_the_older_rotations_and_the_previous_snapshot() {
-    let mut b = bench(2, FLOOR_ONLY);
-    let recorder = Recorder::default();
-    for cycle in 0..2u8 {
-        for i in 0..8u8 {
-            put(
-                &mut b.states[usize::from(i % 2)],
-                &[b'k', cycle, i],
-                b"value-long-enough-to-cross",
-            );
-        }
-        flush_and_sync(&mut b.states);
-        let done = recorder.snapshots.lock().unwrap().len();
-        while recorder.snapshots.lock().unwrap().len() == done {
-            b.checkpoint.tick(0, &mut b.states, now(), &recorder);
-        }
-    }
-    let mut names = b.disk.list(Path::new(WAL)).unwrap();
-    names.sort();
-    assert_eq!(
-        names,
-        [snapshot_name(1, 0, 1), segment_name(1, 0, 2)],
-        "only the current rotation and the latest snapshot remain"
-    );
-    let compactions = recorder.compactions.lock().unwrap().clone();
-    assert_eq!(compactions.len(), 2);
-    assert_eq!(
-        compactions[0].files, 1,
-        "the first cycle removed rotation 0"
-    );
-    assert_eq!(
-        compactions[1].files, 2,
-        "the second removed rotation 1 and snapshot 0"
-    );
-    assert!(compactions[1].bytes > 0);
-    let reports = recorder.snapshots.lock().unwrap().clone();
-    assert!(
-        reports[1].disk_bytes > reports[1].bytes,
-        "the peak was read before the deletion: {:?}",
-        reports[1]
-    );
-    assert!(recorder.faults.lock().unwrap().is_empty());
-    assert_eq!(
-        b.round.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "a lone executor closes the round on its first cycle, and only once"
-    );
-}
-
-type MemStates = Vec<ShardState<FileLog<crate::log::disk::mem::MemFile>>>;
-
-/// Generation 1 left a segment and a snapshot behind; generation 2 runs two
-/// executors of one shard each.
-struct TwoExecutors {
-    disk: MemDisk,
-    round: Arc<AtomicU16>,
-    checkpoints: [SegmentCheckpoint<MemDisk>; 2],
-    states: [MemStates; 2],
-    recorder: Recorder,
-}
-
-fn two_executors_over_an_older_generation() -> TwoExecutors {
-    let disk = MemDisk::default();
-    disk.create_dir_all(Path::new(WAL)).unwrap();
-    disk.write_file(&Path::new(WAL).join(segment_name(1, 0, 3)), b"old")
-        .unwrap();
-    disk.write_file(&Path::new(WAL).join(snapshot_name(1, 0, 2)), b"old")
-        .unwrap();
-    disk.write_file(&Path::new(WAL).join("GENERATION"), b"2")
-        .unwrap();
-    disk.write_file(&Path::new(WAL).join("LOCK"), b"").unwrap();
-    let segments = open_segments(&disk, Path::new(WAL), 2, 2).unwrap();
-    let round = Arc::new(AtomicU16::new(0));
-    let make = |executor: u16| {
-        SegmentCheckpoint::new(CheckpointSpec {
-            disk: disk.clone(),
-            wal: Path::new(WAL).to_path_buf(),
-            generation: 2,
-            executor,
-            executors: 2,
-            segment: Arc::clone(&segments[usize::from(executor)]),
-            round: Arc::clone(&round),
-            config: FLOOR_ONLY,
-        })
-    };
-    let state = |executor: u16| {
-        vec![ShardState::new(
-            Dict::with_seed(DictSeed {
-                k0: u64::from(executor),
-                k1: 1,
-            }),
-            FileLog::new(executor, Arc::clone(&segments[usize::from(executor)])),
-        )]
-    };
-    TwoExecutors {
-        checkpoints: [make(0), make(1)],
-        states: [state(0), state(1)],
-        disk,
-        round,
-        recorder: Recorder::default(),
-    }
-}
-
-impl TwoExecutors {
-    /// Writes past the floor on `executor` and ticks it until its cycle is
-    /// reported.
-    fn cycle(&mut self, executor: usize, prefix: u8) {
-        for i in 0..8u8 {
-            put(
-                &mut self.states[executor][0],
-                &[prefix, i],
-                b"value-long-enough-to-cross",
-            );
-        }
-        flush_and_sync(&mut self.states[executor]);
-        let done = self.recorder.snapshots.lock().unwrap().len();
-        while self.recorder.snapshots.lock().unwrap().len() == done {
-            self.checkpoints[executor].tick(
-                u16::try_from(executor).unwrap(),
-                &mut self.states[executor],
-                now(),
-                &self.recorder,
-            );
-        }
-    }
-
-    fn names(&self) -> Vec<String> {
-        self.disk.list(Path::new(WAL)).unwrap()
-    }
-
-    fn older_left(&self) -> bool {
-        self.names()
-            .iter()
-            .any(|n| n.starts_with("0000000000000001-"))
-    }
-}
-
-#[test]
-fn the_executor_that_closes_the_round_deletes_every_older_generation() {
-    let mut t = two_executors_over_an_older_generation();
-    for executor in 0..2usize {
-        t.cycle(executor, b'k');
-        assert_eq!(
-            t.older_left(),
-            executor == 0,
-            "after executor {executor}'s first cycle: {:?}",
-            t.names()
-        );
-    }
-    let names = t.names();
-    assert!(names.contains(&"GENERATION".to_owned()) && names.contains(&"LOCK".to_owned()));
-    assert_eq!(t.round.load(std::sync::atomic::Ordering::SeqCst), 2);
-    // A second cycle on either executor counts no further.
-    t.cycle(0, b'm');
-    assert_eq!(t.round.load(std::sync::atomic::Ordering::SeqCst), 2);
-}
-
-/// The start writes each cut shard's `Rebase` into rotation 0, and the
-/// `Rebase` is what keeps an older generation's records above it dead. So
-/// rotation 0 outlives every older generation's file, or the next start
-/// would replay records this process declared gone.
-#[test]
-fn rotation_zero_stays_while_an_older_generation_is_on_disk() {
-    let mut t = two_executors_over_an_older_generation();
-    t.cycle(0, b'k');
-    assert!(t.older_left());
-    assert!(
-        t.names().contains(&segment_name(2, 0, 0)),
-        "the round is open, so rotation 0 stays: {:?}",
-        t.names()
-    );
-    t.cycle(1, b'k');
-    assert!(!t.older_left());
-    t.cycle(0, b'm');
-    assert!(
-        !t.names().contains(&segment_name(2, 0, 0)),
-        "with the older generation gone it is an ordinary old rotation: {:?}",
-        t.names()
-    );
-}
-
-/// A removal of an older generation's file that failed is tried again by
-/// the next compaction, on any executor, once the round has closed.
-#[test]
-fn an_older_generation_a_removal_failed_on_is_removed_by_a_later_compaction() {
-    let mut t = two_executors_over_an_older_generation();
-    t.cycle(0, b'k');
-    t.disk.fail_removes(true);
-    t.cycle(1, b'k');
-    t.disk.fail_removes(false);
-    assert!(t.older_left(), "the removals failed");
-    assert!(
-        t.recorder
-            .faults
-            .lock()
-            .unwrap()
-            .contains(&LogFault::Remove)
-    );
-    t.cycle(0, b'm');
-    assert!(!t.older_left(), "{:?}", t.names());
-}
-
-#[test]
 fn a_failed_write_abandons_the_file_and_the_scan_restarts_into_a_new_one() {
     let mut b = bench(
         1,
@@ -611,13 +439,15 @@ fn a_failed_write_abandons_the_file_and_the_scan_restarts_into_a_new_one() {
     for i in 0..12u8 {
         put(&mut b.states[0], &[b'k', i], b"v");
     }
-    flush_and_sync(&mut b.states);
+    let bytes = flush(&mut b.states);
     let recorder = Recorder::default();
-    b.checkpoint.tick(0, &mut b.states, now(), &recorder); // opens, writes the header
+    b.checkpoint
+        .tick(0, &mut b.states, now(), &recorder, at(bytes)); // opens, writes the header
     let first = Path::new(WAL).join(snapshot_name(1, 0, 0));
     assert!(b.disk.len(&first).is_ok());
     b.disk.fail_writes(true);
-    b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+    b.checkpoint
+        .tick(0, &mut b.states, now(), &recorder, at(bytes));
     b.disk.fail_writes(false);
     assert_eq!(
         recorder.faults.lock().unwrap().as_slice(),
@@ -628,7 +458,8 @@ fn a_failed_write_abandons_the_file_and_the_scan_restarts_into_a_new_one() {
     assert!(b.disk.len(&first).is_err(), "the abandoned file is removed");
     let mut ticks = 0;
     while recorder.snapshots.lock().unwrap().is_empty() {
-        b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+        b.checkpoint
+            .tick(0, &mut b.states, now(), &recorder, at(bytes));
         ticks += 1;
         assert!(ticks < 50);
     }
@@ -652,14 +483,16 @@ fn a_failed_footer_sync_abandons_the_file_and_restarts_with_the_same_bases() {
     for i in 0..8u8 {
         put(&mut b.states[0], &[b'k', i], b"value-long-enough-to-cross");
     }
-    flush_and_sync(&mut b.states);
+    let bytes = flush(&mut b.states);
     let recorder = Recorder::default();
-    b.checkpoint.tick(0, &mut b.states, now(), &recorder); // opens
+    b.checkpoint
+        .tick(0, &mut b.states, now(), &recorder, at(bytes)); // opens
     assert!(recorder.snapshots.lock().unwrap().is_empty());
     b.disk.fail_syncs(true);
     let mut ticks = 0;
     while recorder.faults.lock().unwrap().is_empty() {
-        b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+        b.checkpoint
+            .tick(0, &mut b.states, now(), &recorder, at(bytes));
         ticks += 1;
         assert!(ticks < 50, "the footer's sync is reached and fails");
     }
@@ -670,7 +503,8 @@ fn a_failed_footer_sync_abandons_the_file_and_restarts_with_the_same_bases() {
     );
     assert!(recorder.snapshots.lock().unwrap().is_empty());
     while recorder.snapshots.lock().unwrap().is_empty() {
-        b.checkpoint.tick(0, &mut b.states, now(), &recorder);
+        b.checkpoint
+            .tick(0, &mut b.states, now(), &recorder, at(bytes));
         ticks += 1;
         assert!(ticks < 100, "the restarted cycle finishes");
     }
@@ -681,83 +515,95 @@ fn a_failed_footer_sync_abandons_the_file_and_restarts_with_the_same_bases() {
             .contents(&Path::new(WAL).join(snapshot_name(1, 0, 1))),
     )
     .unwrap();
-    assert_eq!(
-        header.bases,
-        vec![(0, 8)],
-        "the bases taken at the rotation"
-    );
+    assert_eq!(header.bases, vec![(0, 8)], "the bases taken at the open");
     assert_eq!(report.entries, 8);
 }
 
 #[test]
-fn a_failed_removal_is_reported_and_the_next_cycle_removes_it() {
-    let mut b = bench(1, FLOOR_ONLY);
-    let recorder = Recorder::default();
-    let run_cycle = |b: &mut Bench, tag: u8| {
-        for i in 0..8u8 {
-            put(&mut b.states[0], &[tag, i], b"value-long-enough-to-cross");
-        }
-        flush_and_sync(&mut b.states);
-        let done = recorder.snapshots.lock().unwrap().len();
-        while recorder.snapshots.lock().unwrap().len() == done {
-            b.checkpoint.tick(0, &mut b.states, now(), &recorder);
-        }
-    };
-    b.disk.fail_removes(true);
-    run_cycle(&mut b, b'a');
-    assert!(recorder.faults.lock().unwrap().contains(&LogFault::Remove));
-    assert!(
-        b.disk
-            .list(Path::new(WAL))
-            .unwrap()
-            .contains(&segment_name(1, 0, 0)),
-        "still there"
-    );
-    b.disk.fail_removes(false);
-    run_cycle(&mut b, b'b');
-    let names = b.disk.list(Path::new(WAL)).unwrap();
-    assert!(
-        !names.contains(&segment_name(1, 0, 0)),
-        "removed at the next cycle: {names:?}"
-    );
-    assert!(!names.contains(&segment_name(1, 0, 1)));
-}
-
-#[test]
-fn the_plant_deletes_at_the_rotation_before_any_snapshot_exists() {
-    // Observable here only as the order of operations: the test disk never
-    // loses a file, so the plant is seen by the removal landing on the tick
-    // that opened the cycle, with no footer anywhere. The simulator is
-    // where it costs data: a crash during the cycle finds neither the old
-    // segments nor an image.
-    let mut b = bench(
-        1,
-        CheckpointConfig {
-            floor: 64,
-            ratio: 1,
-            bytes_per_tick: 40,
-        },
-    );
-    b.checkpoint.deletes_before_durable(true);
+fn the_plant_reports_covered_at_the_open() {
+    let mut b = bench(1, SMALL);
+    b.checkpoint.reports_covered_at_open(true);
     for i in 0..8u8 {
         put(&mut b.states[0], &[b'k', i], b"value-long-enough-to-cross");
     }
-    flush_and_sync(&mut b.states);
-    let recorder = Recorder::default();
-    b.checkpoint.tick(0, &mut b.states, now(), &recorder); // opens — and, planted, deletes
-    let names = b.disk.list(Path::new(WAL)).unwrap();
+    let bytes = flush(&mut b.states);
+    let done = tick(&mut b, bytes, Some(3)).expect("the plant reports at the open");
+    assert_eq!((done.cycle, done.through_batch), (0, Some(3)));
+    assert!(b.checkpoint.is_open(), "the cycle still runs");
+}
+
+#[test]
+fn a_nudge_opens_a_cycle_below_the_floor_and_a_force_abandons_an_open_one() {
+    let mut b = bench(2, SMALL);
+    put(&mut b.states[0], b"a", b"1");
+    let bytes = flush(&mut b.states);
+    assert!(bytes < SMALL.floor);
+    assert!(tick(&mut b, bytes, Some(0)).is_none());
+    assert!(!b.checkpoint.is_open());
+    b.checkpoint.nudge();
+    tick(&mut b, bytes, Some(0));
+    assert!(b.checkpoint.is_open(), "nudged: open whatever the bytes");
+    let open_file = snapshot_name(1, 0, 0);
+    assert!(b.disk.list(Path::new(WAL)).unwrap().contains(&open_file));
+    b.checkpoint.force();
     assert!(
-        !names.contains(&segment_name(1, 0, 0)),
-        "the old rotation is already gone: {names:?}"
+        !b.checkpoint.is_open(),
+        "forced: the open cycle is abandoned"
     );
     assert!(
-        recorder.snapshots.lock().unwrap().is_empty(),
-        "nothing was durable"
+        !b.disk.list(Path::new(WAL)).unwrap().contains(&open_file),
+        "and its file removed"
     );
-    assert_eq!(
-        recorder.compactions.lock().unwrap().len(),
+    tick(&mut b, bytes, Some(0));
+    assert!(
+        b.checkpoint.is_open(),
+        "and the next tick opens from memory"
+    );
+}
+
+#[test]
+fn written_during_counts_what_the_executor_sent_from_the_crossing_to_the_footer() {
+    let mut b = bench(
         1,
-        "and the removal was reported"
+        CheckpointConfig {
+            bytes_per_tick: 64,
+            ..SMALL
+        },
+    );
+    for i in 0..8u8 {
+        put(&mut b.states[0], &[b'k', i], b"value-long-enough-to-cross");
+    }
+    let at_open = flush(&mut b.states);
+    let recorder = Recorder::default();
+    b.checkpoint.tick(
+        0,
+        &mut b.states,
+        now(),
+        &recorder,
+        LogPosition {
+            bytes: at_open,
+            batch: Some(0),
+        },
+    );
+    let mut sent = at_open;
+    while recorder.snapshots.lock().unwrap().is_empty() {
+        put(&mut b.states[0], b"x", b"y");
+        sent += flush(&mut b.states);
+        b.checkpoint.tick(
+            0,
+            &mut b.states,
+            now(),
+            &recorder,
+            LogPosition {
+                bytes: sent,
+                batch: Some(1),
+            },
+        );
+    }
+    let report = recorder.snapshots.lock().unwrap()[0];
+    assert_eq!(
+        report.written_during,
+        (at_open - SMALL.floor) + (sent - at_open)
     );
 }
 
@@ -774,12 +620,13 @@ fn what_was_written_past_the_floor_before_the_cycle_opened_is_reported_as_writte
             b"value-long-enough-to-cross",
         );
     }
-    flush_and_sync(&mut b.states);
-    let past_the_floor = live_log_bytes(&b.segment) - SMALL.floor;
+    let bytes = flush(&mut b.states);
+    let past_the_floor = bytes - SMALL.floor;
     assert!(past_the_floor > 0);
     let trace = Recorder::default();
     for _ in 0..16 {
-        b.checkpoint.tick(0, &mut b.states, now(), &trace);
+        b.checkpoint
+            .tick(0, &mut b.states, now(), &trace, at(bytes));
         if !trace.snapshots.lock().unwrap().is_empty() {
             break;
         }
@@ -788,12 +635,12 @@ fn what_was_written_past_the_floor_before_the_cycle_opened_is_reported_as_writte
     assert_eq!(snapshots.len(), 1, "the cycle finished");
     assert_eq!(
         snapshots[0].written_during, past_the_floor,
-        "nothing was written after the rotation, so what is reported is the overshoot"
+        "nothing was sent after the open, so what is reported is the overshoot"
     );
 }
 
-/// Eight keys over two shards, synced past the floor.
-fn eight_keys_past_the_floor(b: &mut Bench) {
+/// Eight keys over two shards, handed over past the floor: the bytes.
+fn eight_keys_past_the_floor(b: &mut Bench) -> u64 {
     for i in 0..8u8 {
         put(
             &mut b.states[usize::from(i % 2)],
@@ -801,13 +648,13 @@ fn eight_keys_past_the_floor(b: &mut Bench) {
             b"value-long-enough-to-cross",
         );
     }
-    flush_and_sync(&mut b.states);
+    flush(&mut b.states)
 }
 
 /// Ticks until a snapshot is reported, sixteen ticks at most.
-fn tick_until_snapshot(b: &mut Bench, trace: &Recorder) {
+fn tick_until_snapshot(b: &mut Bench, trace: &Recorder, bytes: u64) {
     for _ in 0..16 {
-        b.checkpoint.tick(0, &mut b.states, now(), trace);
+        b.checkpoint.tick(0, &mut b.states, now(), trace, at(bytes));
         if !trace.snapshots.lock().unwrap().is_empty() {
             return;
         }
@@ -830,15 +677,15 @@ fn recovered(b: &Bench) -> crate::log::recovery::Recovery {
 
 /// A snapshot file whose header could not be synced is abandoned, never
 /// reopened: a second header appended under the same name would leave the
-/// finished image unreadable once compaction had deleted the log it covers.
+/// finished image unreadable once the writer had removed the log it covers.
 #[test]
 fn a_failed_header_sync_abandons_the_file_and_the_image_still_reads_whole() {
     let mut b = bench(2, SMALL);
-    eight_keys_past_the_floor(&mut b);
-    // The rotation's header sync goes through; the snapshot header's fails.
-    b.disk.fail_one_sync_after(1);
+    let bytes = eight_keys_past_the_floor(&mut b);
+    // The snapshot header's sync is the first the cycle makes.
+    b.disk.fail_next_sync();
     let trace = Recorder::default();
-    tick_until_snapshot(&mut b, &trace);
+    tick_until_snapshot(&mut b, &trace, bytes);
     assert_eq!(*trace.faults.lock().unwrap(), [LogFault::Snapshot]);
     assert_eq!(
         trace.snapshots.lock().unwrap().len(),
@@ -852,69 +699,34 @@ fn a_failed_header_sync_abandons_the_file_and_the_image_still_reads_whole() {
     assert!(recovery.shards.iter().all(|s| !s.lossy));
 }
 
-/// A rotation whose directory sync failed is retried under a new name: a
-/// second header appended to the half-made segment would read as damage at
-/// the next start, and every shard of the executor would be reported lossy
-/// for a disk that lost nothing.
-#[test]
-fn a_failed_rotation_is_retried_under_a_new_name_and_the_start_reads_no_damage() {
-    let mut b = bench(2, SMALL);
-    eight_keys_past_the_floor(&mut b);
-    // The rotation's directory sync is the first the cycle makes.
-    b.disk.fail_one_dir_sync_after(0);
-    let trace = Recorder::default();
-    tick_until_snapshot(&mut b, &trace);
-    assert_eq!(*trace.faults.lock().unwrap(), [LogFault::Snapshot]);
-    assert_eq!(
-        trace.snapshots.lock().unwrap().len(),
-        1,
-        "the cycle finished"
-    );
-    // Writes after the rotation land in the new segment.
-    put(&mut b.states[0], b"after", b"1");
-    flush_and_sync(&mut b.states);
-    let recovery = recovered(&b);
-    assert_eq!(
-        (recovery.report.damage_bytes, recovery.report.holes),
-        (0, 0),
-        "{:?}",
-        recovery.report
-    );
-    assert!(recovery.shards.iter().all(|s| !s.lossy && !s.cut));
-    let keys: usize = recovery.shards.iter().map(|s| s.dict.len()).sum();
-    assert_eq!(keys, 9);
-}
-
-/// A forced checkpoint opens on the next tick below the threshold, on a
-/// fresh rotation, and `tick` says when its snapshot is durable.
+/// A forced checkpoint opens on the next tick below the threshold, and
+/// `tick` says when its snapshot is durable.
 #[test]
 fn force_opens_a_cycle_below_the_threshold_and_tick_reports_the_completion() {
     let mut b = bench(1, FLOOR_ONLY);
     put(&mut b.states[0], b"a", b"1");
-    flush_and_sync(&mut b.states);
-    assert!(live_log_bytes(&b.segment) < FLOOR_ONLY.floor);
+    let bytes = flush(&mut b.states);
+    assert!(bytes < FLOOR_ONLY.floor);
     assert!(
-        !b.checkpoint.tick(0, &mut b.states, now(), &NoTrace),
+        tick(&mut b, bytes, Some(0)).is_none(),
         "below the threshold: nothing"
     );
     assert!(!b.checkpoint.is_open());
     b.checkpoint.force();
-    let mut completed = b.checkpoint.tick(0, &mut b.states, now(), &NoTrace);
-    assert_eq!(lock(&b.segment).rotation, 1, "a fresh rotation");
+    let mut completed = tick(&mut b, bytes, Some(0));
     for _ in 0..8 {
-        if completed {
+        if completed.is_some() {
             break;
         }
-        completed = b.checkpoint.tick(0, &mut b.states, now(), &NoTrace);
+        completed = tick(&mut b, bytes, Some(0));
     }
-    assert!(completed, "the forced cycle completes");
+    assert!(completed.is_some(), "the forced cycle completes");
     assert_eq!(b.checkpoint.cycles_completed(), 1);
     assert!(!b.checkpoint.is_open());
     assert!(
-        !b.checkpoint.tick(0, &mut b.states, now(), &NoTrace),
+        tick(&mut b, bytes, Some(0)).is_none(),
         "forced once: below the threshold again, nothing opens"
     );
-    assert_eq!(lock(&b.segment).rotation, 1);
 }
 
 /// Forcing while a cycle is open abandons it: its bases predate the
@@ -929,8 +741,8 @@ fn force_while_open_abandons_the_cycle_and_takes_fresh_bases() {
             ..FLOOR_ONLY
         },
     );
-    eight_keys_past_the_floor(&mut b);
-    assert!(!b.checkpoint.tick(0, &mut b.states, now(), &NoTrace));
+    let bytes = eight_keys_past_the_floor(&mut b);
+    assert!(tick(&mut b, bytes, Some(0)).is_none());
     assert!(b.checkpoint.is_open());
     let first_file = snapshot_name(1, 0, 0);
     assert!(b.disk.list(Path::new(WAL)).unwrap().contains(&first_file));
@@ -943,8 +755,7 @@ fn force_while_open_abandons_the_cycle_and_takes_fresh_bases() {
         !b.disk.list(Path::new(WAL)).unwrap().contains(&first_file),
         "its file removed"
     );
-    b.checkpoint.tick(0, &mut b.states, now(), &NoTrace);
-    assert_eq!(lock(&b.segment).rotation, 2, "rotated again");
+    tick(&mut b, bytes, Some(0));
     assert_eq!(
         b.checkpoint.open_bases(),
         vec![b.states[0].seq, b.states[1].seq],
