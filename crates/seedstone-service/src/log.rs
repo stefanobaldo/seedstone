@@ -186,16 +186,25 @@ pub static RECOVERY_FAILED: Event = Event {
     fields: &["error"],
 };
 
-/// Something on disk failed on a housekeeping tick, and will be retried.
+/// The node's log failed on the writer.
 ///
-/// A shard's log could not be written or synced, the executor's snapshot
-/// could not be written or made durable, or a file a durable snapshot made
-/// redundant could not be removed: `stage` is `write`, `sync`, `snapshot`
-/// or `remove`.
+/// It could not be written (`stage` `write`), synced (`sync`), rotated to
+/// its next file (`rotate`), or a file a durable snapshot made redundant
+/// could not be removed (`remove`).
 pub static LOG_FAULT: Event = Event {
     name: "log_fault",
     level: Level::Error,
-    fields: &["shard", "stage", "error"],
+    fields: &["stage", "error"],
+};
+
+/// One executor's snapshot could not be written or made durable.
+///
+/// The scan starts over into a new file on a later tick. `shard` is the
+/// executor's first shard.
+pub static SNAPSHOT_FAULT: Event = Event {
+    name: "snapshot_fault",
+    level: Level::Error,
+    fields: &["shard", "error"],
 };
 
 /// One executor's snapshot became durable: every record below each of its
@@ -258,6 +267,7 @@ pub static EVENTS: &[&Event] = &[
     &RECOVERY_TRUNCATED,
     &RECOVERY_FAILED,
     &LOG_FAULT,
+    &SNAPSHOT_FAULT,
     &REFUSAL_ENDED,
     &SNAPSHOT,
     &COMPACTION,
@@ -337,8 +347,8 @@ pub fn json_escaped(raw: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BIND_FAILED, ERROR_REPLY, EVENTS, Event, Field, LISTENING, Level, STOPPING, json_escaped,
-        line,
+        BIND_FAILED, COMPACTION, ERROR_REPLY, EVENTS, Event, Field, LISTENING, LOG_FAULT, Level,
+        SNAPSHOT_FAULT, STOPPING, json_escaped, line,
     };
 
     #[test]
@@ -429,6 +439,21 @@ mod tests {
     #[should_panic(expected = "listening")]
     fn a_value_count_that_disagrees_with_the_table_panics() {
         let _ = line(0, &LISTENING, &[Field::Num(1)]);
+    }
+
+    /// The node's log fails for the node and names no shard; an executor's
+    /// snapshot fails for that executor and does.
+    #[test]
+    fn the_log_events_carry_their_field_sets() {
+        assert_eq!(LOG_FAULT.fields, ["stage", "error"]);
+        assert_eq!(SNAPSHOT_FAULT.fields, ["shard", "error"]);
+        assert_eq!(COMPACTION.fields, ["files", "bytes"]);
+        let at = |event: &Event| EVENTS.iter().position(|e| std::ptr::eq(*e, event));
+        assert_eq!(
+            at(&SNAPSHOT_FAULT),
+            at(&LOG_FAULT).map(|i| i + 1),
+            "`snapshot_fault` sits right after `log_fault`"
+        );
     }
 
     /// The first row of the table is the first line a server writes.

@@ -350,6 +350,7 @@ async fn a_node_past_the_floor_snapshots_compacts_and_restarts_from_the_image() 
         .iter()
         .find(|line| line.contains("\"evt\":\"compaction\""))
         .unwrap();
+    assert!(field(compaction, "files") >= 1, "{compaction}");
     assert!(field(compaction, "bytes") >= floor, "{compaction}");
     let after = wal_bytes(&dir);
     assert!(

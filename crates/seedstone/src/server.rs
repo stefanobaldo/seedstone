@@ -14,19 +14,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use seedstone_core::dict::DictSeed;
 use seedstone_core::log::checkpoint::{CheckpointConfig, CheckpointSpec, SegmentCheckpoint};
 use seedstone_core::log::disk::{Disk, StdDisk};
-use seedstone_core::log::file::{FileLog, next_generation, open_segments};
-use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, recover};
+use seedstone_core::log::file::{FileLog, next_generation};
+use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, Recovery, recover};
+use seedstone_core::log::writer::{SEGMENT_BYTES, Writer, WriterPlants, WriterSpec, write_rebases};
 use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{
     Command, CompactionReport, Deadlines, ExecutorPlants, LogFault, NoTrace, Now, PoolSpec,
     RefusalReport, Reply, ShardPool, Shutdown, SnapshotReport, SyncPolicy, TraceSink,
 };
-use seedstone_core::slot::executor_of;
 use seedstone_resp::{Frame, encode};
 use seedstone_service::log::{
     COMPACTION, Event, FSYNC_IGNORED, Field, LOG_FAULT, PASSWORD_RELOAD_FAILED,
     PASSWORD_RELOAD_SKIPPED, PASSWORD_RELOADED, RECOVERY, RECOVERY_FAILED, RECOVERY_TRUNCATED,
-    REFUSAL_ENDED, SHUTDOWN_TIMEOUT, SNAPSHOT, STOPPING, line,
+    REFUSAL_ENDED, SHUTDOWN_TIMEOUT, SNAPSHOT, SNAPSHOT_FAULT, STOPPING, line,
 };
 use seedstone_service::{NodeInfo, PasswordStore, Passwords, Secret, serve_connection};
 use tokio::io::AsyncWriteExt;
@@ -813,29 +813,34 @@ pub fn emit(event: &Event, values: &[Field<'_>]) {
 }
 
 /// The trace sink of a node with a log on disk: it observes no commands,
-/// writes one line per failed write, sync, snapshot or removal, and one per
-/// durable snapshot and per compaction.
+/// writes one line per failure of the node's log and per failed snapshot,
+/// and one per durable snapshot and per compaction.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FaultLines;
 
 impl TraceSink for FaultLines {
     fn record(&self, _shard: u16, _seq: u64, _cmd: &Command, _reply: &Reply) {}
 
-    fn fault(&self, shard: u16, fault: LogFault, error: &std::io::Error) {
+    fn fault(&self, shard: u16, _fault: LogFault, error: &std::io::Error) {
+        emit(
+            &SNAPSHOT_FAULT,
+            &[Field::Num(u64::from(shard)), Field::Str(&error.to_string())],
+        );
+    }
+
+    fn log_fault(&self, fault: LogFault, error: &std::io::Error) {
         let stage = match fault {
             LogFault::Write => "write",
             LogFault::Sync => "sync",
-            LogFault::Snapshot => "snapshot",
-            LogFault::Remove => "remove",
             LogFault::Rotate => "rotate",
+            LogFault::Remove => "remove",
+            // Not the writer's: a snapshot fails through `fault`. Named
+            // anyway, since a sink that panicked would take the node down.
+            LogFault::Snapshot => "snapshot",
         };
         emit(
             &LOG_FAULT,
-            &[
-                Field::Num(u64::from(shard)),
-                Field::Str(stage),
-                Field::Str(&error.to_string()),
-            ],
+            &[Field::Str(stage), Field::Str(&error.to_string())],
         );
     }
 
@@ -936,7 +941,7 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
         // could lose the directory the segments' own syncs assume exists.
         disk.sync_dir(dir)?;
         let lock = lock_data_dir(&wal)?;
-        let recovery = recover(RecoverSpec {
+        let mut recovery = recover(RecoverSpec {
             disk: &disk,
             wal: &wal,
             shards: SHARDS,
@@ -949,16 +954,67 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
             },
         })?;
         let generation = next_generation(&disk, &wal)?;
-        let segments = open_segments(&disk, &wal, generation, executors)?;
-        Ok::<_, std::io::Error>((recovery, generation, segments, lock))
+        let mut opened = Writer::open(WriterSpec {
+            disk: StdDisk,
+            wal: wal.clone(),
+            generation,
+            executors,
+            policy: cfg.fsync,
+            segment_bytes: SEGMENT_BYTES,
+            checkpoint: CheckpointConfig::PRODUCTION,
+            trace: FaultLines,
+            plants: WriterPlants::default(),
+        })?;
+        // A rebase the log refuses is reported and the node starts refusing
+        // writes, as on any failed write of the log.
+        let log_failed = match write_rebases(&mut opened.writer, &mut recovery.shards) {
+            Ok(()) => false,
+            Err(error) => {
+                FaultLines.log_fault(LogFault::Write, &error);
+                true
+            }
+        };
+        Ok::<_, std::io::Error>((recovery, generation, opened, log_failed, lock))
     })();
-    let (recovery, generation, segments, lock) = match started {
+    let (recovery, generation, opened, log_failed, lock) = match started {
         Ok(started) => started,
         Err(error) => {
             emit(&RECOVERY_FAILED, &[Field::Str(&error.to_string())]);
             return Err(std::io::Error::new(error.kind(), RecoveryFailed(error)));
         }
     };
+    emit_recovery(&recovery);
+    let pool = ShardPool::spawn_spec(PoolSpec {
+        shards: SHARDS,
+        executors,
+        seed,
+        trace: FaultLines,
+        make_log: FileLog::new,
+        policy: Deadlines,
+        limit: cfg.limit,
+        clock: wall_clock,
+        recovered: recovery.shards,
+        make_checkpoint: move |executor| {
+            SegmentCheckpoint::new(CheckpointSpec {
+                disk: StdDisk,
+                wal: wal.clone(),
+                generation,
+                executor,
+                config: CheckpointConfig::PRODUCTION,
+            })
+        },
+        sync: cfg.fsync,
+        plants: ExecutorPlants::default(),
+        writer_links: opened.links,
+        log_failed,
+    });
+    tokio::spawn(opened.writer.run(opened.inbox));
+    Ok((pool, Some(lock)))
+}
+
+/// The start's report: one `recovery` line, and one `recovery_truncated`
+/// per shard the recovery cut.
+fn emit_recovery(recovery: &Recovery) {
     let report = &recovery.report;
     emit(
         &RECOVERY,
@@ -988,41 +1044,6 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
             ],
         );
     }
-    // Shared by every executor's checkpoint: the one that completes this
-    // process's first round of snapshots removes every older process's files.
-    let round = Arc::new(std::sync::atomic::AtomicU16::new(0));
-    let log_segments = segments.clone();
-    let pool = ShardPool::spawn_spec(PoolSpec {
-        shards: SHARDS,
-        executors,
-        seed,
-        trace: FaultLines,
-        make_log: move |shard| {
-            FileLog::new(
-                shard,
-                Arc::clone(&log_segments[usize::from(executor_of(shard, SHARDS, executors))]),
-            )
-        },
-        policy: Deadlines,
-        limit: cfg.limit,
-        clock: wall_clock,
-        recovered: recovery.shards,
-        make_checkpoint: move |executor| {
-            SegmentCheckpoint::new(CheckpointSpec {
-                disk: StdDisk,
-                wal: wal.clone(),
-                generation,
-                executor,
-                executors,
-                segment: Arc::clone(&segments[usize::from(executor)]),
-                round: Arc::clone(&round),
-                config: CheckpointConfig::PRODUCTION,
-            })
-        },
-        sync: cfg.fsync,
-        plants: ExecutorPlants::default(),
-    });
-    Ok((pool, Some(lock)))
 }
 
 /// Takes the data directory for this process alone: an exclusive lock on
