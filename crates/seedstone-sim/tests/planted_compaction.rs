@@ -1,8 +1,10 @@
 //! Compaction, shown failing and shown holding.
 //!
-//! Two defects: a checkpoint that deletes at the rotation instead of at
-//! the durable footer, and a recovery that trusts a snapshot with no
-//! footer. Both are observable on the swept shape itself — a crash under
+//! Three defects: a checkpoint that reports its executor's batches covered
+//! when the cycle opens instead of at the durable footer, a writer that
+//! removes a rotation once any executor has covered its batches in it
+//! rather than every one, and a recovery that trusts a snapshot with no
+//! footer. All three are observable on the swept shape itself — a crash under
 //! load is what makes them cost data — so they are served on `standard`,
 //! and the honest node runs the same seeds clean.
 //!
@@ -67,18 +69,41 @@ fn the_honest_node_cycles_on_every_seed_and_is_crashed_inside_a_cycle_on_some() 
     );
 }
 
-/// Deleting at the rotation loses every record between the two images to
-/// a crash inside the cycle.
+/// Reporting covered at the cycle's open lets the writer remove the
+/// rotations holding every record between the two images, which a crash
+/// inside the cycle then loses.
 #[test]
-fn deleting_before_the_snapshot_is_durable_is_caught() {
+fn reports_covered_at_open_is_caught() {
     let caught = (1..=SEEDS).find(|sim_seed| {
         let outcome = standard(*sim_seed, Some(Plant::ReportsCoveredAtOpen));
         outcome.lost_durable_writes > 0 || outcome.lost_durable_prefixes > 0
     });
     let Some(seed) = caught else {
         panic!(
-            "no seed in 1..={SEEDS} surfaced the early deletion: no crash landed inside a \
+            "no seed in 1..={SEEDS} surfaced the early cover: no crash landed inside a \
              cycle — investigate, do not widen"
+        );
+    };
+    let honest = standard(seed, None);
+    assert!(
+        honest.invariant_holds(),
+        "seed {seed} is not clean without the plant: {honest:?}"
+    );
+}
+
+/// Removing a rotation once one executor covered its batches in it, with
+/// another's records still only there: a crash before the other's snapshot
+/// finds neither.
+#[test]
+fn removes_uncovered_is_caught() {
+    let caught = (1..=SEEDS).find(|sim_seed| {
+        let outcome = standard(*sim_seed, Some(Plant::RemovesUncovered));
+        outcome.lost_durable_writes > 0 || outcome.lost_durable_prefixes > 0
+    });
+    let Some(seed) = caught else {
+        panic!(
+            "no seed in 1..={SEEDS} surfaced the early removal: no crash landed between one \
+             executor's cover and another's — investigate, do not widen"
         );
     };
     let honest = standard(seed, None);
