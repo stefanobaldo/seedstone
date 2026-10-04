@@ -650,8 +650,11 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         let mut replies = Vec::with_capacity(cmds.len());
         // Which commands appended, kept only where a batch can be held: a
         // policy that answers at once never needs it, and an empty `Vec`
-        // allocates nothing.
-        let holds = self.sync.holds();
+        // allocates nothing. Nor does a refusing executor hold anything: it
+        // applies no client write, and what it may still append — a read
+        // expiring its key — promises nothing that a sync would have to
+        // prove, so a `Durable` must not be what answers it.
+        let holds = self.sync.holds() && !self.sync.is_refusing();
         let mut appended_each = Vec::new();
         // One clock reading for the whole envelope, taken here rather
         // than inside a handler. A handler that read the clock itself

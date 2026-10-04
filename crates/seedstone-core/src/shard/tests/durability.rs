@@ -3,7 +3,7 @@
 //! Either the test plays the writer over [`fake_links`], or the real one
 //! runs over the in-memory disk through [`disk_pool`].
 
-use super::support::{SEED, WAL, disk_pool, disk_pool_cut, fake_links, get, set};
+use super::support::{SEED, WAL, disk_pool, disk_pool_cut, fake_links, get, set, set_ex};
 use crate::log::checkpoint::{CheckpointConfig, CheckpointSpec, NoCheckpoint, SegmentCheckpoint};
 use crate::log::disk::Disk;
 use crate::log::disk::mem::MemDisk;
@@ -319,6 +319,47 @@ async fn a_durable_after_a_fault_raises_nothing() {
         pool.dispatch(set(b"k2", b"v")).await,
         refused(),
         "and the executor refuses until a snapshot lands"
+    );
+}
+
+/// A refusing executor applies no client write, so nothing it answers
+/// waits for a sync: a read that expires its key appends the deletion, and
+/// is answered at once rather than held for a `Durable` that would release
+/// it as a success while the executor is refusing.
+#[tokio::test(start_paused = true)]
+async fn a_refusing_executor_holds_no_reply_not_even_a_read_that_expired_its_key() {
+    let (links, mut to_writer, progress) = fake_links(1);
+    let story = Story::default();
+    let pool = pool_with_links_and_trace(SyncPolicy::ALWAYS, links, story.clone());
+    let write = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.dispatch(set_ex(b"k", b"v", 1)).await }
+    });
+    let Some(ToWriter::Submit { bytes, .. }) = to_writer.recv().await else {
+        panic!("a write is submitted")
+    };
+    progress[0]
+        .send(Progress::Durable {
+            through_batch: Some(0),
+            bytes: bytes.len() as u64,
+            round: 1,
+        })
+        .unwrap();
+    assert_eq!(write.await.unwrap(), Reply::Ok);
+    progress[0].send(Progress::Fault).unwrap();
+    settle().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let read = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.dispatch(get(b"k")).await }
+    });
+    settle().await;
+    assert!(read.is_finished(), "the read is not held while refusing");
+    assert_eq!(read.await.unwrap(), Reply::Bulk(None));
+    assert_eq!(
+        story.held_answered(),
+        vec![(0, 1, false), (0, 0, true)],
+        "nothing released after the refusal began"
     );
 }
 
