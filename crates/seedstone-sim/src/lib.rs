@@ -126,19 +126,20 @@ use seedstone_core::dict::DictSeed;
 // planted trace differ for a reason unrelated to the race.
 use seedstone_core::log::checkpoint::{CheckpointConfig, CheckpointSpec, SegmentCheckpoint};
 use seedstone_core::log::disk::Disk;
-use seedstone_core::log::file::{FileLog, SharedSegment, next_generation, open_segments};
+use seedstone_core::log::file::{FileLog, next_generation};
 use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, RecoveredShard, Recovery, recover};
+use seedstone_core::log::writer::{
+    Opened, Writer, WriterLink, WriterPlants, WriterSpec, write_rebases,
+};
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
 use seedstone_core::shard::{
     Deadlines, ExecutorPlants, Now, PoolSpec, ShardPolicy, ShardPool, SyncPolicy, parse_i64,
 };
-use seedstone_core::slot::executor_of;
 use seedstone_resp::Frame;
 use seedstone_service::{NodeInfo, serve_connection};
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::sync::atomic::AtomicU16;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -168,8 +169,7 @@ pub use routers::{PlantedRouter, SkippingRouter};
 pub use sweep::{SweepReport, sweep};
 pub use trace::mix;
 
-use disk::SimFile;
-use durability::{CrashRecord, Observed, ObservedPlants, increment_is_durable, rest_settle};
+use durability::{CrashRecord, Observed, increment_is_durable, rest_settle};
 use model::Model;
 use outcome::{Shared, lock};
 use plant::{EvictsBelowCeiling, IgnoresCeiling, ScanMissesRehash, ServeExpired, SweepEatsAll};
@@ -311,6 +311,10 @@ pub const SIM_CHECKPOINT: CheckpointConfig = CheckpointConfig {
     ratio: 1,
     bytes_per_tick: 1024,
 };
+
+/// The size at which the simulated node's segment rotates: two floors, so
+/// rotations happen on every swept seed and compaction removes whole files.
+pub const SIM_SEGMENT_BYTES: u64 = 4096;
 
 /// The longest a client waits for its own deadlines before reading everything
 /// back.
@@ -548,6 +552,7 @@ fn crash_and_restart(sim: &mut turmoil::Sim<'_>, shared: &Shared, now: Duration)
         syncs.1 = syncs.0;
         in_flight
     };
+    lock(&shared.rounds).clear();
     if in_flight {
         lock(&shared.tally).crashes_in_flight += 1;
     }
@@ -574,28 +579,28 @@ async fn server(
     limit: MemoryLimit,
     shared: Shared,
 ) -> turmoil::Result {
-    // Recovery and the segments, retried until they succeed: under a disk
+    // Recovery and the writer, retried until they succeed: under a disk
     // that fails I/O a start can fail on the header write of a segment, and
     // a node that gave up there would end the run with a harness error
     // rather than a finding.
-    let (recovery, generation, segments) = loop {
-        if let Ok(started) = start_log(shards, executors, seed, planted, &shared) {
+    let (recovery, generation, opened, log_failed) = loop {
+        if let Ok(started) = start_log(shards, executors, seed, planted, &sink, &shared) {
             break started;
         }
         lock(&shared.tally).start_failures += 1;
         tokio::time::sleep(START_RETRY).await;
     };
+    let Opened {
+        writer,
+        inbox,
+        links,
+    } = opened;
     // Every arm is spawned with the limit, the honest one included: the
     // ceiling is the shape's, not the plant's, and a run whose honest node
     // had no ceiling would be measuring a different server from the one its
     // planted twin runs.
-    // Shared by the process's executors: how many have completed a cycle in
-    // this generation, which is what lets the last of them delete the
-    // previous process's files.
-    let round = Arc::new(AtomicU16::new(0));
-    let checkpoint_segments = segments.clone();
     let disk = shared.disk.clone();
-    let deletes = planted == Some(Plant::DeletesBeforeDurable);
+    let reports_early = planted == Some(Plant::ReportsCoveredAtOpen);
     let parts = PoolParts {
         shards,
         executors,
@@ -605,18 +610,7 @@ async fn server(
         recovered: recovery.shards,
         make_log: {
             let shared = shared.clone();
-            let plants = observed_plants(planted);
-            let issued_at: Vec<_> = segments.iter().map(|_| Arc::default()).collect();
-            move |shard: u16| {
-                let executor = usize::from(executor_of(shard, shards, executors));
-                Observed::new(
-                    shard,
-                    FileLog::new(shard, Arc::clone(&segments[executor])),
-                    plants,
-                    Arc::clone(&issued_at[executor]),
-                    shared.clone(),
-                )
-            }
+            move |shard: u16| Observed::new(shard, FileLog::new(shard), shared.clone())
         },
         make_checkpoint: move |executor: u16| {
             let mut checkpoint = SegmentCheckpoint::new(CheckpointSpec {
@@ -624,16 +618,15 @@ async fn server(
                 wal: Path::new(DATA_DIR).join("wal"),
                 generation,
                 executor,
-                executors,
-                segment: Arc::clone(&checkpoint_segments[usize::from(executor)]),
-                round: Arc::clone(&round),
                 config: SIM_CHECKPOINT,
             });
-            checkpoint.deletes_before_durable(deletes);
+            checkpoint.reports_covered_at_open(reports_early);
             checkpoint
         },
         sync: shared.policy,
         plants: executor_plants(planted),
+        links,
+        log_failed,
     };
     let pool = match planted {
         Some(Plant::ServeExpired) => parts.spawn(ServeExpired),
@@ -648,13 +641,17 @@ async fn server(
             Plant::LostUpdate
             | Plant::CrossingSkipsShard
             | Plant::PrefixScanRecovery
-            | Plant::DeletesBeforeDurable
+            | Plant::ReportsCoveredAtOpen
             | Plant::TrustsUnfinishedSnapshot
-            | Plant::ReleasesOnIssue
+            | Plant::DurableOnIssue
             | Plant::AcksWhileRefusing
-            | Plant::SyncsFromFlushedNow,
+            | Plant::DurableFromWrittenNow
+            | Plant::RemovesUncovered,
         ) => parts.spawn(Deadlines),
     };
+    // Onto the host's `LocalSet`, for the reason the connections are below:
+    // a crash must drop it with the host, in an order the run fixes.
+    tokio::task::spawn_local(writer.run(inbox));
     let listener = turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, PORT)).await?;
     // One per host, as it is in production: it describes the node, not the
     // connection. No workload here asks a host about itself, so nothing reads
@@ -718,22 +715,25 @@ const START_RETRY: Duration = Duration::from_millis(10);
 /// Where the simulated node keeps its log, on its host's own filesystem.
 const DATA_DIR: &str = "/data";
 
-/// The defects the simulated log carries, of the one `planted`.
-const fn observed_plants(planted: Option<Plant>) -> ObservedPlants {
-    ObservedPlants {
-        syncs_from_flushed_now: matches!(planted, Some(Plant::SyncsFromFlushedNow)),
+/// The defects the node's writer carries, of the one `planted`.
+const fn writer_plants(planted: Option<Plant>) -> WriterPlants {
+    WriterPlants {
+        durable_on_issue: matches!(planted, Some(Plant::DurableOnIssue)),
+        durable_from_written_now: matches!(planted, Some(Plant::DurableFromWrittenNow)),
+        removes_uncovered: matches!(planted, Some(Plant::RemovesUncovered)),
     }
 }
 
 /// The defects the executors carry, of the one `planted`.
 const fn executor_plants(planted: Option<Plant>) -> ExecutorPlants {
     ExecutorPlants {
-        releases_on_issue: matches!(planted, Some(Plant::ReleasesOnIssue)),
         acks_while_refusing: matches!(planted, Some(Plant::AcksWhileRefusing)),
     }
 }
 
-/// Reads the log and opens this generation's segments.
+/// Reads the log, opens the node's writer on this generation's first
+/// segment, and writes the cut shards' rebases through it; whether that
+/// write failed, which starts the node refusing.
 ///
 /// Inside the host, never around [`run_sim`]: turmoil's filesystem belongs
 /// to the host that is running, and there is none outside one.
@@ -742,8 +742,9 @@ fn start_log(
     executors: u16,
     seed: DictSeed,
     planted: Option<Plant>,
+    sink: &HashSink,
     shared: &Shared,
-) -> std::io::Result<(Recovery, u64, Vec<SharedSegment<SimFile>>)> {
+) -> std::io::Result<(Recovery, u64, Opened<SimDisk, HashSink>, bool)> {
     let disk = shared.disk.clone();
     let wal = Path::new(DATA_DIR).join("wal");
     disk.create_dir_all(&wal)?;
@@ -752,7 +753,7 @@ fn start_log(
     } else {
         ReaderMode::Resynchronising
     };
-    let recovery = recover(RecoverSpec {
+    let mut recovery = recover(RecoverSpec {
         disk: &disk,
         wal: &wal,
         shards,
@@ -772,8 +773,19 @@ fn start_log(
         tally.files_removed_at_start += recovery.report.files_removed;
     }
     let generation = next_generation(&disk, &wal)?;
-    let segments = open_segments(&disk, &wal, generation, executors)?;
-    Ok((recovery, generation, segments))
+    let mut opened = Writer::open(WriterSpec {
+        disk,
+        wal,
+        generation,
+        executors,
+        policy: shared.policy,
+        segment_bytes: SIM_SEGMENT_BYTES,
+        checkpoint: SIM_CHECKPOINT,
+        trace: sink.clone(),
+        plants: writer_plants(planted),
+    })?;
+    let log_failed = write_rebases(&mut opened.writer, &mut recovery.shards).is_err();
+    Ok((recovery, generation, opened, log_failed))
 }
 
 /// What every arm of the plant match spawns from: the spec minus its policy.
@@ -788,11 +800,13 @@ struct PoolParts<F, G> {
     make_checkpoint: G,
     sync: SyncPolicy,
     plants: ExecutorPlants,
+    links: Vec<WriterLink>,
+    log_failed: bool,
 }
 
 impl<F, G> PoolParts<F, G>
 where
-    F: Fn(u16) -> Observed<SimFile>,
+    F: Fn(u16) -> Observed,
     G: Fn(u16) -> SegmentCheckpoint<SimDisk>,
 {
     fn spawn<P: ShardPolicy>(self, policy: P) -> ShardPool {
@@ -809,6 +823,8 @@ where
             make_checkpoint: self.make_checkpoint,
             sync: self.sync,
             plants: self.plants,
+            writer_links: self.links,
+            log_failed: self.log_failed,
         })
     }
 }

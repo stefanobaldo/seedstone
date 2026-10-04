@@ -10,7 +10,7 @@ use rand::rngs::ChaCha8Rng;
 use seedstone_core::log::checkpoint::CheckpointConfig;
 use seedstone_core::shard::SyncPolicy;
 use seedstone_core::slot::executor_of;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -479,7 +479,15 @@ pub struct Shared {
     /// process: a crash with the first ahead of the second landed with one
     /// in flight.
     pub syncs: Arc<Mutex<(u64, u64)>>,
+    /// The writer's rounds of the node's current process: each round's
+    /// number, and the world instant it was issued — what a durable point
+    /// is dated by. The last few only: a `Durable` names a recent round.
+    pub rounds: Arc<Mutex<BTreeMap<u64, Duration>>>,
 }
+
+/// How many of the writer's latest rounds [`Shared::rounds`] keeps: one in
+/// flight at a time, and every executor told of it before the next settles.
+const ROUNDS_KEPT: u64 = 8;
 
 /// An acknowledged increment, and what a crash would need to have found
 /// synced for it to survive.
@@ -506,6 +514,34 @@ impl Shared {
     pub fn set_refusing(&self, shard: u16, refusing: bool) {
         let executor = executor_of(shard, self.shards, self.executors);
         lock(&self.refusing)[usize::from(executor)] = refusing;
+    }
+
+    /// Marks every executor as refusing: the node's log failed, and the
+    /// refusal begins for all of them at once.
+    pub fn set_all_refusing(&self) {
+        lock(&self.refusing).fill(true);
+    }
+
+    /// Notes that the writer issued `round` at `at`, forgetting rounds old
+    /// enough that no executor can still be told of them.
+    pub fn round_issued(&self, round: u64, at: Duration) {
+        let mut rounds = lock(&self.rounds);
+        rounds.insert(round, at);
+        rounds.retain(|seen, _| *seen + ROUNDS_KEPT >= round);
+    }
+
+    /// When the writer issued `round`, on the world clock.
+    ///
+    /// # Panics
+    ///
+    /// If no round of that number was issued in this process: a `Durable`
+    /// for a round nobody issued is a harness error, not a finding.
+    #[must_use]
+    pub fn round_issued_at(&self, round: u64) -> Duration {
+        lock(&self.rounds)
+            .get(&round)
+            .copied()
+            .unwrap_or_else(|| panic!("round {round} was reported durable and never issued"))
     }
 
     /// Whether the executor that owns `shard` is refusing.
@@ -537,6 +573,7 @@ impl Shared {
             executors: cfg.executors,
             refusing: Arc::new(Mutex::new(vec![false; usize::from(cfg.executors)])),
             syncs: Arc::default(),
+            rounds: Arc::default(),
         }
     }
 }

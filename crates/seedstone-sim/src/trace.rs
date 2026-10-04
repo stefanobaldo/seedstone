@@ -8,6 +8,7 @@ use seedstone_core::shard::{
 };
 use std::sync::{Arc, Mutex};
 
+use crate::durability::world_now;
 use crate::outcome::{Shared, lock};
 
 /// The odd 64-bit constant from Fibonacci hashing, used both to decorrelate
@@ -188,19 +189,38 @@ impl TraceSink for HashSink {
         tally.files_removed += report.files;
     }
 
-    fn fault(&self, shard: u16, fault: LogFault, _error: &std::io::Error) {
-        // A failed write or sync is where the executor's refusal begins.
-        if matches!(fault, LogFault::Write | LogFault::Sync) {
-            self.shared.set_refusing(shard, true);
+    /// The checkpoint's: a snapshot that could not be written or synced.
+    /// The node's log reports through [`log_fault`](TraceSink::log_fault).
+    fn fault(&self, _shard: u16, fault: LogFault, _error: &std::io::Error) {
+        debug_assert!(matches!(fault, LogFault::Snapshot));
+        lock(&self.shared.tally).snapshot_faults += 1;
+    }
+
+    /// A failed write, sync or rotation of the node's log is where every
+    /// executor's refusal begins.
+    fn log_fault(&self, fault: LogFault, _error: &std::io::Error) {
+        if matches!(fault, LogFault::Write | LogFault::Sync | LogFault::Rotate) {
+            self.shared.set_all_refusing();
         }
         let mut tally = lock(&self.shared.tally);
         match fault {
             LogFault::Write => tally.write_faults += 1,
             LogFault::Sync => tally.sync_faults += 1,
-            LogFault::Snapshot => tally.snapshot_faults += 1,
-            LogFault::Remove => tally.remove_faults += 1,
             LogFault::Rotate => tally.rotate_faults += 1,
+            LogFault::Remove => tally.remove_faults += 1,
+            LogFault::Snapshot => tally.snapshot_faults += 1,
         }
+    }
+
+    /// The writer issued `round`: dated on the world clock, which is what
+    /// the durable points its completion raises are dated by.
+    fn sync_issued(&self, round: u64) {
+        self.shared.round_issued(round, world_now());
+        lock(&self.shared.syncs).0 += 1;
+    }
+
+    fn sync_settled(&self, _round: u64) {
+        lock(&self.shared.syncs).1 += 1;
     }
 
     /// Folded: a run whose executor resumed after a different number of
