@@ -398,10 +398,16 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
 
     drive(&mut sim, cfg, &shared);
 
+    let trace_hash = *lock(&trace);
+    outcome(cfg, &shared, trace_hash)
+}
+
+/// What a run observed, read off what its hosts wrote into `shared`.
+fn outcome(cfg: &SimConfig, shared: &Shared, trace_hash: u64) -> SimOutcome {
     let tally = *lock(&shared.tally);
     let crashes = lock(&shared.crashes).len() as u64;
     SimOutcome {
-        trace_hash: *lock(&trace),
+        trace_hash,
         expected_sum: tally.expected,
         actual_sum: tally.actual,
         stale_reads: tally.stale_reads,
@@ -453,6 +459,7 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         disk_bound_bytes: disk_bound(
             cfg.executors,
             SIM_CHECKPOINT,
+            SIM_SEGMENT_BYTES,
             tally.max_snapshot_bytes,
             tally.max_written_during,
             crashes,
