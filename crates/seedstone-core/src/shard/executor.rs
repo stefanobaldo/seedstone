@@ -5,18 +5,17 @@
 
 use crate::dict::{Dict, Entry};
 use crate::log::ReplicationLog;
-use crate::log::checkpoint::Checkpoint;
-use crate::log::disk::SyncFuture;
+use crate::log::checkpoint::{Checkpoint, LogPosition};
 use crate::log::effect::{Effect, Owned};
+use crate::log::writer::{Progress, ToWriter, WriterLink};
 use crate::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use crate::shard::apply::{append, apply};
-use crate::shard::durability::{Held, Mode, SyncState, send};
+use crate::shard::durability::{Held, Mode, Sent, SyncState, send};
 use crate::shard::{
-    Command, Envelope, EvictionPolicy, ExecutorPlants, ExpiryPolicy, KIND_SLOTS, LogFault,
-    RefusalReport, Reply, ReplyError, Route, ShardPolicy, ShardStats, SyncPolicy, TraceSink,
+    Command, Envelope, EvictionPolicy, ExecutorPlants, ExpiryPolicy, KIND_SLOTS, RefusalReport,
+    Reply, ReplyError, Route, ShardPolicy, ShardStats, SyncPolicy, TraceSink,
 };
 use bytes::Bytes;
-use std::io;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
@@ -340,19 +339,22 @@ pub struct ExecutorSpec<T, L, P, C> {
     /// Whether a write of the log already failed before the executor ran:
     /// it then starts refusing.
     pub log_failed: bool,
+    /// The link to the node's writer; `None` on a node with no log.
+    pub link: Option<WriterLink>,
     /// Turns `true` when the pool is shut down.
     pub stop: watch::Receiver<bool>,
 }
 
 /// One executor task: own a contiguous range of shards, answer the inbox,
-/// keep every owned rehash moving, and keep one sync of the log in flight.
+/// keep every owned rehash moving, and hand what it logs to the node's
+/// writer.
 ///
 /// `states` holds the range's shards in ascending order starting at
 /// `first_shard`, so a command's shard id indexes it by subtraction.
 ///
 /// Returns when the pool is shut down or the inbox closes, which happens
 /// once the last [`ShardPool`] handle is dropped — after serving what was
-/// queued and syncing what was flushed, either way.
+/// queued and waiting for the writer's last sync, either way.
 pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint>(
     spec: ExecutorSpec<T, L, P, C>,
     mut inbox: mpsc::UnboundedReceiver<Envelope>,
@@ -391,30 +393,36 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
             // the whole thing a seed is supposed to prevent. `biased` is
             // load-bearing here, not decorative; do not remove it.
             //
-            // The order is the priority. The sync in flight comes first: its
-            // completion releases held replies and lets the next sync be
-            // issued, and it is ready at most once per sync. Behind the inbox
-            // it would be polled only when the inbox ran dry, so a busy
-            // executor would hold its writes' replies, and issue no further
-            // sync, for as long as the load lasted. The stop comes next for
-            // the same reason, and is ready once. Then the inbox: work the
-            // shard was asked for outranks housekeeping.
+            // The order is the priority. The writer's word comes first: it
+            // releases held replies and lowers the budget, and it is ready
+            // at most a few times per round. Behind the inbox it would be
+            // polled only when the inbox ran dry, so a busy executor would
+            // hold its writes' replies for as long as the load lasted. The
+            // stop comes next for the same reason, and is ready once. Then
+            // the inbox: work the shard was asked for outranks housekeeping.
             biased;
 
-            result = in_flight(&mut this.sync.in_flight), if this.sync.in_flight.is_some() => {
-                this.sync_done(result);
-                this.maybe_issue(Instant::now());
+            progress = next_progress(&mut this.sync.link), if this.sync.link.is_some() => {
+                match progress {
+                    Some(message) => this.progress(message),
+                    // The writer is gone: nothing more will be proven.
+                    None => {
+                        this.sync.link = None;
+                        this.refuse();
+                    }
+                }
             }
             // A dropped sender is a dropped pool, which closes the inbox
             // too: stopping on either is the same stop. What is still
             // queued is served by the stop itself.
             _ = stop.changed() => break,
-            envelope = inbox.recv() => {
+            // Above the budget the inbox waits for the writer's progress:
+            // the stall `write` gave the executor, one step later.
+            envelope = inbox.recv(), if !this.sync.over_budget() => {
                 let Some(envelope) = envelope else {
                     break;
                 };
                 this.serve(envelope);
-                this.maybe_issue(Instant::now());
             }
             // One ticker per executor rather than one per shard, advancing
             // every owned dict by the same budget: the same per-dict drain
@@ -425,17 +433,17 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
     this.stop(&mut inbox).await;
 }
 
-/// The sync in flight, polled in place. Only reached with one in flight —
-/// the `select!` arm's guard says so.
-async fn in_flight(slot: &mut Option<(u64, SyncFuture)>) -> io::Result<()> {
-    match slot {
-        Some((_, sync)) => sync.as_mut().await,
+/// The writer's next word, or a future that never completes when there is
+/// no writer — so the `select!` arm can be written once.
+async fn next_progress(link: &mut Option<WriterLink>) -> Option<Progress> {
+    match link {
+        Some(link) => link.progress.recv().await,
         None => std::future::pending().await,
     }
 }
 
 /// What the executor loop holds between arms: [`ExecutorSpec`]'s fields,
-/// plus the sync in flight and the replies waiting on it.
+/// plus the link to the writer and the replies waiting on it.
 struct Executor<T, L, P, C> {
     first_shard: u16,
     states: Vec<ShardState<L>>,
@@ -460,9 +468,10 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             sync,
             plants,
             log_failed,
+            link,
             stop,
         } = spec;
-        let sync = SyncState::new(sync, plants, states.len(), Instant::now());
+        let sync = SyncState::new(sync, plants, link);
         let mut this = Self {
             first_shard,
             states,
@@ -480,74 +489,146 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
     }
 
     /// The last thing an executor does: everything queued is served,
-    /// everything flushed is synced, nothing is held. Under every policy —
-    /// under `never`, this is the one sync the log ever gets.
+    /// everything appended is handed to the writer, and the writer's last
+    /// sync is waited for; nothing is held. Under every policy — under
+    /// `never`, that sync is the one the log ever gets.
     async fn stop(&mut self, inbox: &mut mpsc::UnboundedReceiver<Envelope>) {
         // Nothing new is accepted; what was already sent is answered.
         inbox.close();
         while let Ok(envelope) = inbox.try_recv() {
             self.serve(envelope);
         }
-        if self.sync.in_flight.is_some() {
-            let result = in_flight(&mut self.sync.in_flight).await;
-            self.sync_done(result);
+        let touched = self.stage_all();
+        self.submit(touched);
+        let Some(executor) = self.sync.link.as_ref().map(|link| link.executor) else {
+            let released = self.sync.release_through(self.sync.batch);
+            self.trace.held_answered(self.first_shard, released, false);
+            return;
+        };
+        if let Some(link) = &self.sync.link {
+            let _ = link.to_writer.send(ToWriter::Stop { executor });
         }
-        if self.flush_all() {
-            self.refuse();
+        loop {
+            let next = match self.sync.link.as_mut() {
+                Some(link) => link.progress.recv().await,
+                None => break,
+            };
+            match next {
+                Some(Progress::Stopped) | None => break,
+                Some(message) => self.progress(message),
+            }
         }
-        if let Some(sync) = self.states[0].log.begin_sync() {
-            let through: Vec<_> = self
-                .states
-                .iter()
-                .map(|s| s.log.flushed_through())
-                .collect();
-            match sync.await {
-                Ok(()) => {
-                    for (state, through) in self.states.iter_mut().zip(through) {
-                        state.log.sync_completed(through);
+        // `Durable` or `Fault` answered every held batch before `Stopped`;
+        // anything still here is a batch no sync covered, and goes out as
+        // the refusal rather than as a promise.
+        let failed = self
+            .sync
+            .fail_all(&Reply::Error(ReplyError::LogWriteFailed));
+        if failed > 0 {
+            self.trace.held_answered(self.first_shard, failed, true);
+        }
+    }
+
+    /// Hands every owned shard's buffer to the staging buffer; per shard
+    /// that had anything, by offset, its flushed point.
+    fn stage_all(&mut self) -> Vec<(usize, u64)> {
+        let mut touched = Vec::new();
+        for (offset, state) in self.states.iter_mut().enumerate() {
+            let before = self.sync.staging.len();
+            state.log.flush_into(&mut self.sync.staging);
+            if self.sync.staging.len() > before
+                && let Some(through) = state.log.flushed_through()
+            {
+                touched.push((offset, through));
+            }
+        }
+        touched
+    }
+
+    /// Hands what the batch staged to the writer as one submission;
+    /// whether anything was staged.
+    fn submit(&mut self, shards: Vec<(usize, u64)>) -> bool {
+        if self.sync.staging.is_empty() {
+            return false;
+        }
+        let bytes = std::mem::take(&mut self.sync.staging);
+        self.sync.sent_bytes += bytes.len() as u64;
+        let batch = self.sync.batch;
+        self.sync.batch += 1;
+        match &self.sync.link {
+            Some(link) => {
+                let _ = link.to_writer.send(ToWriter::Submit {
+                    executor: link.executor,
+                    batch,
+                    bytes,
+                });
+                self.sync.sent.push_back(Sent { batch, shards });
+            }
+            // No writer: the bytes go nowhere, and nothing is outstanding.
+            None => self.sync.acked_bytes = self.sync.sent_bytes,
+        }
+        true
+    }
+
+    /// The writer's word.
+    ///
+    /// `Durable` raises each shard's durable point to what it had flushed
+    /// at the batches the sync covered — not to what it flushed after —
+    /// and answers the batches it covered. A `Durable` that names batches
+    /// already let go, after a `Fault`, finds nothing to raise or answer.
+    fn progress(&mut self, message: Progress) {
+        match message {
+            Progress::Written { bytes } => {
+                self.sync.acked_bytes = self.sync.acked_bytes.max(bytes);
+            }
+            Progress::Durable {
+                through_batch,
+                bytes,
+                round,
+            } => {
+                self.sync.acked_bytes = self.sync.acked_bytes.max(bytes);
+                let Some(through_batch) = through_batch else {
+                    return;
+                };
+                while self
+                    .sync
+                    .sent
+                    .front()
+                    .is_some_and(|sent| sent.batch <= through_batch)
+                {
+                    let sent = self.sync.sent.pop_front().expect("checked above");
+                    for (offset, seq) in sent.shards {
+                        self.states[offset].log.sync_completed(Some(seq), round);
                     }
                 }
-                Err(error) => {
-                    self.trace.fault(self.first_shard, LogFault::Sync, &error);
-                    self.refuse();
+                let released = self.sync.release_through(through_batch);
+                if released > 0 {
+                    self.trace.held_answered(self.first_shard, released, false);
                 }
             }
+            Progress::Fault => self.refuse(),
+            Progress::Nudge => self.checkpoint.nudge(),
+            Progress::Stopped => {}
         }
-        self.sync.release_through(self.sync.batch);
     }
 
-    /// Flushes every owned shard, tracing each failure; whether any failed.
-    /// A failed flush keeps its bytes: see `ReplicationLog::flush`.
-    fn flush_all(&mut self) -> bool {
-        let mut failed = false;
-        for offset in 0..self.states.len() {
-            if let Err(error) = self.states[offset].log.flush() {
-                self.trace
-                    .fault(self.shard_at(offset), LogFault::Write, &error);
-                failed = true;
-            }
-        }
-        failed
-    }
-
-    /// A write or a sync of the log failed, and the fault is traced: from
-    /// here this executor refuses writes until a snapshot of its memory is
-    /// durable.
+    /// The node's log failed: from here this executor refuses writes until
+    /// a snapshot of its memory is durable.
     ///
-    /// The segment is marked failed whichever it was — a write that failed
-    /// may have left part of itself in the file, and a later sync would
-    /// otherwise claim the records written after it. What was held is
-    /// answered with the refusal: applied, and not acknowledged. The sync
-    /// in flight is let go — no completion of it could raise a durable
-    /// point now. The checkpoint is forced, abandoning an open cycle whose
-    /// bases predate the failure; its next tick rotates and images memory.
-    /// A failure while already refusing does all of it again, because the
-    /// cycle that was running can no longer be trusted to end the refusal.
+    /// What was held is answered with the refusal: applied, and not
+    /// acknowledged. What was sent and not proven is let go — nothing the
+    /// writer might still say about those batches can raise a point. The
+    /// checkpoint is forced, abandoning an open cycle whose bases predate
+    /// the failure; its next tick images memory. A failure while already
+    /// refusing does all of it again, because the cycle that was running
+    /// can no longer be trusted to end the refusal.
     fn refuse(&mut self) {
-        self.states[0].log.sync_failed();
-        self.sync
+        let failed = self
+            .sync
             .fail_all(&Reply::Error(ReplyError::LogWriteFailed));
-        self.sync.in_flight = None;
+        self.trace.held_answered(self.first_shard, failed, true);
+        self.sync.sent.clear();
+        self.sync.acked_bytes = self.sync.sent_bytes;
         if !self.sync.is_refusing() {
             self.sync.mode = Mode::Refusing {
                 refused: 0,
@@ -564,9 +645,9 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         self.first_shard + u16::try_from(offset).expect("a shard range is shorter than u16::MAX")
     }
 
-    /// Applies one envelope, flushes what it appended, and answers it — at
-    /// once, or once the sync covering it completes when the policy holds
-    /// a write's replies. A read-only envelope never waits.
+    /// Applies one envelope, hands what it appended to the writer, and
+    /// answers it — at once, or once the sync covering it completes when
+    /// the policy holds a write's replies. A read-only envelope never waits.
     fn serve(&mut self, Envelope { mut cmds, reply }: Envelope) {
         // No `await` inside this loop, so a batch is applied as a unit:
         // nothing from another connection lands between its commands.
@@ -574,7 +655,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         // Which commands appended, kept only where a batch can be held: a
         // policy that answers at once never needs it, and an empty `Vec`
         // allocates nothing.
-        let holds = self.sync.policy.hold_acks;
+        let holds = self.sync.holds();
         let mut appended_each = Vec::new();
         // One clock reading for the whole envelope, taken here rather
         // than inside a handler. A handler that read the clock itself
@@ -604,35 +685,33 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
                 appended_each.push(appended);
             }
         }
-        let mut failed = false;
+        let mut touched = Vec::new();
         if wrote {
-            // Into the page cache, now: the bytes a sync issued after this
-            // envelope covers. A shard named twice flushes an empty buffer
-            // the second time, which costs a length check.
+            // Into one buffer, in command order: one submission per batch.
+            // A shard named twice hands over nothing the second time, and
+            // records no second entry.
             for (shard, _) in &cmds {
                 let offset = usize::from(*shard - self.first_shard);
-                if let Err(error) = self.states[offset].log.flush() {
-                    self.trace.fault(*shard, LogFault::Write, &error);
-                    failed = true;
+                let before = self.sync.staging.len();
+                self.states[offset].log.flush_into(&mut self.sync.staging);
+                if self.sync.staging.len() > before
+                    && let Some(through) = self.states[offset].log.flushed_through()
+                {
+                    touched.push((offset, through));
                 }
             }
-            self.sync.dirty = true;
         }
-        if wrote && self.sync.policy.hold_acks {
+        let batch = self.sync.batch;
+        let submitted = self.submit(touched);
+        if submitted && holds {
             self.sync.held.push_back(Held {
-                batch: self.sync.batch,
+                batch,
                 to: reply,
                 replies,
                 wrote: appended_each,
             });
         } else {
             send(reply, replies);
-        }
-        // After the batch is placed, so that a held one is answered with
-        // the refusal; one sent at once was acknowledged, as the policy
-        // that sends at once promises nothing more.
-        if failed {
-            self.refuse();
         }
     }
 
@@ -727,62 +806,9 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         (answer, appended)
     }
 
-    /// Issues a sync of the segment if one is due, recording each shard's
-    /// flushed point at the issue: what the sync covers, and all its
-    /// completion may claim.
-    fn maybe_issue(&mut self, now: Instant) {
-        if !self.sync.due(now) {
-            return;
-        }
-        self.sync.dirty = false;
-        // The first shard's store is the executor's segment: every shard of
-        // it shares one, and the first asked takes the sync.
-        let Some(sync) = self.states[0].log.begin_sync() else {
-            // Nothing written since the last issue, and nothing in flight:
-            // every held batch was covered by a sync that has completed.
-            self.sync.release_through(self.sync.batch);
-            return;
-        };
-        for (at_issue, state) in self.sync.flushed_at_issue.iter_mut().zip(&self.states) {
-            *at_issue = state.log.flushed_through();
-        }
-        let batch = self.sync.batch;
-        self.sync.in_flight = Some((batch, sync));
-        self.sync.issued_at = now;
-        self.sync.batch += 1;
-        if self.sync.plants.releases_on_issue {
-            // The plant: a reply sent before the sync it waited for.
-            self.sync.release_through(batch);
-        }
-    }
-
-    /// The sync in flight finished: on success every shard's durable point
-    /// rises to what it had flushed at the issue — not to what it flushed
-    /// during the flight — and the batches it covered are answered.
-    fn sync_done(&mut self, result: io::Result<()>) {
-        let (batch, _) = self
-            .sync
-            .in_flight
-            .take()
-            .expect("a completion has a sync in flight");
-        match result {
-            Ok(()) => {
-                for (state, through) in self.states.iter_mut().zip(&self.sync.flushed_at_issue) {
-                    state.log.sync_completed(*through);
-                }
-            }
-            Err(error) => {
-                self.trace.fault(self.first_shard, LogFault::Sync, &error);
-                self.refuse();
-                return;
-            }
-        }
-        self.sync.release_through(batch);
-    }
-
     /// The work no command asked for: each shard's rehash step and sweep,
-    /// the flush of what the sweep appended, a sync if one is due, and the
-    /// checkpoint's budget.
+    /// the submission of what the sweep appended, and the checkpoint's
+    /// budget.
     fn housekeeping(&mut self) {
         // One clock reading for the whole tick, for the reason the
         // envelope arm takes one for the whole batch: the shards of an
@@ -807,22 +833,19 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             }
             self.memory.gauge.apply(before, state.dict.used_bytes());
         }
-        // What the sweep appended, and what an earlier failed flush kept.
-        if self.flush_all() {
-            self.refuse();
-        }
+        // What the sweep appended.
+        let touched = self.stage_all();
+        self.submit(touched);
         if let Mode::Refusing { ticks, .. } = &mut self.sync.mode {
             *ticks += 1;
         }
-        // Whether the flushes wrote anything is the segment's to say; a
-        // due sync asks it, and finds nothing when nothing was written.
-        self.sync.dirty = true;
-        self.maybe_issue(now);
         // The checkpoint, last: its bases are read at a point where every
-        // shard's buffer has been offered to the disk, and its budget is
-        // the last thing the tick spends. It may rotate with a sync in
-        // flight: the rotation syncs what the old file holds unsynced, and
-        // the sync in flight keeps its own handle on that file.
+        // shard's buffer has been handed to the writer, and its budget is
+        // the last thing the tick spends.
+        let position = LogPosition {
+            bytes: self.sync.sent_bytes,
+            batch: self.sync.batch.checked_sub(1),
+        };
         let completed = self.checkpoint.tick(
             self.first_shard,
             &mut self.states,
@@ -831,25 +854,27 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
                 unix_millis: (self.clock)(),
             },
             &self.trace,
+            position,
         );
-        if let (true, Mode::Refusing { refused, ticks }) = (completed, self.sync.mode) {
-            // Forced at the failure, so the snapshot is of memory after
-            // it: everything the failed log held is covered.
-            self.trace.refusal_ended(&RefusalReport {
-                executor_first_shard: self.first_shard,
-                refused,
-                ticks,
-            });
-            self.sync.mode = Mode::Serving;
-        }
-        // The checkpoint's rotation syncs the segment it leaves, and that
-        // sync failing is a failed sync of the log like the deferred one:
-        // the checkpoint reports its own stage, and the refusal follows.
-        if !self.sync.is_refusing() && self.states[0].log.has_failed() {
-            let error =
-                io::Error::other("the sync of the segment a snapshot rotated away from failed");
-            self.trace.fault(self.first_shard, LogFault::Sync, &error);
-            self.refuse();
+        if let Some(done) = completed {
+            if let Some(link) = &self.sync.link {
+                let _ = link.to_writer.send(ToWriter::Covered {
+                    executor: link.executor,
+                    cycle: done.cycle,
+                    through_batch: done.through_batch,
+                    snapshot_bytes: done.bytes,
+                });
+            }
+            if let Mode::Refusing { refused, ticks } = self.sync.mode {
+                // Forced at the failure, so the snapshot is of memory after
+                // it: everything the failed log held is covered.
+                self.trace.refusal_ended(&RefusalReport {
+                    executor_first_shard: self.first_shard,
+                    refused,
+                    ticks,
+                });
+                self.sync.mode = Mode::Serving;
+            }
         }
     }
 }
