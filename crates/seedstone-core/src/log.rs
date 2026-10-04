@@ -47,8 +47,6 @@ pub mod reader;
 pub mod recovery;
 pub mod snapshot;
 
-use disk::SyncFuture;
-
 /// Magic byte that opens a record.
 ///
 /// Chosen with both nibbles set and alternating bits so that it is not a value
@@ -348,24 +346,20 @@ pub fn decode_record(buf: &[u8]) -> Decoded<'_> {
 ///
 /// `append` runs inside the shard's command handler, which is a plain `fn`
 /// that cannot `await` — so an implementation must keep it cheap. Buffering in
-/// memory is the shape this split anticipates. `flush` runs after every
-/// envelope that appended. The cadence of syncs is settled by the executor,
-/// not here: it issues a sync of its first shard's store through
-/// [`begin_sync`](ReplicationLog::begin_sync), awaits it beside the batches
-/// that follow, and accounts for its completion per shard through
+/// memory is the shape this split anticipates. `flush_into` runs after every
+/// envelope that appended: the executor collects what its shards hand over
+/// into one buffer and submits it to the node's writer. The node's writer
+/// owns the file and the sync; see [`writer`]. It reports each sync's
+/// completion to the executor, which accounts for it per shard through
 /// [`sync_completed`](ReplicationLog::sync_completed).
-///
-/// What is *not* settled here, deliberately: whether shards group-commit
-/// behind one writer shared across executors. The factory admits it — a
-/// shared writer is a factory returning clones of one handle.
 ///
 /// `Send + 'static` because a shard task owns its log and is moved onto the
 /// runtime with it: the bound is what lets a shard hold a `Box<dyn
 /// ReplicationLog>` without knowing which one it got.
 ///
-/// The methods take `&mut self` because a real implementation owns a file
-/// handle and a write position; only one caller may hold it, and only one
-/// does — the shard task.
+/// The methods take `&mut self` because a real implementation owns a buffer
+/// and its points; only one caller may hold it, and only one does — the
+/// shard task.
 pub trait ReplicationLog: Send + 'static {
     /// Records `rec`, before the command it describes is applied.
     ///
@@ -381,83 +375,30 @@ pub trait ReplicationLog: Send + 'static {
     /// the one divergence recovery cannot detect.
     fn append(&mut self, rec: Record<'_>) -> std::io::Result<()>;
 
-    /// Writes everything appended so far to the store, without making it
-    /// durable.
-    ///
-    /// Called from the housekeeping tick, once per shard, before any
-    /// [`sync`](ReplicationLog::sync). A write that fails **keeps** what it
-    /// could not write, so the next tick retries it: a record whose command
-    /// was acknowledged is never dropped by the server, because a dropped
-    /// record followed by a later successful write is a hole inside the
-    /// durable region — the one damage recovery cannot repair.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the store reports. Nothing is lost; the caller reports the
-    /// fault and moves on.
-    fn flush(&mut self) -> std::io::Result<()>;
+    /// Moves everything appended since the last call to the end of `out`,
+    /// in order, and records the highest sequence it handed over as
+    /// flushed. What one submission to the node's writer carries; the
+    /// executor calls it once per shard a batch touched, into one buffer.
+    /// Infallible: nothing here touches a disk.
+    fn flush_into(&mut self, out: &mut Vec<u8>);
 
-    /// Makes everything flushed so far durable, now, blocking.
-    ///
-    /// The start path's: `rebase` writes and syncs before the pool serves.
-    /// The executor never calls it; see
-    /// [`begin_sync`](ReplicationLog::begin_sync). Separate from
-    /// `append` because syncing every append is what makes torn writes
-    /// unobservable — precisely the fault the record format is built to
-    /// survive.
-    ///
-    /// Returns the highest sequence of this shard that is now durable, or
-    /// `None` if nothing of this shard has ever been made durable.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the store reports. Nothing flushed since the last successful
-    /// sync may be assumed durable afterwards, and a filesystem may drop
-    /// what a failed sync could not write and succeed on the next one — so
-    /// an implementation that cannot tell must not advance the durable
-    /// point past a failure. The next tick syncs again.
-    fn sync(&mut self) -> std::io::Result<Option<u64>>;
-
-    /// The highest sequence of this shard the store has been handed — what
-    /// a sync issued now would cover.
+    /// The highest sequence handed to the writer — what a sync issued after
+    /// the submission that carried it covers.
     fn flushed_through(&self) -> Option<u64>;
 
-    /// Issues a sync of this log's store if anything was written to it
-    /// since the last issue; `None` otherwise.
-    ///
-    /// A store shared by an executor's shards answers once per issue: the
-    /// first shard asked takes the sync and the rest find nothing to issue,
-    /// which is why the executor asks its first shard only. The future
-    /// covers what was flushed before this call; what is flushed while it
-    /// is in flight is the next sync's.
-    fn begin_sync(&mut self) -> Option<SyncFuture>;
-
-    /// A sync issued when this shard's flushed point was `through`
-    /// completed: the durable point rises to `through` — never lowers —
-    /// unless a sync has failed on the store since, which keeps it where it
-    /// was until a snapshot covers the loss. Returns the durable point.
-    fn sync_completed(&mut self, through: Option<u64>) -> Option<u64>;
-
-    /// The issued sync failed: nothing it covered is durable, now or
-    /// later, until a snapshot covers it.
-    fn sync_failed(&mut self);
-
-    /// Whether a sync of this shard's store has failed since a snapshot
-    /// last covered it — the one [`sync_failed`](ReplicationLog::sync_failed)
-    /// reports, or one the store made itself, such as a rotation's sync of
-    /// the segment it leaves. A log that syncs nothing never has.
-    fn has_failed(&self) -> bool {
-        false
-    }
+    /// A sync the writer issued as `round`, when this shard's flushed point
+    /// was `through`, completed: the durable point rises to `through`, never
+    /// lowers. Returns the durable point.
+    fn sync_completed(&mut self, through: Option<u64>, round: u64) -> Option<u64>;
 
     /// This shard's records up to `through` are durable by other means —
     /// a snapshot whose image holds their effect is on disk and synced.
     ///
     /// A log that tracks a durable point raises it to `through` and never
-    /// lets a later [`sync`](ReplicationLog::sync) lower it; a log that
-    /// tracks nothing ignores it. Called by the checkpoint once per shard
-    /// when its snapshot becomes durable.
-    fn covered(&mut self, _through: u64) {}
+    /// lets a later sync lower it; a log that tracks nothing ignores it.
+    /// Called by the checkpoint once per shard when its snapshot becomes
+    /// durable.
+    fn covered(&mut self, through: u64);
 
     /// Whether [`append`](ReplicationLog::append) reads the record's
     /// payload. A log that keeps nothing says no, and the caller does not
@@ -471,10 +412,9 @@ pub trait ReplicationLog: Send + 'static {
 /// A [`ReplicationLog`] that keeps nothing: the log of a node started
 /// without `--data-dir`.
 ///
-/// Every method succeeds without doing anything: there are no bytes to
-/// write, so there is nothing for [`sync`](ReplicationLog::sync) to make
-/// durable and it is trivially satisfied. It keeps no payloads, so no write
-/// on such a node encodes one.
+/// Every method succeeds without doing anything: there are no bytes to hand
+/// over, so nothing is ever durable through it and nothing needs to be. It
+/// keeps no payloads, so no write on such a node encodes one.
 #[derive(Debug)]
 pub struct NoopLog;
 
@@ -483,27 +423,17 @@ impl ReplicationLog for NoopLog {
         Ok(())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn sync(&mut self) -> std::io::Result<Option<u64>> {
-        Ok(None)
-    }
+    fn flush_into(&mut self, _out: &mut Vec<u8>) {}
 
     fn flushed_through(&self) -> Option<u64> {
         None
     }
 
-    fn begin_sync(&mut self) -> Option<SyncFuture> {
+    fn sync_completed(&mut self, _through: Option<u64>, _round: u64) -> Option<u64> {
         None
     }
 
-    fn sync_completed(&mut self, _through: Option<u64>) -> Option<u64> {
-        None
-    }
-
-    fn sync_failed(&mut self) {}
+    fn covered(&mut self, _through: u64) {}
 
     fn keeps_payloads(&self) -> bool {
         false

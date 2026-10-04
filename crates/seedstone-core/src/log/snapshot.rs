@@ -100,7 +100,7 @@ impl SnapshotHeader {
     ///
     /// # Errors
     ///
-    /// `Short`, `BadMagic` or `NewerVersion`; the checksum is not checked
+    /// `Short`, `BadMagic`, `NewerVersion` or `OlderVersion`; the checksum is not checked
     /// here, because the bytes it covers have not been read yet.
     pub fn header_len(fixed: &[u8]) -> Result<usize, HeaderError> {
         let Some(fixed) = fixed.get(..SNAPSHOT_HEADER_FIXED_LEN) else {
@@ -109,8 +109,10 @@ impl SnapshotHeader {
         if fixed[..4] != SNAPSHOT_MAGIC {
             return Err(HeaderError::BadMagic);
         }
-        if fixed[4] > FORMAT_VERSION {
-            return Err(HeaderError::NewerVersion(fixed[4]));
+        match fixed[4] {
+            v if v > FORMAT_VERSION => return Err(HeaderError::NewerVersion(v)),
+            v if v < FORMAT_VERSION => return Err(HeaderError::OlderVersion(v)),
+            _ => {}
         }
         let shards = usize::from(u16::from_le_bytes([fixed[19], fixed[20]]));
         Ok(SNAPSHOT_HEADER_FIXED_LEN + shards * 10 + 4)
@@ -285,6 +287,13 @@ mod tests {
         assert_eq!(
             SnapshotHeader::decode(&flipped),
             Err(HeaderError::BadChecksum)
+        );
+        let mut older = out.clone();
+        older[4] = 1;
+        assert_eq!(
+            SnapshotHeader::decode(&older),
+            Err(HeaderError::OlderVersion(1)),
+            "an image from before this build's layout is named, not read as damage"
         );
         let mut newer = out;
         newer[4] = FORMAT_VERSION + 1;

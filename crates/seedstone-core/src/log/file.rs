@@ -1,49 +1,42 @@
-//! The on-disk layout, and the log that writes it.
+//! The on-disk layout, and the log that buffers for it.
 //!
 //! ```text
 //! <data-dir>/wal/
-//!   GENERATION                  the generation counter, decimal ASCII
-//!   0000000000000003-0000-00000000.seg   <generation:016x>-<executor:04x>-<rotation:08x>.seg
-//!   0000000000000003-0001-00000000.seg
+//!   GENERATION                           the generation counter, decimal ASCII
+//!   0000000000000003-00000000.seg        <generation:016x>-<rotation:08x>.seg
+//!   0000000000000003-0001-00000000.snap  one executor's image: snapshot.rs
 //! ```
 //!
 //! A **generation** is one process lifetime: read on start-up, incremented,
 //! written back atomically. Segments of a newer generation sort after every
-//! segment of an older one whatever the executor counts were, so a shard's
-//! records are in sequence order across files whichever executor owned it
-//! each time. A **segment** is a fixed header followed by records in the
-//! format `log.rs` defines, the shards interleaved in arrival order. Each
-//! executor writes its own segment: one `fsync` per executor per tick.
+//! segment of an older one, so a shard's records are in sequence order
+//! across files whichever executor owned it each time. A **segment** is a
+//! fixed header followed by records in the format `log.rs` defines.
 //!
-//! Who writes a segment is not part of the layout. A single writer with
-//! group commit could write one segment for the whole node and nothing on
-//! disk would change; compaction can delete whole segments. That is what
-//! the layout was chosen for. A rotation opens the next file; compaction
-//! deletes whole rotations.
+//! There is one segment per node, written by the node's writer
+//! ([`writer`](crate::log::writer)): every executor hands it its batches,
+//! and the shards are interleaved in the order the batches arrived. A
+//! rotation opens the next file; compaction deletes whole rotations.
 //!
-//! The write path is two-phase, in the housekeeping tick: `flush` writes a
-//! shard's buffered records to the segment, `sync` makes the segment
-//! durable — once per tick, because the first shard's `sync` clears the
-//! segment's dirty flag and the rest find it clean. A write that fails
-//! keeps its buffer: an acknowledged record is never dropped, because a
-//! dropped record followed by a later successful write is a hole inside the
-//! durable region, the one damage the reader cannot repair.
+//! A shard's [`FileLog`] is a buffer: it encodes what the shard appends,
+//! hands the bytes to the writer when the executor flushes, and keeps the
+//! shard's points — what it handed over, what a sync made durable, and what
+//! a snapshot covered.
 
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
-use crate::log::disk::{Disk, LogFile, SyncFuture};
+use crate::log::disk::{Disk, LogFile};
 use crate::log::{Record, ReplicationLog, crc32_iso_hdlc, encode_record};
 
 /// The four bytes every segment starts with.
 pub const SEGMENT_MAGIC: [u8; 4] = *b"SSEG";
 
-/// The layout version this build writes and the highest it reads.
-pub const FORMAT_VERSION: u8 = 1;
+/// The layout version this build writes, and the only one it reads.
+pub const FORMAT_VERSION: u8 = 2;
 
-/// Magic, version, generation, executor, rotation, and a CRC over the rest.
-pub const SEGMENT_HEADER_LEN: usize = 4 + 1 + 8 + 2 + 4 + 4;
+/// Magic, version, generation, rotation, and a CRC over the rest.
+pub const SEGMENT_HEADER_LEN: usize = 4 + 1 + 8 + 4 + 4;
 
 /// The file the generation counter lives in.
 pub const GENERATION_FILE: &str = "GENERATION";
@@ -51,24 +44,24 @@ pub const GENERATION_FILE: &str = "GENERATION";
 /// The name the counter is written under before it is renamed into place.
 const GENERATION_TMP: &str = "GENERATION.tmp";
 
-/// The name the segment `executor` writes in `generation` at `rotation`.
+/// The name of the node's segment in `generation` at `rotation`.
 ///
-/// Rotation is the checkpoint's counter: every cycle opens a fresh segment
-/// so that what precedes it can be deleted as a whole file. Zero at start.
+/// The writer rotates at a size, so that what precedes a rotation can be
+/// deleted as a whole file once every executor has covered it. Zero at
+/// start.
 #[must_use]
-pub fn segment_name(generation: u64, executor: u16, rotation: u32) -> String {
-    format!("{generation:016x}-{executor:04x}-{rotation:08x}.seg")
+pub fn segment_name(generation: u64, rotation: u32) -> String {
+    format!("{generation:016x}-{rotation:08x}.seg")
 }
 
-/// The generation, executor and rotation a segment name carries, if it is
-/// one.
+/// The generation and rotation a segment name carries, if it is one.
 #[must_use]
-pub fn parse_segment_name(name: &str) -> Option<(u64, u16, u32)> {
-    parse_name(name, ".seg")
+pub fn parse_segment_name(name: &str) -> Option<(u64, u32)> {
+    parse_name2(name, ".seg")
 }
 
-/// `<generation:016x>-<executor:04x>-<counter:08x><suffix>`, the shape both
-/// file types share.
+/// `<generation:016x>-<executor:04x>-<counter:08x><suffix>`: a snapshot's
+/// shape, and the previous layout's segments'.
 pub(crate) fn parse_name(name: &str, suffix: &str) -> Option<(u64, u16, u32)> {
     let stem = name.strip_suffix(suffix)?;
     let mut parts = stem.split('-');
@@ -84,13 +77,28 @@ pub(crate) fn parse_name(name: &str, suffix: &str) -> Option<(u64, u16, u32)> {
     ))
 }
 
+/// `<generation:016x>-<counter:08x><suffix>`: a segment's shape.
+pub(crate) fn parse_name2(name: &str, suffix: &str) -> Option<(u64, u32)> {
+    let stem = name.strip_suffix(suffix)?;
+    let (generation, counter) = stem.split_once('-')?;
+    if generation.len() != 16
+        || counter.len() != 8
+        || stem.contains(|c: char| !c.is_ascii_hexdigit() && c != '-')
+    {
+        return None;
+    }
+    Some((
+        u64::from_str_radix(generation, 16).ok()?,
+        u32::from_str_radix(counter, 16).ok()?,
+    ))
+}
+
 /// Appends a segment header to `out`: the fields, then a CRC over them.
-pub fn encode_segment_header(generation: u64, executor: u16, rotation: u32, out: &mut Vec<u8>) {
+pub fn encode_segment_header(generation: u64, rotation: u32, out: &mut Vec<u8>) {
     let at = out.len();
     out.extend_from_slice(&SEGMENT_MAGIC);
     out.push(FORMAT_VERSION);
     out.extend_from_slice(&generation.to_le_bytes());
-    out.extend_from_slice(&executor.to_le_bytes());
     out.extend_from_slice(&rotation.to_le_bytes());
     let crc = crc32_iso_hdlc(&out[at..]);
     out.extend_from_slice(&crc.to_le_bytes());
@@ -113,39 +121,31 @@ pub enum HeaderError {
     BadChecksum,
 }
 
-/// Reads a segment header: the generation, executor and rotation it names.
+/// Reads a segment header: the generation and rotation it names.
 ///
-/// The version is checked before the checksum: a newer version may lay its
+/// The version is checked before the checksum: another version may lay its
 /// header out differently, and refusing it as damage would scan a downgrade
-/// as a hole.
+/// as a hole, or an earlier build's directory as every shard's loss.
 ///
 /// # Errors
 ///
 /// [`HeaderError`], as each variant says.
-pub fn decode_segment_header(buf: &[u8]) -> Result<(u64, u16, u32), HeaderError> {
+pub fn decode_segment_header(buf: &[u8]) -> Result<(u64, u32), HeaderError> {
     let Some(header) = buf.get(..SEGMENT_HEADER_LEN) else {
         return Err(HeaderError::Short);
     };
     if header[..4] != SEGMENT_MAGIC {
         return Err(HeaderError::BadMagic);
     }
-    if header[4] > FORMAT_VERSION {
-        return Err(HeaderError::NewerVersion(header[4]));
-    }
-    if header[4] < FORMAT_VERSION {
-        return Err(HeaderError::OlderVersion(header[4]));
+    match header[4] {
+        v if v > FORMAT_VERSION => return Err(HeaderError::NewerVersion(v)),
+        v if v < FORMAT_VERSION => return Err(HeaderError::OlderVersion(v)),
+        _ => {}
     }
     check_header_crc(header)?;
-    let mut generation = [0; 8];
-    generation.copy_from_slice(&header[5..13]);
-    let executor = u16::from_le_bytes([header[13], header[14]]);
-    let mut rotation = [0; 4];
-    rotation.copy_from_slice(&header[15..19]);
-    Ok((
-        u64::from_le_bytes(generation),
-        executor,
-        u32::from_le_bytes(rotation),
-    ))
+    let generation = u64::from_le_bytes(header[5..13].try_into().expect("8 bytes"));
+    let rotation = u32::from_le_bytes(header[13..17].try_into().expect("4 bytes"));
+    Ok((generation, rotation))
 }
 
 /// The last four bytes of `header` are the CRC of everything before them.
@@ -160,71 +160,51 @@ pub(crate) fn check_header_crc(header: &[u8]) -> Result<(), HeaderError> {
     }
 }
 
-/// One open segment, shared by the shards of the executor that writes it.
+/// The node's open segment: the writer's alone.
 pub struct Segment<F: LogFile> {
-    file: F,
-    /// Which rotation of this executor's segment the file is.
+    pub(crate) file: F,
+    /// Which rotation of the node's segment the file is.
     pub(crate) rotation: u32,
     /// The highest rotation a rotation has tried to create. A rotation that
     /// failed may have left a file under its name, so the next attempt takes
     /// the name after it rather than appending a second header to that one.
-    attempted: u32,
-    /// Bytes written to this rotation: the live log the checkpoint's
-    /// trigger reads. Reset by a rotation, not by a deletion.
+    pub(crate) attempted: u32,
+    /// Bytes written to this rotation: what the rotation's size reads.
     pub(crate) bytes_written: u64,
     /// Whether anything was written since the last sync was issued —
-    /// cleared at the issue, so that what is flushed during a sync in
+    /// cleared at the issue, so that what is written during a sync in
     /// flight is the next one's.
-    ///
-    /// Public to the crate so a test can see the one-sync-per-issue property
-    /// it exists for.
     pub(crate) dirty: bool,
-    /// Whether a sync of this executor's segment has failed and nothing
-    /// has since proved the loss covered. A filesystem may drop the pages
-    /// a failed sync could not write and report success on the next one,
-    /// so from then on no sync proves anything new: every shard's durable
-    /// point stays where it was — until a snapshot whose image holds the
-    /// effect of every record before its base is durable, which is what
-    /// [`segment_snapshot_covered`] says.
-    sync_failed: bool,
-    /// Whether a sync failed since the last rotation. A snapshot covers
-    /// what was written before its rotation; a failure after it is a
-    /// failure the snapshot cannot heal.
-    pub(crate) failed_this_rotation: bool,
+    /// Whether a write or a sync of this file has failed. A filesystem may
+    /// drop the pages a failed sync could not write and report success on
+    /// the next one, so from then on no sync of this file proves anything:
+    /// the writer never heals it, it rotates away from it.
+    pub(crate) sync_failed: bool,
 }
 
-/// A segment behind the lock the shards of one executor share.
-///
-/// Uncontended by construction — one executor task owns every shard that
-/// holds a clone — and a lock rather than a `RefCell` only because a shard's
-/// state has to be `Send` to be moved onto the runtime.
-pub type SharedSegment<F> = Arc<Mutex<Segment<F>>>;
-
-/// One shard's log: a buffer, and the segment it is flushed to.
-pub struct FileLog<F: LogFile> {
+/// One shard's log: a buffer, and the points it keeps.
+pub struct FileLog {
     shard: u16,
-    /// Records appended and not yet written.
+    /// Records appended and not yet handed to the writer.
     pending: Vec<u8>,
     /// The highest sequence in `pending`.
     pending_through: Option<u64>,
-    /// The highest sequence written to the segment.
+    /// The highest sequence handed to the writer.
     flushed_through: Option<u64>,
-    /// The highest sequence a sync has made durable.
+    /// The highest sequence a sync or a snapshot has made durable.
     durable: Option<u64>,
-    segment: SharedSegment<F>,
 }
 
-impl<F: LogFile> FileLog<F> {
-    /// A log for `shard` that flushes into `segment`.
+impl FileLog {
+    /// A log for `shard`.
     #[must_use]
-    pub const fn new(shard: u16, segment: SharedSegment<F>) -> Self {
+    pub const fn new(shard: u16) -> Self {
         Self {
             shard,
             pending: Vec::new(),
             pending_through: None,
             flushed_through: None,
             durable: None,
-            segment,
         }
     }
 
@@ -235,17 +215,7 @@ impl<F: LogFile> FileLog<F> {
     }
 }
 
-/// The segment's lock, taken through the field alone so the rest of the
-/// log stays borrowable while it is held.
-pub(crate) fn lock<F: LogFile>(
-    segment: &SharedSegment<F>,
-) -> std::sync::MutexGuard<'_, Segment<F>> {
-    segment
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-impl<F: LogFile> ReplicationLog for FileLog<F> {
+impl ReplicationLog for FileLog {
     fn append(&mut self, rec: Record<'_>) -> io::Result<()> {
         debug_assert_eq!(
             rec.shard, self.shard,
@@ -256,72 +226,24 @@ impl<F: LogFile> ReplicationLog for FileLog<F> {
         Ok(())
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush_into(&mut self, out: &mut Vec<u8>) {
         if self.pending.is_empty() {
-            return Ok(());
+            return;
         }
-        let mut segment = lock(&self.segment);
-        segment.file.write_all(&self.pending)?;
-        segment.bytes_written += self.pending.len() as u64;
-        segment.dirty = true;
-        drop(segment);
+        out.extend_from_slice(&self.pending);
         self.pending.clear();
         self.flushed_through = self.pending_through.take().or(self.flushed_through);
-        Ok(())
-    }
-
-    fn sync(&mut self) -> io::Result<Option<u64>> {
-        let mut segment = lock(&self.segment);
-        if segment.dirty {
-            if let Err(error) = segment.file.sync_data() {
-                segment.sync_failed = true;
-                segment.failed_this_rotation = true;
-                return Err(error);
-            }
-            segment.dirty = false;
-        }
-        if !segment.sync_failed {
-            // Never lower: `covered` may have raised the point past what a
-            // late flush of a kept buffer reports.
-            self.durable = self.durable.max(self.flushed_through);
-        }
-        drop(segment);
-        Ok(self.durable)
     }
 
     fn flushed_through(&self) -> Option<u64> {
         self.flushed_through
     }
 
-    fn begin_sync(&mut self) -> Option<SyncFuture> {
-        let mut segment = lock(&self.segment);
-        if !segment.dirty {
-            return None;
-        }
-        // Cleared at issue, not at completion: what is flushed from here on
-        // is the next sync's, and a sync that fails sets the sticky flag
-        // the rotation's assertion reads.
-        segment.dirty = false;
-        Some(segment.file.sync_later())
-    }
-
-    fn sync_completed(&mut self, through: Option<u64>) -> Option<u64> {
-        let segment = lock(&self.segment);
-        if !segment.sync_failed {
-            self.durable = self.durable.max(through);
-        }
-        drop(segment);
+    fn sync_completed(&mut self, through: Option<u64>, _round: u64) -> Option<u64> {
+        // Never lower: `covered` may have raised the point past what an
+        // earlier round covered.
+        self.durable = self.durable.max(through);
         self.durable
-    }
-
-    fn sync_failed(&mut self) {
-        let mut segment = lock(&self.segment);
-        segment.sync_failed = true;
-        segment.failed_this_rotation = true;
-    }
-
-    fn has_failed(&self) -> bool {
-        lock(&self.segment).sync_failed
     }
 
     fn covered(&mut self, through: u64) {
@@ -347,7 +269,7 @@ pub fn next_generation<D: Disk>(disk: &D, wal: &Path) -> io::Result<u64> {
         .list(wal)?
         .iter()
         .filter_map(|name| parse_segment_name(name))
-        .map(|(generation, _, _)| generation)
+        .map(|(generation, _)| generation)
         .max()
         .unwrap_or(0);
     let next = recorded.max(on_disk) + 1;
@@ -368,38 +290,6 @@ fn read_generation<D: Disk>(disk: &D, wal: &Path) -> Option<u64> {
     std::str::from_utf8(&text).ok()?.trim().parse().ok()
 }
 
-/// Creates this generation's segment for every executor, header written and
-/// synced, then syncs the directory once.
-///
-/// The directory sync is the step that is easy to miss: a crash
-/// discards a file whose directory entry was never synced, header and all.
-///
-/// # Errors
-///
-/// Whatever the disk reports.
-pub fn open_segments<D: Disk>(
-    disk: &D,
-    wal: &Path,
-    generation: u64,
-    executors: u16,
-) -> io::Result<Vec<SharedSegment<D::File>>> {
-    let mut segments = Vec::with_capacity(usize::from(executors));
-    for executor in 0..executors {
-        let file = create_segment(disk, wal, generation, executor, 0)?;
-        segments.push(Arc::new(Mutex::new(Segment {
-            file,
-            rotation: 0,
-            attempted: 0,
-            bytes_written: 0,
-            dirty: false,
-            sync_failed: false,
-            failed_this_rotation: false,
-        })));
-    }
-    disk.sync_dir(wal)?;
-    Ok(segments)
-}
-
 /// Creates one segment file: header written and synced. The directory is
 /// the caller's to sync — once per batch of files, not once per file.
 ///
@@ -410,96 +300,14 @@ pub fn create_segment<D: Disk>(
     disk: &D,
     wal: &Path,
     generation: u64,
-    executor: u16,
     rotation: u32,
 ) -> io::Result<D::File> {
-    let mut file = disk.create_append(&wal.join(segment_name(generation, executor, rotation)))?;
+    let mut file = disk.create_append(&wal.join(segment_name(generation, rotation)))?;
     let mut header = Vec::with_capacity(SEGMENT_HEADER_LEN);
-    encode_segment_header(generation, executor, rotation, &mut header);
+    encode_segment_header(generation, rotation, &mut header);
     file.write_all(&header)?;
     file.sync_data()?;
     Ok(file)
-}
-
-/// Opens the next rotation of `executor`'s segment and swaps it in.
-///
-/// The new file is created, its header synced and the directory synced
-/// before the swap, so a crash at any point leaves either the old rotation
-/// alone or both — never a writer on a file with no directory entry. The
-/// live-log counter restarts; the sticky sync failure does not, because the
-/// records it gates are in the old file. Called by the checkpoint; the old
-/// file's unsynced bytes are synced here first, so the executor may rotate
-/// whatever its policy left unsynced, and with a sync in flight.
-///
-/// # Errors
-///
-/// Whatever the disk reports; nothing was swapped.
-pub fn rotate_segment<D: Disk>(
-    disk: &D,
-    wal: &Path,
-    generation: u64,
-    executor: u16,
-    segment: &SharedSegment<D::File>,
-) -> io::Result<u32> {
-    let next = {
-        let mut guard = lock(segment);
-        // What the old file holds unsynced is synced before the file is let
-        // go: the executor's policy may have left bytes there — `never`
-        // always does — and a later sync of the new file would otherwise
-        // raise a durable point past records the old one never made
-        // durable. One sync per rotation, a few per cycle. A failure is the
-        // sticky one; nothing is swapped, and the next attempt rotates
-        // without retrying, because the snapshot it opens is what covers
-        // those bytes.
-        if guard.dirty && !guard.sync_failed {
-            if let Err(error) = guard.file.sync_data() {
-                guard.sync_failed = true;
-                guard.failed_this_rotation = true;
-                return Err(error);
-            }
-            guard.dirty = false;
-        }
-        guard.attempted += 1;
-        guard.attempted
-    };
-    let file = create_segment(disk, wal, generation, executor, next)?;
-    disk.sync_dir(wal)?;
-    let mut guard = lock(segment);
-    // Dropping the old file's dirty flag is safe only because the old
-    // file was synced above: bytes still unsynced there are bytes a sync
-    // failed on, and the sticky failure keeps them out of every durable
-    // point until a snapshot covers them. A sync in flight on the old file
-    // finishes on its own handle and accounts only for what it covered.
-    debug_assert!(
-        !guard.dirty || guard.sync_failed,
-        "a rotation that did not sync the old file would abandon unsynced records"
-    );
-    guard.file = file;
-    guard.rotation = next;
-    guard.bytes_written = 0;
-    guard.dirty = false;
-    guard.failed_this_rotation = false;
-    drop(guard);
-    Ok(next)
-}
-
-/// A snapshot whose bases were taken at this segment's last rotation is
-/// durable.
-///
-/// Everything the old rotations held is covered by its image, so a sync
-/// failure on them no longer gates the durable point — unless a sync has
-/// failed since, on the rotation the image does not cover.
-pub fn segment_snapshot_covered<F: LogFile>(segment: &SharedSegment<F>) {
-    let mut guard = lock(segment);
-    if !guard.failed_this_rotation {
-        guard.sync_failed = false;
-    }
-}
-
-/// Bytes written to the segment since its last rotation.
-#[must_use]
-pub fn live_log_bytes<F: LogFile>(segment: &SharedSegment<F>) -> u64 {
-    lock(segment).bytes_written
 }
 
 #[cfg(test)]
@@ -509,46 +317,33 @@ mod tests {
     use crate::log::{Decoded, decode_record};
 
     #[test]
-    fn segment_names_sort_by_generation_then_executor_then_rotation() {
-        assert_eq!(segment_name(3, 1, 0), "0000000000000003-0001-00000000.seg");
+    fn segment_names_carry_generation_and_rotation_and_sort_by_both() {
+        assert_eq!(segment_name(3, 2), "0000000000000003-00000002.seg");
+        assert_eq!(
+            parse_segment_name("0000000000000003-00000002.seg"),
+            Some((3, 2))
+        );
         assert_eq!(
             parse_segment_name("0000000000000003-0001-00000002.seg"),
-            Some((3, 1, 2))
-        );
-        assert_eq!(parse_segment_name("GENERATION"), None);
-        assert_eq!(
-            parse_segment_name("0000000000000003-0001.seg"),
             None,
-            "the old shape"
+            "the previous layout's shape"
         );
-        assert_eq!(
-            parse_segment_name("0000000000000003-0001-00000002.snap"),
-            None
-        );
-        let mut names = vec![
-            segment_name(2, 0, 0),
-            segment_name(1, 3, 0),
-            segment_name(1, 0, 1),
-            segment_name(1, 0, 0),
-        ];
+        assert_eq!(parse_segment_name("0000000000000003-00000002.snap"), None);
+        assert_eq!(parse_segment_name("GENERATION"), None);
+        let mut names = vec![segment_name(2, 0), segment_name(1, 3), segment_name(1, 0)];
         names.sort();
         assert_eq!(
             names,
-            [
-                segment_name(1, 0, 0),
-                segment_name(1, 0, 1),
-                segment_name(1, 3, 0),
-                segment_name(2, 0, 0)
-            ]
+            [segment_name(1, 0), segment_name(1, 3), segment_name(2, 0)]
         );
     }
 
     #[test]
-    fn a_segment_header_round_trips_and_refuses_a_newer_version_or_a_bad_checksum() {
+    fn a_segment_header_round_trips_and_refuses_other_versions_and_a_bad_checksum() {
         let mut out = Vec::new();
-        encode_segment_header(9, 2, 5, &mut out);
+        encode_segment_header(9, 5, &mut out);
         assert_eq!(out.len(), SEGMENT_HEADER_LEN);
-        assert_eq!(decode_segment_header(&out), Ok((9, 2, 5)));
+        assert_eq!(decode_segment_header(&out), Ok((9, 5)));
         assert_eq!(decode_segment_header(&out[..3]), Err(HeaderError::Short));
         let mut bad = out.clone();
         bad[0] = b'X';
@@ -557,207 +352,80 @@ mod tests {
         flipped[7] ^= 0x01; // inside the generation
         assert_eq!(
             decode_segment_header(&flipped),
-            Err(HeaderError::BadChecksum),
-            "a header whose bytes moved is damage, not a different header"
+            Err(HeaderError::BadChecksum)
         );
-        let mut older = out.clone();
-        older[4] = 0;
-        assert_eq!(
-            decode_segment_header(&older),
-            Err(HeaderError::OlderVersion(0)),
-            "a header from before this build's layout is named, not read as damage"
-        );
-        let mut newer = out;
+        let mut newer = out.clone();
         newer[4] = FORMAT_VERSION + 1;
-        // The version is read before the checksum: a newer version writes a
-        // header this build cannot checksum, and refusing it as damage would
-        // scan a downgrade as a hole.
         assert_eq!(
             decode_segment_header(&newer),
             Err(HeaderError::NewerVersion(FORMAT_VERSION + 1))
         );
-    }
-
-    #[test]
-    fn open_segments_creates_one_per_executor_with_a_synced_header() {
-        let disk = MemDisk::default();
-        let wal = Path::new("/data/wal");
-        disk.create_dir_all(wal).unwrap();
-        let segments = open_segments(&disk, wal, 4, 2).unwrap();
-        assert_eq!(segments.len(), 2);
-        let mut names = disk.list(wal).unwrap();
-        names.sort();
-        assert_eq!(names, [segment_name(4, 0, 0), segment_name(4, 1, 0)]);
-        let header = disk.contents(&wal.join(segment_name(4, 1, 0)));
-        assert_eq!(decode_segment_header(&header), Ok((4, 1, 0)));
-    }
-
-    #[test]
-    fn append_buffers_flush_writes_and_sync_reports_the_durable_point() {
-        let disk = MemDisk::default();
-        let wal = Path::new("/data/wal");
-        disk.create_dir_all(wal).unwrap();
-        let segments = open_segments(&disk, wal, 1, 1).unwrap();
-        let path = wal.join(segment_name(1, 0, 0));
-        let mut log = FileLog::new(5, Arc::clone(&segments[0]));
-
-        log.append(Record {
-            shard: 5,
-            seq: 0,
-            payload: b"a",
-        })
-        .unwrap();
-        log.append(Record {
-            shard: 5,
-            seq: 1,
-            payload: b"b",
-        })
-        .unwrap();
+        let mut older = out;
+        older[4] = 1;
         assert_eq!(
-            disk.contents(&path).len(),
-            SEGMENT_HEADER_LEN,
-            "append writes nothing"
-        );
-        assert_eq!(
-            log.sync().unwrap(),
-            None,
-            "nothing flushed, nothing durable"
-        );
-
-        log.flush().unwrap();
-        let written = disk.contents(&path);
-        assert!(written.len() > SEGMENT_HEADER_LEN, "flush wrote the buffer");
-        assert!(matches!(
-            decode_record(&written[SEGMENT_HEADER_LEN..]),
-            Decoded::Record {
-                shard: 5,
-                seq: 0,
-                ..
-            }
-        ));
-        assert_eq!(log.sync().unwrap(), Some(1), "both records are durable");
-        log.flush().unwrap();
-        assert_eq!(
-            disk.contents(&path),
-            written,
-            "an empty buffer writes nothing"
+            decode_segment_header(&older),
+            Err(HeaderError::OlderVersion(1))
         );
     }
 
     #[test]
-    fn a_failed_flush_keeps_the_buffer_and_the_next_flush_writes_it() {
+    fn create_segment_writes_a_synced_header_under_the_name() {
         let disk = MemDisk::default();
-        let wal = Path::new("/data/wal");
-        disk.create_dir_all(wal).unwrap();
-        let segments = open_segments(&disk, wal, 1, 1).unwrap();
-        let path = wal.join(segment_name(1, 0, 0));
-        let mut log = FileLog::new(0, Arc::clone(&segments[0]));
-        log.append(Record {
-            shard: 0,
-            seq: 0,
-            payload: b"kept",
-        })
-        .unwrap();
+        disk.create_dir_all(Path::new("/w")).unwrap();
+        let _file = create_segment(&disk, Path::new("/w"), 4, 1).unwrap();
+        let bytes = disk.contents(&Path::new("/w").join(segment_name(4, 1)));
+        assert_eq!(decode_segment_header(&bytes), Ok((4, 1)));
+        assert_eq!(
+            disk.synced_len(&Path::new("/w").join(segment_name(4, 1))),
+            bytes.len()
+        );
+    }
 
-        disk.fail_writes(true);
-        assert!(log.flush().is_err());
-        assert_eq!(log.sync().unwrap(), None, "nothing reached the disk");
-        disk.fail_writes(false);
+    fn rec(shard: u16, seq: u64, payload: &[u8]) -> Record<'_> {
+        Record {
+            shard,
+            seq,
+            payload,
+        }
+    }
 
-        log.append(Record {
-            shard: 0,
-            seq: 1,
-            payload: b"later",
-        })
-        .unwrap();
-        log.flush().unwrap();
-        assert_eq!(log.sync().unwrap(), Some(1));
-        let written = disk.contents(&path);
-        let Decoded::Record { seq, consumed, .. } = decode_record(&written[SEGMENT_HEADER_LEN..])
+    #[test]
+    fn a_log_buffers_hands_over_in_order_and_dates_its_points_by_what_it_handed_over() {
+        let mut log = FileLog::new(3);
+        assert_eq!(log.flushed_through(), None);
+        log.append(rec(3, 0, b"a")).unwrap();
+        log.append(rec(3, 1, b"b")).unwrap();
+        let mut out = vec![0xEE];
+        log.flush_into(&mut out);
+        assert_eq!(log.flushed_through(), Some(1));
+        assert_eq!(out[0], 0xEE, "appended after what the buffer held");
+        let Decoded::Record {
+            shard,
+            seq,
+            payload,
+            consumed: next,
+        } = decode_record(&out[1..])
         else {
-            panic!("the first record is intact")
+            panic!()
         };
-        assert_eq!(seq, 0, "the record the failed flush kept came first");
-        assert!(matches!(
-            decode_record(&written[SEGMENT_HEADER_LEN + consumed..]),
-            Decoded::Record { seq: 1, .. }
-        ));
-    }
-
-    #[test]
-    fn a_failed_sync_leaves_the_durable_point_where_it_was() {
-        let disk = MemDisk::default();
-        let wal = Path::new("/data/wal");
-        disk.create_dir_all(wal).unwrap();
-        let segments = open_segments(&disk, wal, 1, 1).unwrap();
-        let mut log = FileLog::new(0, Arc::clone(&segments[0]));
-        log.append(Record {
-            shard: 0,
-            seq: 0,
-            payload: b"x",
-        })
-        .unwrap();
-        log.flush().unwrap();
-        assert_eq!(log.sync().unwrap(), Some(0));
-        log.append(Record {
-            shard: 0,
-            seq: 1,
-            payload: b"y",
-        })
-        .unwrap();
-        log.flush().unwrap();
-        disk.fail_writes(true);
-        assert!(log.sync().is_err());
-        disk.fail_writes(false);
-        // A filesystem may drop the pages a failed sync could not write and
-        // report success on the next one, so the retry proves nothing about
-        // what the failed sync held: the point stays where it was, and
-        // recovery on the next start finds whatever was really lost.
+        assert_eq!((shard, seq, payload), (3, 0, &b"a"[..]));
+        let Decoded::Record { seq, .. } = decode_record(&out[1 + next..]) else {
+            panic!()
+        };
+        assert_eq!(seq, 1);
+        let mut again = Vec::new();
+        log.flush_into(&mut again);
+        assert!(again.is_empty(), "a second flush hands over nothing");
+        assert_eq!(log.flushed_through(), Some(1), "and moves no point");
+        assert_eq!(log.sync_completed(Some(0), 1), Some(0));
+        assert_eq!(log.sync_completed(Some(1), 2), Some(1));
+        assert_eq!(log.sync_completed(Some(0), 3), Some(1), "never lowers");
+        log.covered(7);
         assert_eq!(
-            log.sync().unwrap(),
-            Some(0),
-            "a sync after a failed one does not advance the durable point"
+            log.sync_completed(Some(1), 4),
+            Some(7),
+            "a cover is kept past a later sync"
         );
-        log.append(Record {
-            shard: 0,
-            seq: 2,
-            payload: b"z",
-        })
-        .unwrap();
-        log.flush().unwrap();
-        assert_eq!(log.sync().unwrap(), Some(0), "nor does any later one");
-    }
-
-    #[test]
-    fn two_shards_on_one_segment_pay_one_sync_per_tick() {
-        // Observable through the dirty flag: after the first shard's sync the
-        // segment is clean, and the second shard's sync reports its own
-        // flushed point without a second `sync_data`. The mem disk cannot
-        // count syncs, so the test reads the flag.
-        let disk = MemDisk::default();
-        let wal = Path::new("/data/wal");
-        disk.create_dir_all(wal).unwrap();
-        let segments = open_segments(&disk, wal, 1, 1).unwrap();
-        let mut a = FileLog::new(0, Arc::clone(&segments[0]));
-        let mut b = FileLog::new(1, Arc::clone(&segments[0]));
-        a.append(Record {
-            shard: 0,
-            seq: 0,
-            payload: b"a",
-        })
-        .unwrap();
-        b.append(Record {
-            shard: 1,
-            seq: 0,
-            payload: b"b",
-        })
-        .unwrap();
-        a.flush().unwrap();
-        b.flush().unwrap();
-        assert!(segments[0].lock().unwrap().dirty);
-        assert_eq!(a.sync().unwrap(), Some(0));
-        assert!(!segments[0].lock().unwrap().dirty);
-        assert_eq!(b.sync().unwrap(), Some(0), "covered by a's sync");
     }
 
     #[test]
@@ -786,7 +454,7 @@ mod tests {
         let disk = MemDisk::default();
         let wal = Path::new("/data/wal");
         disk.create_dir_all(wal).unwrap();
-        open_segments(&disk, wal, 7, 2).unwrap();
+        create_segment(&disk, wal, 7, 0).unwrap();
         disk.write_file(&wal.join(GENERATION_FILE), b"7\xff\x00")
             .unwrap();
         assert_eq!(
@@ -794,278 +462,12 @@ mod tests {
             8,
             "one above the highest generation any segment carries"
         );
-        open_segments(&disk, wal, 8, 2).unwrap();
+        create_segment(&disk, wal, 8, 0).unwrap();
         disk.write_file(&wal.join(GENERATION_FILE), b"3").unwrap();
         assert_eq!(
             next_generation(&disk, wal).unwrap(),
             9,
             "a counter behind the segments is not trusted either"
-        );
-    }
-
-    fn write(log: &mut FileLog<crate::log::disk::mem::MemFile>, seq: u64, payload: &[u8]) {
-        log.append(Record {
-            shard: log.shard(),
-            seq,
-            payload,
-        })
-        .unwrap();
-        log.flush().unwrap();
-        log.sync().unwrap();
-    }
-
-    #[test]
-    fn rotation_opens_the_next_segment_and_the_shards_keep_writing_into_it() {
-        let disk = MemDisk::default();
-        let wal = Path::new("/data/wal");
-        disk.create_dir_all(wal).unwrap();
-        let segments = open_segments(&disk, wal, 1, 1).unwrap();
-        let mut a = FileLog::new(0, Arc::clone(&segments[0]));
-        write(&mut a, 0, b"before");
-        assert!(
-            live_log_bytes(&segments[0]) > 0,
-            "flush counts the bytes it wrote"
-        );
-        let rotation = rotate_segment(&disk, wal, 1, 0, &segments[0]).unwrap();
-        assert_eq!(rotation, 1);
-        assert_eq!(
-            live_log_bytes(&segments[0]),
-            0,
-            "the counter restarts with the file"
-        );
-        write(&mut a, 1, b"after");
-        let mut names = disk.list(wal).unwrap();
-        names.sort();
-        assert_eq!(names, [segment_name(1, 0, 0), segment_name(1, 0, 1)]);
-        let first = disk.contents(&wal.join(segment_name(1, 0, 0)));
-        let second = disk.contents(&wal.join(segment_name(1, 0, 1)));
-        assert!(matches!(
-            decode_record(&first[SEGMENT_HEADER_LEN..]),
-            Decoded::Record { seq: 0, .. }
-        ));
-        assert_eq!(decode_segment_header(&second), Ok((1, 0, 1)));
-        assert!(matches!(
-            decode_record(&second[SEGMENT_HEADER_LEN..]),
-            Decoded::Record { seq: 1, .. }
-        ));
-        assert_eq!(a.sync().unwrap(), Some(1));
-    }
-
-    #[test]
-    fn covered_raises_the_durable_point_and_a_later_sync_never_lowers_it() {
-        let disk = MemDisk::default();
-        let wal = Path::new("/data/wal");
-        disk.create_dir_all(wal).unwrap();
-        let segments = open_segments(&disk, wal, 1, 1).unwrap();
-        let mut log = FileLog::new(0, Arc::clone(&segments[0]));
-        log.append(Record {
-            shard: 0,
-            seq: 0,
-            payload: b"a",
-        })
-        .unwrap();
-        disk.fail_writes(true);
-        assert!(log.flush().is_err(), "kept");
-        disk.fail_writes(false);
-        // A snapshot taken now covers record 0 whatever the flush did.
-        log.covered(0);
-        assert_eq!(log.sync().unwrap(), Some(0), "covered is durable");
-        // The kept buffer lands late; the durable point must not fall back
-        // to what the flush reports.
-        log.flush().unwrap();
-        assert_eq!(log.sync().unwrap(), Some(0));
-        log.append(Record {
-            shard: 0,
-            seq: 1,
-            payload: b"b",
-        })
-        .unwrap();
-        log.flush().unwrap();
-        assert_eq!(log.sync().unwrap(), Some(1));
-    }
-
-    #[test]
-    fn a_failed_sync_is_healed_by_a_snapshot_only_if_the_new_rotation_never_failed() {
-        let disk = MemDisk::default();
-        let wal = Path::new("/data/wal");
-        disk.create_dir_all(wal).unwrap();
-        let segments = open_segments(&disk, wal, 1, 1).unwrap();
-        let mut log = FileLog::new(0, Arc::clone(&segments[0]));
-        write(&mut log, 0, b"x");
-        log.append(Record {
-            shard: 0,
-            seq: 1,
-            payload: b"y",
-        })
-        .unwrap();
-        log.flush().unwrap();
-        disk.fail_writes(true);
-        assert!(log.sync().is_err());
-        disk.fail_writes(false);
-        rotate_segment(&disk, wal, 1, 0, &segments[0]).unwrap();
-        write(&mut log, 2, b"z");
-        assert_eq!(
-            log.sync().unwrap(),
-            Some(0),
-            "the old segment's failure still gates the point after a rotation"
-        );
-        // The snapshot's bases were taken at the rotation: seq 2, so 0 and 1
-        // are covered by the image.
-        log.covered(1);
-        segment_snapshot_covered(&segments[0]);
-        assert_eq!(
-            log.sync().unwrap(),
-            Some(2),
-            "everything below the base is in the image, and the new rotation never failed"
-        );
-        // A failure on the new rotation is not healed by the same snapshot.
-        log.append(Record {
-            shard: 0,
-            seq: 3,
-            payload: b"w",
-        })
-        .unwrap();
-        log.flush().unwrap();
-        disk.fail_writes(true);
-        assert!(log.sync().is_err());
-        disk.fail_writes(false);
-        segment_snapshot_covered(&segments[0]);
-        assert_eq!(
-            log.sync().unwrap(),
-            Some(2),
-            "the failure since the rotation stands"
-        );
-    }
-
-    /// The executor's sync: issued once per segment however many shards
-    /// share it, and on completion each shard's point rises to what it had
-    /// flushed when the sync was issued — not to what it flushed during it.
-    #[tokio::test]
-    async fn a_sync_is_issued_once_per_segment_and_completes_to_the_point_at_issue() {
-        let disk = MemDisk::default();
-        let wal = Path::new("/data/wal");
-        disk.create_dir_all(wal).unwrap();
-        let segments = open_segments(&disk, wal, 1, 1).unwrap();
-        let mut a = FileLog::new(0, Arc::clone(&segments[0]));
-        let mut b = FileLog::new(1, Arc::clone(&segments[0]));
-        assert!(a.begin_sync().is_none(), "nothing written, nothing to sync");
-        a.append(Record {
-            shard: 0,
-            seq: 0,
-            payload: b"a",
-        })
-        .unwrap();
-        b.append(Record {
-            shard: 1,
-            seq: 0,
-            payload: b"b",
-        })
-        .unwrap();
-        a.flush().unwrap();
-        b.flush().unwrap();
-        let (at_a, at_b) = (a.flushed_through(), b.flushed_through());
-        assert_eq!((at_a, at_b), (Some(0), Some(0)));
-        let pending = a.begin_sync().expect("dirty: issued");
-        assert!(b.begin_sync().is_none(), "the same segment, already issued");
-        // Flushed during the flight: covered by the next sync, not this one.
-        a.append(Record {
-            shard: 0,
-            seq: 1,
-            payload: b"late",
-        })
-        .unwrap();
-        a.flush().unwrap();
-        pending.await.unwrap();
-        assert_eq!(a.sync_completed(at_a), Some(0), "what was flushed at issue");
-        assert_eq!(b.sync_completed(at_b), Some(0));
-        let next = a.begin_sync().expect("the late flush made it dirty again");
-        next.await.unwrap();
-        assert_eq!(a.sync_completed(a.flushed_through()), Some(1));
-    }
-
-    /// A failed sync is sticky for the segment until a snapshot covers it,
-    /// through the deferred path as through the blocking one.
-    #[tokio::test]
-    async fn a_failed_deferred_sync_freezes_every_shard_of_the_segment() {
-        let disk = MemDisk::default();
-        let wal = Path::new("/data/wal");
-        disk.create_dir_all(wal).unwrap();
-        let segments = open_segments(&disk, wal, 1, 1).unwrap();
-        let mut log = FileLog::new(0, Arc::clone(&segments[0]));
-        write(&mut log, 0, b"x");
-        log.append(Record {
-            shard: 0,
-            seq: 1,
-            payload: b"y",
-        })
-        .unwrap();
-        log.flush().unwrap();
-        disk.fail_syncs(true);
-        let pending = log.begin_sync().unwrap();
-        assert!(pending.await.is_err());
-        log.sync_failed();
-        disk.fail_syncs(false);
-        assert_eq!(
-            log.sync_completed(Some(1)),
-            Some(0),
-            "nothing proven by a failed sync"
-        );
-        log.append(Record {
-            shard: 0,
-            seq: 2,
-            payload: b"z",
-        })
-        .unwrap();
-        log.flush().unwrap();
-        let again = log.begin_sync().unwrap();
-        again.await.unwrap();
-        assert_eq!(log.sync_completed(Some(2)), Some(0), "nor by a later one");
-        rotate_segment(&disk, wal, 1, 0, &segments[0]).unwrap();
-        log.covered(1);
-        segment_snapshot_covered(&segments[0]);
-        assert_eq!(
-            log.sync_completed(Some(2)),
-            Some(2),
-            "a snapshot past the failure heals it"
-        );
-    }
-
-    /// A rotation syncs what the old file holds unsynced before it lets
-    /// go of it: the executor rotates whatever its policy left unsynced,
-    /// and a later sync of the new file must not claim records the old one
-    /// never made durable. A failure there is the sticky one.
-    #[test]
-    fn a_rotation_syncs_the_old_file_first_and_a_failure_there_is_sticky() {
-        let disk = MemDisk::default();
-        let wal = Path::new("/data/wal");
-        disk.create_dir_all(wal).unwrap();
-        let segments = open_segments(&disk, wal, 1, 1).unwrap();
-        let mut log = FileLog::new(0, Arc::clone(&segments[0]));
-        write(&mut log, 0, b"synced");
-        log.append(Record {
-            shard: 0,
-            seq: 1,
-            payload: b"unsynced",
-        })
-        .unwrap();
-        log.flush().unwrap();
-        disk.fail_one_sync_after(0);
-        assert!(
-            rotate_segment(&disk, wal, 1, 0, &segments[0]).is_err(),
-            "the old file's sync is the rotation's first step, and it failed"
-        );
-        assert_eq!(
-            log.sync_completed(Some(1)),
-            Some(0),
-            "the failure is sticky: no later sync proves the record"
-        );
-        rotate_segment(&disk, wal, 1, 0, &segments[0]).unwrap();
-        log.covered(1);
-        segment_snapshot_covered(&segments[0]);
-        assert_eq!(
-            log.sync_completed(Some(1)),
-            Some(1),
-            "until a snapshot covers it"
         );
     }
 }

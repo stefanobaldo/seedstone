@@ -230,6 +230,8 @@ pub(crate) mod mem {
     struct MemFs {
         dirs: BTreeSet<PathBuf>,
         files: BTreeMap<PathBuf, Vec<u8>>,
+        /// How many bytes of each file the last successful sync covered.
+        synced: BTreeMap<PathBuf, usize>,
         fail_writes: bool,
         /// The kind a failed write reports: `Other` unless a test names one.
         write_kind: WriteKind,
@@ -254,6 +256,12 @@ pub(crate) mod mem {
     impl MemFs {
         fn write_failure(&self) -> io::Error {
             io::Error::new(self.write_kind.0, "injected write failure")
+        }
+
+        /// Records that `path`'s current bytes are synced.
+        fn mark_synced(&mut self, path: &Path) {
+            let len = self.files.get(path).map_or(0, Vec::len);
+            self.synced.insert(path.to_path_buf(), len);
         }
 
         /// Whether the next file sync fails, counting the one-shot down.
@@ -295,6 +303,12 @@ pub(crate) mod mem {
         /// What `path` holds right now.
         pub fn contents(&self, path: &Path) -> Vec<u8> {
             self.lock().files.get(path).cloned().unwrap_or_default()
+        }
+
+        /// How many of `path`'s bytes the last successful sync of it
+        /// covered.
+        pub fn synced_len(&self, path: &Path) -> usize {
+            self.lock().synced.get(path).copied().unwrap_or(0)
         }
 
         /// Replaces what `path` holds — how a test plants damage.
@@ -355,22 +369,26 @@ pub(crate) mod mem {
         }
 
         fn sync_data(&mut self) -> io::Result<()> {
-            let failing = self.disk.lock().sync_fails();
-            if failing {
+            let mut fs = self.disk.lock();
+            if fs.sync_fails() {
                 return Err(io::Error::other("injected sync failure"));
             }
+            fs.mark_synced(&self.path);
+            drop(fs);
             Ok(())
         }
 
         /// The same decision as [`sync_data`](LogFile::sync_data), taken at
         /// the call, answered by a future that is already ready.
         fn sync_later(&self) -> SyncFuture {
-            let failing = self.disk.lock().sync_fails();
-            let result = if failing {
+            let mut fs = self.disk.lock();
+            let result = if fs.sync_fails() {
                 Err(io::Error::other("injected sync failure"))
             } else {
+                fs.mark_synced(&self.path);
                 Ok(())
             };
+            drop(fs);
             Box::pin(std::future::ready(result))
         }
     }
