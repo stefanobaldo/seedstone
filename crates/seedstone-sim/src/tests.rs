@@ -525,24 +525,25 @@ fn the_disk_bound_is_the_formula_and_a_peak_past_it_is_a_violation() {
         ratio: 1,
         bytes_per_tick: 4096,
     };
-    // S = 10 000, W = 500: 2S + max(2048, S) + W = 30 500 per executor.
+    // S = 10 000, W = 500: 2S + max(2048, S) + W = 30 500 per executor,
+    // and one closed segment of 4 096 for the node.
     assert_eq!(
-        disk_bound(4, config, 10_000, 500, 0),
-        4 * 30_500 + DISK_SLACK
+        disk_bound(4, config, 4096, 10_000, 500, 0),
+        4 * 30_500 + 4096 + DISK_SLACK
     );
     assert_eq!(
-        disk_bound(4, config, 10_000, 500, 1),
-        2 * 4 * 30_500 + DISK_SLACK,
+        disk_bound(4, config, 4096, 10_000, 500, 1),
+        2 * (4 * 30_500 + 4096) + DISK_SLACK,
         "a restart keeps the previous process's files beside the new one's"
     );
     assert_eq!(
-        disk_bound(4, config, 10_000, 500, 2),
-        3 * 4 * 30_500 + DISK_SLACK,
+        disk_bound(4, config, 4096, 10_000, 500, 2),
+        3 * (4 * 30_500 + 4096) + DISK_SLACK,
         "a second restart before the first one's round closed keeps three"
     );
     assert_eq!(
-        disk_bound(1, config, 100, 0, 0),
-        2 * 100 + 2048 + DISK_SLACK,
+        disk_bound(1, config, 4096, 100, 0, 0),
+        2 * 100 + 2048 + 4096 + DISK_SLACK,
         "the floor governs a small image"
     );
     let mut outcome = crate::outcome::nothing_observed();
@@ -852,7 +853,7 @@ fn the_node_refuses_as_one_and_resumes_one_executor_at_a_time() {
 fn a_run_that_never_completes_a_cycle_is_not_read_against_an_empty_bound() {
     let mut outcome = crate::outcome::nothing_observed();
     outcome.crashes = 2;
-    outcome.disk_bound_bytes = disk_bound(10, SIM_CHECKPOINT, 0, 0, 2);
+    outcome.disk_bound_bytes = disk_bound(10, SIM_CHECKPOINT, SIM_SEGMENT_BYTES, 0, 0, 2);
     assert_eq!(outcome.snapshot_cycles, 0);
     assert_eq!(outcome.disk_peak_bytes, 0, "nothing reported, nothing read");
     assert!(outcome.invariant_holds(), "{outcome:?}");
