@@ -273,22 +273,100 @@ fn damage_loses_only_the_records_in_the_hole() {
     );
 }
 
+/// Flips a byte inside the payload of the record that starts `at` bytes
+/// into the segment.
+fn corrupt_record_at(disk: &MemDisk, path: &Path, at: usize) {
+    let mut bytes = disk.contents(path);
+    bytes[at + 9 + 10 + 1] ^= 0xFF;
+    disk.overwrite(path, bytes);
+}
+
 #[test]
-fn damage_is_charged_to_every_shard() {
-    // One file holds every shard's records: a hole in it could have held
-    // either shard's, so both are lossy though shard 1 recovered
-    // everything it wrote.
+fn a_hole_is_charged_to_the_shards_with_nothing_after_it() {
+    // One file holds every shard's records, so a hole could have held any
+    // of them. A shard with an intact record after the hole would show
+    // what it lost there as a gap; one whose last record precedes it, or
+    // with none at all, would show nothing — those are the lossy ones.
     let disk = MemDisk::default();
+    let path = Path::new("/data/wal").join(segment_name(1, 0));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 1, 0, &put(b"b", b"1"));
+    let hole = disk.contents(&path).len();
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write(&mut seg, 2, 0, &put(b"c", b"1"));
+    corrupt_record_at(&disk, &path, hole);
+
+    let recovery = recover(spec(&disk, 3)).unwrap();
+    assert_eq!(recovery.report.holes, 1);
+    let lossy: Vec<bool> = recovery.shards.iter().map(|shard| shard.lossy).collect();
+    assert_eq!(
+        lossy,
+        [true, true, false],
+        "shard 0 has nothing intact, shard 1's last record precedes the hole, shard 2 \
+         has a record after it and no gap"
+    );
+    assert_eq!(recovery.shards[2].seq, 1);
+}
+
+#[test]
+fn a_gap_behind_a_hole_is_a_loss_the_shard_reports() {
+    // Shard 0's second record is in the hole and its third is intact
+    // after it: the gap is where it lost something, and with damage on
+    // disk that is a loss, not a cut nothing explains.
+    let disk = MemDisk::default();
+    let path = Path::new("/data/wal").join(segment_name(1, 0));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    let hole = disk.contents(&path).len();
+    write(&mut seg, 0, 1, &put(b"a", b"2"));
+    write(&mut seg, 0, 2, &put(b"a", b"3"));
+    write(&mut seg, 1, 0, &put(b"b", b"1"));
+    corrupt_record_at(&disk, &path, hole);
+
+    let recovery = recover(spec(&disk, 2)).unwrap();
+    assert_eq!(recovery.shards[0].seq, 1);
+    assert!(recovery.shards[0].cut);
+    assert!(recovery.shards[0].lossy);
+    assert!(
+        !recovery.shards[1].lossy,
+        "shard 1's only record is after the hole, and it starts at zero"
+    );
+}
+
+#[test]
+fn a_hole_across_rotations_is_judged_by_the_later_rotation() {
+    // A hole in the first rotation; shard 1 continues in the second with
+    // its next sequence, so it lost nothing there.
+    let disk = MemDisk::default();
+    let first = Path::new("/data/wal").join(segment_name(1, 0));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 1, 0, &put(b"b", b"1"));
+    let hole = disk.contents(&first).len();
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    let mut next = rotate(&disk, 1, 1);
+    write(&mut next, 1, 1, &put(b"b", b"2"));
+    corrupt_record_at(&disk, &first, hole);
+
+    let recovery = recover(spec(&disk, 2)).unwrap();
+    assert!(recovery.shards[0].lossy);
+    assert!(!recovery.shards[1].lossy);
+    assert_eq!(recovery.shards[1].seq, 2);
+}
+
+#[test]
+fn a_cut_tail_is_charged_to_every_shard() {
+    // A record the segment ends inside of: nothing intact follows, so any
+    // shard's last records may have been in it.
+    let disk = MemDisk::default();
+    let path = Path::new("/data/wal").join(segment_name(1, 0));
     let mut seg = wal(&disk, 1);
     write(&mut seg, 0, 0, &put(b"a", b"1"));
     write(&mut seg, 1, 0, &put(b"b", b"1"));
-    let path = Path::new("/data/wal").join(segment_name(1, 0));
     let mut bytes = disk.contents(&path);
-    bytes[SEGMENT_HEADER_LEN + 9 + 10 + 1] ^= 0xFF;
+    bytes.truncate(bytes.len() - 3);
     disk.overwrite(&path, bytes);
 
     let recovery = recover(spec(&disk, 2)).unwrap();
-    assert_eq!(recovery.shards[1].seq, 1);
     assert!(recovery.shards.iter().all(|shard| shard.lossy));
 }
 

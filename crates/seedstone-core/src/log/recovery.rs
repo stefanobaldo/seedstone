@@ -23,7 +23,11 @@
 //!    for the next older file.
 //! 4. **Tails.** Per shard, the gapless prefix from the chosen base — the
 //!    same prefix rule as ever, starting at the base rather than at `0` —
-//!    replayed over the image.
+//!    replayed over the image. One file holds every shard's records, so
+//!    damage in it is charged to each shard it may have cost without a
+//!    trace: one whose highest record precedes the latest hole, or that has
+//!    none. A shard with a record after the hole shows what it lost there
+//!    as a gap, and a gap on a disk with damage is reported as a loss.
 //! 5. **Garbage.** Every `.snap` no shard used and every `.seg` no kept
 //!    record came from is removed — unless damage was met reading it: a
 //!    read can fail where the next succeeds, and the file may be the only
@@ -205,6 +209,7 @@ pub fn recover<D: Disk>(spec: RecoverSpec<'_, D>) -> io::Result<Recovery> {
     for (index, file) in segments.iter().enumerate() {
         scan.segment(spec.disk, spec.wal, spec.reader, file, index)?;
     }
+    scan.charge_holes();
     let rebases = scan.rebases();
     let mut building = Building {
         dicts: (0..spec.shards)
@@ -363,9 +368,17 @@ struct Scan {
     report: Report,
     /// Per shard: `(seq, generation, file index, effect)`.
     buckets: Vec<Vec<(u64, u64, usize, Owned)>>,
-    /// Per shard: damage sat in a segment, which may have held any shard's
-    /// records.
+    /// Per shard: damage may have taken records of it that nothing else on
+    /// disk shows missing.
     damaged: Vec<bool>,
+    /// Intact records read so far, over every segment in order: where a
+    /// record or a hole sits in the node's log.
+    position: u64,
+    /// Per shard: the position of its record with the highest sequence.
+    last: Vec<Option<(u64, u64)>>,
+    /// The position of the latest damage: before the record read there,
+    /// or at a segment's end.
+    last_hole: Option<u64>,
     /// A loss nobody can attribute to a shard: every shard may have paid.
     unattributed_loss: bool,
     /// Per segment file: damage was met reading it. Such a file is never
@@ -379,6 +392,9 @@ impl Scan {
             report: Report::default(),
             buckets: (0..shards).map(|_| Vec::new()).collect(),
             damaged: vec![false; usize::from(shards)],
+            position: 0,
+            last: vec![None; usize::from(shards)],
+            last_hole: None,
             unattributed_loss: false,
             unread: vec![false; files],
         }
@@ -435,9 +451,18 @@ impl Scan {
         }
         let body_len = len.saturating_sub(SEGMENT_HEADER_LEN as u64);
         let mut reader = Reader::new(src, body_len, mode);
+        let mut holes = 0;
         loop {
             match reader.next_record() {
-                Ok(Some(item)) => self.item(&item, file.generation, index),
+                Ok(Some(item)) => {
+                    // A hole the reader stepped over to reach this record
+                    // lies before it.
+                    if reader.damage().holes > holes {
+                        holes = reader.damage().holes;
+                        self.last_hole = Some(self.position);
+                    }
+                    self.item(&item, file.generation, index);
+                }
                 Ok(None) => break,
                 Err(_) => {
                     self.abandon(index);
@@ -454,25 +479,50 @@ impl Scan {
         if damage.bytes > 0 || damage.holes > 0 || damage.truncated_tail > 0 {
             self.unread[index] = true;
         }
-        // A hole can swallow a shard's last records, leaving no gap behind
-        // to show for it; a cut tail can be a damaged length on the last
-        // record rather than a crash. One file holds every shard's records,
-        // so either may have cost any of them.
-        if damage.holes > 0 || damage.truncated_tail > 0 {
-            for hit in &mut self.damaged {
-                *hit = true;
-            }
+        // Damage at the segment's end — a hole nothing intact followed, or
+        // a cut tail, which can be a damaged length on the last record
+        // rather than a crash — lies after every record read so far.
+        if damage.holes > holes || damage.truncated_tail > 0 {
+            self.last_hole = Some(self.position);
         }
         Ok(())
+    }
+
+    /// Charges the latest hole to every shard whose highest record precedes
+    /// it, or that has none: those are the shards it may have taken records
+    /// from with nothing left to show for it.
+    ///
+    /// One file holds every shard's records, so a hole could have held any
+    /// of them. A shard with an intact record after it is not charged: its
+    /// sequences are contiguous, so whatever the hole took from it is a gap
+    /// below that record, which its prefix finds and [`replay_tails`]
+    /// reports as a loss because the disk had damage. The highest sequence
+    /// and not merely the last record read, so that an older record
+    /// written again after the hole does not stand in for the ones it took.
+    fn charge_holes(&mut self) {
+        let Some(hole) = self.last_hole else {
+            return;
+        };
+        for (damaged, last) in self.damaged.iter_mut().zip(&self.last) {
+            if last.is_none_or(|(_, at)| at < hole) {
+                *damaged = true;
+            }
+        }
     }
 
     /// One intact record, bucketed by shard.
     fn item(&mut self, item: &Item, generation: u64, file: usize) {
         self.report.records += 1;
+        let at = self.position;
+        self.position += 1;
         let Some(bucket) = self.buckets.get_mut(usize::from(item.shard)) else {
             self.report.malformed += 1;
             return;
         };
+        let last = &mut self.last[usize::from(item.shard)];
+        if last.is_none_or(|(seq, _)| item.seq >= seq) {
+            *last = Some((item.seq, at));
+        }
         if let Some(effect) = Effect::decode(&item.payload) {
             bucket.push((item.seq, generation, file, effect.to_owned()));
         } else {
@@ -741,7 +791,11 @@ fn replay_tails<D: Disk>(
         // A refused image is a loss only where the log does not reach what
         // it covered: short of its base, those records may be gone.
         let short_of_refused = chosen.refused[index].is_some_and(|refused| seq < refused);
-        let lossy = damaged || scan.unattributed_loss || short_of_refused;
+        // A gap where the disk had damage is records the damage took.
+        let lossy = damaged
+            || scan.unattributed_loss
+            || short_of_refused
+            || (gap && scan.last_hole.is_some());
         shards.push(RecoveredShard {
             dict,
             seq,
