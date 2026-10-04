@@ -1,15 +1,14 @@
 use super::*;
 use crate::dict::{Dict, DictSeed};
+use crate::log::disk::LogFile;
 use crate::log::disk::mem::{MemDisk, MemFile};
 use crate::log::effect::Effect;
 use crate::log::file::{
-    FORMAT_VERSION, FileLog, SEGMENT_HEADER_LEN, SharedSegment, encode_segment_header,
-    open_segments, rotate_segment, segment_name,
+    FORMAT_VERSION, SEGMENT_HEADER_LEN, create_segment, encode_segment_header, segment_name,
 };
 use crate::log::snapshot::{Footer, SnapshotHeader, encode_entry, snapshot_name};
-use crate::log::{Record, ReplicationLog};
+use crate::log::{Record, encode_record};
 use crate::shard::Now;
-use std::sync::Arc;
 use tokio::time::Instant;
 
 fn now() -> Now {
@@ -71,23 +70,31 @@ fn del(key: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A wal directory with one generation of `executors` segments, and the
-/// logs to write into them.
-fn wal(disk: &MemDisk, generation: u64, executors: u16) -> Vec<SharedSegment<MemFile>> {
+/// A wal directory with `generation`'s first segment, to write into.
+fn wal(disk: &MemDisk, generation: u64) -> MemFile {
     let dir = Path::new("/data/wal");
     disk.create_dir_all(dir).unwrap();
-    open_segments(disk, dir, generation, executors).unwrap()
+    create_segment(disk, dir, generation, 0).unwrap()
 }
 
-fn write(log: &mut FileLog<MemFile>, seq: u64, payload: &[u8]) {
-    log.append(Record {
-        shard: log.shard(),
-        seq,
-        payload,
-    })
-    .unwrap();
-    log.flush().unwrap();
-    log.sync().unwrap();
+/// The next rotation of `generation`'s segment, as the writer opens it.
+fn rotate(disk: &MemDisk, generation: u64, rotation: u32) -> MemFile {
+    create_segment(disk, Path::new("/data/wal"), generation, rotation).unwrap()
+}
+
+/// One record of `shard`, written and synced.
+fn write(file: &mut MemFile, shard: u16, seq: u64, payload: &[u8]) {
+    let mut bytes = Vec::new();
+    encode_record(
+        &Record {
+            shard,
+            seq,
+            payload,
+        },
+        &mut bytes,
+    );
+    file.write_all(&bytes).unwrap();
+    file.sync_data().unwrap();
 }
 
 /// One image entry: `(shard, key, value, deadline)`.
@@ -144,30 +151,21 @@ fn snapshot(
     .unwrap();
 }
 
-/// Rotates `segment` as the checkpoint does. Returns the new rotation.
-fn rotate(disk: &MemDisk, generation: u64, executor: u16, segment: &SharedSegment<MemFile>) -> u32 {
-    rotate_segment(disk, Path::new("/data/wal"), generation, executor, segment).unwrap()
-}
-
 #[test]
 fn records_are_recovered_per_shard_in_sequence_order_across_segments() {
     let disk = MemDisk::default();
-    // Generation 1: shard 0 on executor 0, shard 1 on executor 1.
-    let segments = wal(&disk, 1, 2);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    let mut s1 = FileLog::new(1, Arc::clone(&segments[1]));
-    write(&mut s0, 0, &put(b"a", b"1"));
-    write(&mut s1, 0, &put(b"b", b"1"));
-    write(&mut s0, 1, &put(b"a", b"2"));
-    // Generation 2: one executor, both shards on it.
-    let later = open_segments(&disk, Path::new("/data/wal"), 2, 1).unwrap();
-    let mut s0 = FileLog::new(0, Arc::clone(&later[0]));
-    let mut s1 = FileLog::new(1, Arc::clone(&later[0]));
-    write(&mut s1, 1, &put(b"b", b"2"));
-    write(&mut s0, 2, &put(b"a", b"3"));
+    // Generation 1: both shards in the node's segment.
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write(&mut seg, 1, 0, &put(b"b", b"1"));
+    write(&mut seg, 0, 1, &put(b"a", b"2"));
+    // Generation 2: the next process's segment.
+    let mut later = wal(&disk, 2);
+    write(&mut later, 1, 1, &put(b"b", b"2"));
+    write(&mut later, 0, 2, &put(b"a", b"3"));
 
     let recovery = recover(spec(&disk, 2)).unwrap();
-    assert_eq!(recovery.report.segments, 3);
+    assert_eq!(recovery.report.segments, 2);
     assert_eq!(recovery.report.records, 5);
     assert_eq!(recovery.report.applied, 5);
     assert_eq!(recovery.shards[0].seq, 3);
@@ -186,22 +184,20 @@ fn records_are_recovered_per_shard_in_sequence_order_across_segments() {
 #[test]
 fn records_a_cut_left_behind_never_return_on_a_later_start() {
     let disk = MemDisk::default();
-    let gen1 = wal(&disk, 1, 1);
-    let mut old = FileLog::new(0, Arc::clone(&gen1[0]));
-    write(&mut old, 0, &put(b"a", b"1"));
-    write(&mut old, 1, &put(b"a", b"2"));
+    let mut gen1 = wal(&disk, 1);
+    write(&mut gen1, 0, 0, &put(b"a", b"1"));
+    write(&mut gen1, 0, 1, &put(b"a", b"2"));
     write(&mut old, 3, &put(b"c", b"stale")); // seq 2 never written
-    write(&mut old, 4, &put(b"d", b"stale"));
+    write(&mut gen1, 0, 4, &put(b"d", b"stale"));
     let first = recover(spec(&disk, 1)).unwrap();
     assert_eq!(first.shards[0].seq, 2, "cut at the gap");
 
     // The next generation resumes at 2, as the node does after a cut.
-    let gen2 = wal(&disk, 2, 1);
-    let mut new = FileLog::new(0, Arc::clone(&gen2[0]));
+    let mut gen2 = wal(&disk, 2);
     let mut rebase = Vec::new();
     Effect::Rebase.encode(&mut rebase);
-    write(&mut new, 2, &rebase);
-    write(&mut new, 3, &put(b"b", b"new"));
+    write(&mut gen2, 0, 2, &rebase);
+    write(&mut gen2, 0, 3, &put(b"b", b"new"));
 
     let second = recover(spec(&disk, 1)).unwrap();
     let shard = &second.shards[0];
@@ -224,14 +220,12 @@ fn records_a_cut_left_behind_never_return_on_a_later_start() {
 #[test]
 fn a_gap_truncates_that_shard_and_nothing_else() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    let mut s1 = FileLog::new(1, Arc::clone(&segments[0]));
-    write(&mut s0, 0, &put(b"a", b"1"));
-    write(&mut s0, 1, &put(b"a", b"2"));
-    write(&mut s1, 0, &put(b"b", b"1"));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write(&mut seg, 0, 1, &put(b"a", b"2"));
+    write(&mut seg, 1, 0, &put(b"b", b"1"));
     write(&mut s0, 3, &put(b"a", b"4")); // seq 2 never written
-    write(&mut s1, 1, &put(b"b", b"2"));
+    write(&mut seg, 1, 1, &put(b"b", b"2"));
 
     let recovery = recover(spec(&disk, 2)).unwrap();
     assert_eq!(recovery.shards[0].seq, 2);
@@ -254,16 +248,13 @@ fn a_gap_truncates_that_shard_and_nothing_else() {
 }
 
 #[test]
-fn damage_in_one_segment_loses_only_the_records_in_the_hole() {
-    // Two executors, one shard each: the hole is in shard 0's segment.
+fn damage_loses_only_the_records_in_the_hole() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 2);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    let mut s1 = FileLog::new(1, Arc::clone(&segments[1]));
-    write(&mut s0, 0, &put(b"a", b"1"));
-    write(&mut s1, 0, &put(b"b", b"1"));
-    write(&mut s1, 1, &put(b"b", b"2"));
-    let path = Path::new("/data/wal").join(segment_name(1, 0, 0));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write(&mut seg, 1, 0, &put(b"b", b"1"));
+    write(&mut seg, 1, 1, &put(b"b", b"2"));
+    let path = Path::new("/data/wal").join(segment_name(1, 0));
     let mut bytes = disk.contents(&path);
     // Flip a byte inside the first record's payload.
     bytes[SEGMENT_HEADER_LEN + 9 + 10 + 1] ^= 0xFF;
@@ -276,29 +267,22 @@ fn damage_in_one_segment_loses_only_the_records_in_the_hole() {
         recovery.shards[0].dict.is_empty(),
         "shard 0's only record was in the hole"
     );
-    assert!(
-        recovery.shards[0].lossy,
-        "no gap shows the loss — nothing of shard 0 came after — so the damage in its segment must"
-    );
-    assert_eq!(recovery.shards[1].seq, 2, "shard 1 is untouched");
-    assert!(
-        !recovery.shards[1].lossy,
-        "its executor's segment was intact"
+    assert_eq!(
+        recovery.shards[1].seq, 2,
+        "shard 1's records outside the hole replay"
     );
 }
 
 #[test]
-fn damage_is_charged_to_every_shard_its_segment_hosted() {
-    // One executor hosting both shards: a hole in the segment could have
-    // held either shard's records, so both are lossy though shard 1
-    // recovered everything it wrote.
+fn damage_is_charged_to_every_shard() {
+    // One file holds every shard's records: a hole in it could have held
+    // either shard's, so both are lossy though shard 1 recovered
+    // everything it wrote.
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    let mut s1 = FileLog::new(1, Arc::clone(&segments[0]));
-    write(&mut s0, 0, &put(b"a", b"1"));
-    write(&mut s1, 0, &put(b"b", b"1"));
-    let path = Path::new("/data/wal").join(segment_name(1, 0, 0));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write(&mut seg, 1, 0, &put(b"b", b"1"));
+    let path = Path::new("/data/wal").join(segment_name(1, 0));
     let mut bytes = disk.contents(&path);
     bytes[SEGMENT_HEADER_LEN + 9 + 10 + 1] ^= 0xFF;
     disk.overwrite(&path, bytes);
@@ -309,28 +293,58 @@ fn damage_is_charged_to_every_shard_its_segment_hosted() {
 }
 
 #[test]
+fn a_directory_from_the_previous_format_refuses_the_start() {
+    let disk = MemDisk::default();
+    disk.create_dir_all(Path::new("/data/wal")).unwrap();
+    // The previous layout's header: magic, version 1, generation, executor,
+    // rotation, crc.
+    let mut header = Vec::new();
+    header.extend_from_slice(b"SSEG");
+    header.push(1);
+    header.extend_from_slice(&1u64.to_le_bytes());
+    header.extend_from_slice(&0u16.to_le_bytes());
+    header.extend_from_slice(&0u32.to_le_bytes());
+    let crc = crate::log::crc32_iso_hdlc(&header);
+    header.extend_from_slice(&crc.to_le_bytes());
+    // The name does not parse as a segment of this layout; the start must
+    // still read the header rather than ignore the file.
+    disk.write_file(
+        Path::new("/data/wal/0000000000000001-0000-00000000.seg"),
+        &header,
+    )
+    .unwrap();
+    let error = recover(spec(&disk, 2)).err().expect("refused");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(error.to_string().contains("predates"), "{error}");
+}
+
+#[test]
 fn a_newer_format_version_refuses_to_recover() {
     let disk = MemDisk::default();
-    wal(&disk, 1, 1);
+    wal(&disk, 1);
     let mut header = Vec::new();
-    encode_segment_header(2, 0, 0, &mut header);
+    encode_segment_header(2, 0, &mut header);
     header[4] = FORMAT_VERSION + 1;
-    disk.write_file(&Path::new("/data/wal").join(segment_name(2, 0, 0)), &header)
+    disk.write_file(&Path::new("/data/wal").join(segment_name(2, 0)), &header)
         .unwrap();
     let error = recover(spec(&disk, 1)).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-    assert!(error.to_string().contains("version 2"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("version {}", FORMAT_VERSION + 1)),
+        "{error}"
+    );
 }
 
 #[test]
 fn a_segment_with_a_bad_header_is_abandoned_and_every_shard_is_lossy() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s1 = FileLog::new(1, Arc::clone(&segments[0]));
-    write(&mut s1, 0, &put(b"b", b"1"));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 1, 0, &put(b"b", b"1"));
     // A header's length of bytes that are not a header.
     disk.write_file(
-        &Path::new("/data/wal").join(segment_name(2, 0, 0)),
+        &Path::new("/data/wal").join(segment_name(2, 0)),
         &[b'j'; crate::log::file::SEGMENT_HEADER_LEN],
     )
     .unwrap();
@@ -345,10 +359,9 @@ fn a_segment_with_a_bad_header_is_abandoned_and_every_shard_is_lossy() {
 #[test]
 fn a_segment_that_could_not_be_read_is_kept_for_the_next_start() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    write(&mut s0, 0, &put(b"a", b"1"));
-    let path = Path::new("/data/wal").join(segment_name(1, 0, 0));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    let path = Path::new("/data/wal").join(segment_name(1, 0));
     let good = disk.contents(&path);
     let mut bad = good.clone();
     bad[0] ^= 0xFF;
@@ -366,11 +379,10 @@ fn a_segment_that_could_not_be_read_is_kept_for_the_next_start() {
 #[test]
 fn a_malformed_payload_ends_that_shards_prefix() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    write(&mut s0, 0, &put(b"a", b"1"));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
     write(&mut s0, 1, &[99]); // no such tag
-    write(&mut s0, 2, &put(b"a", b"3"));
+    write(&mut seg, 0, 2, &put(b"a", b"3"));
     let recovery = recover(spec(&disk, 1)).unwrap();
     assert_eq!(recovery.report.malformed, 1);
     assert_eq!(recovery.shards[0].seq, 1);
@@ -402,12 +414,11 @@ fn a_missing_directory_is_an_error_and_an_empty_one_is_a_fresh_node() {
 #[test]
 fn an_image_plus_its_tail_replays_to_the_state_and_the_covered_segment_goes() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    write(&mut s0, 0, &put(b"a", b"1"));
-    write(&mut s0, 1, &put(b"a", b"2"));
-    write(&mut s0, 2, &put(b"b", b"1"));
-    write(&mut s0, 3, &put(b"c", b"1"));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write(&mut seg, 0, 1, &put(b"a", b"2"));
+    write(&mut seg, 0, 2, &put(b"b", b"1"));
+    write(&mut seg, 0, 3, &put(b"c", b"1"));
     // The cycle: rotation 1 from seq 4, the image taken fuzzily.
     snapshot(
         &disk,
@@ -422,9 +433,9 @@ fn an_image_plus_its_tail_replays_to_the_state_and_the_covered_segment_goes() {
         ],
         true,
     );
-    rotate(&disk, 1, 0, &segments[0]);
-    write(&mut s0, 4, &del(b"b"));
-    write(&mut s0, 5, &put(b"c", b"9"));
+    seg = rotate(&disk, 1, 1);
+    write(&mut seg, 0, 4, &del(b"b"));
+    write(&mut seg, 0, 5, &put(b"c", b"9"));
 
     let recovery = recover(spec(&disk, 1)).unwrap();
     let shard = &recovery.shards[0];
@@ -438,17 +449,16 @@ fn an_image_plus_its_tail_replays_to_the_state_and_the_covered_segment_goes() {
         "rotation 0 is below every base"
     );
     let names = disk.list(Path::new("/data/wal")).unwrap();
-    assert!(!names.contains(&segment_name(1, 0, 0)), "{names:?}");
-    assert!(names.contains(&segment_name(1, 0, 1)) && names.contains(&snapshot_name(1, 0, 0)));
+    assert!(!names.contains(&segment_name(1, 0)), "{names:?}");
+    assert!(names.contains(&segment_name(1, 1)) && names.contains(&snapshot_name(1, 0, 0)));
 }
 
 #[test]
 fn a_snapshot_without_a_footer_is_ignored_and_removed_and_the_log_carries_the_shard() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    write(&mut s0, 0, &put(b"a", b"1"));
-    write(&mut s0, 1, &put(b"b", b"1"));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write(&mut seg, 0, 1, &put(b"b", b"1"));
     snapshot(&disk, 1, 0, 0, &[(0, 2)], &[(0, b"a", b"1", None)], false);
     let recovery = recover(spec(&disk, 1)).unwrap();
     assert_eq!(
@@ -480,9 +490,8 @@ fn a_snapshot_without_a_footer_is_ignored_and_removed_and_the_log_carries_the_sh
 #[test]
 fn a_torn_unfinished_snapshot_is_refused_without_a_loss() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    write(&mut s0, 0, &put(b"a", b"1"));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
     snapshot(
         &disk,
         1,
@@ -509,11 +518,10 @@ fn a_torn_unfinished_snapshot_is_refused_without_a_loss() {
 #[test]
 fn an_unfinished_snapshot_with_a_hole_is_refused_without_a_loss_while_the_log_covers_it() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    write(&mut s0, 0, &put(b"a", b"1"));
-    write(&mut s0, 1, &put(b"b", b"1"));
-    write(&mut s0, 2, &put(b"c", b"1"));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write(&mut seg, 0, 1, &put(b"b", b"1"));
+    write(&mut seg, 0, 2, &put(b"c", b"1"));
     snapshot(
         &disk,
         1,
@@ -557,10 +565,9 @@ fn an_unfinished_snapshot_with_a_hole_is_refused_without_a_loss_while_the_log_co
 #[test]
 fn the_planted_recovery_trusts_an_unfinished_snapshot_and_loses_the_rest() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    write(&mut s0, 0, &put(b"a", b"1"));
-    write(&mut s0, 1, &put(b"b", b"1"));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write(&mut seg, 0, 1, &put(b"b", b"1"));
     snapshot(&disk, 1, 0, 0, &[(0, 2)], &[(0, b"a", b"1", None)], false);
     let mut planted = spec(&disk, 1);
     planted.trust_unfinished = true;
@@ -576,8 +583,7 @@ fn the_planted_recovery_trusts_an_unfinished_snapshot_and_loses_the_rest() {
 #[test]
 fn a_snapshot_whose_counts_do_not_match_falls_back_to_the_older_image() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
+    let mut seg = wal(&disk, 1);
     let log: [(&[u8], &[u8]); 6] = [
         (b"a", b"1"),
         (b"b", b"1"),
@@ -587,7 +593,7 @@ fn a_snapshot_whose_counts_do_not_match_falls_back_to_the_older_image() {
         (b"e", b"1"),
     ];
     for (seq, (key, value)) in (0u64..).zip(log) {
-        write(&mut s0, seq, &put(key, value));
+        write(&mut seg, 0, seq, &put(key, value));
     }
     snapshot(
         &disk,
@@ -654,13 +660,12 @@ fn a_snapshot_whose_counts_do_not_match_falls_back_to_the_older_image() {
 fn a_shard_whose_only_image_is_refused_and_whose_log_was_compacted_is_cut_lossy_and_reported() {
     let disk = MemDisk::default();
     // Rotation 0 was deleted by a compaction; rotation 1 holds 4 and 5.
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    rotate(&disk, 1, 0, &segments[0]);
-    disk.remove_file(&Path::new("/data/wal").join(segment_name(1, 0, 0)))
+    let mut seg = wal(&disk, 1);
+    seg = rotate(&disk, 1, 1);
+    disk.remove_file(&Path::new("/data/wal").join(segment_name(1, 0)))
         .unwrap();
-    write(&mut s0, 4, &put(b"x", b"4"));
-    write(&mut s0, 5, &put(b"y", b"5"));
+    write(&mut seg, 0, 4, &put(b"x", b"4"));
+    write(&mut seg, 0, 5, &put(b"y", b"5"));
     // The finished image the compaction relied on, its footer damaged.
     snapshot(&disk, 1, 0, 0, &[(0, 4)], &[(0, b"a", b"1", None)], true);
     let path = Path::new("/data/wal").join(snapshot_name(1, 0, 0));
@@ -691,10 +696,9 @@ fn a_snapshot_is_dead_for_a_shard_a_newer_generation_rebased_below_its_base() {
     let disk = MemDisk::default();
     // Generation 1: records 0..=1, then a snapshot with base 4 whose image
     // holds a value only the (missing) records 2..=3 could have produced.
-    let gen1 = wal(&disk, 1, 1);
-    let mut old = FileLog::new(0, Arc::clone(&gen1[0]));
-    write(&mut old, 0, &put(b"x", b"old"));
-    write(&mut old, 1, &put(b"y", b"old"));
+    let mut gen1 = wal(&disk, 1);
+    write(&mut gen1, 0, 0, &put(b"x", b"old"));
+    write(&mut gen1, 0, 1, &put(b"y", b"old"));
     snapshot(
         &disk,
         1,
@@ -706,12 +710,11 @@ fn a_snapshot_is_dead_for_a_shard_a_newer_generation_rebased_below_its_base() {
     );
     // Generation 2 refused that snapshot (say its read was corrupted),
     // cut the log at the gap at 2, and rebased there.
-    let gen2 = open_segments(&disk, Path::new("/data/wal"), 2, 1).unwrap();
-    let mut new = FileLog::new(0, Arc::clone(&gen2[0]));
+    let mut gen2 = wal(&disk, 2);
     let mut rebase = Vec::new();
     Effect::Rebase.encode(&mut rebase);
-    write(&mut new, 2, &rebase);
-    write(&mut new, 3, &put(b"x", b"new"));
+    write(&mut gen2, 0, 2, &rebase);
+    write(&mut gen2, 0, 3, &put(b"x", b"new"));
 
     let recovery = recover(spec(&disk, 1)).unwrap();
     let shard = &recovery.shards[0];
@@ -733,7 +736,7 @@ fn a_snapshot_is_dead_for_a_shard_a_newer_generation_rebased_below_its_base() {
 #[test]
 fn a_header_naming_a_shard_outside_the_node_is_refused() {
     let disk = MemDisk::default();
-    wal(&disk, 1, 1);
+    wal(&disk, 1);
     snapshot(&disk, 1, 0, 0, &[(5, 0)], &[], true);
     let recovery = recover(spec(&disk, 2)).unwrap();
     assert_eq!(recovery.report.snapshots_refused, 1);
@@ -754,7 +757,7 @@ fn a_header_naming_a_shard_outside_the_node_is_refused() {
 #[test]
 fn a_snapshot_header_that_fails_its_checksum_makes_every_shard_lossy() {
     let disk = MemDisk::default();
-    wal(&disk, 1, 1);
+    wal(&disk, 1);
     snapshot(&disk, 1, 0, 0, &[(0, 0), (1, 0)], &[], true);
     let path = Path::new("/data/wal").join(snapshot_name(1, 0, 0));
     let mut bytes = disk.contents(&path);
@@ -768,10 +771,9 @@ fn a_snapshot_header_that_fails_its_checksum_makes_every_shard_lossy() {
 #[test]
 fn a_crash_between_the_two_directory_syncs_leaves_both_snapshots_and_the_newer_wins() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    write(&mut s0, 0, &put(b"a", b"1"));
-    write(&mut s0, 1, &put(b"b", b"1"));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write(&mut seg, 0, 1, &put(b"b", b"1"));
     snapshot(
         &disk,
         1,
@@ -781,9 +783,9 @@ fn a_crash_between_the_two_directory_syncs_leaves_both_snapshots_and_the_newer_w
         &[(0, b"a", b"1", None), (0, b"b", b"1", None)],
         true,
     );
-    rotate(&disk, 1, 0, &segments[0]);
-    write(&mut s0, 2, &put(b"a", b"2"));
-    write(&mut s0, 3, &put(b"c", b"1"));
+    seg = rotate(&disk, 1, 1);
+    write(&mut seg, 0, 2, &put(b"a", b"2"));
+    write(&mut seg, 0, 3, &put(b"c", b"1"));
     snapshot(
         &disk,
         1,
@@ -797,8 +799,8 @@ fn a_crash_between_the_two_directory_syncs_leaves_both_snapshots_and_the_newer_w
         ],
         true,
     );
-    rotate(&disk, 1, 0, &segments[0]);
-    write(&mut s0, 4, &del(b"a"));
+    seg = rotate(&disk, 1, 2);
+    write(&mut seg, 0, 4, &del(b"a"));
 
     let recovery = recover(spec(&disk, 1)).unwrap();
     assert_eq!(
@@ -818,9 +820,9 @@ fn a_crash_between_the_two_directory_syncs_leaves_both_snapshots_and_the_newer_w
             .is_some_and(|ext| ext == "seg" || ext == "snap")
     });
     names.sort();
-    // Sorted by name: the generation and executor tie, so rotation 1's
-    // snapshot sorts before rotation 2's segment.
-    assert_eq!(names, [snapshot_name(1, 0, 1), segment_name(1, 0, 2)]);
+    // Sorted by name: the generations tie, and a snapshot's executor field
+    // sorts before a segment's rotation.
+    assert_eq!(names, [snapshot_name(1, 0, 1), segment_name(1, 2)]);
 }
 
 #[test]
@@ -828,15 +830,13 @@ fn an_executor_count_change_finds_a_shards_image_in_an_older_generations_file() 
     let disk = MemDisk::default();
     // Generation 1, two executors: shard 1 lived on executor 1, which
     // snapshotted it.
-    let gen1 = wal(&disk, 1, 2);
-    let mut s1 = FileLog::new(1, Arc::clone(&gen1[1]));
-    write(&mut s1, 0, &put(b"k", b"v"));
+    let mut gen1 = wal(&disk, 1);
+    write(&mut gen1, 1, 0, &put(b"k", b"v"));
     snapshot(&disk, 1, 1, 0, &[(1, 1)], &[(1, b"k", b"v", None)], true);
     // Generation 2, one executor: it wrote shard 1's record 1 and never
     // completed a cycle.
-    let gen2 = open_segments(&disk, Path::new("/data/wal"), 2, 1).unwrap();
-    let mut s1 = FileLog::new(1, Arc::clone(&gen2[0]));
-    write(&mut s1, 1, &put(b"k2", b"v2"));
+    let mut gen2 = wal(&disk, 2);
+    write(&mut gen2, 1, 1, &put(b"k2", b"v2"));
 
     let recovery = recover(spec(&disk, 2)).unwrap();
     assert_eq!(
@@ -855,8 +855,7 @@ fn an_executor_count_change_finds_a_shards_image_in_an_older_generations_file() 
 #[test]
 fn a_flush_in_the_tail_clears_the_image() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
+    let mut seg = wal(&disk, 1);
     snapshot(
         &disk,
         1,
@@ -866,11 +865,11 @@ fn a_flush_in_the_tail_clears_the_image() {
         &[(0, b"a", b"1", None), (0, b"b", b"1", None)],
         true,
     );
-    rotate(&disk, 1, 0, &segments[0]);
+    seg = rotate(&disk, 1, 1);
     let mut flush = Vec::new();
     Effect::Flush.encode(&mut flush);
-    write(&mut s0, 2, &flush);
-    write(&mut s0, 3, &put(b"c", b"1"));
+    write(&mut seg, 0, 2, &flush);
+    write(&mut seg, 0, 3, &put(b"c", b"1"));
     let recovery = recover(spec(&disk, 1)).unwrap();
     assert_eq!(contents(&recovery.shards[0].dict), pairs(&[(b"c", b"1")]));
 }
@@ -878,8 +877,7 @@ fn a_flush_in_the_tail_clears_the_image() {
 #[test]
 fn a_passed_deadline_in_the_image_is_removed_unless_the_tail_moved_it() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
+    let mut seg = wal(&disk, 1);
     snapshot(
         &disk,
         1,
@@ -893,14 +891,14 @@ fn a_passed_deadline_in_the_image_is_removed_unless_the_tail_moved_it() {
         ],
         true,
     );
-    rotate(&disk, 1, 0, &segments[0]);
+    seg = rotate(&disk, 1, 1);
     let mut moved = Vec::new();
     Effect::Deadline {
         key: b"moved",
         deadline: Some(2_000_000),
     }
     .encode(&mut moved);
-    write(&mut s0, 2, &moved);
+    write(&mut seg, 0, 2, &moved);
     let recovery = recover(spec(&disk, 1)).unwrap();
     let dict = &recovery.shards[0].dict;
     assert!(dict.get(b"stale").is_none());
@@ -911,7 +909,7 @@ fn a_passed_deadline_in_the_image_is_removed_unless_the_tail_moved_it() {
 #[test]
 fn a_snapshot_from_a_newer_format_version_refuses_the_start() {
     let disk = MemDisk::default();
-    wal(&disk, 1, 1);
+    wal(&disk, 1);
     let header = SnapshotHeader {
         generation: 1,
         executor: 0,
@@ -927,27 +925,6 @@ fn a_snapshot_from_a_newer_format_version_refuses_the_start() {
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 }
 
-/// Damage in a segment is charged to the shards of the executor that wrote
-/// it, and a start knows how many executors a generation ran only from the
-/// segments it finds. So every executor's newest rotation stays, even with
-/// nothing in it, until the round removes the whole generation: were the
-/// highest executor's to go, the next start would count one executor fewer
-/// and charge damage to the wrong shards.
-#[test]
-fn every_executors_newest_segment_stays_even_when_it_holds_nothing() {
-    let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 2);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    write(&mut s0, 0, &put(b"a", b"1"));
-    let recovery = recover(spec(&disk, 2)).unwrap();
-    assert_eq!(recovery.report.files_removed, 0);
-    let names = disk.list(Path::new("/data/wal")).unwrap();
-    assert!(
-        names.contains(&segment_name(1, 1, 0)),
-        "executor 1's only segment, empty, stays: {names:?}"
-    );
-}
-
 /// A finished snapshot whose footer was lost — here cut short, so the file
 /// reads as one a crash interrupted — after compaction removed the log it
 /// covered. Nothing on disk says whether it was ever finished, but the log
@@ -956,12 +933,11 @@ fn every_executors_newest_segment_stays_even_when_it_holds_nothing() {
 #[test]
 fn an_unfinished_looking_snapshot_whose_log_is_gone_is_a_loss_and_is_kept() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    rotate(&disk, 1, 0, &segments[0]);
-    disk.remove_file(&Path::new("/data/wal").join(segment_name(1, 0, 0)))
+    let mut seg = wal(&disk, 1);
+    seg = rotate(&disk, 1, 1);
+    disk.remove_file(&Path::new("/data/wal").join(segment_name(1, 0)))
         .unwrap();
-    write(&mut s0, 4, &put(b"x", b"4"));
+    write(&mut seg, 0, 4, &put(b"x", b"4"));
     snapshot(&disk, 1, 0, 0, &[(0, 4)], &[(0, b"a", b"1", None)], true);
     let path = Path::new("/data/wal").join(snapshot_name(1, 0, 0));
     let mut bytes = disk.contents(&path);
@@ -985,17 +961,13 @@ fn an_unfinished_looking_snapshot_whose_log_is_gone_is_a_loss_and_is_kept() {
 #[test]
 fn a_segment_shorter_than_its_header_held_nothing_and_is_not_damage() {
     let disk = MemDisk::default();
-    let segments = wal(&disk, 1, 1);
-    let mut s0 = FileLog::new(0, Arc::clone(&segments[0]));
-    write(&mut s0, 0, &put(b"a", b"1"));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
     let mut partial = Vec::new();
-    crate::log::file::encode_segment_header(1, 0, 1, &mut partial);
+    crate::log::file::encode_segment_header(1, 1, &mut partial);
     partial.truncate(7);
-    disk.write_file(
-        &Path::new("/data/wal").join(segment_name(1, 0, 1)),
-        &partial,
-    )
-    .unwrap();
+    disk.write_file(&Path::new("/data/wal").join(segment_name(1, 1)), &partial)
+        .unwrap();
     let recovery = recover(spec(&disk, 2)).unwrap();
     assert_eq!(
         recovery.report.abandoned_segments, 0,
