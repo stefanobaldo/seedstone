@@ -65,10 +65,11 @@ fn the_honest_node_holds_under_every_policy_and_is_crashed_mid_flight_on_some_se
     }
 }
 
-/// Releasing a batch at issue rather than at completion loses an
-/// acknowledged write to a crash inside the flight.
+/// The writer reporting a batch durable at the sync's issue rather than at
+/// its completion releases an acknowledged write a crash inside the flight
+/// takes.
 #[test]
-fn releasing_before_the_sync_completes_is_caught() {
+fn durable_on_issue_is_caught() {
     let caught = (1..=SEEDS).find(|seed| {
         let outcome = standard(*seed, SyncPolicy::ALWAYS, Some(Plant::DurableOnIssue));
         outcome.lost_durable_writes > 0
@@ -83,24 +84,27 @@ fn releasing_before_the_sync_completes_is_caught() {
     );
 }
 
-/// Raising the point to what was flushed during the flight claims as
-/// durable what the sync never covered.
+/// The writer naming, at a sync's completion, the last batch written then
+/// rather than the one frozen at its issue claims as durable what the sync
+/// never covered. Shown at `always`, where the claim releases replies: the
+/// next sync, issued at once, covers them, and a crash inside its flight
+/// takes them.
 #[test]
-fn syncing_from_the_point_of_now_rather_than_of_issue_is_caught() {
+fn durable_from_written_now_is_caught() {
     let caught = (1..=SEEDS).find(|seed| {
         let outcome = standard(
             *seed,
-            SyncPolicy::INTERVAL,
+            SyncPolicy::ALWAYS,
             Some(Plant::DurableFromWrittenNow),
         );
         outcome.lost_durable_writes > 0 || outcome.lost_durable_prefixes > 0
     });
     let Some(seed) = caught else {
-        panic!("no seed in 1..={SEEDS} surfaced the point of now — investigate, do not widen")
+        panic!("no seed in 1..={SEEDS} surfaced the batch of now — investigate, do not widen")
     };
     eprintln!("durable-from-written-now: first caught on seed {seed}");
     assert!(
-        standard(seed, SyncPolicy::INTERVAL, None).invariant_holds(),
+        standard(seed, SyncPolicy::ALWAYS, None).invariant_holds(),
         "seed {seed} is not clean without the plant"
     );
 }
