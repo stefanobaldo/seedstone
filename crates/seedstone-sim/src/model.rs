@@ -564,6 +564,10 @@ impl Model {
                         }
                         _ => None,
                     };
+                    // A deadline the server took: something that can die.
+                    if self.deadlines[*slot as usize].is_some() {
+                        lock(&self.shared.tally).volatile_acked += 1;
+                    }
                     self.volatile_acked[*slot as usize] = Some(acked);
                     self.volatile_kept[*slot as usize] = None;
                 }
@@ -575,6 +579,10 @@ impl Model {
                         Frame::Integer(1) => Some(Deadline::new(*deadline, sent, received)),
                         _ => None,
                     };
+                    // A deadline the server took: something that can die.
+                    if self.deadlines[*slot as usize].is_some() {
+                        lock(&self.shared.tally).volatile_acked += 1;
+                    }
                     self.volatile_acked[*slot as usize] = Some(acked);
                     self.volatile_kept[*slot as usize] = None;
                 }
@@ -1096,7 +1104,7 @@ impl Model {
                 if reply == Frame::Simple("OK".into()) {
                     stable.insert(name);
                 } else if is_refusal(&reply) {
-                    maybe.insert(name);
+                    self.refused_maybe(&mut maybe, name);
                 }
             }
         }
@@ -1153,6 +1161,13 @@ impl Model {
     /// walk built out of them has no cursor in flight between its steps.
     const fn names_a_count(&self) -> bool {
         !self.id.is_multiple_of(2)
+    }
+
+    /// A walk's write the node refused: counted with every other refusal,
+    /// and its key one that may be there or not.
+    fn refused_maybe(&self, maybe: &mut BTreeSet<Vec<u8>>, name: Vec<u8>) {
+        lock(&self.shared.tally).refused += 1;
+        maybe.insert(name);
     }
 
     /// Drives the `SCAN` half of [`Model::walk`] and reports what it found,
@@ -1231,7 +1246,7 @@ impl Model {
                 if *reply == Frame::Simple("OK".into()) {
                     written.push(name.clone());
                 } else if is_refusal(reply) {
-                    maybe.insert(name.clone().into_bytes());
+                    self.refused_maybe(&mut maybe, name.clone().into_bytes());
                 }
             }
             for (name, reply) in targets.iter().zip(&replies[fresh.len()..]) {
@@ -1242,7 +1257,7 @@ impl Model {
                 if matches!(reply, Frame::Integer(_)) {
                     gone.insert(name.clone().into_bytes());
                 } else if is_refusal(reply) {
-                    maybe.insert(name.clone().into_bytes());
+                    self.refused_maybe(&mut maybe, name.clone().into_bytes());
                 }
             }
 

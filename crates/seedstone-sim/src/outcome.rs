@@ -170,6 +170,22 @@ pub struct SimOutcome {
     /// of the refusal that fault began: each is a promise the refusal says
     /// the node does not make.
     pub acked_while_refusing: u64,
+    /// Writes an executor answered with the refusal at the command, already
+    /// refusing before the batch: certain non-writes.
+    pub refused_certain: u64,
+    /// Held writes an executor answered with the refusal at a fault:
+    /// applied, never acknowledged. With the count above, every refusal the
+    /// clients saw — a refusal the server cannot account for is a write
+    /// refused after it was applied outside the held path.
+    pub refused_applied: u64,
+    /// Held writes released as success while their executor was refusing:
+    /// the case `acked_while_refusing`, read at the command, cannot see.
+    pub released_while_refusing: u64,
+    /// Volatile writes the clients saw take their deadline: a run with any
+    /// owes its expiration checks, refused or not.
+    pub volatile_acked: u64,
+    /// Rotations of the node's segment that failed.
+    pub rotate_faults: u64,
     /// Whether the run's disk could fail and lie, which is what decides
     /// whether a reported loss is excused.
     pub hostile: bool,
@@ -281,10 +297,22 @@ impl SimOutcome {
             // write: on a disk that raised no error it is a defect, and on
             // one that did, it follows a fault.
             && (self.hostile || self.refused == 0)
-            && (self.refused == 0 || self.write_faults + self.sync_faults > 0)
+            && (self.refused == 0
+                || self.write_faults + self.sync_faults + self.rotate_faults > 0)
             // And the converse, read on the node's own answers: after a
-            // fault, no write is done until the refusal it began is over.
+            // fault, no write is done until the refusal it began is over —
+            // neither at the command nor at the release of a held write.
             && self.acked_while_refusing == 0
+            && self.released_while_refusing == 0
+            // Every refusal the clients saw is one the server counted: at
+            // the command, or to a held write at a fault. A crash can take
+            // a refusal's reply before a client reads it, so across one the
+            // server may count more; never fewer.
+            && (if self.crashes == 0 {
+                self.refused == self.refused_certain + self.refused_applied
+            } else {
+                self.refused <= self.refused_certain + self.refused_applied
+            })
     }
 
     /// Whether the run's invariants decided anything at all.
@@ -298,9 +326,10 @@ impl SimOutcome {
     pub const fn invariants_were_exercised(&self) -> bool {
         // A run that refused may have had every write to the volatile
         // family refused, and a key with no deadline the server took has
-        // nothing to die by: the expiration checks are owed only by a run
-        // whose node never refused a write.
-        let expiry = self.refused > 0 || (self.dead_checks > 0 && self.alive_checks > 0);
+        // nothing to die by: the expiration checks are excused only for a
+        // run that refused and saw no volatile write taken.
+        let expiry = (self.refused > 0 && self.volatile_acked == 0)
+            || (self.dead_checks > 0 && self.alive_checks > 0);
         self.expected_sum != 0
             && expiry
             && self.plain_checks > 0
@@ -393,6 +422,11 @@ pub const fn nothing_observed() -> SimOutcome {
         refused: 0,
         refusals_ended: 0,
         acked_while_refusing: 0,
+        refused_certain: 0,
+        refused_applied: 0,
+        released_while_refusing: 0,
+        volatile_acked: 0,
+        rotate_faults: 0,
         hostile: false,
         snapshot_cycles: 0,
         compactions: 0,
@@ -472,8 +506,8 @@ pub struct Shared {
     /// shard belongs to.
     pub shards: u16,
     pub executors: u16,
-    /// Per executor, whether it is between a log fault and the end of the
-    /// refusal that fault began, as the trace reports it.
+    /// Per executor, whether it is between its own refusal — the node's log
+    /// failed and it heard so — and the end of it, as the trace reports it.
     pub refusing: Arc<Mutex<Vec<bool>>>,
     /// Syncs issued, and syncs completed or failed, over the node's current
     /// process: a crash with the first ahead of the second landed with one
@@ -514,12 +548,6 @@ impl Shared {
     pub fn set_refusing(&self, shard: u16, refusing: bool) {
         let executor = executor_of(shard, self.shards, self.executors);
         lock(&self.refusing)[usize::from(executor)] = refusing;
-    }
-
-    /// Marks every executor as refusing: the node's log failed, and the
-    /// refusal begins for all of them at once.
-    pub fn set_all_refusing(&self) {
-        lock(&self.refusing).fill(true);
     }
 
     /// Notes that the writer issued `round` at `at`, forgetting rounds old
@@ -624,6 +652,11 @@ pub struct Tally {
     pub refusals_ended: u64,
     /// Writes answered as done by a refusing executor.
     pub acked_while_refusing: u64,
+    /// See [`SimOutcome`], whose fields these become.
+    pub refused_certain: u64,
+    pub refused_applied: u64,
+    pub released_while_refusing: u64,
+    pub volatile_acked: u64,
     /// Client hosts that finished their bursts and are waiting, at rest,
     /// for the driver.
     pub paused: u32,
