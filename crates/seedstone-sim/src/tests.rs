@@ -679,6 +679,7 @@ fn a_crash_records_whether_a_sync_was_in_flight() {
 fn a_refusal_on_a_disk_that_raises_no_error_is_a_violation() {
     let mut outcome = crate::outcome::nothing_observed();
     outcome.refused = 1;
+    outcome.refused_certain = 1;
     assert!(!outcome.invariant_holds(), "no fault, yet a refusal");
     outcome.hostile = true;
     assert!(
@@ -731,6 +732,7 @@ fn a_run_that_refused_is_held_to_the_counter_range() {
     outcome.hostile = true;
     outcome.write_faults = 1;
     outcome.refused = 1;
+    outcome.refused_applied = 1;
     outcome.expected_sum = 5;
     outcome.actual_sum = 7;
     outcome.counter_floor = 5;
@@ -751,10 +753,54 @@ fn a_write_acknowledged_by_a_refusing_executor_is_a_violation() {
     assert!(!outcome.invariant_holds());
 }
 
-/// A run that refused writes owes no expiration check: its volatile writes
-/// may all have been refused. Everything else it still owes.
+/// The server's two counts of its refusals add up to what the clients saw:
+/// one answered at the command, the executor already refusing, and one
+/// answered to a held write at a fault, applied and never acknowledged. A
+/// refusal outside both is a write refused after it was applied somewhere
+/// the held path does not reach.
 #[test]
-fn a_run_that_refused_owes_no_expiration_check() {
+fn every_refused_reply_is_either_certain_or_applied_and_a_third_kind_is_a_violation() {
+    let mut outcome = crate::outcome::nothing_observed();
+    outcome.hostile = true;
+    outcome.write_faults = 1;
+    outcome.refused = 5;
+    outcome.refused_certain = 3;
+    outcome.refused_applied = 2;
+    assert!(outcome.invariant_holds());
+    outcome.refused_applied = 1;
+    assert!(
+        !outcome.invariant_holds(),
+        "one refusal the server cannot account for"
+    );
+    outcome.refused_applied = 3;
+    assert!(
+        !outcome.invariant_holds(),
+        "with no crash to take it, a refusal no client read"
+    );
+    outcome.crashes = 1;
+    assert!(
+        outcome.invariant_holds(),
+        "a crash may take a refusal's reply"
+    );
+}
+
+/// `acked_while_refusing` reads at the command, before a later fault; a held
+/// write released as success once its executor was refusing is visible
+/// only at the release.
+#[test]
+fn a_held_write_released_as_success_after_a_fault_is_a_violation() {
+    let mut outcome = crate::outcome::nothing_observed();
+    outcome.hostile = true;
+    outcome.write_faults = 1;
+    assert!(outcome.invariant_holds());
+    outcome.released_while_refusing = 1;
+    assert!(!outcome.invariant_holds());
+}
+
+/// A run that refused owes its expiration checks unless every volatile
+/// write was refused: one the server took has a deadline to die by.
+#[test]
+fn a_run_that_refused_owes_its_expiration_checks_unless_no_volatile_write_was_taken() {
     let mut outcome = crate::outcome::nothing_observed();
     outcome.expected_sum = 1;
     outcome.plain_checks = 1;
@@ -762,12 +808,37 @@ fn a_run_that_refused_owes_no_expiration_check() {
     outcome.snapshot_cycles = 1;
     assert!(!outcome.invariants_were_exercised(), "no expiry decided");
     outcome.refused = 1;
-    assert!(outcome.invariants_were_exercised());
+    outcome.volatile_acked = 4;
+    assert!(
+        !outcome.invariants_were_exercised(),
+        "volatile writes were taken: the expiration checks are owed"
+    );
+    outcome.volatile_acked = 0;
+    assert!(
+        outcome.invariants_were_exercised(),
+        "every volatile write refused: nothing could die"
+    );
     outcome.plain_checks = 0;
     assert!(
         !outcome.invariants_were_exercised(),
         "the plain family still owes"
     );
+}
+
+/// A failure of the node's log refuses every executor at once, and each
+/// returns on its own snapshot: at most one return per executor per fault.
+#[test]
+fn the_node_refuses_as_one_and_resumes_one_executor_at_a_time() {
+    let cfg = SimConfig::hostile(1, 2);
+    let outcome = run_sim(&cfg);
+    let faults = outcome.write_faults + outcome.sync_faults + outcome.rotate_faults;
+    assert!(faults >= 1, "seed 2 faults: {outcome:?}");
+    assert!(outcome.refusals_ended >= 1, "{outcome:?}");
+    assert!(
+        outcome.refusals_ended <= u64::from(cfg.executors) * faults,
+        "more returns than executors per fault: {outcome:?}"
+    );
+    assert!(outcome.invariant_holds(), "{outcome:?}");
 }
 
 /// A run whose crashes interrupt every cycle reports no snapshot, so the

@@ -133,7 +133,8 @@ use seedstone_core::log::writer::{
 };
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
 use seedstone_core::shard::{
-    Deadlines, ExecutorPlants, Now, PoolSpec, ShardPolicy, ShardPool, SyncPolicy, parse_i64,
+    Deadlines, ExecutorPlants, LogFault, Now, PoolSpec, ShardPolicy, ShardPool, SyncPolicy,
+    TraceSink, parse_i64,
 };
 use seedstone_resp::Frame;
 use seedstone_service::{NodeInfo, serve_connection};
@@ -437,6 +438,11 @@ pub fn run_sim(cfg: &SimConfig) -> SimOutcome {
         refused: tally.refused,
         refusals_ended: tally.refusals_ended,
         acked_while_refusing: tally.acked_while_refusing,
+        refused_certain: tally.refused_certain,
+        refused_applied: tally.refused_applied,
+        released_while_refusing: tally.released_while_refusing,
+        volatile_acked: tally.volatile_acked,
+        rotate_faults: tally.rotate_faults,
         hostile: cfg.disk.lies(),
         snapshot_cycles: tally.snapshot_cycles,
         compactions: tally.compactions,
@@ -784,7 +790,15 @@ fn start_log(
         trace: sink.clone(),
         plants: writer_plants(planted),
     })?;
-    let log_failed = write_rebases(&mut opened.writer, &mut recovery.shards).is_err();
+    // Reported as the binary reports it, so the run counts the fault its
+    // refusals follow.
+    let log_failed = match write_rebases(&mut opened.writer, &mut recovery.shards) {
+        Ok(()) => false,
+        Err(error) => {
+            sink.log_fault(LogFault::Write, &error);
+            true
+        }
+    };
     Ok((recovery, generation, opened, log_failed))
 }
 

@@ -4,7 +4,8 @@
 //! Changing anything here moves every pinned hash.
 
 use seedstone_core::shard::{
-    Command, CompactionReport, LogFault, RefusalReport, Reply, Route, SnapshotReport, TraceSink,
+    Command, CompactionReport, LogFault, RefusalReport, Reply, ReplyError, Route, SnapshotReport,
+    TraceSink,
 };
 use std::sync::{Arc, Mutex};
 
@@ -95,11 +96,12 @@ impl TraceSink for HashSink {
         drop(h);
         // Read on the executor's own answer, before anything holds it for a
         // sync: what it decided, not what reached the wire.
-        if cmd.writes_the_log()
-            && !matches!(reply, Reply::Error(_))
-            && self.shared.is_refusing(shard)
-        {
-            lock(&self.shared.tally).acked_while_refusing += 1;
+        if cmd.writes_the_log() {
+            if matches!(reply, Reply::Error(ReplyError::LogWriteFailed)) {
+                lock(&self.shared.tally).refused_certain += 1;
+            } else if !matches!(reply, Reply::Error(_)) && self.shared.is_refusing(shard) {
+                lock(&self.shared.tally).acked_while_refusing += 1;
+            }
         }
     }
 
@@ -196,12 +198,14 @@ impl TraceSink for HashSink {
         lock(&self.shared.tally).snapshot_faults += 1;
     }
 
-    /// A failed write, sync or rotation of the node's log is where every
-    /// executor's refusal begins.
+    /// Counted only. The writer's failure refuses every executor, but each
+    /// hears of it on its own channel, after whatever the writer told it
+    /// first: a `Durable` from a round that completed before the failure is
+    /// still a sync that completed, and a write answered under `interval` or
+    /// `never` before the `Fault` arrives was never promised a sync. So an
+    /// executor counts as refusing from its own refusal on — see
+    /// [`held_answered`](TraceSink::held_answered).
     fn log_fault(&self, fault: LogFault, _error: &std::io::Error) {
-        if matches!(fault, LogFault::Write | LogFault::Sync | LogFault::Rotate) {
-            self.shared.set_all_refusing();
-        }
         let mut tally = lock(&self.shared.tally);
         match fault {
             LogFault::Write => tally.write_faults += 1,
@@ -221,6 +225,19 @@ impl TraceSink for HashSink {
 
     fn sync_settled(&self, _round: u64) {
         lock(&self.shared.syncs).1 += 1;
+    }
+
+    /// Where an executor's refusal begins, as it reports it: it answers
+    /// what it held with the refusal on every one, `wrote` possibly zero.
+    /// Held writes released as success while it is refusing are counted —
+    /// the release a check at the command cannot see.
+    fn held_answered(&self, first_shard: u16, wrote: u64, refused: bool) {
+        if refused {
+            self.shared.set_refusing(first_shard, true);
+            lock(&self.shared.tally).refused_applied += wrote;
+        } else if self.shared.is_refusing(first_shard) {
+            lock(&self.shared.tally).released_while_refusing += wrote;
+        }
     }
 
     /// Folded: a run whose executor resumed after a different number of
