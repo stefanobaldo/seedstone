@@ -598,11 +598,7 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
             self.round.fetch_add(1, Ordering::SeqCst);
         }
         let round_closed = self.round.load(Ordering::SeqCst) >= self.executors;
-        let mut removed = CompactionReport {
-            executor: self.executor,
-            files: 0,
-            bytes: 0,
-        };
+        let mut removed = CompactionReport { files: 0, bytes: 0 };
         let names = self.disk.list(&self.wal).unwrap_or_default();
         let mut older_left = false;
         for name in names.iter().filter(|name| self.is_older(name)) {

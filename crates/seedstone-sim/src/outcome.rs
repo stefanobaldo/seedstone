@@ -626,6 +626,7 @@ pub struct Tally {
     pub disk_peak_bytes: u64,
     pub snapshot_faults: u64,
     pub remove_faults: u64,
+    pub rotate_faults: u64,
     pub snapshots_refused_at_start: u64,
     pub files_removed_at_start: u64,
 }

@@ -291,6 +291,15 @@ fn read_headers<D: Disk>(
                     format!("{name}: format version {version} is newer than this build reads"),
                 ));
             }
+            Err(HeaderError::OlderVersion(version)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "{name}: format version {version} predates this build's layout; \
+                         the directory was written by an earlier build and is not read"
+                    ),
+                ));
+            }
             Err(HeaderError::Short | HeaderError::BadMagic | HeaderError::BadChecksum) => {
                 // Synced before the file's name was: a header that does
                 // not read is damage, not a crash.
@@ -409,6 +418,16 @@ impl Scan {
                     io::ErrorKind::Unsupported,
                     format!(
                         "{}: format version {version} is newer than this build reads",
+                        file.name
+                    ),
+                ));
+            }
+            Err(HeaderError::OlderVersion(version)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "{}: format version {version} predates this build's layout; \
+                         the directory was written by an earlier build and is not read",
                         file.name
                     ),
                 ));

@@ -106,6 +106,9 @@ pub enum HeaderError {
     /// A version above [`FORMAT_VERSION`]: a file this build must not guess
     /// at.
     NewerVersion(u8),
+    /// A version below [`FORMAT_VERSION`]: the file predates this build's
+    /// layout; nothing reads it, and a start that finds one refuses.
+    OlderVersion(u8),
     /// The fields do not match their CRC: damage.
     BadChecksum,
 }
@@ -128,6 +131,9 @@ pub fn decode_segment_header(buf: &[u8]) -> Result<(u64, u16, u32), HeaderError>
     }
     if header[4] > FORMAT_VERSION {
         return Err(HeaderError::NewerVersion(header[4]));
+    }
+    if header[4] < FORMAT_VERSION {
+        return Err(HeaderError::OlderVersion(header[4]));
     }
     check_header_crc(header)?;
     let mut generation = [0; 8];
@@ -553,6 +559,13 @@ mod tests {
             decode_segment_header(&flipped),
             Err(HeaderError::BadChecksum),
             "a header whose bytes moved is damage, not a different header"
+        );
+        let mut older = out.clone();
+        older[4] = 0;
+        assert_eq!(
+            decode_segment_header(&older),
+            Err(HeaderError::OlderVersion(0)),
+            "a header from before this build's layout is named, not read as damage"
         );
         let mut newer = out;
         newer[4] = FORMAT_VERSION + 1;
