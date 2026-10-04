@@ -143,7 +143,9 @@ jobs:
       # when each executor began to notice a completed sync ahead of its
       # queue, which moves when syncs are issued; the run before this one,
       # of the same code, read 608 s, so the runner's own variance is wider
-      # than anything that change could be credited with. The workload
+      # than anything that change could be credited with. `481 s` on
+      # 2026-10-04, after the node's one log writer joined the schedule —
+      # inside that variance, so nothing here moved. The workload
       # before it — each seed drawing its durability policy, a latency of
       # 1-250 ms for every sync, about a third of the seeds holding their
       # replies for it — read 985 s, 1012 s, 1057 s, 1322 s and 1075 s,
