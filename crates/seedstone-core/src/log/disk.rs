@@ -232,6 +232,11 @@ pub(crate) mod mem {
         files: BTreeMap<PathBuf, Vec<u8>>,
         /// How many bytes of each file the last successful sync covered.
         synced: BTreeMap<PathBuf, usize>,
+        /// How many syncs of each file succeeded.
+        syncs: BTreeMap<PathBuf, u32>,
+        /// How long a deferred sync takes to answer: zero unless a test
+        /// holds a round in flight.
+        sync_latency: std::time::Duration,
         fail_writes: bool,
         /// The kind a failed write reports: `Other` unless a test names one.
         write_kind: WriteKind,
@@ -262,6 +267,7 @@ pub(crate) mod mem {
         fn mark_synced(&mut self, path: &Path) {
             let len = self.files.get(path).map_or(0, Vec::len);
             self.synced.insert(path.to_path_buf(), len);
+            *self.syncs.entry(path.to_path_buf()).or_default() += 1;
         }
 
         /// Whether the next file sync fails, counting the one-shot down.
@@ -309,6 +315,17 @@ pub(crate) mod mem {
         /// covered.
         pub fn synced_len(&self, path: &Path) -> usize {
             self.lock().synced.get(path).copied().unwrap_or(0)
+        }
+
+        /// How many syncs of `path` succeeded.
+        pub fn sync_count(&self, path: &Path) -> u32 {
+            self.lock().syncs.get(path).copied().unwrap_or(0)
+        }
+
+        /// Makes every deferred sync answer `latency` after its call, on
+        /// tokio's clock: how a test holds a round in flight.
+        pub fn set_sync_latency(&self, latency: std::time::Duration) {
+            self.lock().sync_latency = latency;
         }
 
         /// Replaces what `path` holds — how a test plants damage.
@@ -379,7 +396,8 @@ pub(crate) mod mem {
         }
 
         /// The same decision as [`sync_data`](LogFile::sync_data), taken at
-        /// the call, answered by a future that is already ready.
+        /// the call, answered after the disk's latency — at once unless a
+        /// test set one.
         fn sync_later(&self) -> SyncFuture {
             let mut fs = self.disk.lock();
             let result = if fs.sync_fails() {
@@ -388,8 +406,15 @@ pub(crate) mod mem {
                 fs.mark_synced(&self.path);
                 Ok(())
             };
+            let latency = fs.sync_latency;
             drop(fs);
-            Box::pin(std::future::ready(result))
+            if latency.is_zero() {
+                return Box::pin(std::future::ready(result));
+            }
+            Box::pin(async move {
+                tokio::time::sleep(latency).await;
+                result
+            })
         }
     }
 
