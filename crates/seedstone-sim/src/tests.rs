@@ -205,7 +205,10 @@ fn the_trace_hash_is_pinned_across_processes_and_builds() {
     // the inbox ran dry — which on a busy executor could be never. That
     // moves when each sync is noticed and so when the next is issued, and
     // the trace folds both. `expected_sum` and the four counts held still.
-    const MINI_1_42: u64 = 0x6d40_9fae_bec2_e3a6;
+    //
+    // Re-pinned: the writer task joined the schedule and a compaction report
+    // names no executor.
+    const MINI_1_42: u64 = 0xe2ea_4a4c_62dd_f6cc;
 
     let outcome = run_sim(&SimConfig::mini(1, 42));
     assert_eq!(
@@ -872,9 +875,12 @@ fn one_seed_per_durability_policy_is_pinned() {
     // `always` moved alone when a completed sync began to outrank the
     // inbox: the order changes when held replies leave, and only `always`
     // holds any.
-    const HOSTILE_1_3_ALWAYS: u64 = 0x86f9_9a80_8807_2dd2;
-    const HOSTILE_1_3_INTERVAL: u64 = 0x3234_f441_cdab_ad5b;
-    const HOSTILE_1_3_NEVER: u64 = 0x71ba_5c7c_fbcc_a684;
+    //
+    // Re-pinned: the writer task joined the schedule and a compaction report
+    // names no executor.
+    const HOSTILE_1_3_ALWAYS: u64 = 0x4952_a76a_1c3c_8d12;
+    const HOSTILE_1_3_INTERVAL: u64 = 0x9597_7a37_09d2_82e6;
+    const HOSTILE_1_3_NEVER: u64 = 0x1908_f60a_1ca9_8c24;
     for (policy, pinned) in [
         (SyncPolicy::ALWAYS, HOSTILE_1_3_ALWAYS),
         (SyncPolicy::INTERVAL, HOSTILE_1_3_INTERVAL),
