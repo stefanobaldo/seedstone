@@ -151,6 +151,8 @@ struct Lane {
     received: Option<u64>,
     /// The last batch written to the file.
     written: Option<u64>,
+    /// The last batch a `Durable` named.
+    durable: Option<u64>,
     /// Bytes received and not yet written.
     pending_bytes: u64,
     /// Bytes written, cumulative.
@@ -174,6 +176,7 @@ impl Lane {
         Self {
             received: None,
             written: None,
+            durable: None,
             pending_bytes: 0,
             written_bytes: 0,
             reported_bytes: 0,
@@ -443,6 +446,12 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
             .in_flight
             .take()
             .expect("a completion has a round in flight");
+        self.settle(frozen, result);
+    }
+
+    /// The round in flight settled: `Durable` through what it froze, or the
+    /// node's refusal.
+    fn settle(&mut self, frozen: Vec<Option<u64>>, result: io::Result<()>) {
         self.trace.sync_settled(self.round);
         match result {
             Ok(()) => {
@@ -458,9 +467,15 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         }
     }
 
+    /// `Durable` to each executor whose covered batch advanced: one that
+    /// sent nothing since the last round has nothing to hear.
     fn report_durable(&mut self, covered: &[Option<u64>]) {
         let round = self.round;
         for (lane, through_batch) in self.lanes.iter_mut().zip(covered) {
+            if *through_batch <= lane.durable {
+                continue;
+            }
+            lane.durable = *through_batch;
             lane.reported_bytes = lane.written_bytes;
             let _ = lane.progress.send(Progress::Durable {
                 through_batch: *through_batch,
@@ -470,25 +485,96 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         }
     }
 
-    // Stub: the onset of the node's refusal, whole.
+    /// The node's log failed. Traced once; the segment is marked failed and
+    /// never written again — the first submission after this rotates; what
+    /// was staged is dropped, since the executors it came from are told;
+    /// the round in flight is let go. A fresh failure reaches every
+    /// executor; a failure of the retry reaches only those with bytes in
+    /// it, so that an executor still refusing from the first is not made
+    /// to abandon the snapshot that will end its refusal.
     fn fail(&mut self, fault: LogFault, error: &io::Error) {
         self.trace.log_fault(fault, error);
+        let fresh = !self.segment.sync_failed;
         self.segment.sync_failed = true;
-        self.in_flight = None;
-        for lane in &self.lanes {
-            let _ = lane.progress.send(Progress::Fault);
+        self.segment.dirty = false;
+        self.staged.clear();
+        if self.in_flight.take().is_some() {
+            self.trace.sync_settled(self.round);
+        }
+        for lane in &mut self.lanes {
+            let had_bytes = std::mem::take(&mut lane.pending_bytes) > 0;
+            lane.received = lane.written;
+            if fresh || had_bytes {
+                let _ = lane.progress.send(Progress::Fault);
+            }
         }
     }
 
-    // Stub: the rotation.
-    #[allow(clippy::unused_async)]
+    /// Opens the next rotation and swaps it in; `true` when a clean
+    /// segment is open. The old file's unsynced bytes are synced first,
+    /// unless it already failed — a sync that fails here is the sticky
+    /// one, and nothing is swapped. The new file's header and the
+    /// directory are synced before the swap.
     async fn rotate(&mut self) -> bool {
-        false
+        if self.segment.dirty && !self.segment.sync_failed {
+            if let Err(error) = self.segment.file.sync_later().await {
+                self.fail(LogFault::Sync, &error);
+                return false;
+            }
+            self.segment.dirty = false;
+        }
+        self.segment.attempted += 1;
+        let next = self.segment.attempted;
+        let created = create_segment(&self.disk, &self.wal, self.generation, next)
+            .and_then(|file| self.disk.sync_dir(&self.wal).map(|()| file));
+        let file = match created {
+            Ok(file) => file,
+            Err(error) => {
+                self.fail(LogFault::Rotate, &error);
+                return false;
+            }
+        };
+        let closing = std::mem::replace(
+            &mut self.segment,
+            Segment {
+                file,
+                rotation: next,
+                attempted: next,
+                bytes_written: 0,
+                dirty: false,
+                sync_failed: false,
+            },
+        );
+        self.closed.push_back(Closed {
+            rotation: closing.rotation,
+            last_batch: self.lanes.iter().map(|lane| lane.written).collect(),
+            bytes: closing.bytes_written,
+        });
+        self.nudge_if_due();
+        true
     }
 
-    // Stub: the last round's sync before `Stopped`.
-    #[allow(clippy::unused_async)]
+    /// Every executor has sent its `Stop`: wait for the round in flight,
+    /// sync what was written since, answer, and let each executor end.
     async fn last_round(&mut self) {
+        if let Some((frozen, sync)) = self.in_flight.take() {
+            let result = sync.await;
+            self.settle(frozen, result);
+        }
+        if self.segment.dirty && !self.segment.sync_failed {
+            self.round += 1;
+            self.trace.sync_issued(self.round);
+            let frozen: Vec<Option<u64>> = self.lanes.iter().map(|lane| lane.written).collect();
+            let result = self.segment.file.sync_later().await;
+            self.trace.sync_settled(self.round);
+            match result {
+                Ok(()) => {
+                    self.segment.dirty = false;
+                    self.report_durable(&frozen);
+                }
+                Err(error) => self.fail(LogFault::Sync, &error),
+            }
+        }
         for lane in &self.lanes {
             let _ = lane.progress.send(Progress::Stopped);
         }

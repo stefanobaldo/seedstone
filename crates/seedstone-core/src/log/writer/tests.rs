@@ -343,3 +343,182 @@ async fn the_start_path_appends_and_syncs_now_and_a_rebase_advances_the_cut_shar
     drop(inbox);
     drop(writer);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_sync_faults_every_executor_and_the_next_submission_rotates_to_a_clean_segment() {
+    let disk = MemDisk::default();
+    let mut rig = open(
+        &disk,
+        2,
+        SyncPolicy::ALWAYS,
+        1 << 20,
+        WriterPlants::default(),
+    );
+    rig.submit(0, 0, record(0, 0, b"a"));
+    rig.durable(0).await;
+    disk.fail_next_sync();
+    rig.submit(1, 0, record(5, 0, b"b"));
+    assert!(
+        matches!(rig.next(0).await, Progress::Fault),
+        "the executor that wrote nothing this round hears it too"
+    );
+    assert!(matches!(rig.next(1).await, Progress::Fault));
+    // The one that resumes writes into rotation 1; rotation 0 is never written again.
+    rig.submit(0, 1, record(0, 1, b"c"));
+    let (through, _, _) = rig.durable(0).await;
+    assert_eq!(through, Some(1));
+    assert_eq!(decode_segment_header(&rig.segment(1)), Ok((1, 1)));
+    let body = &rig.segment(1)[crate::log::file::SEGMENT_HEADER_LEN..];
+    let Decoded::Record { seq, .. } = decode_record(body) else {
+        panic!()
+    };
+    assert_eq!(seq, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_write_faults_and_drops_what_was_staged() {
+    let disk = MemDisk::default();
+    let mut rig = open(
+        &disk,
+        1,
+        SyncPolicy::INTERVAL,
+        1 << 20,
+        WriterPlants::default(),
+    );
+    disk.fail_writes(true);
+    rig.submit(0, 0, record(0, 0, b"a"));
+    assert!(matches!(rig.next(0).await, Progress::Fault));
+    disk.fail_writes(false);
+    rig.submit(0, 1, record(0, 1, b"b"));
+    let (through, bytes, _) = rig.durable(0).await;
+    assert_eq!(through, Some(1));
+    assert_eq!(
+        bytes,
+        record(0, 1, b"b").len() as u64,
+        "the dropped batch's bytes are not counted as written"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_that_fails_faults_only_the_executors_that_sent_bytes() {
+    let disk = MemDisk::default();
+    let mut rig = open(
+        &disk,
+        2,
+        SyncPolicy::INTERVAL,
+        1 << 20,
+        WriterPlants::default(),
+    );
+    disk.fail_writes(true);
+    rig.submit(0, 0, record(0, 0, b"a"));
+    assert!(matches!(rig.next(0).await, Progress::Fault));
+    assert!(
+        matches!(rig.next(1).await, Progress::Fault),
+        "a fresh failure reaches everyone"
+    );
+    disk.fail_creates(true); // the rotation cannot create the next file
+    rig.submit(0, 1, record(0, 1, b"b"));
+    assert!(matches!(rig.next(0).await, Progress::Fault));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), rig.links[1].progress.recv())
+            .await
+            .is_err(),
+        "the one still refusing is not told again"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_segment_rotates_at_its_size_and_the_old_one_is_synced_first() {
+    let disk = MemDisk::default();
+    let mut rig = open(&disk, 1, SyncPolicy::NEVER, 64, WriterPlants::default());
+    rig.submit(0, 0, vec![1u8; 70]);
+    tokio::task::yield_now().await;
+    rig.submit(0, 1, vec![2u8; 10]);
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        rig.segment(0).len(),
+        crate::log::file::SEGMENT_HEADER_LEN + 70
+    );
+    assert_eq!(
+        disk.synced_len(&Path::new(WAL).join(segment_name(1, 0))),
+        rig.segment(0).len(),
+        "under never the rotation is the one sync the old file gets"
+    );
+    assert_eq!(
+        rig.segment(1).len(),
+        crate::log::file::SEGMENT_HEADER_LEN + 10
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rotation_whose_sync_fails_faults_and_nothing_is_swapped() {
+    let disk = MemDisk::default();
+    let mut rig = open(&disk, 1, SyncPolicy::NEVER, 64, WriterPlants::default());
+    rig.submit(0, 0, vec![1u8; 70]);
+    tokio::task::yield_now().await;
+    disk.fail_next_sync();
+    rig.submit(0, 1, vec![2u8; 10]);
+    assert!(matches!(rig.next(0).await, Progress::Fault));
+    assert!(
+        disk.list(Path::new(WAL))
+            .unwrap()
+            .iter()
+            .all(|n| n != &segment_name(1, 1)),
+        "no new file while the old one's bytes are unproven"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_during_a_flight_is_answered_after_both_syncs() {
+    let disk = MemDisk::default();
+    disk.set_sync_latency(Duration::from_millis(10));
+    let mut rig = open(
+        &disk,
+        1,
+        SyncPolicy::ALWAYS,
+        1 << 20,
+        WriterPlants::default(),
+    );
+    rig.submit(0, 0, record(0, 0, b"a"));
+    tokio::task::yield_now().await;
+    rig.submit(0, 1, record(0, 1, b"b"));
+    rig.links[0]
+        .to_writer
+        .send(ToWriter::Stop { executor: 0 })
+        .unwrap();
+    let (through, _, round) = rig.durable(0).await;
+    assert_eq!((through, round), (Some(0), 1));
+    let (through, _, round) = rig.durable(0).await;
+    assert_eq!(
+        (through, round),
+        (Some(1), 2),
+        "the last submission is synced before the stop is answered"
+    );
+    assert!(matches!(rig.next(0).await, Progress::Stopped));
+    tokio::time::timeout(Duration::from_secs(1), &mut rig.task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_whose_last_sync_fails_answers_fault_then_stopped() {
+    let disk = MemDisk::default();
+    let mut rig = open(
+        &disk,
+        1,
+        SyncPolicy::NEVER,
+        1 << 20,
+        WriterPlants::default(),
+    );
+    rig.submit(0, 0, record(0, 0, b"a"));
+    tokio::task::yield_now().await;
+    disk.fail_next_sync();
+    rig.links[0]
+        .to_writer
+        .send(ToWriter::Stop { executor: 0 })
+        .unwrap();
+    assert!(matches!(rig.next(0).await, Progress::Fault));
+    assert!(matches!(rig.next(0).await, Progress::Stopped));
+}

@@ -242,6 +242,8 @@ pub(crate) mod mem {
         write_kind: WriteKind,
         fail_syncs: bool,
         fail_removes: bool,
+        /// Whether creating a file fails.
+        fail_creates: bool,
         /// File syncs to let through before one fails, once.
         sync_fails_after: Option<u32>,
         /// Directory syncs to let through before one fails, once.
@@ -326,6 +328,16 @@ pub(crate) mod mem {
         /// tokio's clock: how a test holds a round in flight.
         pub fn set_sync_latency(&self, latency: std::time::Duration) {
             self.lock().sync_latency = latency;
+        }
+
+        /// Makes the next file sync fail, once.
+        pub fn fail_next_sync(&self) {
+            self.fail_one_sync_after(0);
+        }
+
+        /// Makes every file creation fail, or none.
+        pub fn fail_creates(&self, fail: bool) {
+            self.lock().fail_creates = fail;
         }
 
         /// Replaces what `path` holds — how a test plants damage.
@@ -454,7 +466,12 @@ pub(crate) mod mem {
         }
 
         fn create_append(&self, path: &Path) -> io::Result<Self::File> {
-            self.lock().files.entry(path.to_path_buf()).or_default();
+            let mut fs = self.lock();
+            if fs.fail_creates {
+                return Err(io::Error::other("injected create failure"));
+            }
+            fs.files.entry(path.to_path_buf()).or_default();
+            drop(fs);
             Ok(MemFile {
                 disk: self.clone(),
                 path: path.to_path_buf(),
