@@ -281,9 +281,12 @@ impl Plant {
                 "SimConfig::crossing, walked by crates/seedstone-sim/tests/planted_crossing.rs",
             ),
             // A hole inside the durable region needs read corruption, which
-            // the swept shapes do not draw.
+            // the swept shapes do not draw. Nor does `hostile` catch it any
+            // longer: its torn tail charges every shard of the node's one
+            // segment, so the loss it hides is reported regardless — the
+            // claim there is kept, ignored, with the seeds measured.
             Self::PrefixScanRecovery => Some(
-                "SimConfig::hostile at --fsync always, swept by \
+                "no shape today; the claim is kept, ignored, in \
                  crates/seedstone-sim/tests/planted_recovery.rs",
             ),
             // A refusal needs a write or a sync that fails, which only the
