@@ -6,8 +6,9 @@ use crate::log::checkpoint::CheckpointConfig;
 use crate::log::disk::mem::MemDisk;
 use crate::log::file::{decode_segment_header, segment_name};
 use crate::log::{Decoded, decode_record};
-use crate::shard::{NoTrace, SyncPolicy};
+use crate::shard::{CompactionReport, LogFault, NoTrace, SyncPolicy, TraceSink};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -32,6 +33,17 @@ fn open(
     segment_bytes: u64,
     plants: WriterPlants,
 ) -> Rig {
+    open_with(disk, executors, policy, segment_bytes, plants, NoTrace)
+}
+
+fn open_with<T: TraceSink>(
+    disk: &MemDisk,
+    executors: u16,
+    policy: SyncPolicy,
+    segment_bytes: u64,
+    plants: WriterPlants,
+    trace: T,
+) -> Rig {
     disk.create_dir_all(Path::new(WAL)).unwrap();
     let Opened {
         writer,
@@ -45,7 +57,7 @@ fn open(
         policy,
         segment_bytes,
         checkpoint: SMALL,
-        trace: NoTrace,
+        trace,
         plants,
     })
     .unwrap();
@@ -521,4 +533,224 @@ async fn a_stop_whose_last_sync_fails_answers_fault_then_stopped() {
         .unwrap();
     assert!(matches!(rig.next(0).await, Progress::Fault));
     assert!(matches!(rig.next(0).await, Progress::Stopped));
+}
+
+/// A sink that keeps what the writer reported.
+#[derive(Clone, Default)]
+struct Recorder {
+    compactions: Arc<Mutex<Vec<CompactionReport>>>,
+    faults: Arc<Mutex<Vec<LogFault>>>,
+    rounds: Arc<Mutex<Vec<u64>>>,
+}
+
+impl TraceSink for Recorder {
+    fn record(&self, _: u16, _: u64, _: &crate::shard::Command, _: &crate::shard::Reply) {}
+    fn compaction(&self, report: &CompactionReport) {
+        self.compactions.lock().unwrap().push(*report);
+    }
+    fn log_fault(&self, fault: LogFault, _error: &std::io::Error) {
+        self.faults.lock().unwrap().push(fault);
+    }
+    fn sync_issued(&self, round: u64) {
+        self.rounds.lock().unwrap().push(round);
+    }
+}
+
+fn covered(
+    rig: &Rig,
+    executor: usize,
+    cycle: u32,
+    through_batch: Option<u64>,
+    snapshot_bytes: u64,
+) {
+    let link = &rig.links[executor];
+    link.to_writer
+        .send(ToWriter::Covered {
+            executor: link.executor,
+            cycle,
+            through_batch,
+            snapshot_bytes,
+        })
+        .unwrap();
+}
+
+fn names(disk: &MemDisk) -> Vec<String> {
+    let mut names = disk.list(Path::new(WAL)).unwrap();
+    names.sort();
+    names
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rotation_is_removed_once_every_executor_covered_its_batches_in_it() {
+    let disk = MemDisk::default();
+    let mut rig = open(&disk, 2, SyncPolicy::NEVER, 64, WriterPlants::default());
+    rig.submit(0, 0, vec![1u8; 40]);
+    rig.submit(1, 0, vec![2u8; 40]); // rotation 0 fills: 80 ≥ 64
+    tokio::task::yield_now().await;
+    rig.submit(0, 1, vec![1u8; 10]); // opens rotation 1
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert!(names(&disk).contains(&segment_name(1, 1)));
+    covered(&rig, 0, 0, Some(1), 100);
+    tokio::task::yield_now().await;
+    assert!(
+        names(&disk).contains(&segment_name(1, 0)),
+        "executor 1 has not covered its batch 0 in rotation 0"
+    );
+    covered(&rig, 1, 0, Some(0), 100);
+    tokio::task::yield_now().await;
+    assert!(
+        !names(&disk).contains(&segment_name(1, 0)),
+        "both covered: rotation 0 goes"
+    );
+    assert!(
+        names(&disk).contains(&segment_name(1, 1)),
+        "the open rotation never goes"
+    );
+    drop(rig);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_executor_that_wrote_nothing_pins_nothing_and_still_closes_the_generation() {
+    let disk = MemDisk::default();
+    disk.create_dir_all(Path::new(WAL)).unwrap();
+    disk.write_file(&Path::new(WAL).join(segment_name(0, 0)), &[0u8; 30])
+        .unwrap(); // an older generation's file
+    let mut rig = open(&disk, 2, SyncPolicy::NEVER, 64, WriterPlants::default());
+    rig.submit(0, 0, vec![1u8; 70]);
+    tokio::task::yield_now().await;
+    rig.submit(0, 1, vec![1u8; 10]);
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    covered(&rig, 0, 0, Some(1), 100);
+    tokio::task::yield_now().await;
+    assert!(
+        names(&disk).contains(&segment_name(1, 0)),
+        "rotation 0 holds the rebases' place while an older generation remains"
+    );
+    assert!(
+        names(&disk).contains(&segment_name(0, 0)),
+        "executor 1 has not reported: the older generation stays"
+    );
+    covered(&rig, 1, 0, None, 0);
+    tokio::task::yield_now().await;
+    assert!(
+        !names(&disk).contains(&segment_name(0, 0)),
+        "every executor reported: older generations go"
+    );
+    assert!(
+        !names(&disk).contains(&segment_name(1, 0)),
+        "and rotation 0 with them, covered by executor 0 and never written by 1"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_covered_removes_that_executors_older_snapshots_and_reports_one_compaction() {
+    let disk = MemDisk::default();
+    disk.create_dir_all(Path::new(WAL)).unwrap();
+    use crate::log::snapshot::snapshot_name;
+    disk.write_file(&Path::new(WAL).join(snapshot_name(1, 0, 0)), &[0u8; 10])
+        .unwrap();
+    disk.write_file(&Path::new(WAL).join(snapshot_name(1, 0, 1)), &[0u8; 10])
+        .unwrap();
+    disk.write_file(&Path::new(WAL).join(snapshot_name(1, 1, 0)), &[0u8; 10])
+        .unwrap();
+    let recorder = Recorder::default();
+    let rig = open_with(
+        &disk,
+        2,
+        SyncPolicy::NEVER,
+        64,
+        WriterPlants::default(),
+        recorder.clone(),
+    );
+    covered(&rig, 0, 1, None, 10);
+    tokio::task::yield_now().await;
+    let names = names(&disk);
+    assert!(!names.contains(&snapshot_name(1, 0, 0)));
+    assert!(
+        names.contains(&snapshot_name(1, 0, 1)),
+        "the snapshot that was reported stays"
+    );
+    assert!(
+        names.contains(&snapshot_name(1, 1, 0)),
+        "another executor's snapshot is not this executor's to lose"
+    );
+    let compactions = recorder.compactions.lock().unwrap();
+    assert_eq!(compactions.len(), 1);
+    assert_eq!((compactions[0].files, compactions[0].bytes), (1, 10));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_plant_removes_a_rotation_one_executor_covered_while_another_has_not() {
+    let disk = MemDisk::default();
+    let mut rig = open(
+        &disk,
+        2,
+        SyncPolicy::NEVER,
+        64,
+        WriterPlants {
+            removes_uncovered: true,
+            ..WriterPlants::default()
+        },
+    );
+    rig.submit(0, 0, vec![1u8; 40]);
+    rig.submit(1, 0, vec![2u8; 40]);
+    tokio::task::yield_now().await;
+    rig.submit(0, 1, vec![1u8; 10]);
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    covered(&rig, 0, 0, Some(1), 100);
+    tokio::task::yield_now().await;
+    assert!(
+        !names(&disk).contains(&segment_name(1, 0)),
+        "the plant: gone with executor 1's records in it"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_oldest_holder_is_nudged_once_the_retained_log_passes_its_bound() {
+    // SMALL's floor is 64: executor 1 writes 10 bytes into every rotation
+    // and never snapshots on its own; executor 0 fills them.
+    let disk = MemDisk::default();
+    let mut rig = open(&disk, 2, SyncPolicy::NEVER, 64, WriterPlants::default());
+    for batch in 0..3u64 {
+        rig.submit(1, batch, vec![2u8; 10]);
+        rig.submit(0, batch, vec![1u8; 60]);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        covered(&rig, 0, batch as u32, Some(batch), 100);
+        tokio::task::yield_now().await;
+    }
+    // Rotations closed and retained on executor 1's account: past 64 bytes
+    // from the second rotation on.
+    assert!(matches!(rig.next(1).await, Progress::Nudge));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), rig.links[1].progress.recv())
+            .await
+            .is_err(),
+        "nudged once until it answers"
+    );
+    covered(&rig, 1, 0, Some(2), 10);
+    tokio::task::yield_now().await;
+    let names = names(&disk);
+    assert!(
+        !names.contains(&segment_name(1, 0)) && !names.contains(&segment_name(1, 1)),
+        "covered by both: the closed rotations go: {names:?}"
+    );
+    assert!(
+        names.contains(&segment_name(1, 2)),
+        "the open rotation never goes: {names:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_a_restart_the_older_generation_is_retained_log_and_its_holders_are_nudged_at_open() {
+    let disk = MemDisk::default();
+    disk.create_dir_all(Path::new(WAL)).unwrap();
+    disk.write_file(&Path::new(WAL).join(segment_name(0, 0)), &[0u8; 100])
+        .unwrap(); // 100 > SMALL.floor
+    let mut rig = open(&disk, 2, SyncPolicy::NEVER, 64, WriterPlants::default());
+    assert!(matches!(rig.next(0).await, Progress::Nudge));
+    assert!(matches!(rig.next(1).await, Progress::Nudge));
 }
