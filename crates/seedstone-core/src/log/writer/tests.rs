@@ -439,6 +439,43 @@ async fn a_retry_that_fails_faults_only_the_executors_that_sent_bytes() {
     );
 }
 
+/// Bytes an executor sent before it heard of a failure reach the writer
+/// after it, and each retries the rotation; a retry that fails on a segment
+/// that had already failed is the same incident, not a new line. A failure
+/// after a clean rotation is a new one.
+#[tokio::test(start_paused = true)]
+async fn a_retry_that_fails_on_a_failed_segment_traces_no_second_line() {
+    let disk = MemDisk::default();
+    let trace = Recorder::default();
+    let mut rig = open_with(
+        &disk,
+        2,
+        SyncPolicy::INTERVAL,
+        1 << 20,
+        WriterPlants::default(),
+        trace.clone(),
+    );
+    disk.fail_writes(true);
+    rig.submit(0, 0, record(0, 0, b"a"));
+    assert!(matches!(rig.next(0).await, Progress::Fault));
+    disk.fail_creates(true);
+    rig.submit(1, 0, record(512, 0, b"b"));
+    assert!(matches!(rig.next(1).await, Progress::Fault));
+    assert!(matches!(rig.next(1).await, Progress::Fault));
+    assert_eq!(*trace.faults.lock().unwrap(), vec![LogFault::Write]);
+    disk.fail_creates(false);
+    disk.fail_writes(false);
+    rig.submit(0, 1, record(0, 1, b"c"));
+    tokio::task::yield_now().await;
+    disk.fail_writes(true);
+    rig.submit(0, 2, record(0, 2, b"d"));
+    while !matches!(rig.next(0).await, Progress::Fault) {}
+    assert_eq!(
+        *trace.faults.lock().unwrap(),
+        vec![LogFault::Write, LogFault::Write]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_segment_rotates_at_its_size_and_the_old_one_is_synced_first() {
     let disk = MemDisk::default();
