@@ -26,7 +26,7 @@ seedstone --version | --help
 | `--requirepass-file PATH` | none | The password file: one password per line, one or two lines. See *Password and rotation*. |
 | `--no-auth` | off | Run with no password, on purpose. See *Running without a password*. |
 | `--data-dir PATH` | none | Where the node keeps its log. With it, every write is recorded and replayed on the next start; without it a restart is an empty keyspace. Snapshots keep it bounded; see *What `--data-dir` promises*. |
-| `--fsync always\|interval\|never` | `interval` | When the log is synced: `always` before a write is acknowledged, `interval` once 100 ms have passed since the last sync, while there is anything to sync, `never` only when a snapshot rotates the log and at a clean stop. Only with `--data-dir`. |
+| `--fsync always\|interval\|never` | `interval` | When the log is synced: `always` before a write is acknowledged, `interval` once 100 ms have passed since the last sync, while there is anything to sync, `never` only when the log rotates to its next file and at a clean stop. Only with `--data-dir`. |
 
 `--version` and `--help` answer on stdout and exit 0, in first position only.
 `SEEDSTONE_REQUIREPASS` in the environment is the other way to give a
@@ -82,9 +82,9 @@ as the server writes them:
 | `recovery_failed` | `error` | `error` | the log could not be read — the directory cannot be created or listed, or a segment is from a newer version; the process exits 1 after this line |
 | `log_fault` | `error` | `stage`, `error` | the node's log could not be written (`stage` `write`), made durable (`sync`) or rotated to its next file (`rotate`), or a file a durable snapshot made redundant could not be removed (`remove`). After a failed write, sync or rotation every executor refuses writes, serves reads, and takes a snapshot of its memory; each serves writes again once its own snapshot is durable, on `refusal_ended` — see *What `--data-dir` promises*. A failed removal is retried at the next snapshot and at the next start. The next start reads what the disk kept and reports any damage it finds |
 | `snapshot_fault` | `error` | `shard`, `error` | the snapshot of the executor whose first shard is `shard` could not be written or made durable; it starts over in a new file on a later housekeeping tick |
-| `refusal_ended` | `info` | `shard`, `refused`, `ticks` | the executor whose first shard is `shard` serves writes again: it refused them after its log could not be written or synced (`log_fault` came first), and a snapshot of its memory taken after the failure is durable; `refused` writes were refused over `ticks` housekeeping ticks |
+| `refusal_ended` | `info` | `shard`, `refused`, `ticks` | the executor whose first shard is `shard` serves writes again: it refused them after the node's log could not be written, synced or rotated (`log_fault` came first), and a snapshot of its memory taken after the failure is durable; `refused` writes were refused over `ticks` housekeeping ticks |
 | `snapshot` | `info` | `executor`, `cycle`, `entries`, `bytes`, `ticks`, `disk_bytes` | one executor's snapshot became durable: `entries` keys in `bytes` bytes, taken over `ticks` housekeeping ticks; `disk_bytes` is the whole of `PATH/wal/` at that moment, before the compaction that follows — the directory's peak |
-| `compaction` | `info` | `files`, `bytes` | the node removed `files` files, `bytes` bytes, that durable snapshots made redundant: segments every executor has covered, superseded snapshots, or every older process's files once every executor of this process has a durable snapshot |
+| `compaction` | `info` | `files`, `bytes` | the node removed `files` files, `bytes` bytes, that durable snapshots made redundant: segments every executor has covered, snapshots a newer one of the same executor superseded, or every older process's files once every executor of this process has a durable snapshot |
 | `fsync_ignored` | `warn` | — | `--fsync` was given without `--data-dir`; there is no log to sync, and the setting does nothing |
 
 `error_reply` is `warn` and not `error` on purpose: an `ERR unknown command`
@@ -183,87 +183,98 @@ The node appends every write to a log under `PATH/wal/`; `--fsync` says
 when the log is synced, and so what a crash can cost.
 
 - **`always`**: a write is acknowledged only once a sync covering its record
-  has completed, so every acknowledged write survives a crash. The sync runs
-  off the executor, one at a time, and covers every write that arrived while
-  the previous one was in flight. A read waits for one only when its
+  has completed, so every acknowledged write survives a crash. The node
+  issues one sync at a time, from one writer every executor feeds, and each
+  covers every write that was ready when it was issued. A read waits for one only when its
   connection pipelined it together with a write, whose reply goes out in
   the order it was sent, or when it finds its key expired and deletes it,
   which is a write; a read on any other connection is answered at once.
 - **`interval`** (the default): a write is acknowledged at once, and the log
   is synced once 100 ms have passed since the last sync, whenever there is
-  something to sync and no sync is in flight — on a busy node from the
-  request path, on an idle one from the housekeeping tick. A crash costs
-  what was acknowledged since the last sync that completed.
+  something to sync and no sync is in flight — on a busy node right after a
+  write, on an idle one from the writer's tick. A crash costs what was
+  acknowledged since the last sync that completed. A process that is
+  killed, as opposed to a machine that loses power, can also cost what an
+  executor had handed to the writer in the last microseconds and the writer
+  had not yet written.
 - **`never`**: the node issues no sync of its own. The kernel writes the log
-  when it will; a snapshot syncs the segment it leaves behind. A crash keeps
-  the last durable snapshot, plus whatever of the log the kernel had written.
+  when it will; the writer syncs a file when it rotates to the next one. A
+  crash keeps the last durable snapshot, plus whatever of the log the kernel
+  had written. A process that is killed, as opposed to a machine that loses
+  power, can also cost what an executor had handed to the writer in the last
+  microseconds and the writer had not yet written.
 
 Under every setting what survives of a shard is a prefix of what was
 acknowledged on it, and a clean stop (`SIGTERM`, `SIGINT`) syncs everything
 before the process ends, so a rollout never loses what only a crash would —
-except on an executor that is refusing writes, whose failed log only the
-snapshot it was taking could have covered.
+except on an executor still refusing writes after the log failed, whose
+acknowledged writes only the snapshot it was taking could have covered.
 `--fsync` without `--data-dir` is accepted, logged as `fsync_ignored`, and
 does nothing. On start the log is read back: a shard whose records have a
 gap is replayed up to the gap and reported with `recovery_truncated`, and
 the node serves what it has.
 
-**When the disk fails.** A write or a sync of the log that fails
-(`log_fault`) puts the executor whose log it was into refusal: every write
-to its shards is answered `MISCONF Errors writing to the log: writes are
-refused until a snapshot is durable` (the shape of the reply Redis 6.2.24
-and 8.10.1 give a failed AOF write under `appendfsync everysec` —
-[compatibility.md](compatibility.md) has the reading),
-its reads are served, and the other executors do not notice: a node of ten
-executors with one refusing serves nine tenths of its writes. The executor
-then moves to a fresh segment and takes a snapshot of its shards' memory;
-once the snapshot is durable it serves writes again, on the
-`refusal_ended` line. Under `interval` and `never`, writes acknowledged
-between the last good sync and the failure are in memory, and the snapshot
-covers them; what a crash before it lands would lose is what the setting
-already allowed. Under `always`, the writes of a batch whose sync failed are
-answered with the refusal, and a read in the same batch is answered as
-usual. Those writes were applied without being acknowledged, exactly as a
-client sees a dropped connection, and the snapshot makes them durable: a
-client that retries a `SET` gets the same value, and one that retries an
-`INCRBY` counts twice, as after any lost reply. A disk with no space fails
-the snapshot too (`log_fault` with `stage` `snapshot`, every tick), and the
-executor keeps refusing until space is freed; a start whose first write to
-the log fails begins refusing writes the same way. A full disk asks for
-space, not for a restart.
+**When the disk fails.** A write, a sync or a rotation of the log that
+fails (`log_fault`) puts the node into refusal: every write is answered
+`MISCONF Errors writing to the log: writes are refused until a snapshot is
+durable` (the shape of the reply Redis 6.2.24 and 8.10.1 give a failed AOF
+write under `appendfsync everysec` — [compatibility.md](compatibility.md)
+has the reading), reads are served, and each executor takes a snapshot of
+its shards' memory. The executors return one at a time: each serves writes
+again once its own snapshot is durable, on its `refusal_ended` line, so a
+node of ten executors is back to nine tenths of its writes as soon as nine
+snapshots have landed, without waiting for the tenth; the first write after
+the failure moves the log to a fresh file. Under `interval` and `never`,
+writes acknowledged between the last good sync and the failure are in
+memory, and the snapshots cover them; what a crash before they land would
+lose is what the setting already allowed. Under `always`, the writes of a
+batch whose sync failed are answered with the refusal, and a read in the
+same batch is answered as usual. Those writes were applied without being
+acknowledged, exactly as a client sees a dropped connection, and the
+snapshot makes them durable: a client that retries a `SET` gets the same
+value, and one that retries an `INCRBY` counts twice, as after any lost
+reply. A disk with no space fails the snapshots too (`snapshot_fault`,
+every tick), and the executors keep refusing until space is freed; a start
+whose first write to the log fails begins refusing writes the same way. A
+full disk asks for space, not for a restart.
 
 The node runs one *executor* per available core, each serving a fixed
-range of the shards and keeping one log for them; the `snapshot` and
-`compaction` lines name it by number. Once an executor's log has grown past
-64 MiB — or past the size of its last snapshot, whichever is larger — it
-takes a snapshot of its shards: about 1 MiB of it is written per
-housekeeping tick while the shards keep serving between ticks, so a
-snapshot never holds them for longer than one tick's share takes to write,
-and the `snapshot` line says when it is durable. The log it covers is then
-removed, on the `compaction` line. What that bounds: **an executor's files
-never exceed its last snapshot, plus the one it is writing, plus the larger
-of 64 MiB and its last snapshot, plus what was written from the moment
-the log crossed that size until the snapshot was durable** — three times
-the last snapshot plus 64 MiB, and the writes of that span, on a keyspace
-that is not growing. The crossing is noticed on the next housekeeping
-tick, so the span starts up to one tick before the snapshot does. The
-directory is the sum over the executors.
+range of the shards; one writer appends every executor's records to the
+node's log and syncs it. The `snapshot` line names the executor by number.
+Once an executor has written 64 MiB to the log since its last snapshot — or
+more than the size of that snapshot, whichever is larger — it takes a
+snapshot of its shards: about 1 MiB of it is written per housekeeping tick
+while the shards keep serving between ticks, so a snapshot never holds them
+for longer than one tick's share takes to write, and the `snapshot` line
+says when it is durable. The crossing is noticed on the next housekeeping
+tick, so the span starts up to one tick before the snapshot does. The log
+rotates into a new file every 64 MiB, and a file is removed, on the
+`compaction` line, once every executor's durable snapshot covers what it
+wrote there. An executor that writes little would keep such files alive
+indefinitely; so the node also asks an executor for a snapshot when the log it
+holds back from removal exceeds the same 64 MiB-or-its-last-snapshot bound.
+What that bounds: **the node's files never exceed the sum of the last
+snapshots, plus the ones being written, plus — per executor — the larger of
+64 MiB and its last snapshot, plus what was written from each log crossing
+its size until its snapshot was durable, plus one 64 MiB file** of
+granularity. On a keyspace that is not growing, about three times the
+snapshots plus 64 MiB per executor plus 64 MiB, and the writes of those
+spans.
 
-After a restart, the previous process's files stay until every executor of
-the new one has taken a snapshot of its own; an executor that receives
-little writing may take a long time to reach 64 MiB, and until it does the
-directory holds the previous process's files beside the new one's. A
-second restart before then adds a third process's files, and so on: each
-process's share is within the bound above, and all of them are removed
-together by the first process whose executors all complete a snapshot. A
-start reads the newest snapshot of each shard and the log still on disk, so
-both the time a start takes and the memory it needs grow with the keyspace
-plus that log — which the bound above limits — not with the whole write
-history.
+After a restart, the previous process's files stay until the node has
+replaced them with snapshots of its own. They count as retained log, so the
+same rule applies: once they exceed the bound on an executor's account that
+executor snapshots, and when every executor of the new process has a
+durable snapshot the previous process's files are removed together. A start
+reads the newest snapshot of each shard and the log still on disk, so both
+the time a start takes and the memory it needs grow with the keyspace plus
+that log — which the bound above limits — not with the whole write history.
+A directory written by an earlier build whose layout differs is refused at
+start, with `recovery_failed` saying so.
 
 The bound holds on a disk that eventually writes. A disk that refuses every
-write parks the snapshot (`log_fault` with `stage` `snapshot`, retried on
-every tick), and the log grows until it accepts one.
+snapshot parks it (`snapshot_fault`, retried on every tick), and the log
+grows until one lands.
 
 One process at a time: the node takes an exclusive lock on `PATH/wal/LOCK`
 before it reads the log, and a second node started on the same directory

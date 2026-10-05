@@ -109,41 +109,52 @@ applied, at a gapless position per shard, as the *effect* it had — the value
 a key now holds and the absolute deadline it carries, a deletion, a flush —
 rather than the command that caused it, so any prefix of a shard's log
 replays to a state the shard actually held. With `--data-dir` the records go
-to segment files, one per executor per process lifetime with the shards
-interleaved; on start every segment is read through a reader that steps
-over damage, and each shard replays the gapless prefix of its sequence. A
-shard whose prefix was cut resumes there behind a *rebase* record, synced
-before it serves, so the records the cut left on disk are never replayed by
-a later start. The same abstraction becomes a consensus log after that.
-Without the flag the log is a no-op, as it was, and a write encodes no
-record at all.
+to one segment file per node, written by one writer task that every
+executor feeds: an executor encodes a batch's records and hands them over as
+one message, and the writer appends them in arrival order, the shards
+interleaved. On start every segment is read through a reader that steps
+over damage, and each shard replays the gapless prefix of its sequence.
+Damage in that one file is charged to the shards it may have cost without a
+trace — those with no intact record after it — and a gap behind damage is
+reported as a loss. A shard whose prefix was cut resumes there behind a
+*rebase* record, written and synced before the node serves, so the records
+the cut left on disk are never replayed by a later start. The same
+abstraction becomes a consensus log after that. Without the flag the log is
+a no-op, as it was, and a write encodes no record at all.
 
-**The sync is in flight, never in the way.** An executor flushes what each
-batch appended before answering it, and keeps at most one sync of its
-segment in flight, issued on its own cadence (`--fsync`) on a blocking
-thread; the batches that arrive meanwhile are served and pipelined behind
-it, and the next sync covers all of them. Under `always` the replies of a
-batch that wrote are held until a sync covering it completes; a batch that
-only read is answered at once, and the connection's in-order emission keeps
-the wire ordered.
-A write or sync that fails puts that executor into refusal: writes are
-answered with an error, reads are served, and the checkpoint is forced to
-snapshot memory into a fresh segment; once the snapshot is durable the
-executor writes again. The other executors never notice.
+**One sync stream, never in the way.** The writer keeps at most one sync of
+the segment in flight, issued on its cadence (`--fsync`) on a blocking
+thread, and freezes at each issue, per executor, the last batch it had
+written: that is what the sync covers, and what it tells each executor is
+durable when it completes. What arrives while a sync is in flight is written
+behind it and covered by the next one, so a sync covers every write that was
+ready when it was issued, from every executor, and the device sees one
+stream of syncs for the node rather than one per executor. Under `always` an
+executor holds the replies of a batch that wrote until the writer says the
+batch is durable; a batch that only read is answered at once, and the
+connection's in-order emission keeps the wire ordered. An executor keeps a
+budget of bytes it has handed over and not yet seen written, and stops
+reading its inbox above it. A write or sync that fails puts the node into
+refusal: every executor answers writes with an error, serves reads, and is
+forced to snapshot its memory; each serves writes again once its own
+snapshot is durable, without waiting for the others.
 
-**Snapshots are fuzzy, and there is no fork.** When an executor's log has
-grown past a floor, or past the size of its last snapshot, it takes an
-image of its shards a budget per housekeeping tick, through the same
-cursor `SCAN` uses, while the shards keep serving. The image is not the
-state at any instant, and does not need to be: every record is an absolute
-effect, so the log's tail from the moment the image began, replayed over
-it, is the state. That is the reason the log records effects rather than
-commands, cashed in: a snapshot with no pause beyond one tick's budget and
-no copy of the keyspace, where a server that forks for its snapshot copies,
-page by page, every part of the heap written while the child runs. Once the image's commit record is synced the segments it
-covers are deleted, and a start reads image plus tail. The image is
-ordinary log records in a file of its own, so the reader that steps over
-damage reads both.
+**Snapshots are fuzzy, and there is no fork.** When an executor has handed
+over more log than a floor since its last snapshot, or more than the size of
+that snapshot — or when the writer asks it to, because the log it holds back
+from removal has passed the same bound — it takes an image of its shards a
+budget per housekeeping tick, through the same cursor `SCAN` uses, while the
+shards keep serving. The image is not the state at any instant, and does not
+need to be: every record is an absolute effect, so the log's tail from the
+moment the image began, replayed over it, is the state. That is the reason
+the log records effects rather than commands, cashed in: a snapshot with no
+pause beyond one tick's budget and no copy of the keyspace, where a server
+that forks for its snapshot copies, page by page, every part of the heap
+written while the child runs. Once the image's commit record is synced the
+executor tells the writer what it covers, and the writer removes every
+segment that every executor has covered; a start reads image plus tail. The
+image is ordinary log records in a file of its own, so the reader that steps
+over damage reads both.
 
 ## The edge is an adapter
 
