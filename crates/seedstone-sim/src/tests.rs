@@ -619,7 +619,7 @@ fn a_simulated_sync_completes_after_a_drawn_latency() {
         let host = Arc::clone(&drawn);
         sim.client("host", async move {
             let rng = Arc::new(Mutex::new(ChaCha8Rng::seed_from_u64(seed)));
-            let disk = SimDisk::new((5, 40), Some(rng));
+            let disk = SimDisk::new((5, 40), 0, Some(rng));
             disk.create_dir_all(Path::new("/d")).unwrap();
             let mut file = disk.create_append(Path::new("/d/f")).unwrap();
             for _ in 0..4 {
@@ -880,9 +880,13 @@ fn one_seed_per_durability_policy_is_pinned() {
     // Re-pinned: the writer task joined the schedule and a compaction report
     // names no executor. And again, all three, when a snapshot that made
     // nothing redundant stopped reporting a compaction of nothing.
-    const HOSTILE_1_3_ALWAYS: u64 = 0x296e_bcb7_c905_179c;
-    const HOSTILE_1_3_INTERVAL: u64 = 0x5657_3195_fe57_0de9;
-    const HOSTILE_1_3_NEVER: u64 = 0x15e5_9a69_8a7a_93a4;
+    //
+    // Re-pinned, all three, when `hostile` went from a thousand shards to
+    // sixteen, drew its crash at rest or under load per seed, and its disk
+    // began to draw sync faults — one move for the three.
+    const HOSTILE_1_3_ALWAYS: u64 = 0xbcab_6e06_771a_2024;
+    const HOSTILE_1_3_INTERVAL: u64 = 0x1993_a816_ff88_3124;
+    const HOSTILE_1_3_NEVER: u64 = 0x72cd_472a_b03f_4ab5;
     for (policy, pinned) in [
         (SyncPolicy::ALWAYS, HOSTILE_1_3_ALWAYS),
         (SyncPolicy::INTERVAL, HOSTILE_1_3_INTERVAL),

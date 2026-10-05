@@ -24,6 +24,13 @@ use seedstone_sim::{FsyncDraw, Plant, SimConfig, SimOutcome, run_sim};
 /// How many hostile seeds each claim is given.
 const SEEDS: u64 = 12;
 
+/// How many of the twelve seeds the honest node must decide at least one
+/// durable read on. Read on 2026-10-05: 5 of 12 — seeds 4, 8, 10, 11 and
+/// 12, all but one crashed at rest. A seed crashed under load is charged a
+/// possible loss on every shard, so it decides only by luck. A change that
+/// lowers this is the finding — see the module doc.
+const DECIDING_SEEDS: u64 = 5;
+
 fn hostile(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
     let mut cfg = SimConfig::hostile(1, sim_seed);
     cfg.planted = plant;
@@ -45,23 +52,24 @@ fn hostile_always(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
 
 /// The honest node, and the shape's calibration: every seed meets a fault
 /// of some kind, recovers, and still decides its checks — all but the
-/// expiration checks on a seed whose recoveries excused every durable read:
-/// a crash under load tears the one segment's last record, every shard is
-/// charged a possible loss, and a key read dead on a shard that reported
-/// one decides nothing. Some seed of the range still decides them.
+/// expiration checks on a seed whose recoveries reported a loss: the model
+/// gives up a deadline kept across such a recovery, and a crash under load
+/// charges every shard, so such a seed may have none left to decide. Some
+/// seed of the range still decides them, and at least `DECIDING_SEEDS`
+/// decide a durable read.
 #[test]
 fn the_hostile_shape_faults_on_every_seed_and_the_honest_node_holds() {
     let mut any_recovered_lossy = false;
     let mut any_expiry_decided = false;
+    let mut deciding = 0u64;
     for sim_seed in 1..=SEEDS {
         let outcome = hostile(sim_seed, None);
         assert!(
             outcome.invariant_holds(),
             "seed {sim_seed} violated an invariant with an honest node: {outcome:?}"
         );
-        let excused_everything = outcome.durable_checks == 0 && outcome.excused_losses > 0;
         let mut rest = outcome.clone();
-        if excused_everything {
+        if outcome.excused_losses > 0 {
             rest.dead_checks = rest.dead_checks.max(1);
             rest.alive_checks = rest.alive_checks.max(1);
         }
@@ -76,7 +84,12 @@ fn the_hostile_shape_faults_on_every_seed_and_the_honest_node_holds() {
             "seed {sim_seed}: the hostile disk did nothing hostile; raise DiskFaults::HOSTILE: {outcome:?}"
         );
         any_recovered_lossy |= outcome.lost_durable_prefixes > 0;
+        deciding += u64::from(outcome.durable_checks > 0);
     }
+    assert!(
+        deciding >= DECIDING_SEEDS,
+        "only {deciding} of 1..={SEEDS} decided a durable read; the shape stopped deciding"
+    );
     assert!(
         any_expiry_decided,
         "no seed in 1..={SEEDS} decided an expiration check"
@@ -85,6 +98,19 @@ fn the_hostile_shape_faults_on_every_seed_and_the_honest_node_holds() {
         any_recovered_lossy,
         "no seed in 1..={SEEDS} put a hole inside the durable region, so nothing here \
          distinguishes the honest reader from a prefix scan; raise corruption_permille"
+    );
+}
+
+/// turmoil's sync draws no fault (0.7.2, read 2026-10-02), so the shape's
+/// disk draws its own: over the calibration seeds some sync fails, and the
+/// refusal that begins at a sync — reached before only by the core's
+/// in-memory disk — is reached in the sweep.
+#[test]
+fn the_hostile_disk_fails_a_sync_on_some_seed() {
+    let faulted = (1..=SEEDS).any(|sim_seed| hostile(sim_seed, None).sync_faults > 0);
+    assert!(
+        faulted,
+        "no seed in 1..={SEEDS} met a failed sync; the disk draws none"
     );
 }
 

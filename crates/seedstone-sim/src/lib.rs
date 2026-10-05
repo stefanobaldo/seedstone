@@ -501,7 +501,8 @@ fn drive(sim: &mut turmoil::Sim<'_>, cfg: &SimConfig, shared: &Shared) {
     // The driver: turmoil's own `run` loop, with the crash plan in it.
     // Everything the plan does happens between steps, from outside every
     // host, which is the only place a host can be crashed from.
-    let mut schedule = CrashSchedule::draw(cfg.crashes, cfg.sim_seed);
+    let plan = cfg.crash_plan();
+    let mut schedule = CrashSchedule::draw(plan, cfg.sim_seed);
     let mut rest_since: Option<Duration> = None;
     loop {
         let finished = sim.step().expect("simulation failed");
@@ -509,8 +510,8 @@ fn drive(sim: &mut turmoil::Sim<'_>, cfg: &SimConfig, shared: &Shared) {
             break;
         }
         let now = sim.elapsed();
-        match cfg.crashes {
-            CrashPlan::None => {}
+        match plan {
+            CrashPlan::None | CrashPlan::PerSeed { .. } => {}
             CrashPlan::UnderLoad { .. } => {
                 if schedule.next_due(now) {
                     crash_and_restart(sim, shared, now);
@@ -915,7 +916,7 @@ async fn client(id: u16, cfg: SimConfig, shared: Shared) -> turmoil::Result {
     // the log has had three ticks to sync, and the settle that follows reads
     // back against a model that expects everything.
     lock(&shared.tally).paused += 1;
-    if cfg.crashes == CrashPlan::AtRest {
+    if cfg.crash_plan() == CrashPlan::AtRest {
         while !lock(&shared.tally).rest_crashed {
             tokio::time::sleep(VERIFIER_POLL).await;
         }

@@ -597,7 +597,11 @@ impl Shared {
             crashes: Arc::default(),
             truncated: Arc::new(Mutex::new(vec![None; usize::from(shards)])),
             increments: Arc::default(),
-            disk: SimDisk::new(disk.sync_latency_ms, Some(Arc::new(Mutex::new(rng)))),
+            disk: SimDisk::new(
+                disk.sync_latency_ms,
+                disk.io_error_permille,
+                Some(Arc::new(Mutex::new(rng))),
+            ),
             disk_lies: disk.lies(),
             policy: cfg.policy(),
             shards: cfg.shards,
