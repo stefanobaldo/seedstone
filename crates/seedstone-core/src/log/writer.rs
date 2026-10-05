@@ -162,12 +162,14 @@ struct Lane {
     reported_bytes: u64,
     /// What its last durable snapshot covers.
     covered: Option<u64>,
-    /// Whether a snapshot has been reported this generation.
-    reported: bool,
-    /// That snapshot's size.
-    snapshot_bytes: u64,
+    /// The size of the last snapshot it reported this generation; `None`
+    /// until it reports one.
+    snapshot_bytes: Option<u64>,
     /// A `Nudge` was sent and no `Covered` has answered it yet.
     nudged: bool,
+    /// A `Fault` was sent and no `Covered` has answered it yet: refusing,
+    /// as far as the writer knows.
+    refusing: bool,
     stopped: bool,
     progress: mpsc::UnboundedSender<Progress>,
 }
@@ -182,9 +184,9 @@ impl Lane {
             written_bytes: 0,
             reported_bytes: 0,
             covered: None,
-            reported: false,
-            snapshot_bytes: 0,
+            snapshot_bytes: None,
             nudged: false,
+            refusing: false,
             stopped: false,
             progress,
         }
@@ -497,12 +499,17 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
     /// round in flight is let go. A fresh failure is traced and reaches
     /// every executor; a failure of the retry is the same incident — bytes
     /// sent before their executor heard of the first retry it too — so it
-    /// is not traced again, and reaches only those with bytes in it, so
-    /// that an executor still refusing from the first is not made to
-    /// abandon the snapshot that will end its refusal.
+    /// reaches only those with bytes in it, so that an executor still
+    /// refusing from the first is not made to abandon the snapshot that
+    /// will end its refusal, and is traced again only when it reaches one
+    /// that had resumed: that is a refusal starting over.
     fn fail(&mut self, fault: LogFault, error: &io::Error) {
         let fresh = !self.segment.sync_failed;
-        if fresh {
+        let refuses_again = self
+            .lanes
+            .iter()
+            .any(|lane| lane.pending_bytes > 0 && !lane.refusing);
+        if fresh || refuses_again {
             self.trace.log_fault(fault, error);
         }
         self.segment.sync_failed = true;
@@ -520,6 +527,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
             let had_bytes = dropped > 0;
             lane.received = lane.written;
             if fresh || had_bytes {
+                lane.refusing = true;
                 let _ = lane.progress.send(Progress::Fault);
             }
         }
@@ -604,9 +612,9 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
     ) {
         let lane = &mut self.lanes[usize::from(executor)];
         lane.covered = lane.covered.max(through_batch);
-        lane.reported = true;
-        lane.snapshot_bytes = snapshot_bytes;
+        lane.snapshot_bytes = Some(snapshot_bytes);
         lane.nudged = false;
+        lane.refusing = false;
         self.compact(executor, cycle);
     }
 
@@ -621,7 +629,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
     fn compact(&mut self, executor: u16, cycle: u32) {
         let mut removed = CompactionReport { files: 0, bytes: 0 };
         let names = self.disk.list(&self.wal).unwrap_or_default();
-        let round_closed = self.lanes.iter().all(|lane| lane.reported);
+        let round_closed = self.lanes.iter().all(|lane| lane.snapshot_bytes.is_some());
         let mut older_left = false;
         for name in names.iter().filter(|name| self.is_older(name)) {
             if !round_closed {
@@ -738,17 +746,18 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
             if lane.nudged {
                 continue;
             }
-            let holds_older = older && !lane.reported;
+            let holds_older = older && lane.snapshot_bytes.is_none();
             let holds_front = front.as_ref().is_some_and(|last| {
                 last[index].is_some_and(|batch| lane.covered.is_none_or(|covered| covered < batch))
             });
             if !(holds_older || holds_front) {
                 continue;
             }
-            let threshold = self
-                .checkpoint
-                .floor
-                .max(self.checkpoint.ratio.saturating_mul(lane.snapshot_bytes));
+            let threshold = self.checkpoint.floor.max(
+                self.checkpoint
+                    .ratio
+                    .saturating_mul(lane.snapshot_bytes.unwrap_or(0)),
+            );
             if retained > threshold {
                 lane.nudged = true;
                 let _ = lane.progress.send(Progress::Nudge);
