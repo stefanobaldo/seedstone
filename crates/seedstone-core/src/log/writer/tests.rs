@@ -478,6 +478,41 @@ async fn a_retry_that_fails_on_a_failed_segment_traces_no_second_line() {
     );
 }
 
+/// A rotation that keeps failing is still one incident while the executors
+/// it reaches are refusing from it; once one has resumed — its snapshot
+/// covered — a failure that refuses it again is a new line, or the node
+/// would go back to refusing with nothing in its log to say why.
+#[tokio::test(start_paused = true)]
+async fn a_retry_that_fails_after_an_executor_resumed_is_a_new_line() {
+    let disk = MemDisk::default();
+    let trace = Recorder::default();
+    let mut rig = open_with(
+        &disk,
+        2,
+        SyncPolicy::INTERVAL,
+        1 << 20,
+        WriterPlants::default(),
+        trace.clone(),
+    );
+    disk.fail_writes(true);
+    disk.fail_creates(true);
+    rig.submit(0, 0, record(0, 0, b"a"));
+    assert!(matches!(rig.next(0).await, Progress::Fault));
+    assert!(matches!(rig.next(1).await, Progress::Fault));
+    rig.submit(0, 1, record(0, 1, b"b")); // sent while refusing
+    assert!(matches!(rig.next(0).await, Progress::Fault));
+    assert_eq!(*trace.faults.lock().unwrap(), vec![LogFault::Write]);
+    covered(&rig, 1, 0, None, 10); // executor 1's snapshot ends its refusal
+    tokio::task::yield_now().await;
+    rig.submit(1, 0, record(512, 0, b"c"));
+    assert!(matches!(rig.next(1).await, Progress::Fault));
+    assert_eq!(
+        *trace.faults.lock().unwrap(),
+        vec![LogFault::Write, LogFault::Rotate],
+        "the rotation still fails, and now refuses an executor that had resumed"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_segment_rotates_at_its_size_and_the_old_one_is_synced_first() {
     let disk = MemDisk::default();
