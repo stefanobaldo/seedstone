@@ -179,10 +179,11 @@ jobs:
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 24 --eviction --workload-seed 1
 
-      # The shape whose disk fails and lies, and the only one where the
-      # recovery machinery meets a hole inside the durable region: it is
-      # where a reader or a writer that loses records is visible at all.
-      # Seconds, not minutes — twenty-four seeds of the small shape.
+      # The shape whose disk fails and lies — writes, reads and, since the
+      # shape's own draw, syncs — and the only one where the recovery
+      # machinery meets a hole inside the durable region: where a reader or
+      # a writer that loses records is visible at all. Sixteen shards,
+      # crashed under load or at rest by the seed. Seconds, not minutes.
       - name: DST sweep, hostile disk
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: cargo run --release -p seedstone-sim --bin sweep -- --seeds 24 --hostile --workload-seed 1

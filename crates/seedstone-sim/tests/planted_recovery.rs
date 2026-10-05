@@ -6,12 +6,16 @@
 //! is served on `hostile`, whose reads corrupt and whose writes fail, and
 //! the honest node runs the same seeds clean.
 //!
-//! Since a node writes one segment for all its shards, `hostile` no longer
-//! catches it: a crash under load tears the segment's last record, which
-//! lies after every record of every shard, so recovery charges every shard
-//! with a possible loss, and a loss the plant hides is reported anyway. The
-//! claim is kept, ignored, with what was measured, until a shape that can
-//! catch it exists.
+//! The shape catches it rarely, and the reason is the recovery's and not
+//! the shape's. A crash under load tears the one segment's last record,
+//! which lies after every shard's highest record, so recovery charges
+//! every shard with a possible loss and a loss the plant hides is reported
+//! anyway. A crash at rest tears nothing, and the reads after it decide
+//! durable writes — but a read-corruption hole inside the durable region,
+//! met by the recovery after one, is rare on the shape's disk: over seeds
+//! 1..=100 the plant surfaced on one, at `--fsync always`
+//! (read 2026-10-05). The claim is kept, ignored, with that reading, until
+//! recovery can tell a crash's tear from damage to what was synced.
 //!
 //! The claim is "some seed catches it", in the pattern `standard_catches.rs`
 //! set, because whether a given seed puts a hole inside the durable region
@@ -116,10 +120,11 @@ fn the_hostile_disk_fails_a_sync_on_some_seed() {
 
 /// A reader that stops at the first damage loses records it never reports.
 ///
-/// Measured with one segment per node: no seed in 1..=24 catches it, with
-/// crashes under load or at rest.
+/// Measured on sixteen shards, crashed under load or at rest by the seed:
+/// no seed in 1..=12 catches it; over 1..=100 one does, seed 88, at
+/// `--fsync always` (read 2026-10-05).
 #[test]
-#[ignore = "no shape catches it while a crash's torn tail charges every shard: see the module doc"]
+#[ignore = "caught on one seed in a hundred while a crash's torn tail charges every shard: see the module doc"]
 fn a_prefix_scan_recovery_is_caught_as_an_unreported_loss() {
     let caught = (1..=SEEDS).find(|sim_seed| {
         hostile_always(*sim_seed, Some(Plant::PrefixScanRecovery)).unreported_losses > 0
