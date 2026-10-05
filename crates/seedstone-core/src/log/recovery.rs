@@ -133,10 +133,12 @@ pub struct RecoveredShard {
     /// The position the shard resumes at.
     pub seq: u64,
     /// Whether damage on disk could explain a loss of this shard's
-    /// records: damage in a segment its executor wrote, a segment or
-    /// snapshot header nobody could read, or a finished image of it that
-    /// was refused. A gap alone does not set it — a gap in an intact log is
-    /// not something a disk did.
+    /// records: a hole in the node's log after its highest record, or with
+    /// no record of it at all; a gap in its records where the log had
+    /// damage; a record of it this build could not read; a segment or
+    /// snapshot header nobody could read; or a refused image of it whose
+    /// base the log does not reach. A gap alone does not set it — a gap in
+    /// an intact log is not something a disk did.
     pub lossy: bool,
     /// Whether the shard's prefix was cut, or its loss is possible: the
     /// pool writes a `Rebase` before serving it.

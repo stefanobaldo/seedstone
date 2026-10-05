@@ -115,8 +115,8 @@ one message, and the writer appends them in arrival order, the shards
 interleaved. On start every segment is read through a reader that steps
 over damage, and each shard replays the gapless prefix of its sequence.
 Damage in that one file is charged to the shards it may have cost without a
-trace — those with no intact record after it — and a gap behind damage is
-reported as a loss. A shard whose prefix was cut resumes there behind a
+trace — those whose highest record precedes it, or that have none — and a
+gap behind damage is reported as a loss. A shard whose prefix was cut resumes there behind a
 *rebase* record, written and synced before the node serves, so the records
 the cut left on disk are never replayed by a later start. The same
 abstraction becomes a consensus log after that. Without the flag the log is
