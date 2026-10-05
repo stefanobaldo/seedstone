@@ -207,8 +207,9 @@ fn the_trace_hash_is_pinned_across_processes_and_builds() {
     // the trace folds both. `expected_sum` and the four counts held still.
     //
     // Re-pinned: the writer task joined the schedule and a compaction report
-    // names no executor.
-    const MINI_1_42: u64 = 0xe2ea_4a4c_62dd_f6cc;
+    // names no executor. And again when a snapshot that made nothing
+    // redundant stopped reporting a compaction of nothing.
+    const MINI_1_42: u64 = 0x73f9_4d12_77fe_7dc5;
 
     let outcome = run_sim(&SimConfig::mini(1, 42));
     assert_eq!(
@@ -877,10 +878,11 @@ fn one_seed_per_durability_policy_is_pinned() {
     // holds any.
     //
     // Re-pinned: the writer task joined the schedule and a compaction report
-    // names no executor.
-    const HOSTILE_1_3_ALWAYS: u64 = 0x4952_a76a_1c3c_8d12;
-    const HOSTILE_1_3_INTERVAL: u64 = 0x9597_7a37_09d2_82e6;
-    const HOSTILE_1_3_NEVER: u64 = 0x1908_f60a_1ca9_8c24;
+    // names no executor. And again, all three, when a snapshot that made
+    // nothing redundant stopped reporting a compaction of nothing.
+    const HOSTILE_1_3_ALWAYS: u64 = 0x296e_bcb7_c905_179c;
+    const HOSTILE_1_3_INTERVAL: u64 = 0x5657_3195_fe57_0de9;
+    const HOSTILE_1_3_NEVER: u64 = 0x15e5_9a69_8a7a_93a4;
     for (policy, pinned) in [
         (SyncPolicy::ALWAYS, HOSTILE_1_3_ALWAYS),
         (SyncPolicy::INTERVAL, HOSTILE_1_3_INTERVAL),

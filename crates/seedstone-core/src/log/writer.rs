@@ -616,7 +616,8 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
     /// reporting executor's older snapshots; and the closed rotations every
     /// executor has covered, a prefix — except rotation 0 while any older
     /// generation's file remains, because it holds the rebases that keep
-    /// those files' records above them dead. One report for all of it.
+    /// those files' records above them dead. One report for all of it, and
+    /// none when nothing went.
     fn compact(&mut self, executor: u16, cycle: u32) {
         let mut removed = CompactionReport { files: 0, bytes: 0 };
         let names = self.disk.list(&self.wal).unwrap_or_default();
@@ -694,6 +695,10 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
                     break;
                 }
             }
+        }
+        // Nothing removed, nothing to make durable or to report.
+        if removed.files == 0 {
+            return;
         }
         if let Err(error) = self.disk.sync_dir(&self.wal) {
             self.trace.log_fault(LogFault::Remove, &error);
