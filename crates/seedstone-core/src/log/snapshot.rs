@@ -27,7 +27,9 @@
 //! reason the log records effects and not commands, cashed in here.
 
 use crate::log::effect::Effect;
-use crate::log::file::{FORMAT_VERSION, HeaderError, check_header_crc, parse_name};
+use crate::log::file::{
+    FORMAT_VERSION, HeaderError, check_header_crc, parse_name, version_mismatch,
+};
 use crate::log::{Record, crc32_iso_hdlc, encode_record};
 
 /// The four bytes every snapshot starts with.
@@ -124,7 +126,17 @@ impl SnapshotHeader {
     ///
     /// [`HeaderError`], as each variant says.
     pub fn decode(buf: &[u8]) -> Result<Self, HeaderError> {
-        let len = Self::header_len(buf)?;
+        let len = match Self::header_len(buf) {
+            Ok(len) => len,
+            Err(error @ (HeaderError::NewerVersion(_) | HeaderError::OlderVersion(_))) => {
+                // Read at this layout's length, the checksum says whether
+                // the version byte was damaged or written by another build.
+                let shards = usize::from(u16::from_le_bytes([buf[19], buf[20]]));
+                let header = buf.get(..SNAPSHOT_HEADER_FIXED_LEN + shards * 10 + 4);
+                return Err(header.map_or(error, version_mismatch));
+            }
+            Err(error) => return Err(error),
+        };
         let Some(header) = buf.get(..len) else {
             return Err(HeaderError::Short);
         };
@@ -230,6 +242,7 @@ impl Footer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::file::tests::restamped;
     use crate::log::{Decoded, decode_record};
 
     #[test]
@@ -288,19 +301,26 @@ mod tests {
             SnapshotHeader::decode(&flipped),
             Err(HeaderError::BadChecksum)
         );
-        let mut older = out.clone();
-        older[4] = 1;
+        let older = restamped(&out, 1);
         assert_eq!(
             SnapshotHeader::decode(&older),
             Err(HeaderError::OlderVersion(1)),
             "an image from before this build's layout is named, not read as damage"
         );
-        let mut newer = out;
-        newer[4] = FORMAT_VERSION + 1;
+        let newer = restamped(&out, FORMAT_VERSION + 1);
         assert_eq!(
             SnapshotHeader::decode(&newer),
             Err(HeaderError::NewerVersion(FORMAT_VERSION + 1))
         );
+        for version in [0, 1, FORMAT_VERSION + 1, u8::MAX] {
+            let mut damaged = out.clone();
+            damaged[4] = version;
+            assert_eq!(
+                SnapshotHeader::decode(&damaged),
+                Err(HeaderError::BadChecksum),
+                "a damaged version byte {version} is damage, not another version"
+            );
+        }
     }
 
     #[test]
