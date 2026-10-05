@@ -1,4 +1,13 @@
-# Nightly DST sweep — a rotating 10,000-seed window against `main`.
+# Nightly DST sweep — two rotating 10,000-seed windows against `main`.
+#
+# Two legs over the same window of seeds. The `standard` leg holds the
+# strong invariant on a disk that only tears what was never synced: every
+# acknowledged write before a shard's last sync survives a crash. The
+# `hostile` leg holds the weak invariant on a disk that fails and lies —
+# writes, reads and syncs — with the node crashed under load or at rest: no
+# phantom value, every loss reported, the node up after every restart. Each
+# leg is sharded across jobs and budgeted against its slowest shard
+# observed, not the mean: the spread is the runners'.
 #
 # A clean seed is a statement about one build, so the window only advances:
 # on new code a fresh range and an old range cost the same and are worth the
@@ -49,6 +58,8 @@ jobs:
       workload-seed: ${{ steps.compute.outputs.workload-seed }}
       shards: ${{ steps.compute.outputs.shards }}
       shard-count: ${{ steps.compute.outputs.shard-count }}
+      hostile-shards: ${{ steps.compute.outputs.hostile-shards }}
+      hostile-shard-count: ${{ steps.compute.outputs.hostile-shard-count }}
     steps:
       # Dispatch inputs are free text, so they are validated here rather than
       # left to fail as arithmetic three jobs later. The shard count is capped
@@ -63,6 +74,7 @@ jobs:
             count=64
             wseed=1
             shards=2
+            hostile_shards=2
           else
             k=$(( ( $(date -u +%s) - $(date -u -d 2026-01-01 +%s) ) / 86400 ))
             start="${{ github.event.inputs.seed-start }}"
@@ -83,16 +95,26 @@ jobs:
                 exit 1
               fi
             done
-            shards=16
+            # 24 shards for `standard`: the slowest shard observed read 39 min
+            # of the 45-minute timeout on 16 (runs 37297676517 and 37193639390,
+            # 2026-10-04/05, one shard cancelled at 45), so 24 puts the same
+            # window near 26 min on the same runners. The hostile count is
+            # sized the same way, from a runner reading written beside it.
+            shards=24
             [ "$count" -ge "$shards" ] || shards=1
+            hostile_shards=8
+            [ "$count" -ge "$hostile_shards" ] || hostile_shards=1
           fi
           list=$(seq 0 $(( shards - 1 )) | jq -Rsc 'split("\n") | map(select(length > 0))')
+          hostile_list=$(seq 0 $(( hostile_shards - 1 )) | jq -Rsc 'split("\n") | map(select(length > 0))')
           {
             echo "seed-start=$start"
             echo "seeds=$count"
             echo "workload-seed=$wseed"
             echo "shards=$list"
             echo "shard-count=$shards"
+            echo "hostile-shards=$hostile_list"
+            echo "hostile-shard-count=$hostile_shards"
           } >> "$GITHUB_OUTPUT"
 
   sweep:
@@ -101,7 +123,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       # One shard's failure is a seed to replay, not a reason to throw away
-      # the fifteen windows still being swept beside it.
+      # the windows still being swept beside it.
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(needs.window.outputs.shards) }}
@@ -130,16 +152,50 @@ jobs:
             --seeds "$count" --seed-start "$start" \
             --workload-seed "${{ needs.window.outputs.workload-seed }}"
 
-  # Sixteen shard results are sixteen places to look; this job is the one
+  # The hostile leg: the same window on the disk that fails and lies, on a
+  # shape of sixteen shards, so a seed costs a fraction of a `standard` one
+  # and the leg needs fewer shards for the same window. Its count is sized
+  # from a runner reading, like the other leg's.
+  sweep-hostile:
+    needs: window
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.window.outputs.hostile-shards) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: sweep this shard's slice of the window, hostile disk
+        run: |
+          set -euo pipefail
+          base=${{ needs.window.outputs.seed-start }}
+          total=${{ needs.window.outputs.seeds }}
+          shards=${{ needs.window.outputs.hostile-shard-count }}
+          i=${{ matrix.shard }}
+          share=$(( total / shards ))
+          start=$(( base + i * share ))
+          count=$share
+          if [ "$i" -eq $(( shards - 1 )) ]; then
+            count=$(( total - i * share ))
+          fi
+          cargo run --release -p seedstone-sim --bin sweep -- \
+            --hostile --seeds "$count" --seed-start "$start" \
+            --workload-seed "${{ needs.window.outputs.workload-seed }}"
+
+  # Every shard result of both legs is a place to look; this job is the one
   # place, and it names the window it is a verdict about.
   verdict:
-    needs: [window, sweep]
+    needs: [window, sweep, sweep-hostile]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: one status for the whole window
+      - name: one status for the whole window, both legs
         run: |
           echo "window: start=${{ needs.window.outputs.seed-start }}" \
                "seeds=${{ needs.window.outputs.seeds }}" \
-               "workload-seed=${{ needs.window.outputs.workload-seed }}"
-          [ "${{ needs.sweep.result }}" = "success" ]
+               "workload-seed=${{ needs.window.outputs.workload-seed }}" \
+               "standard-shards=${{ needs.window.outputs.shard-count }}" \
+               "hostile-shards=${{ needs.window.outputs.hostile-shard-count }}"
+          [ "${{ needs.sweep.result }}" = "success" ] && [ "${{ needs.sweep-hostile.result }}" = "success" ]
