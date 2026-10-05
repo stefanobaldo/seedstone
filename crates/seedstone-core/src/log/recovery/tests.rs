@@ -335,6 +335,33 @@ fn a_gap_behind_a_hole_is_a_loss_the_shard_reports() {
 }
 
 #[test]
+fn an_older_record_found_again_after_a_hole_does_not_stand_in_for_what_it_took() {
+    // Shard 0's third record is in the hole; a copy of its first is intact
+    // after it. The copy is the last of shard 0's records read, but not
+    // its highest: what the hole took from shard 0 shows no gap, so the
+    // shard is charged as one with nothing after the hole.
+    let disk = MemDisk::default();
+    let path = Path::new("/data/wal").join(segment_name(1, 0));
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write(&mut seg, 0, 1, &put(b"a", b"2"));
+    let hole = disk.contents(&path).len();
+    write(&mut seg, 0, 2, &put(b"a", b"3"));
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write(&mut seg, 1, 0, &put(b"b", b"1"));
+    corrupt_record_at(&disk, &path, hole);
+
+    let recovery = recover(spec(&disk, 2)).unwrap();
+    assert_eq!(recovery.report.holes, 1);
+    assert_eq!(recovery.shards[0].seq, 2);
+    assert!(
+        recovery.shards[0].lossy,
+        "the copy after the hole is older than what the hole took"
+    );
+    assert!(!recovery.shards[1].lossy);
+}
+
+#[test]
 fn a_hole_across_rotations_is_judged_by_the_later_rotation() {
     // A hole in the first rotation; shard 1 continues in the second with
     // its next sequence, so it lost nothing there.
