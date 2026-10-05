@@ -98,11 +98,15 @@ jobs:
             # 24 shards for `standard`: the slowest shard observed read 39 min
             # of the 45-minute timeout on 16 (runs 37297676517 and 37193639390,
             # 2026-10-04/05, one shard cancelled at 45), so 24 puts the same
-            # window near 26 min on the same runners. The hostile count is
-            # sized the same way, from a runner reading written beside it.
+            # window near 26 min on the same runners.
             shards=24
             [ "$count" -ge "$shards" ] || shards=1
-            hostile_shards=8
+            # Hostile: 0.034 s per seed on ubuntu-latest (run 37390030306,
+            # 2026-10-05, 1,000 seeds on one shard in 34 s), so one shard
+            # would sweep 10,000 in about 6 min. Four rather than one, so a
+            # runner lost mid-sweep costs a quarter of the window and not all
+            # of it: each shard near 1.5 min plus the build.
+            hostile_shards=4
             [ "$count" -ge "$hostile_shards" ] || hostile_shards=1
           fi
           list=$(seq 0 $(( shards - 1 )) | jq -Rsc 'split("\n") | map(select(length > 0))')
