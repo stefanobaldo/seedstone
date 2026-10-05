@@ -591,3 +591,218 @@ async fn fsync_without_a_data_dir_warns_once() {
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::remove_file(&stderr).unwrap();
 }
+
+/// CRC-32/ISO-HDLC, bit by bit: the checksum a segment header carries.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// A directory written by a build whose segments named their executor is
+/// refused at start, with a line that says what it is — not read as damage
+/// to every shard and served empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_directory_from_the_previous_format_is_refused_with_a_line_that_says_so() {
+    let dir = scratch();
+    let wal = dir.join("wal");
+    std::fs::create_dir_all(&wal).unwrap();
+    // The previous layout's header: magic, version 1, generation, executor,
+    // rotation, checksum.
+    let mut header = Vec::new();
+    header.extend_from_slice(b"SSEG");
+    header.push(1);
+    header.extend_from_slice(&1u64.to_le_bytes());
+    header.extend_from_slice(&0u16.to_le_bytes());
+    header.extend_from_slice(&0u32.to_le_bytes());
+    let crc = crc32(&header);
+    header.extend_from_slice(&crc.to_le_bytes());
+    std::fs::write(wal.join("0000000000000001-0000-00000000.seg"), header).unwrap();
+    let stderr = dir.join("stderr");
+    let mut child = spawn(&dir, &["--data-dir".as_ref(), dir.as_os_str()], &stderr);
+    let status = child.wait().expect("reaped");
+    let lines = std::fs::read_to_string(&stderr).unwrap();
+    assert_eq!(status.code(), Some(1), "{lines}");
+    assert!(
+        lines.contains("\"evt\":\"recovery_failed\"") && lines.contains("predates"),
+        "{lines}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The executors the binary runs on this host.
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+/// Names of the segments and snapshots under `dir/wal`.
+fn log_names(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir.join("wal"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| {
+            Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext == "seg" || ext == "snap")
+        })
+        .collect()
+}
+
+/// Lines with `evt` in `stderr`, once there are at least `count` of them;
+/// fails after thirty seconds.
+async fn until_event_count(stderr: &Path, evt: &str, count: usize) -> Vec<String> {
+    let needle = format!("\"evt\":\"{evt}\"");
+    for _ in 0..1500 {
+        let text = std::fs::read_to_string(stderr).unwrap_or_default();
+        let found: Vec<String> = text
+            .lines()
+            .filter(|line| line.contains(&needle))
+            .map(str::to_owned)
+            .collect();
+        if found.len() >= count {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "fewer than {count} {evt} lines within thirty seconds: {}",
+        std::fs::read_to_string(stderr).unwrap_or_default()
+    )
+}
+
+/// Writes 16 KiB values over keys spread across every shard, and so across
+/// every executor, until `total` bytes of values are written or a reply is
+/// not `OK`; returns that reply, if one came.
+async fn write_spread(port: u16, total: u64) -> Option<Frame> {
+    const VALUE: usize = 16 * 1024;
+    let value = "v".repeat(VALUE);
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    for i in 0..total / VALUE as u64 {
+        let reply = round_trip(&mut stream, &["SET", &format!("s{i}"), &value]).await;
+        if reply != Frame::Simple("OK".into()) {
+            return Some(reply);
+        }
+    }
+    None
+}
+
+/// Spread over every executor, 70 MiB leaves each one's own writing far
+/// short of the floor. Killed, then started again, the node holds the
+/// previous process's files as retained log above the bound: every
+/// executor is asked for a snapshot, and once each is durable the older
+/// files go together.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_a_restart_the_previous_process_s_files_are_replaced_once_they_exceed_the_bound() {
+    let dir = scratch();
+    let first_err = dir.with_extension("stderr-1");
+    let (mut first, port) = start_with(&dir, &first_err, &["--fsync", "never"]).await;
+    assert_eq!(write_spread(port, 70 * 1024 * 1024).await, None);
+    first.kill().expect("SIGKILL");
+    first.wait().expect("reaped");
+    let older = log_names(&dir);
+    assert!(!older.is_empty());
+
+    let second_err = dir.with_extension("stderr-2");
+    let (mut second, port) = start_with(&dir, &second_err, &["--fsync", "never"]).await;
+    set_many(port, 10).await;
+    until_event_count(&second_err, "snapshot", available_parallelism()).await;
+    let mut left = older.clone();
+    for _ in 0..1500 {
+        left.retain(|name| dir.join("wal").join(name).exists());
+        if left.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        left.is_empty(),
+        "{left:?} stayed: {}",
+        std::fs::read_to_string(&second_err).unwrap()
+    );
+    // Recovery removes a snapshot the kill left unfinished; the node, the
+    // rest. The files go before the line that reports them is written.
+    let removed = |text: &str| -> u64 {
+        text.lines()
+            .filter(|line| {
+                line.contains("\"evt\":\"compaction\"") || line.contains("\"evt\":\"recovery\"")
+            })
+            .map(|line| {
+                if line.contains("\"evt\":\"recovery\"") {
+                    field(line, "files_removed")
+                } else {
+                    field(line, "files")
+                }
+            })
+            .sum()
+    };
+    let mut text = String::new();
+    for _ in 0..500 {
+        text = std::fs::read_to_string(&second_err).unwrap();
+        if removed(&text) >= older.len() as u64 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(removed(&text) >= older.len() as u64, "{older:?}: {text}");
+    second.kill().expect("SIGKILL");
+    second.wait().expect("reaped");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&first_err).unwrap();
+    std::fs::remove_file(&second_err).unwrap();
+}
+
+/// A log that cannot rotate is one `log_fault` line for the node; every
+/// executor refuses writes, and each returns on its own `refusal_ended`
+/// line once its snapshot is durable.
+///
+/// The directory is made read-only after the start: the open segment keeps
+/// taking writes, and the rotation past 64 MiB cannot create its file —
+/// nor can a snapshot until the directory is writable again. A process
+/// that ignores the permission (root) cannot be made to fail this way, and
+/// the test says so and stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_log_that_cannot_rotate_is_one_line_for_the_node_and_one_return_per_executor() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let (mut node, port) = start_with(&dir, &stderr, &["--fsync", "never"]).await;
+    let wal = dir.join("wal");
+    std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(wal.join("probe"), b"").is_ok() {
+        eprintln!("this process writes to a read-only directory; nothing to provoke");
+        node.kill().expect("SIGKILL");
+        node.wait().expect("reaped");
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
+    let refused = write_spread(port, 80 * 1024 * 1024).await;
+    let Some(Frame::Error(text)) = refused else {
+        panic!("no refusal within 80 MiB: {refused:?}")
+    };
+    assert!(text.starts_with("MISCONF"), "{text}");
+    std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ended = until_event_count(&stderr, "refusal_ended", available_parallelism()).await;
+    assert_eq!(ended.len(), available_parallelism(), "{ended:?}");
+    set_many(port, 10).await;
+    let text = std::fs::read_to_string(&stderr).unwrap();
+    let faults: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("\"evt\":\"log_fault\""))
+        .collect();
+    assert_eq!(faults.len(), 1, "{text}");
+    assert!(faults[0].contains("\"stage\":\"rotate\""), "{}", faults[0]);
+    assert!(!faults[0].contains("\"shard\""), "{}", faults[0]);
+    node.kill().expect("SIGKILL");
+    node.wait().expect("reaped");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}
