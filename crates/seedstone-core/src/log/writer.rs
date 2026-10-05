@@ -82,7 +82,8 @@ pub enum ToWriter {
 /// What the writer sends an executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Progress {
-    /// `bytes` of this executor's submissions are in the file, cumulative.
+    /// `bytes` of this executor's submissions are in the file, or were
+    /// dropped at a failure it was told of, cumulative.
     Written { bytes: u64 },
     /// A sync covering this executor's batches through `through_batch`
     /// completed, as round `round`; `bytes` as in `Written`.
@@ -155,7 +156,7 @@ struct Lane {
     durable: Option<u64>,
     /// Bytes received and not yet written.
     pending_bytes: u64,
-    /// Bytes written, cumulative.
+    /// Bytes written, or dropped at a failure, cumulative.
     written_bytes: u64,
     /// What the last `Written` or `Durable` told the executor.
     reported_bytes: u64,
@@ -511,7 +512,12 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
             self.trace.sync_settled(self.round);
         }
         for lane in &mut self.lanes {
-            let had_bytes = std::mem::take(&mut lane.pending_bytes) > 0;
+            // Dropped bytes count as consumed: the executor lets go of
+            // everything it sent when it hears `Fault`, and a count behind
+            // its own would keep its budget spent.
+            let dropped = std::mem::take(&mut lane.pending_bytes);
+            lane.written_bytes += dropped;
+            let had_bytes = dropped > 0;
             lane.received = lane.written;
             if fresh || had_bytes {
                 let _ = lane.progress.send(Progress::Fault);
