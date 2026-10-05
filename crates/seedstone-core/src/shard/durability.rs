@@ -147,6 +147,9 @@ pub struct SyncState {
     /// The number the next submission is tagged with.
     pub batch: u64,
     pub mode: Mode,
+    /// The writer's channel closed: nothing can be made durable again, so
+    /// a refusal never ends.
+    pub writer_lost: bool,
 }
 
 impl SyncState {
@@ -164,6 +167,7 @@ impl SyncState {
             held: VecDeque::new(),
             batch: 0,
             mode: Mode::Serving,
+            writer_lost: false,
         }
     }
 

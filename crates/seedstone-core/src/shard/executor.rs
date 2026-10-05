@@ -406,8 +406,10 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
                 if let Some(message) = progress {
                     this.progress(message);
                 } else {
-                    // The writer is gone: nothing more will be proven.
+                    // The writer is gone: nothing more will be proven, and
+                    // the refusal this begins is never ended.
                     this.sync.link = None;
+                    this.sync.writer_lost = true;
                     this.refuse();
                 }
             }
@@ -864,7 +866,9 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
                     snapshot_bytes: done.bytes,
                 });
             }
-            if let Mode::Refusing { refused, ticks } = self.sync.mode {
+            if let Mode::Refusing { refused, ticks } = self.sync.mode
+                && !self.sync.writer_lost
+            {
                 // Forced at the failure, so the snapshot is of memory after
                 // it: everything the failed log held is covered.
                 self.trace.refusal_ended(&RefusalReport {

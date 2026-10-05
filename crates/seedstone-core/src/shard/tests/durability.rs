@@ -419,6 +419,20 @@ async fn a_nudge_opens_a_cycle_and_its_completion_is_reported_covered() {
     assert_eq!(covered, Some((0, Some(batch))));
 }
 
+/// A writer that is gone cannot make anything durable again: the executor
+/// refuses writes from then on, and its snapshot does not end the refusal
+/// — ending it would serve `always` writes with no log behind them.
+#[tokio::test(start_paused = true)]
+async fn an_executor_whose_writer_is_gone_refuses_writes_for_good() {
+    let (links, _to_writer, progress) = fake_links(1);
+    let pool = pool_with_links_and_checkpoint(SyncPolicy::ALWAYS, links);
+    drop(progress);
+    settle().await;
+    tick(16).await;
+    assert_eq!(pool.dispatch(set(b"k", b"v")).await, refused());
+    assert_eq!(pool.dispatch(get(b"k")).await, Reply::Bulk(None));
+}
+
 /// A stop hands what is queued to the writer and waits for its last sync
 /// — under every policy, `never` included.
 #[tokio::test(start_paused = true)]
