@@ -388,7 +388,7 @@ async fn a_failed_sync_faults_every_executor_and_the_next_submission_rotates_to_
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_failed_write_faults_and_drops_what_was_staged() {
+async fn a_failed_write_faults_drops_what_was_staged_and_counts_it_consumed() {
     let disk = MemDisk::default();
     let mut rig = open(
         &disk,
@@ -406,8 +406,10 @@ async fn a_failed_write_faults_and_drops_what_was_staged() {
     assert_eq!(through, Some(1));
     assert_eq!(
         bytes,
-        record(0, 1, b"b").len() as u64,
-        "the dropped batch's bytes are not counted as written"
+        (record(0, 0, b"a").len() + record(0, 1, b"b").len()) as u64,
+        "the dropped batch's bytes are counted as consumed: the executor let \
+         them go at its `Fault`, and a count behind its own would hold its \
+         budget spent for good"
     );
 }
 
