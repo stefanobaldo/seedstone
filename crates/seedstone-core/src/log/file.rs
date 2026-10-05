@@ -125,7 +125,9 @@ pub enum HeaderError {
 ///
 /// The version is checked before the checksum: another version may lay its
 /// header out differently, and refusing it as damage would scan a downgrade
-/// as a hole, or an earlier build's directory as every shard's loss.
+/// as a hole, or an earlier build's directory as every shard's loss. A
+/// version byte that is this layout's own once restored, with the checksum
+/// then matching, was damaged rather than written by another build.
 ///
 /// # Errors
 ///
@@ -137,10 +139,8 @@ pub fn decode_segment_header(buf: &[u8]) -> Result<(u64, u32), HeaderError> {
     if header[..4] != SEGMENT_MAGIC {
         return Err(HeaderError::BadMagic);
     }
-    match header[4] {
-        v if v > FORMAT_VERSION => return Err(HeaderError::NewerVersion(v)),
-        v if v < FORMAT_VERSION => return Err(HeaderError::OlderVersion(v)),
-        _ => {}
+    if header[4] != FORMAT_VERSION {
+        return Err(version_mismatch(header));
     }
     check_header_crc(header)?;
     let mut generation = [0; 8];
@@ -148,6 +148,21 @@ pub fn decode_segment_header(buf: &[u8]) -> Result<(u64, u32), HeaderError> {
     let mut rotation = [0; 4];
     rotation.copy_from_slice(&header[13..17]);
     Ok((u64::from_le_bytes(generation), u32::from_le_bytes(rotation)))
+}
+
+/// Why a header of this layout's length carries another version: written
+/// by another build, or this layout's own header with its version byte
+/// damaged — which the checksum tells apart, since it covers the byte.
+pub(crate) fn version_mismatch(header: &[u8]) -> HeaderError {
+    let mut restored = header.to_vec();
+    restored[4] = FORMAT_VERSION;
+    if check_header_crc(&restored).is_ok() {
+        return HeaderError::BadChecksum;
+    }
+    match header[4] {
+        v if v > FORMAT_VERSION => HeaderError::NewerVersion(v),
+        v => HeaderError::OlderVersion(v),
+    }
 }
 
 /// The last four bytes of `header` are the CRC of everything before them.
@@ -313,7 +328,7 @@ pub fn create_segment<D: Disk>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::log::disk::mem::MemDisk;
     use crate::log::{Decoded, decode_record};
@@ -356,18 +371,43 @@ mod tests {
             decode_segment_header(&flipped),
             Err(HeaderError::BadChecksum)
         );
-        let mut newer = out.clone();
-        newer[4] = FORMAT_VERSION + 1;
+        let newer = restamped(&out, FORMAT_VERSION + 1);
         assert_eq!(
             decode_segment_header(&newer),
             Err(HeaderError::NewerVersion(FORMAT_VERSION + 1))
         );
-        let mut older = out;
-        older[4] = 1;
+        let older = restamped(&out, 1);
         assert_eq!(
             decode_segment_header(&older),
             Err(HeaderError::OlderVersion(1))
         );
+    }
+
+    /// `header` with its version byte set to `version` and its CRC made to
+    /// match: what a build writing that version would have laid out, had it
+    /// kept this layout.
+    pub fn restamped(header: &[u8], version: u8) -> Vec<u8> {
+        let mut out = header.to_vec();
+        out[4] = version;
+        let fields = out.len() - 4;
+        let crc = crc32_iso_hdlc(&out[..fields]);
+        out[fields..].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn a_damaged_version_byte_is_a_bad_checksum_not_another_version() {
+        let mut out = Vec::new();
+        encode_segment_header(9, 5, &mut out);
+        for version in [0, 1, FORMAT_VERSION + 1, u8::MAX] {
+            let mut damaged = out.clone();
+            damaged[4] = version;
+            assert_eq!(
+                decode_segment_header(&damaged),
+                Err(HeaderError::BadChecksum),
+                "version byte {version}"
+            );
+        }
     }
 
     #[test]

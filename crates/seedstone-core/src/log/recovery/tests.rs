@@ -3,6 +3,7 @@ use crate::dict::{Dict, DictSeed};
 use crate::log::disk::LogFile;
 use crate::log::disk::mem::{MemDisk, MemFile};
 use crate::log::effect::Effect;
+use crate::log::file::tests::restamped;
 use crate::log::file::{
     FORMAT_VERSION, SEGMENT_HEADER_LEN, create_segment, encode_segment_header, segment_name,
 };
@@ -402,7 +403,7 @@ fn a_newer_format_version_refuses_to_recover() {
     wal(&disk, 1);
     let mut header = Vec::new();
     encode_segment_header(2, 0, &mut header);
-    header[4] = FORMAT_VERSION + 1;
+    let header = restamped(&header, FORMAT_VERSION + 1);
     disk.write_file(&Path::new("/data/wal").join(segment_name(2, 0)), &header)
         .unwrap();
     let error = recover(spec(&disk, 1)).unwrap_err();
@@ -430,6 +431,23 @@ fn a_segment_with_a_bad_header_is_abandoned_and_every_shard_is_lossy() {
     assert_eq!(recovery.report.abandoned_segments, 1);
     assert!(recovery.shards.iter().all(|shard| shard.lossy));
     assert_eq!(recovery.shards[1].seq, 1, "the good segment still counts");
+}
+
+/// One flipped bit in a header's version byte is damage like any other, not
+/// a directory from another build: the start goes on and charges it.
+#[test]
+fn a_segment_whose_version_byte_is_damaged_is_abandoned_not_refused() {
+    let disk = MemDisk::default();
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 1, 0, &put(b"b", b"1"));
+    let mut header = Vec::new();
+    encode_segment_header(2, 0, &mut header);
+    header[4] ^= 0x03; // 2 -> 1: what an earlier build would have written
+    disk.write_file(&Path::new("/data/wal").join(segment_name(2, 0)), &header)
+        .unwrap();
+    let recovery = recover(spec(&disk, 2)).expect("damage, not another version");
+    assert_eq!(recovery.report.abandoned_segments, 1);
+    assert!(recovery.shards.iter().all(|shard| shard.lossy));
 }
 
 /// A read can fail where the next one succeeds: a segment this start could
@@ -996,7 +1014,7 @@ fn a_snapshot_from_a_newer_format_version_refuses_the_start() {
     };
     let mut bytes = Vec::new();
     header.encode(&mut bytes);
-    bytes[4] = FORMAT_VERSION + 1;
+    let bytes = restamped(&bytes, FORMAT_VERSION + 1);
     disk.write_file(&Path::new("/data/wal").join(snapshot_name(1, 0, 0)), &bytes)
         .unwrap();
     let error = recover(spec(&disk, 1)).unwrap_err();
