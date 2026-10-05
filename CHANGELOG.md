@@ -30,9 +30,9 @@ SemVer and are `0.x` until the server persists data;
 - A disk that fails or fills under `--data-dir` is met with refusal, not
   with acknowledgements the node cannot keep: the node answers writes
   `MISCONF`, serves reads, and each executor resumes on its own once a
-  snapshot of its memory is durable. A start whose first write to the log fails begins the same way. The
-  reply, and how it compares with Redis's on a failed AOF write, is in
-  `docs/compatibility.md` (#72).
+  snapshot of its memory is durable. A start whose first write to the log
+  fails begins the same way. The reply, and how it compares with Redis's on
+  a failed AOF write, is in `docs/compatibility.md` (#72).
 - Snapshots and compaction under `--data-dir`: past 64 MiB of log an
   executor takes a snapshot of its shards without stopping them, and the
   node removes the log every executor's snapshot covers. The directory
