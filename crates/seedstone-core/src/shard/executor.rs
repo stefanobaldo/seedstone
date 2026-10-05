@@ -558,7 +558,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
                     batch,
                     bytes,
                 });
-                self.sync.sent.push_back(Sent { batch, shards });
+                self.sync.track(Sent { batch, shards });
             }
             // No writer: the bytes go nowhere, and nothing is outstanding.
             None => self.sync.acked_bytes = self.sync.sent_bytes,
