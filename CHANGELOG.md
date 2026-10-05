@@ -13,10 +13,10 @@ SemVer and are `0.x` until the server persists data;
   and replays it on the next start. A shard whose log has a gap is
   replayed up to the gap and reported. One node per directory: a second
   one started on it is refused. A clean stop (`SIGTERM`, `SIGINT`) syncs
-  the log before the process ends. Nine new log events: `recovery`,
-  `recovery_truncated`, `recovery_failed`, `log_fault`, `snapshot`,
-  `compaction`, `refusal_ended`, `shutdown_timeout`, `fsync_ignored` — see
-  `docs/operations.md`.
+  the log before the process ends. Ten new log events: `recovery`,
+  `recovery_truncated`, `recovery_failed`, `log_fault`, `snapshot_fault`,
+  `snapshot`, `compaction`, `refusal_ended`, `shutdown_timeout`,
+  `fsync_ignored` — see `docs/operations.md`.
 - `--fsync always|interval|never` under `--data-dir`: `always` acknowledges
   a write only once it is on disk, `interval` (the default) syncs the log
   every 100 ms while there is anything to sync, busy or idle, and `never`
@@ -24,21 +24,23 @@ SemVer and are `0.x` until the server persists data;
   off the request path, and a read waits for one only when it is pipelined
   with a write on its own connection. What each setting
   promises is in `docs/operations.md`.
+- The log is written by one writer per node, so `--fsync always` issues
+  one sync at a time for the whole node, and each covers every write that
+  was ready when it was issued (#81).
 - A disk that fails or fills under `--data-dir` is met with refusal, not
-  with acknowledgements the node cannot keep: the executor whose log
-  failed answers its writes `MISCONF`, serves reads, and resumes on its own
-  once a snapshot of its memory is durable; the other executors carry on.
-  A start whose first write to the log fails begins the same way. The
+  with acknowledgements the node cannot keep: the node answers writes
+  `MISCONF`, serves reads, and each executor resumes on its own once a
+  snapshot of its memory is durable. A start whose first write to the log fails begins the same way. The
   reply, and how it compares with Redis's on a failed AOF write, is in
   `docs/compatibility.md` (#72).
 - Snapshots and compaction under `--data-dir`: past 64 MiB of log an
-  executor takes a snapshot of its shards without stopping them, then
-  removes the log the snapshot covers. An executor's files stay within
-  about three times its last snapshot plus 64 MiB, plus what is written
-  from the log crossing its threshold until the snapshot is durable, and a
-  start reads the newest snapshot plus the log since it rather than the
-  whole history. `docs/operations.md` states the bound, and what a restart
-  keeps until it is reached again.
+  executor takes a snapshot of its shards without stopping them, and the
+  node removes the log every executor's snapshot covers. The directory
+  stays within a stated bound — about three times the snapshots plus
+  64 MiB per executor, plus one 64 MiB file — across restarts too: a
+  previous process's files are replaced once they exceed it. A start reads
+  the newest snapshot plus the log since it rather than the whole history.
+  `docs/operations.md` states the bound.
 - `bench/campaign.sh durability`: `SET` at two pipeline depths under each
   `--fsync` setting, against Redis with AOF at the matching `appendfsync`,
   and `GET` with the log synced on every write against no log.
