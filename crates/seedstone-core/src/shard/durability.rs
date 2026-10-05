@@ -180,6 +180,16 @@ impl SyncState {
         self.policy.hold_acks && self.link.is_some()
     }
 
+    /// Keeps `sent` until a `Durable` covers it — unless the policy never
+    /// syncs, when the only `Durable` is the stop's and the queue would
+    /// grow with every batch until then. Under `never` a shard's durable
+    /// point is raised by its snapshots alone.
+    pub fn track(&mut self, sent: Sent) {
+        if self.policy.min_interval.is_some() {
+            self.sent.push_back(sent);
+        }
+    }
+
     /// Whether writes are being refused.
     #[must_use]
     pub const fn is_refusing(&self) -> bool {
@@ -233,6 +243,25 @@ mod tests {
     use tokio::sync::oneshot;
 
     use crate::shard::ReplyError;
+
+    /// Under `never` the writer syncs only at a rotation and at the stop,
+    /// so no `Durable` would come to pop what was kept: nothing is kept,
+    /// or the queue would grow with every batch for the life of the node.
+    #[test]
+    fn under_never_no_sent_batch_is_kept_waiting_for_a_durable() {
+        let mut never = SyncState::new(SyncPolicy::NEVER, ExecutorPlants::default(), None);
+        never.track(Sent {
+            batch: 0,
+            shards: vec![(0, 1)],
+        });
+        assert!(never.sent.is_empty());
+        let mut interval = SyncState::new(SyncPolicy::INTERVAL, ExecutorPlants::default(), None);
+        interval.track(Sent {
+            batch: 0,
+            shards: vec![(0, 1)],
+        });
+        assert_eq!(interval.sent.len(), 1);
+    }
 
     #[test]
     fn the_budget_is_what_was_sent_and_not_yet_written() {
