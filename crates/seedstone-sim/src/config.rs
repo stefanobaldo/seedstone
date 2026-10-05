@@ -4,6 +4,7 @@
 //! shape the pinned hash is taken on.
 
 use crate::Plant;
+use crate::durability::CrashSchedule;
 use crate::trace::{GOLDEN, mix};
 use seedstone_core::dict::{BUCKET_OVERHEAD, ENTRY_OVERHEAD};
 use seedstone_core::shard::SyncPolicy;
@@ -158,6 +159,14 @@ pub enum CrashPlan {
         /// The most crashes one run may draw.
         max: u8,
     },
+    /// One of the other two, drawn from the simulator seed: `UnderLoad {
+    /// max }` on about half the seeds, `AtRest` on the rest — and on a seed
+    /// whose draw under load crashes nothing, so that every seed crashes.
+    /// See [`SimConfig::crash_plan`].
+    PerSeed {
+        /// The most crashes a seed drawn under load may draw.
+        max: u8,
+    },
 }
 
 /// What the simulated disk does to the node.
@@ -217,13 +226,14 @@ impl DiskFaults {
     /// A disk that also fails and lies: the `hostile` shape's, where only
     /// the weak invariant can be asserted.
     ///
-    /// A write or a read on it fails; a sync does not. Read on turmoil 0.7.2
-    /// on 2026-10-02: its sync checks no probability, and over `hostile`
-    /// seeds 1–24 at `--fsync always` the node met 0 sync faults and 582
-    /// write faults. So a refusal here always begins at a write; one that
-    /// begins at a sync is exercised by `MemDisk` in the core's tests
-    /// (`a_failed_sync_refuses_writes_until_a_snapshot_lands`) and by the
-    /// production path only.
+    /// A write or a read on it fails at `io_error_permille`, through
+    /// turmoil; a sync fails at the same rate, drawn by `SimDisk` from the
+    /// run's own stream, because turmoil 0.7.2's sync checks no
+    /// probability (read against its source on 2026-10-02; before this
+    /// draw existed, `hostile` seeds 1–24 at `--fsync always` met 0 sync
+    /// faults against 582 write faults). So a refusal here begins at a
+    /// write, a sync or a rotation, and the checkpoint's footer sync can
+    /// fail too.
     pub const HOSTILE: Self = Self {
         block_size: Some(32),
         io_error_permille: 20,
@@ -441,19 +451,33 @@ impl SimConfig {
         }
     }
 
-    /// `mini`'s dimensions on a disk that tears, fails and lies, with the
-    /// node crashed under load.
+    /// `mini`'s keys and clients over sixteen shards, on a disk that tears,
+    /// fails and lies, with the node crashed under load on some seeds and
+    /// at rest on the others.
     ///
     /// The shape where the weak invariant is measured — no phantom value,
     /// every loss reported, the node up after every restart — and the only
-    /// one where a hole can sit inside the durable region, which is what
-    /// makes the recovery plants observable. Calibrated by
-    /// `tests/planted_recovery.rs`: every honest seed must meet at least one
-    /// fault and still decide its checks.
+    /// one where a hole can sit inside the durable region.
+    ///
+    /// Both crashes, because each decides what the other cannot. A crash
+    /// under load tears the log's last record, which lies after every
+    /// shard's highest record at the restart, so recovery charges every
+    /// shard with a possible loss and every durable read is excused: such a
+    /// seed decides no phantom and no lost restart, but nothing about
+    /// survival. A crash at rest, after the log had time to sync, tears
+    /// nothing, so recovery charges only what the disk's own faults took,
+    /// and the reads that follow decide whether a write acknowledged before
+    /// its shard's last sync came back. Sixteen shards, `eviction`'s count:
+    /// the shard dimension is not what this shape is about, and a thousand
+    /// cost a seed more for no read more.
+    ///
+    /// Calibrated by `tests/planted_recovery.rs`: every honest seed meets a
+    /// fault, and at least `DECIDING_SEEDS` of them decide a durable read.
     #[must_use]
     pub const fn hostile(workload_seed: u64, sim_seed: u64) -> Self {
         Self {
-            crashes: CrashPlan::UnderLoad { max: 2 },
+            shards: 16,
+            crashes: CrashPlan::PerSeed { max: 2 },
             disk: DiskFaults::HOSTILE,
             fsync: FsyncDraw::PerSeed,
             ..Self::mini(workload_seed, sim_seed)
@@ -473,6 +497,32 @@ impl SimConfig {
                     [SyncPolicy::ALWAYS, SyncPolicy::INTERVAL, SyncPolicy::NEVER];
                 POLICIES[(mix(GOLDEN.rotate_left(41), self.sim_seed) % 3) as usize]
             }
+        }
+    }
+
+    /// When this run's driver crashes the node, with a per-seed draw
+    /// resolved to the plan it drew.
+    ///
+    /// Drawn from its own derivation of the simulator seed, as
+    /// [`policy`](Self::policy) is, so that the draw moves nothing else the
+    /// seed decides. A seed drawn under load whose schedule holds no crash
+    /// crashes at rest instead: a seed that never crashes decides nothing
+    /// a crash leaves behind, and on a disk whose faults are a draw too it
+    /// may meet nothing hostile at all.
+    #[must_use]
+    pub fn crash_plan(&self) -> CrashPlan {
+        match self.crashes {
+            CrashPlan::PerSeed { max } => {
+                let under_load = CrashPlan::UnderLoad { max };
+                if mix(GOLDEN.rotate_left(53), self.sim_seed).is_multiple_of(2)
+                    || CrashSchedule::draw(under_load, self.sim_seed).is_empty()
+                {
+                    CrashPlan::AtRest
+                } else {
+                    under_load
+                }
+            }
+            plan => plan,
         }
     }
 }

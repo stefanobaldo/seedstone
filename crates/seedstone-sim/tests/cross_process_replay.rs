@@ -34,7 +34,7 @@
 //! for two kinds longer than that was true.
 
 use seedstone_core::shard::SyncPolicy;
-use seedstone_sim::{CrashSchedule, FsyncDraw, SimConfig, run_sim};
+use seedstone_sim::{CrashPlan, CrashSchedule, FsyncDraw, SimConfig, run_sim};
 
 /// How many eviction-shape seeds are replayed.
 ///
@@ -210,18 +210,15 @@ fn the_eviction_shape_replays_across_processes() {
 /// recovery through damage, and the reconnects after it are schedule like
 /// anything else, and replay the same in a fresh process.
 ///
-/// The first [`SEEDS`] seeds that *draw* a crash, rather than seeds `1..=`
-/// it: a seed with none replays nothing about recovery, and skipping it
+/// The first [`SEEDS`] seeds that *draw* a crash — at rest, or at least
+/// one under load — rather than seeds `1..=` it: a seed with none replays nothing about recovery, and skipping it
 /// silently would leave the count claiming more than it shows.
 #[test]
 fn the_hostile_shape_replays_across_processes() {
     let crashing = (1..)
         .filter(|sim_seed| {
-            !CrashSchedule::draw(
-                SimConfig::hostile(WORKLOAD_SEED, *sim_seed).crashes,
-                *sim_seed,
-            )
-            .is_empty()
+            let plan = SimConfig::hostile(WORKLOAD_SEED, *sim_seed).crash_plan();
+            plan == CrashPlan::AtRest || !CrashSchedule::draw(plan, *sim_seed).is_empty()
         })
         .take(usize::try_from(SEEDS).expect("a small count"));
     for sim_seed in crashing {

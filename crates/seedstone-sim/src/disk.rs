@@ -21,23 +21,40 @@ use crate::outcome::lock;
 ///
 /// A deferred sync waits a latency drawn from the run's own stream before
 /// turmoil syncs the file, so that a crash can land while one is in
-/// flight; the inline sync and every other verb answer at once.
+/// flight; the inline sync and every other verb answer at once. A sync of
+/// either kind may fail, at a rate drawn from the same stream.
 #[derive(Debug, Clone, Default)]
 pub struct SimDisk {
     /// The range a deferred sync's latency is drawn from, in milliseconds,
     /// both ends included.
     latency_ms: (u64, u64),
-    /// The stream the latencies are drawn from, or `None` for a disk whose
-    /// syncs take no time.
+    /// Probability, in permille, that a sync — deferred or inline — fails
+    /// with `EIO`. turmoil 0.7.2's `sync_data` checks no probability of its
+    /// own (read against its `fs/shim/std/fs/mod.rs` on 2026-10-02), so
+    /// the shape's `io_error_permille` is applied here, from the run's own
+    /// stream, where the writer's rotation, the checkpoint's footer and the
+    /// deferred sync all pass.
+    sync_fault_permille: u16,
+    /// The stream the latencies and the sync faults are drawn from, or
+    /// `None` for a disk whose syncs take no time and never fail.
     rng: Option<Arc<Mutex<ChaCha8Rng>>>,
 }
 
 impl SimDisk {
-    /// A disk whose deferred syncs take a latency in `latency_ms`, drawn
-    /// from `rng`; with no stream, they take none.
+    /// A disk whose deferred syncs take a latency in `latency_ms` and whose
+    /// syncs fail at `sync_fault_permille`, both drawn from `rng`; with no
+    /// stream, they take none and never fail.
     #[must_use]
-    pub const fn new(latency_ms: (u64, u64), rng: Option<Arc<Mutex<ChaCha8Rng>>>) -> Self {
-        Self { latency_ms, rng }
+    pub const fn new(
+        latency_ms: (u64, u64),
+        sync_fault_permille: u16,
+        rng: Option<Arc<Mutex<ChaCha8Rng>>>,
+    ) -> Self {
+        Self {
+            latency_ms,
+            sync_fault_permille,
+            rng,
+        }
     }
 
     fn draw(&self) -> Duration {
@@ -46,6 +63,18 @@ impl SimDisk {
         };
         let (min, max) = self.latency_ms;
         Duration::from_millis(lock(rng).random_range(min..=max))
+    }
+
+    /// Whether this sync fails: one draw from the same stream the latency
+    /// comes from, so a shape with no sync faults draws nothing extra.
+    fn sync_fails(&self) -> bool {
+        if self.sync_fault_permille == 0 {
+            return false;
+        }
+        let Some(rng) = &self.rng else {
+            return false;
+        };
+        lock(rng).random_range(0..1000u16) < self.sync_fault_permille
     }
 }
 
@@ -63,6 +92,9 @@ impl LogFile for SimFile {
     }
 
     fn sync_data(&mut self) -> io::Result<()> {
+        if self.disk.sync_fails() {
+            return Err(io::Error::other("injected sync failure"));
+        }
         self.file.sync_data()
     }
 
@@ -74,12 +106,19 @@ impl LogFile for SimFile {
     /// 2026-10-02. turmoil resolves a handle to its path and fails a sync
     /// of one that is gone, and the log removes a rotation the checkpoint
     /// covered whether or not a sync of it is still in flight.
+    ///
+    /// Whether it fails is drawn at the call, before the sleep, so the
+    /// stream's order does not depend on when the future is polled.
     fn sync_later(&self) -> SyncFuture {
         let latency = self.disk.draw();
+        let fails = self.disk.sync_fails();
         let handle = self.file.try_clone();
         let path = self.path.clone();
         Box::pin(async move {
             tokio::time::sleep(latency).await;
+            if fails {
+                return Err(io::Error::other("injected sync failure"));
+            }
             if !sim_fs::exists(&path) {
                 return Ok(());
             }
