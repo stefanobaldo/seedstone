@@ -821,3 +821,26 @@ async fn a_rotation_whose_directory_sync_fails_is_retried_under_the_next_name() 
         "the retry writes into the next name"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_covered_that_removes_nothing_reports_nothing_and_syncs_no_directory() {
+    let disk = MemDisk::default();
+    let recorder = Recorder::default();
+    let rig = open_with(
+        &disk,
+        2,
+        SyncPolicy::NEVER,
+        64,
+        WriterPlants::default(),
+        recorder.clone(),
+    );
+    // A directory sync now would fail and be traced as a removal's fault.
+    disk.fail_one_dir_sync_after(0);
+    covered(&rig, 0, 0, None, 10);
+    tokio::task::yield_now().await;
+    assert!(recorder.compactions.lock().unwrap().is_empty());
+    assert!(
+        recorder.faults.lock().unwrap().is_empty(),
+        "no directory was synced"
+    );
+}
