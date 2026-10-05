@@ -490,16 +490,20 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         }
     }
 
-    /// The node's log failed. Traced once; the segment is marked failed and
-    /// never written again — the first submission after this rotates; what
-    /// was staged is dropped, since the executors it came from are told;
-    /// the round in flight is let go. A fresh failure reaches every
-    /// executor; a failure of the retry reaches only those with bytes in
-    /// it, so that an executor still refusing from the first is not made
-    /// to abandon the snapshot that will end its refusal.
+    /// The node's log failed. The segment is marked failed and never
+    /// written again — the first submission after this rotates; what was
+    /// staged is dropped, since the executors it came from are told; the
+    /// round in flight is let go. A fresh failure is traced and reaches
+    /// every executor; a failure of the retry is the same incident — bytes
+    /// sent before their executor heard of the first retry it too — so it
+    /// is not traced again, and reaches only those with bytes in it, so
+    /// that an executor still refusing from the first is not made to
+    /// abandon the snapshot that will end its refusal.
     fn fail(&mut self, fault: LogFault, error: &io::Error) {
-        self.trace.log_fault(fault, error);
         let fresh = !self.segment.sync_failed;
+        if fresh {
+            self.trace.log_fault(fault, error);
+        }
         self.segment.sync_failed = true;
         self.segment.dirty = false;
         self.staged.clear();
