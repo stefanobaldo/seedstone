@@ -881,3 +881,137 @@ async fn shutdown_from_a_client_is_the_clean_stop() {
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::remove_file(&stderr).unwrap();
 }
+
+/// `SAVE` under each policy: `OK` once every executor's image is durable,
+/// `LASTSAVE` advances to it, and a restart starts from the images and
+/// dates them the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn save_lands_an_image_on_every_executor_and_lastsave_dates_it() {
+    for policy in ["always", "interval", "never"] {
+        let dir = scratch();
+        let stderr = dir.with_extension("stderr");
+        let (mut node, port) = start_with(&dir, &stderr, &["--fsync", policy]).await;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        assert_eq!(
+            round_trip(&mut stream, &["LASTSAVE"]).await,
+            Frame::Integer(0),
+            "{policy}"
+        );
+        set_many(port, 50).await;
+        assert_eq!(
+            round_trip(&mut stream, &["SAVE"]).await,
+            Frame::Simple("OK".into()),
+            "{policy}"
+        );
+        let snapshots = until_event_count(&stderr, "snapshot", available_parallelism()).await;
+        assert_eq!(
+            snapshots.len(),
+            available_parallelism(),
+            "{policy}: one image per executor"
+        );
+        let Frame::Integer(at) = round_trip(&mut stream, &["LASTSAVE"]).await else {
+            panic!("{policy}: LASTSAVE is an integer")
+        };
+        // The image is dated when its cycle opened, just before its file
+        // was written: within a second or two of the files' own times. The
+        // filesystem's clock rather than the test's, which the determinism
+        // lints keep out of the tree.
+        let written = snapshot_mtimes(&dir);
+        let (oldest, newest) = (written[0], written[written.len() - 1]);
+        assert!(
+            at > 0 && at <= newest && at + 2 >= oldest,
+            "{policy}: LASTSAVE {at}, files written {oldest}..={newest}"
+        );
+        node.kill().unwrap();
+        node.wait().unwrap();
+        let (mut again, port) = start_with(&dir, &stderr, &["--fsync", policy]).await;
+        let recovery = until_event(&stderr, "recovery").await;
+        let line = recovery
+            .iter()
+            .find(|line| line.contains("\"evt\":\"recovery\""))
+            .unwrap();
+        assert_eq!(
+            field(line, "snapshots_used"),
+            available_parallelism() as u64,
+            "{policy}: {line}"
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        assert_eq!(
+            round_trip(&mut stream, &["LASTSAVE"]).await,
+            Frame::Integer(at),
+            "{policy}: LASTSAVE survives a restart"
+        );
+        assert_eq!(dbsize(port).await, Frame::Integer(50), "{policy}");
+        again.kill().unwrap();
+        again.wait().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_file(&stderr).unwrap();
+    }
+}
+
+/// The modification times of `dir/wal`'s snapshot files, in Unix seconds,
+/// ascending.
+fn snapshot_mtimes(dir: &Path) -> Vec<i64> {
+    let mut times: Vec<i64> = std::fs::read_dir(dir.join("wal"))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".snap"))
+        .map(|entry| {
+            let modified = entry.metadata().unwrap().modified().unwrap();
+            let since = modified.duration_since(std::time::UNIX_EPOCH).unwrap();
+            i64::try_from(since.as_secs()).unwrap()
+        })
+        .collect();
+    times.sort_unstable();
+    assert!(!times.is_empty(), "no snapshot file");
+    times
+}
+
+/// `SAVE` pipelined behind writes under `always` is answered after them,
+/// and a kill right after its `OK` loses none of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_save_pipelined_behind_writes_under_always_is_answered_after_them_and_keeps_them() {
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let (mut node, port) = start_with(&dir, &stderr, &["--fsync", "always"]).await;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let replies = pipelined(
+        &mut stream,
+        &[&["SET", "a", "1"], &["SET", "b", "2"], &["SAVE"]],
+    )
+    .await;
+    assert_eq!(replies, vec![Frame::Simple("OK".into()); 3]);
+    node.kill().unwrap();
+    node.wait().unwrap();
+    let (mut again, port) = start_with(&dir, &stderr, &["--fsync", "always"]).await;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert_eq!(
+        round_trip(&mut stream, &["MGET", "a", "b"]).await,
+        Frame::Array(vec![Frame::Bulk("1".into()), Frame::Bulk("2".into())])
+    );
+    again.kill().unwrap();
+    again.wait().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}
+
+/// Without `--data-dir`, `SAVE`, `BGSAVE` and `LASTSAVE` each name the flag.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_data_dir_the_three_persistence_commands_name_the_flag() {
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let mut node = spawn(&dir, &[], &stderr);
+    let lines = until_listening(&stderr).await;
+    let port = port_of(lines.last().unwrap());
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    for cmd in [&["SAVE"][..], &["BGSAVE"], &["LASTSAVE"]] {
+        let Frame::Error(text) = round_trip(&mut stream, cmd).await else {
+            panic!("{cmd:?} is an error")
+        };
+        assert!(text.contains("--data-dir"), "{text}");
+    }
+    node.kill().unwrap();
+    node.wait().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}
