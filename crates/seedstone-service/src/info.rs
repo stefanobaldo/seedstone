@@ -228,7 +228,8 @@ pub fn persistence_section(node: &NodeInfo) -> String {
         "rdb_last_bgsave_status:{}\r\n",
         if stats.any_save_failed() { "err" } else { "ok" }
     );
-    // Whole seconds, as Redis prints it, and `-1` before any image.
+    // Whole seconds, and `-1` before any image, as 6.2.24 and 8.10.1 print
+    // it. Counted in housekeeping ticks, the nominal 100 ms each.
     let seconds = if stats.saves() == 0 {
         -1
     } else {

@@ -600,8 +600,8 @@ async fn persistence_text(node: &NodeInfo) -> String {
     info(&router, node, &[b"persistence".to_vec()]).await
 }
 
-/// Without `--data-dir` the section is the two lines a Redis with
-/// persistence off gives the `redisdb` check.
+/// Without `--data-dir` the section is two lines: there is no log, and the
+/// fields that would describe one are absent rather than zero.
 #[tokio::test]
 async fn info_persistence_without_a_data_dir_is_two_lines() {
     let text = persistence_text(&NodeInfo::for_tests()).await;
@@ -652,8 +652,8 @@ async fn info_persistence_with_a_log_prints_every_field_once_in_order() {
     assert!(text.contains("last_sync_ms:7\r\n"), "{text}");
 }
 
-/// `# Persistence` is in Redis's default set, between `# Memory` and
-/// `# Stats`.
+/// `# Persistence` is in the default document, between `# Memory` and
+/// `# Stats`, where 6.2.24 and 8.10.1 print it.
 #[tokio::test]
 async fn info_carries_persistence_in_the_default_document_after_memory() {
     let router = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace);

@@ -302,7 +302,7 @@ Redis (read on 6.2.24 and 8.10.1).
 | `rdb_bgsave_in_progress` | `0` or `1` | `1` while any executor's snapshot is being written; the shards keep serving while it is |
 | `rdb_last_save_time` | Unix seconds | when the oldest of the shards' newest durable snapshots was taken: everything written before it is covered by a snapshot. Absent until every shard has one. A snapshot read back at start counts, so a restart does not reset it |
 | `rdb_last_bgsave_status` | `ok` or `err` | `err` when the last snapshot of any executor ended in `snapshot_fault` |
-| `rdb_last_bgsave_time_sec` | seconds | how long the last completed snapshot took, the longest over the executors; `-1` before any |
+| `rdb_last_bgsave_time_sec` | seconds | how long the last completed snapshot took, the longest over the executors, counted in housekeeping ticks of 100 ms and rounded down; `-1` before any |
 | `rdb_saves` | count | snapshots that became durable since the process started, summed over the executors |
 | `rdb_last_load_keys_loaded` | count | keys the start recovered, from snapshots and from the log |
 | `aof_enabled` | `1` | the log is on |
