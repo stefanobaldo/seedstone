@@ -161,7 +161,9 @@ impl Model {
         self.plain_history[slot].record_unacknowledged(known, at);
         self.plain_state[slot] = Known::Either(flatten(self.plain_history[slot].candidates(None)));
         self.plain_durable[slot] = None;
-        self.plain_since[slot] = None;
+        // `plain_since` stays: a write with no reply settles nothing, so the
+        // value under it still depends on whatever recovery it did before,
+        // and a loss that recovery reported is still one a read may find.
     }
 
     /// Holds a read of a key a crash left open against its candidates, and
@@ -291,4 +293,64 @@ fn flatten(candidates: Vec<Known>) -> Vec<Known> {
         }
     }
     flat
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::config::SimConfig;
+    use crate::durability::CrashRecord;
+    use crate::outcome::Shared;
+
+    /// A key known exactly across a recovery that reported its shard lossy,
+    /// then written again with no reply before a second crash, may be read
+    /// back absent: the write settled nothing, so the value under it still
+    /// depends on the recovery that reported the loss. Hostile seed 2784715
+    /// at workload seed 279, read on the node as it stood before the
+    /// clients asked for snapshots, called that read a phantom.
+    #[test]
+    fn a_write_with_no_reply_keeps_the_reported_recovery_its_key_depends_on() {
+        let phantoms = Arc::new(Mutex::new(None));
+        let out = Arc::clone(&phantoms);
+        let mut sim = turmoil::Builder::new().build();
+        sim.client("client", async move {
+            let cfg = SimConfig::hostile(1, 1);
+            let shared = Shared::new(&cfg);
+            let mut model = Model::new(0, &cfg, shared.clone());
+            let owner = usize::from(model.plain_shard[0]);
+            let tick = Duration::from_millis(1);
+            let crash = |durable: Option<u64>| CrashRecord {
+                at: world_now(),
+                durable: (0..usize::from(cfg.shards))
+                    .map(|s| durable.filter(|_| s == owner).map(|seq| (seq, world_now())))
+                    .collect(),
+            };
+
+            model.wrote(0, Known::Value(b"a".to_vec()), world_now());
+            tokio::time::sleep(tick).await;
+            // Synced after the write was acknowledged, so the crash keeps it
+            // exactly; its recovery then reports the shard as lossy.
+            lock(&shared.crashes).push(crash(Some(0)));
+            model.absorb_crashes();
+            lock(&shared.truncated)[owner] = Some(0);
+            tokio::time::sleep(tick).await;
+            model.in_flight(&[Check::PlainSet {
+                slot: 0,
+                value: b"b".to_vec(),
+            }]);
+            tokio::time::sleep(tick).await;
+            // The shard synced again since, so the crash alone leaves the key
+            // one of the two values, never its absence.
+            lock(&shared.crashes).push(crash(Some(1)));
+            model.absorb_crashes();
+            model.open_reported();
+            model.check_either(0, &Frame::Null);
+            *out.lock().unwrap() = Some(lock(&shared.tally).phantom_writes);
+            Ok(())
+        });
+        sim.run().unwrap();
+        assert_eq!(*phantoms.lock().unwrap(), Some(0));
+    }
 }
