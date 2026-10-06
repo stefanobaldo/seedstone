@@ -409,6 +409,7 @@ fn outcome(cfg: &SimConfig, shared: &Shared, trace_hash: u64) -> SimOutcome {
     SimOutcome {
         trace_hash,
         expected_sum: tally.expected,
+        counter_acks: tally.counter_acks,
         actual_sum: tally.actual,
         stale_reads: tally.stale_reads,
         spurious_deaths: tally.spurious_deaths,

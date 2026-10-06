@@ -29,6 +29,9 @@ pub struct SimOutcome {
     pub trace_hash: u64,
     /// The sum of every acknowledged `INCRBY` delta.
     pub expected_sum: i64,
+    /// How many `INCRBY`s were acknowledged: what says the counter was
+    /// exercised, since the deltas can sum to zero.
+    pub counter_acks: u64,
     /// The sum of every counter key read back at the end.
     pub actual_sum: i64,
     /// Reads that returned a value for a key certainly past its deadline.
@@ -330,7 +333,7 @@ impl SimOutcome {
         // run that refused and saw no volatile write taken.
         let expiry = (self.refused > 0 && self.volatile_acked == 0)
             || (self.dead_checks > 0 && self.alive_checks > 0);
-        self.expected_sum != 0
+        self.counter_acks > 0
             && expiry
             && self.plain_checks > 0
             && self.walk_checks > 0
@@ -390,6 +393,7 @@ pub const fn nothing_observed() -> SimOutcome {
     SimOutcome {
         trace_hash: 0,
         expected_sum: 0,
+        counter_acks: 0,
         actual_sum: 0,
         stale_reads: 0,
         spurious_deaths: 0,
@@ -618,6 +622,8 @@ impl Shared {
 pub struct Tally {
     /// The sum of every acknowledged `INCRBY` delta.
     pub expected: i64,
+    /// How many `INCRBY`s were acknowledged.
+    pub counter_acks: u64,
     /// The sum of every counter read back at the end.
     pub actual: i64,
     /// How many client hosts have finished their workload.
