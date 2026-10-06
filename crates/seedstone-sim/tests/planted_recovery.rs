@@ -54,8 +54,9 @@ fn hostile_always(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
     run_sim(&cfg)
 }
 
-/// The honest node, and the shape's calibration: every seed meets a fault
-/// of some kind, recovers, and still decides its checks — all but the
+/// The honest node, and the shape's calibration: every seed meets a disk
+/// fault of some kind — a crash does not count, since every hostile seed
+/// crashes by construction — recovers, and still decides its checks — all but the
 /// expiration checks on a seed whose recoveries reported a loss: the model
 /// gives up a deadline kept across such a recovery, and a crash under load
 /// charges every shard, so such a seed may have none left to decide. Some
@@ -83,8 +84,12 @@ fn the_hostile_shape_faults_on_every_seed_and_the_honest_node_holds() {
         );
         any_expiry_decided |= outcome.dead_checks > 0 && outcome.alive_checks > 0;
         assert!(
-            outcome.write_faults + outcome.sync_faults + outcome.start_failures > 0
-                || outcome.crashes > 0,
+            outcome.write_faults
+                + outcome.sync_faults
+                + outcome.rotate_faults
+                + outcome.snapshot_faults
+                + outcome.start_failures
+                > 0,
             "seed {sim_seed}: the hostile disk did nothing hostile; raise DiskFaults::HOSTILE: {outcome:?}"
         );
         any_recovered_lossy |= outcome.lost_durable_prefixes > 0;
