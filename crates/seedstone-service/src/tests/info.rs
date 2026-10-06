@@ -622,8 +622,11 @@ async fn info_persistence_with_a_log_prints_every_field_once_in_order() {
         .map(|line| line.split(':').next().unwrap())
         .collect();
     let mut every: Vec<&str> = PERSISTENCE_FIELDS.to_vec();
-    every.retain(|field| *field != "rdb_last_save_time");
-    assert_eq!(names, every, "absent until every shard has an image");
+    every.retain(|field| !matches!(*field, "rdb_last_save_time" | "last_sync_ms"));
+    assert_eq!(
+        names, every,
+        "absent until every shard has an image, and until the first sync"
+    );
     assert!(text.contains("fsync_policy:interval\r\n"), "{text}");
     assert!(text.contains("rdb_last_bgsave_time_sec:-1\r\n"), "{text}");
     for cell in &stats.executors {
@@ -632,6 +635,8 @@ async fn info_persistence_with_a_log_prints_every_field_once_in_order() {
         cell.last_save_ticks.store(25, Ordering::Relaxed);
     }
     stats.refusing.store(1, Ordering::Relaxed);
+    stats.syncs_total.store(1, Ordering::Relaxed);
+    stats.last_sync_micros.store(7_400, Ordering::Relaxed);
     let text = persistence_text(&node).await;
     let names: Vec<&str> = text
         .lines()
@@ -644,6 +649,7 @@ async fn info_persistence_with_a_log_prints_every_field_once_in_order() {
     assert!(text.contains("rdb_last_bgsave_time_sec:2\r\n"), "{text}");
     assert!(text.contains("aof_last_write_status:err\r\n"), "{text}");
     assert!(text.contains("refusing_executors:1\r\n"), "{text}");
+    assert!(text.contains("last_sync_ms:7\r\n"), "{text}");
 }
 
 /// `# Persistence` is in Redis's default set, between `# Memory` and

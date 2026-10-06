@@ -313,7 +313,7 @@ Redis (read on 6.2.24 and 8.10.1).
 | `fsync_policy` | `always`, `interval` or `never` | the `--fsync` setting |
 | `log_segments` | count | the log's segment files on disk |
 | `syncs_total` | count | syncs of the log completed since the start |
-| `last_sync_ms` | milliseconds | how long the last completed sync took |
+| `last_sync_ms` | milliseconds | how long the last completed sync took; absent until the first one |
 | `refusing_executors` | count | executors refusing writes right now |
 | `lossy_shards` | count | shards the start reported lossy (the `recovery` line's `lossy_shards`) that no durable snapshot has covered since; it only falls within a process, and each snapshot that covers one says so with its `cleared` field |
 
