@@ -113,6 +113,26 @@ pub struct Completed {
     pub through_batch: Option<u64>,
     /// The snapshot file's size.
     pub bytes: u64,
+    /// Housekeeping ticks the cycle took.
+    pub ticks: u64,
+    /// Shards the start reported lossy that this image covers.
+    pub cleared: u64,
+}
+
+/// What one housekeeping tick of the checkpoint did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tick {
+    /// `Some` on the tick a snapshot became durable.
+    pub completed: Option<Completed>,
+    /// The tick's step failed: the cycle ended in a fault.
+    pub faulted: bool,
+}
+
+impl Tick {
+    pub const NONE: Self = Self {
+        completed: None,
+        faulted: false,
+    };
 }
 
 /// What an executor runs in its housekeeping tick.
@@ -123,8 +143,7 @@ pub struct Completed {
 pub trait Checkpoint: Send + 'static {
     /// One tick's work over the executor's shards, with `first_shard` the
     /// id of `states[0]`, `now` the tick's one clock reading and `log`
-    /// where the executor's log stands. `Some` on the tick a snapshot
-    /// became durable.
+    /// where the executor's log stands.
     fn tick<L: ReplicationLog, T: TraceSink>(
         &mut self,
         first_shard: u16,
@@ -132,7 +151,7 @@ pub trait Checkpoint: Send + 'static {
         now: Now,
         trace: &T,
         log: LogPosition,
-    ) -> Option<Completed>;
+    ) -> Tick;
 
     /// Open a cycle on the next tick whatever the live log — the way out of
     /// a log the disk refused: everything in memory, imaged into a fresh
@@ -143,6 +162,11 @@ pub trait Checkpoint: Send + 'static {
     /// Open a cycle on the next tick whatever the live log, without
     /// abandoning one that is open: the writer's nudge.
     fn nudge(&mut self) {}
+
+    /// Whether a cycle is open.
+    fn is_open(&self) -> bool {
+        false
+    }
 }
 
 /// The checkpoint of a node with no data directory: nothing.
@@ -157,8 +181,8 @@ impl Checkpoint for NoCheckpoint {
         _now: Now,
         _trace: &T,
         _log: LogPosition,
-    ) -> Option<Completed> {
-        None
+    ) -> Tick {
+        Tick::NONE
     }
 }
 
@@ -584,6 +608,8 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
             cycle: cycle.number,
             through_batch: cycle.through_batch,
             bytes: cycle.bytes,
+            ticks: cycle.ticks,
+            cleared: 0,
         }
     }
 
@@ -606,12 +632,12 @@ impl<D: Disk + Send + 'static> Checkpoint for SegmentCheckpoint<D> {
         now: Now,
         trace: &T,
         log: LogPosition,
-    ) -> Option<Completed> {
+    ) -> Tick {
         let mut early = None;
         if self.open.is_none() {
             let live = log.bytes.saturating_sub(self.opened_at);
             if !self.forced && !self.nudged && live < self.threshold() {
-                return None;
+                return Tick::NONE;
             }
             self.open_cycle(states, log);
             self.forced = false;
@@ -623,15 +649,26 @@ impl<D: Disk + Send + 'static> Checkpoint for SegmentCheckpoint<D> {
                     cycle: cycle.number,
                     through_batch: cycle.through_batch,
                     bytes: self.last_snapshot,
+                    ticks: 0,
+                    cleared: 0,
                 });
             }
         }
         match self.step(first_shard, states, now) {
-            Ok(false) => early,
-            Ok(true) => Some(self.finish(states, trace, log)),
+            Ok(false) => Tick {
+                completed: early,
+                faulted: false,
+            },
+            Ok(true) => Tick {
+                completed: Some(self.finish(states, trace, log)),
+                faulted: false,
+            },
             Err(error) => {
                 trace.fault(first_shard, LogFault::Snapshot, &error);
-                early
+                Tick {
+                    completed: early,
+                    faulted: true,
+                }
             }
         }
     }
@@ -652,6 +689,10 @@ impl<D: Disk + Send + 'static> Checkpoint for SegmentCheckpoint<D> {
 
     fn nudge(&mut self) {
         self.nudged = true;
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.is_some()
     }
 }
 

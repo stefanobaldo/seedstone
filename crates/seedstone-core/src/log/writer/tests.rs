@@ -59,6 +59,7 @@ fn open_with<T: TraceSink>(
         checkpoint: SMALL,
         trace,
         plants,
+        stats: crate::shard::PersistenceStats::new(executors),
     })
     .unwrap();
     Rig {
@@ -308,6 +309,7 @@ async fn the_start_path_appends_and_syncs_now_and_a_rebase_advances_the_cut_shar
         checkpoint: SMALL,
         trace: NoTrace,
         plants: WriterPlants::default(),
+        stats: crate::shard::PersistenceStats::new(1),
     })
     .unwrap();
     let mut shards = vec![

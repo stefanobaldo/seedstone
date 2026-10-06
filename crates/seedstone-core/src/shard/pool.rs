@@ -11,8 +11,8 @@ use crate::log::{NoopLog, ReplicationLog};
 use crate::memory::{MemoryGauge, MemoryLimit};
 use crate::shard::executor::{ExecutorSpec, Memory, ShardState, frozen_clock, run_executor};
 use crate::shard::{
-    Command, Deadlines, ExecutorPlants, HOUSEKEEPING_TICK, KIND_SLOTS, Reply, ReplyError, Route,
-    ShardPolicy, SyncPolicy, TraceSink,
+    Command, Deadlines, ExecutorPlants, HOUSEKEEPING_TICK, KIND_SLOTS, PersistenceStats, Reply,
+    ReplyError, Route, ShardPolicy, SyncPolicy, TraceSink,
 };
 use crate::slot::{executor_of, shard_of};
 use std::future::Future;
@@ -385,6 +385,9 @@ pub struct ShardPool {
     stop: Arc<watch::Sender<bool>>,
     /// The executor tasks, taken by the first `shutdown` to await them.
     executors_done: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// The persistence counters the executors keep: see
+    /// [`stats`](ShardPool::stats).
+    stats: Arc<PersistenceStats>,
 }
 
 /// Everything a pool is built from, with every seam exposed.
@@ -427,6 +430,9 @@ pub struct PoolSpec<T, F, P, G> {
     /// Whether the node's log failed before the pool served: a rebase the
     /// writer could not write or sync. Every executor then starts refusing.
     pub log_failed: bool,
+    /// The node's persistence counters, one cell per executor; shared with
+    /// the writer and `INFO`.
+    pub stats: Arc<PersistenceStats>,
 }
 
 impl ShardPool {
@@ -461,6 +467,7 @@ impl ShardPool {
             plants: ExecutorPlants::default(),
             writer_links: Vec::new(),
             log_failed: false,
+            stats: PersistenceStats::new(executors),
         })
     }
 
@@ -499,6 +506,7 @@ impl ShardPool {
             plants: ExecutorPlants::default(),
             writer_links: Vec::new(),
             log_failed: false,
+            stats: PersistenceStats::new(executors),
         })
     }
 
@@ -547,6 +555,7 @@ impl ShardPool {
             plants: ExecutorPlants::default(),
             writer_links: Vec::new(),
             log_failed: false,
+            stats: PersistenceStats::new(executors),
         })
     }
 
@@ -585,6 +594,7 @@ impl ShardPool {
             plants: ExecutorPlants::default(),
             writer_links: Vec::new(),
             log_failed: false,
+            stats: PersistenceStats::new(executors),
         })
     }
 
@@ -627,6 +637,7 @@ impl ShardPool {
             plants: ExecutorPlants::default(),
             writer_links: Vec::new(),
             log_failed: false,
+            stats: PersistenceStats::new(executors),
         })
     }
 
@@ -669,6 +680,7 @@ impl ShardPool {
             plants,
             writer_links,
             log_failed,
+            stats,
         } = spec;
         check_shape(shards, executors, recovered.len(), writer_links.len());
 
@@ -684,6 +696,7 @@ impl ShardPool {
         // Each executor gets its checkpoint by index, built as it spawns.
         let spawn = |gathered: Gathered<L>, trace: T, policy: P, link: Option<WriterLink>| {
             let (first_shard, states) = gathered;
+            let executor = executor_of(first_shard, shards, executors);
             spawn_executor(ExecutorSpec {
                 first_shard,
                 states,
@@ -691,12 +704,14 @@ impl ShardPool {
                 policy,
                 memory: memory.clone(),
                 clock,
-                checkpoint: make_checkpoint(executor_of(first_shard, shards, executors)),
+                checkpoint: make_checkpoint(executor),
                 sync,
                 plants,
                 log_failed,
                 link,
                 stop: stopped.clone(),
+                stats: stats.clone(),
+                executor,
             })
         };
         let mut inboxes = Vec::with_capacity(usize::from(executors));
@@ -756,6 +771,7 @@ impl ShardPool {
             limit,
             stop: Arc::new(stop),
             executors_done: Arc::new(Mutex::new(handles)),
+            stats,
         }
     }
 
@@ -793,6 +809,13 @@ impl ShardPool {
     #[must_use]
     pub const fn executors(&self) -> u16 {
         self.executors
+    }
+
+    /// The persistence counters this pool's executors keep — the same
+    /// `Arc` its [`PoolSpec`] was given.
+    #[must_use]
+    pub const fn stats(&self) -> &Arc<PersistenceStats> {
+        &self.stats
     }
 
     /// The node-wide memory figure the executors keep current.

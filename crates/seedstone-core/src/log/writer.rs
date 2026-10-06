@@ -30,6 +30,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -42,7 +43,9 @@ use crate::log::file::{Segment, create_segment, parse_segment_name, segment_name
 use crate::log::recovery::RecoveredShard;
 use crate::log::snapshot::parse_snapshot_name;
 use crate::log::{Record, encode_record};
-use crate::shard::{CompactionReport, HOUSEKEEPING_TICK, LogFault, SyncPolicy, TraceSink};
+use crate::shard::{
+    CompactionReport, HOUSEKEEPING_TICK, LogFault, PersistenceStats, SyncPolicy, TraceSink,
+};
 
 #[cfg(test)]
 mod tests;
@@ -137,6 +140,8 @@ pub struct WriterSpec<D: Disk, T: TraceSink> {
     pub checkpoint: CheckpointConfig,
     pub trace: T,
     pub plants: WriterPlants,
+    /// The node's persistence counters: the writer keeps the log's.
+    pub stats: Arc<PersistenceStats>,
 }
 
 /// A writer, its inbox, and one link per executor.
