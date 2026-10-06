@@ -452,6 +452,7 @@ fn outcome(cfg: &SimConfig, shared: &Shared, trace_hash: u64) -> SimOutcome {
         rotate_faults: tally.rotate_faults,
         hostile: cfg.disk.lies(),
         snapshot_cycles: tally.snapshot_cycles,
+        lossy_cleared: tally.lossy_cleared,
         compactions: tally.compactions,
         files_removed: tally.files_removed,
         max_snapshot_bytes: tally.max_snapshot_bytes,

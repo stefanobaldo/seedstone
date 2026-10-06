@@ -284,8 +284,8 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
     ),
     (
         b"BGSAVE",
-        Coverage::NotEmitted {
-            reason: "not yet a rare operation of the simulated clients.",
+        Coverage::Emitted {
+            forms: &[FORM_BGSAVE],
         },
     ),
     (
@@ -343,6 +343,7 @@ pub(crate) const FORM_TTL: &str = "TTL key";
 pub(crate) const FORM_PEXPIRE: &str = "PEXPIRE key millis";
 pub(crate) const FORM_PERSIST: &str = "PERSIST key";
 pub(crate) const FORM_INCRBY: &str = "INCRBY key delta";
+pub(crate) const FORM_BGSAVE: &str = "BGSAVE";
 pub(crate) const FORM_TYPE: &str = "TYPE key";
 pub(crate) const FORM_STRLEN: &str = "STRLEN key";
 pub(crate) const FORM_SETEX: &str = "SETEX key seconds value";
