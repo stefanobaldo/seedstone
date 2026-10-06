@@ -98,6 +98,9 @@ fn write(file: &mut MemFile, shard: u16, seq: u64, payload: &[u8]) {
     file.sync_data().unwrap();
 }
 
+/// The time every hand-written image carries.
+const IMAGE_MILLIS: u64 = 1_759_000_000_000;
+
 /// One image entry: `(shard, key, value, deadline)`.
 type ImageEntry<'a> = (u16, &'a [u8], &'a [u8], Option<u64>);
 
@@ -117,6 +120,7 @@ fn snapshot(
         generation,
         executor,
         cycle,
+        unix_millis: IMAGE_MILLIS,
         bases: bases.to_vec(),
     };
     let mut bytes = Vec::new();
@@ -666,6 +670,7 @@ fn an_unfinished_snapshot_with_a_hole_is_refused_without_a_loss_while_the_log_co
             generation: 1,
             executor: 0,
             cycle: 0,
+            unix_millis: 0,
             bases: vec![(0, 3)],
         }
         .encoded_len();
@@ -733,6 +738,7 @@ fn a_snapshot_whose_counts_do_not_match_falls_back_to_the_older_image() {
         generation: 1,
         executor: 0,
         cycle: 1,
+        unix_millis: 0,
         bases: vec![(0, 4)],
     };
     let mut bytes = Vec::new();
@@ -856,23 +862,58 @@ fn a_snapshot_is_dead_for_a_shard_a_newer_generation_rebased_below_its_base() {
     );
 }
 
+/// A header that passes its checksum and names a shard the node does not
+/// have is damage of that file, not another node's file: the name matched.
 #[test]
-fn a_header_naming_a_shard_outside_the_node_is_refused() {
+fn a_header_naming_a_shard_outside_the_node_is_charged_as_damage() {
     let disk = MemDisk::default();
     wal(&disk, 1);
-    snapshot(&disk, 1, 0, 0, &[(5, 0)], &[], true);
-    let recovery = recover(spec(&disk, 2)).unwrap();
+    snapshot(&disk, 1, 0, 0, &[(0, 0), (4, 0)], &[], true);
+    let recovery = recover(spec(&disk, 4)).unwrap();
     assert_eq!(recovery.report.snapshots_refused, 1);
     assert!(
-        recovery.shards.iter().all(|shard| !shard.lossy),
-        "no shard of this node was imaged by it"
+        recovery.shards.iter().all(|shard| shard.lossy),
+        "unattributed damage charges every shard"
     );
-    assert!(
-        !disk
-            .list(Path::new("/data/wal"))
-            .unwrap()
-            .contains(&snapshot_name(1, 0, 0))
-    );
+}
+
+/// The same for a header that lists one shard twice.
+#[test]
+fn a_header_naming_a_shard_twice_is_charged_as_damage() {
+    let disk = MemDisk::default();
+    wal(&disk, 1);
+    snapshot(&disk, 1, 0, 0, &[(0, 0), (0, 0)], &[], true);
+    let recovery = recover(spec(&disk, 2)).unwrap();
+    assert_eq!(recovery.report.snapshots_refused, 1);
+    assert!(recovery.shards.iter().all(|shard| shard.lossy));
+}
+
+/// A header whose fields disagree with its file's name is not this node's
+/// file: refused, and nothing charged.
+#[test]
+fn a_header_that_disagrees_with_its_name_is_refused_without_charge() {
+    let disk = MemDisk::default();
+    wal(&disk, 1);
+    snapshot(&disk, 1, 0, 0, &[(0, 0)], &[], true);
+    let from = Path::new("/data/wal").join(snapshot_name(1, 0, 0));
+    let bytes = disk.contents(&from);
+    disk.remove_file(&from).unwrap();
+    disk.write_file(&Path::new("/data/wal").join(snapshot_name(1, 0, 7)), &bytes)
+        .unwrap();
+    let recovery = recover(spec(&disk, 2)).unwrap();
+    assert_eq!(recovery.report.snapshots_refused, 1);
+    assert!(recovery.shards.iter().all(|shard| !shard.lossy));
+}
+
+/// A shard rebuilt from an image knows when that image was taken.
+#[test]
+fn a_shard_rebuilt_from_an_image_carries_its_time() {
+    let disk = MemDisk::default();
+    wal(&disk, 1);
+    snapshot(&disk, 1, 0, 0, &[(0, 0)], &[(0, b"a", b"1", None)], true);
+    let recovery = recover(spec(&disk, 2)).unwrap();
+    assert_eq!(recovery.shards[0].image_unix_millis, Some(IMAGE_MILLIS));
+    assert_eq!(recovery.shards[1].image_unix_millis, None, "no image of it");
 }
 
 /// The header is synced before the file's name is, so a header that does
@@ -1037,6 +1078,7 @@ fn a_snapshot_from_a_newer_format_version_refuses_the_start() {
         generation: 1,
         executor: 0,
         cycle: 0,
+        unix_millis: 0,
         bases: vec![(0, 0)],
     };
     let mut bytes = Vec::new();

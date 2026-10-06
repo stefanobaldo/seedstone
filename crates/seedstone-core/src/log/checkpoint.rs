@@ -253,6 +253,9 @@ struct Cycle<F> {
     through_batch: Option<u64>,
     /// `LogPosition::bytes` at the open.
     opened_at: u64,
+    /// The wall clock at the open, Unix milliseconds: the image describes
+    /// memory as of its bases, so this is its time.
+    opened_unix: u64,
 }
 
 impl<F> Cycle<F> {
@@ -279,6 +282,7 @@ impl<F> Cycle<F> {
             overshoot,
             through_batch,
             opened_at,
+            opened_unix: 0,
         }
     }
 
@@ -346,16 +350,21 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
 
     /// Takes the bases and opens the cycle. Nothing is written to the
     /// snapshot file yet; `step` creates it.
-    fn open_cycle<L: ReplicationLog>(&mut self, states: &[ShardState<L>], log: LogPosition) {
+    fn open_cycle<L: ReplicationLog>(
+        &mut self,
+        states: &[ShardState<L>],
+        log: LogPosition,
+        unix_millis: u64,
+    ) {
         let overshoot = log
             .bytes
             .saturating_sub(self.opened_at)
             .saturating_sub(self.threshold());
         self.opened_at = log.bytes;
         let bases = states.iter().map(|state| state.seq).collect();
-        self.open = Some(Cycle::fresh(
-            self.cycle, bases, overshoot, log.batch, log.bytes,
-        ));
+        let mut cycle = Cycle::fresh(self.cycle, bases, overshoot, log.batch, log.bytes);
+        cycle.opened_unix = unix_millis;
+        self.open = Some(cycle);
         self.cycle += 1;
     }
 
@@ -368,6 +377,7 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
             generation: self.generation,
             executor: self.executor,
             cycle: cycle.number,
+            unix_millis: cycle.opened_unix,
             bases: cycle
                 .bases
                 .iter()
@@ -425,6 +435,7 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
             cycle.opened_at,
         );
         restarted.ticks = cycle.ticks;
+        restarted.opened_unix = cycle.opened_unix;
         self.cycle += 1;
         *cycle = restarted;
         self.remove_abandoned(&abandoned);
@@ -595,6 +606,11 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         }
         self.last_snapshot = cycle.bytes;
         self.completed += 1;
+        let mut cleared = 0;
+        for state in states.iter_mut() {
+            cleared += u64::from(std::mem::take(&mut state.lossy));
+            state.image_unix_millis = Some(cycle.opened_unix);
+        }
         trace.snapshot(&SnapshotReport {
             executor: self.executor,
             cycle: cycle.number,
@@ -602,14 +618,15 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
             bytes: cycle.bytes,
             ticks: cycle.ticks,
             disk_bytes: self.disk_bytes(),
-            written_during: cycle.overshoot + log.bytes.saturating_sub(cycle.opened_at),
+            bytes_written: cycle.overshoot + log.bytes.saturating_sub(cycle.opened_at),
+            cleared,
         });
         Completed {
             cycle: cycle.number,
             through_batch: cycle.through_batch,
             bytes: cycle.bytes,
             ticks: cycle.ticks,
-            cleared: 0,
+            cleared,
         }
     }
 
@@ -639,7 +656,7 @@ impl<D: Disk + Send + 'static> Checkpoint for SegmentCheckpoint<D> {
             if !self.forced && !self.nudged && live < self.threshold() {
                 return Tick::NONE;
             }
-            self.open_cycle(states, log);
+            self.open_cycle(states, log, now.unix_millis);
             self.forced = false;
             self.nudged = false;
             if self.reports_covered_at_open {

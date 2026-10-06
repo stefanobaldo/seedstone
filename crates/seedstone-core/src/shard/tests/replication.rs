@@ -672,12 +672,14 @@ async fn a_pool_spawned_from_a_recovery_serves_the_recovered_keys() {
             seq: 0,
             lossy: true,
             cut: true,
+            image_unix_millis: None,
         },
         RecoveredShard {
             dict: imaged,
             seq: 1,
             lossy: false,
             cut: false,
+            image_unix_millis: None,
         },
     ];
     let pool = ShardPool::spawn_spec(PoolSpec {

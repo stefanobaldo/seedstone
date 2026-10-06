@@ -43,7 +43,10 @@ pub struct SnapshotReport {
     /// cycle, until the snapshot was durable — the `W` of the disk bound.
     /// The crossing falls between two ticks and the cycle opens on the
     /// next, so this counts what that tick's interval wrote past it too.
-    pub written_during: u64,
+    pub bytes_written: u64,
+    /// Shards the start reported lossy that this image covers: their
+    /// durable state no longer depends on the damaged region.
+    pub cleared: u64,
 }
 
 /// What one compaction removed, for the sink. The node's: the writer is the

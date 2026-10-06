@@ -593,7 +593,7 @@ fn a_nudge_opens_a_cycle_below_the_floor_and_a_force_abandons_an_open_one() {
 }
 
 #[test]
-fn written_during_counts_what_the_executor_sent_from_the_crossing_to_the_footer() {
+fn bytes_written_counts_what_the_executor_sent_from_the_crossing_to_the_footer() {
     let mut b = bench(
         1,
         CheckpointConfig {
@@ -633,7 +633,7 @@ fn written_during_counts_what_the_executor_sent_from_the_crossing_to_the_footer(
     }
     let report = recorder.snapshots.lock().unwrap()[0];
     assert_eq!(
-        report.written_during,
+        report.bytes_written,
         (at_open - SMALL.floor) + (sent - at_open)
     );
 }
@@ -665,7 +665,7 @@ fn what_was_written_past_the_floor_before_the_cycle_opened_is_reported_as_writte
     let snapshots = trace.snapshots.lock().unwrap().clone();
     assert_eq!(snapshots.len(), 1, "the cycle finished");
     assert_eq!(
-        snapshots[0].written_during, past_the_floor,
+        snapshots[0].bytes_written, past_the_floor,
         "nothing was sent after the open, so what is reported is the overshoot"
     );
 }

@@ -435,6 +435,32 @@ pub struct PoolSpec<T, F, P, G> {
     pub stats: Arc<PersistenceStats>,
 }
 
+/// One shard's state as recovery left it, counted into the node's
+/// persistence stats: its keys loaded, and whether the start found it lossy.
+fn recovered_state<L>(
+    recovered: RecoveredShard,
+    log: L,
+    stats: &PersistenceStats,
+) -> ShardState<L> {
+    let RecoveredShard {
+        dict,
+        seq,
+        lossy,
+        image_unix_millis,
+        ..
+    } = recovered;
+    let mut shard = ShardState::recovered(dict, seq, log);
+    shard.lossy = lossy;
+    shard.image_unix_millis = image_unix_millis;
+    if lossy {
+        stats.lossy_shards.fetch_add(1, Ordering::Relaxed);
+    }
+    stats
+        .keys_loaded
+        .fetch_add(shard.dict.len() as u64, Ordering::Relaxed);
+    shard
+}
+
 impl ShardPool {
     /// Spawns `executors` executor tasks on the current tokio runtime,
     /// hosting `shards` virtual shards between them.
@@ -727,14 +753,16 @@ impl ShardPool {
                 seq: 0,
                 lossy: false,
                 cut: false,
+                image_unix_millis: None,
             };
             // A cut shard's `Rebase` was written and synced through the
             // node's writer before the pool was built: see `write_rebases`.
-            let RecoveredShard {
-                dict, seq, lossy, ..
-            } = recovered.next().unwrap_or_else(fresh);
-            let state = ShardState::recovered(dict, seq, make_log(shard));
-            trace.recovered(shard, state.seq, lossy);
+            let state = recovered_state(
+                recovered.next().unwrap_or_else(fresh),
+                make_log(shard),
+                &stats,
+            );
+            trace.recovered(shard, state.seq, state.lossy);
             // A fresh dict already costs its table, and the gauge is the sum
             // of what the dicts account — so it starts at the sum of what
             // they hold after replay rather than at zero.

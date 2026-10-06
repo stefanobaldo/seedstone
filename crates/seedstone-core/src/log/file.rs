@@ -33,7 +33,7 @@ use crate::log::{Record, ReplicationLog, crc32_iso_hdlc, encode_record};
 pub const SEGMENT_MAGIC: [u8; 4] = *b"SSEG";
 
 /// The layout version this build writes, and the only one it reads.
-pub const FORMAT_VERSION: u8 = 2;
+pub const FORMAT_VERSION: u8 = 3;
 
 /// Magic, version, generation, rotation, and a CRC over the rest.
 pub const SEGMENT_HEADER_LEN: usize = 4 + 1 + 8 + 4 + 4;

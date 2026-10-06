@@ -322,12 +322,14 @@ async fn the_start_path_appends_and_syncs_now_and_a_rebase_advances_the_cut_shar
             seq: 4,
             lossy: false,
             cut: true,
+            image_unix_millis: None,
         },
         crate::log::recovery::RecoveredShard {
             dict: crate::dict::Dict::with_seed(crate::dict::DictSeed { k0: 1, k1: 3 }),
             seq: 9,
             lossy: false,
             cut: false,
+            image_unix_millis: None,
         },
     ];
     write_rebases(&mut writer, &mut shards).unwrap();

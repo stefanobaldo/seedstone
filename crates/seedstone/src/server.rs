@@ -870,6 +870,8 @@ impl TraceSink for FaultLines {
                 Field::Num(report.bytes),
                 Field::Num(report.ticks),
                 Field::Num(report.disk_bytes),
+                Field::Num(report.bytes_written),
+                Field::Num(report.cleared),
             ],
         );
     }
