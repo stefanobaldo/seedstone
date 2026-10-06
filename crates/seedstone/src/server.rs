@@ -431,6 +431,9 @@ pub struct Server {
     /// lives, or `None` without one: dropping it is what lets another
     /// process open the log.
     _data_lock: Option<std::fs::File>,
+    /// The `--fsync` policy, when there is a log to sync: what `INFO
+    /// persistence` reports, and whether it reports anything.
+    fsync: Option<SyncPolicy>,
 }
 
 impl Server {
@@ -465,6 +468,7 @@ impl Server {
             passwords: PasswordStore::new(cfg.passwords),
             source: cfg.source,
             run_id,
+            fsync: data_lock.as_ref().map(|_| cfg.fsync),
             _data_lock: data_lock,
         })
     }
@@ -534,6 +538,8 @@ impl Server {
             errorstats: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             edge_calls: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             edge_usec: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            persistence: self.fsync.map(|_| self.pool.stats().clone()),
+            fsync: self.fsync.unwrap_or(SyncPolicy::INTERVAL),
         };
         // Created once and polled across every turn of the loop, rather than
         // rebuilt inside the `select!`: a signal watcher registered afresh on

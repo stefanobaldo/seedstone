@@ -283,6 +283,48 @@ before it reads the log, and a second node started on the same directory
 writes `recovery_failed` and exits 1. The kernel releases the lock when the
 process dies, so a crashed node never leaves it behind.
 
+## What `INFO persistence` reports
+
+`INFO persistence` is what a monitor reads about the log and the snapshots.
+A node without `--data-dir` prints `loading:0` and `aof_enabled:0` and
+nothing else: there is no log, and the fields that would describe one are
+absent rather than zero. With `--data-dir` the section carries the fields
+below, in this order. The first ones use Redis's names, where this node
+measures what the name says. The ones from `fsync_policy` on are this
+server's own. The section is part of an argumentless `INFO`, as it is on
+Redis (read on 6.2.24 and 8.10.1).
+
+| Field | Value | What it measures |
+|---|---|---|
+| `loading` | `0` | the node reads its log before it listens, so a client never sees it loading |
+| `rdb_changes_since_last_save` | count | records appended to the log that no durable snapshot covers yet, summed over the executors |
+| `rdb_bgsave_in_progress` | `0` or `1` | `1` while any executor's snapshot is being written; the shards keep serving while it is |
+| `rdb_last_save_time` | Unix seconds | when the oldest of the shards' newest durable snapshots was taken: everything written before it is covered by a snapshot. Absent until every shard has one. A snapshot read back at start counts, so a restart does not reset it |
+| `rdb_last_bgsave_status` | `ok` or `err` | `err` when the last snapshot of any executor ended in `snapshot_fault` |
+| `rdb_last_bgsave_time_sec` | seconds | how long the last completed snapshot took, the longest over the executors; `-1` before any |
+| `rdb_saves` | count | snapshots that became durable since the process started, summed over the executors |
+| `rdb_last_load_keys_loaded` | count | keys the start recovered, from snapshots and from the log |
+| `aof_enabled` | `1` | the log is on |
+| `aof_last_write_status` | `ok` or `err` | `err` while any executor refuses writes because the log failed (see `log_fault`) |
+| `aof_current_size` | bytes | the log's files on disk, every segment |
+| `aof_pending_bio_fsync` | `0` or `1` | `1` while a sync of the log is in flight; there is one writer and one sync at a time |
+| `aof_delayed_fsync` | count | syncs that were in flight for more than one second, since the start: each wrote a `sync_slow` line |
+| `fsync_policy` | `always`, `interval` or `never` | the `--fsync` setting |
+| `log_segments` | count | the log's segment files on disk |
+| `syncs_total` | count | syncs of the log completed since the start |
+| `last_sync_ms` | milliseconds | how long the last completed sync took |
+| `refusing_executors` | count | executors refusing writes right now |
+| `lossy_shards` | count | shards the start reported lossy (the `recovery` line's `lossy_shards`) that no durable snapshot has covered since; it only falls within a process, and each snapshot that covers one says so with its `cleared` field |
+
+The rest of Redis's section is absent. There is no fork and no rewrite, so
+there are no copy-on-write, fork or rewrite fields. A snapshot's duration is
+reported when it ends, and the open snapshots of several executors have no
+single duration, so `rdb_current_bgsave_time_sec` is absent. Nothing here
+measures what `aof_base_size`, `aof_buffer_length` and `mem_aof_buffer` name.
+The start does not count the keys it found expired, so
+`rdb_last_load_keys_expired` is absent. A number this server does not measure
+is absent here rather than zero.
+
 ## What `INFO` gives a monitor
 
 `INFO` is the operational surface a monitoring agent reads, and

@@ -639,6 +639,35 @@ async fn a_directory_from_the_previous_format_is_refused_with_a_line_that_says_s
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// `INFO persistence` on a node with a log: the log is on, the policy is
+/// named, the write counts as a change, and no image exists yet — so the
+/// time of the last one is absent rather than zero.
+#[tokio::test(flavor = "multi_thread")]
+async fn info_persistence_reports_the_log_and_the_images() {
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let (mut node, port) = start_with(&dir, &stderr, &["--fsync", "interval"]).await;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert_eq!(
+        round_trip(&mut stream, &["SET", "k", "v"]).await,
+        Frame::Simple("OK".into())
+    );
+    let Frame::Bulk(text) = round_trip(&mut stream, &["INFO", "persistence"]).await else {
+        panic!("INFO answers a bulk")
+    };
+    let text = String::from_utf8(text.to_vec()).unwrap();
+    assert!(text.contains("aof_enabled:1\r\n"), "{text}");
+    assert!(text.contains("fsync_policy:interval\r\n"), "{text}");
+    assert!(text.contains("rdb_changes_since_last_save:1\r\n"), "{text}");
+    assert!(text.contains("rdb_saves:0\r\n"), "{text}");
+    assert!(text.contains("log_segments:1\r\n"), "{text}");
+    assert!(!text.contains("rdb_last_save_time:"), "{text}");
+    node.kill().expect("SIGKILL");
+    node.wait().expect("reaped");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}
+
 /// The executors the binary runs on this host.
 fn available_parallelism() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)

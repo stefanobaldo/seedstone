@@ -5,8 +5,8 @@
 use crate::EDGE_NAMES;
 use crate::containers::reported_limit;
 use crate::node::{KIND_NAMES, NodeInfo, SERVER_MODE};
-use seedstone_core::shard::{Command, Reply, Router, ShardStats};
-use std::sync::atomic::Ordering;
+use seedstone_core::shard::{Command, HOUSEKEEPING_TICK, Reply, Router, ShardStats};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The `INFO` arguments that name no section but every section there is.
 ///
@@ -41,7 +41,8 @@ pub const INFO_EVERY_SECTION: [&[u8]; 2] = [b"all", b"everything"];
 /// `# Errorstats` was checked against `redis:6-alpine`
 /// (`redis_version:6.2.24`) when this server started printing it: an
 /// argumentless `INFO` there carries the section, so it is inside the default
-/// set and does not belong in this list.
+/// set and does not belong in this list. `# Persistence` was checked the same
+/// way on 6.2.24 and 8.10.1 on 2026-10-05: inside the default set.
 pub const INFO_OUTSIDE_DEFAULT: [&[u8]; 1] = [b"commandstats"];
 
 /// Renders the `INFO` sections a peer asked for, or all of them if it named
@@ -127,6 +128,9 @@ pub async fn info<R: Router>(router: &R, node: &NodeInfo, wanted: &[Vec<u8>]) ->
             policy.name(),
         );
     }
+    if asked_for(b"persistence") {
+        text.push_str(&persistence_section(node));
+    }
     // The broadcast is paid for only by a request that asks for one of the
     // three sections built from it — `INFO memory` reaches no shard at all —
     // and a scrape that wants everything pays it once rather than three times.
@@ -163,6 +167,108 @@ pub async fn info<R: Router>(router: &R, node: &NodeInfo, wanted: &[Vec<u8>]) ->
     if text.ends_with("\r\n\r\n") {
         text.truncate(text.len() - 2);
     }
+    text
+}
+
+/// Every field `INFO persistence` can print, in print order — the contract
+/// `docs/operations.md`'s table is held to.
+pub const PERSISTENCE_FIELDS: &[&str] = &[
+    "loading",
+    "rdb_changes_since_last_save",
+    "rdb_bgsave_in_progress",
+    "rdb_last_save_time",
+    "rdb_last_bgsave_status",
+    "rdb_last_bgsave_time_sec",
+    "rdb_saves",
+    "rdb_last_load_keys_loaded",
+    "aof_enabled",
+    "aof_last_write_status",
+    "aof_current_size",
+    "aof_pending_bio_fsync",
+    "aof_delayed_fsync",
+    "fsync_policy",
+    "log_segments",
+    "syncs_total",
+    "last_sync_ms",
+    "refusing_executors",
+    "lossy_shards",
+];
+
+/// `# Persistence`: Redis's field names where this node measures what the
+/// name says, this server's own after them, and nothing filled in.
+///
+/// Without a log the section is `loading:0` and `aof_enabled:0`: there is
+/// no log for the other fields to describe. `rdb_last_save_time` is printed only once every shard has a durable
+/// image — a gauge the check simply does not see before that, rather than
+/// a zero it would plot.
+#[must_use]
+pub fn persistence_section(node: &NodeInfo) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::from("# Persistence\r\nloading:0\r\n");
+    let Some(stats) = &node.persistence else {
+        text.push_str("aof_enabled:0\r\n\r\n");
+        return text;
+    };
+    let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+    let _ = write!(
+        text,
+        "rdb_changes_since_last_save:{}\r\n",
+        stats.changes_since_save()
+    );
+    let _ = write!(
+        text,
+        "rdb_bgsave_in_progress:{}\r\n",
+        u8::from(stats.any_cycle_open())
+    );
+    if let Some(at) = stats.last_save_unix() {
+        let _ = write!(text, "rdb_last_save_time:{at}\r\n");
+    }
+    let _ = write!(
+        text,
+        "rdb_last_bgsave_status:{}\r\n",
+        if stats.any_save_failed() { "err" } else { "ok" }
+    );
+    // Whole seconds, as Redis prints it, and `-1` before any image.
+    let seconds = if stats.saves() == 0 {
+        -1
+    } else {
+        let millis = u128::from(stats.last_save_ticks()) * HOUSEKEEPING_TICK.as_millis();
+        i64::try_from(millis / 1000).unwrap_or(i64::MAX)
+    };
+    let _ = write!(text, "rdb_last_bgsave_time_sec:{seconds}\r\n");
+    let _ = write!(text, "rdb_saves:{}\r\n", stats.saves());
+    let _ = write!(
+        text,
+        "rdb_last_load_keys_loaded:{}\r\n",
+        load(&stats.keys_loaded)
+    );
+    text.push_str("aof_enabled:1\r\n");
+    let _ = write!(
+        text,
+        "aof_last_write_status:{}\r\n",
+        if load(&stats.refusing) > 0 {
+            "err"
+        } else {
+            "ok"
+        }
+    );
+    let _ = write!(text, "aof_current_size:{}\r\n", load(&stats.log_bytes));
+    let _ = write!(
+        text,
+        "aof_pending_bio_fsync:{}\r\n",
+        load(&stats.sync_in_flight)
+    );
+    let _ = write!(text, "aof_delayed_fsync:{}\r\n", load(&stats.delayed_syncs));
+    let _ = write!(text, "fsync_policy:{}\r\n", node.fsync.name());
+    let _ = write!(text, "log_segments:{}\r\n", load(&stats.log_segments));
+    let _ = write!(text, "syncs_total:{}\r\n", load(&stats.syncs_total));
+    let _ = write!(
+        text,
+        "last_sync_ms:{}\r\n",
+        load(&stats.last_sync_micros) / 1000
+    );
+    let _ = write!(text, "refusing_executors:{}\r\n", load(&stats.refusing));
+    let _ = write!(text, "lossy_shards:{}\r\n\r\n", load(&stats.lossy_shards));
     text
 }
 
