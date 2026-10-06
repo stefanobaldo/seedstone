@@ -39,8 +39,10 @@ SemVer and are `0.x` while the keyspace holds only strings;
   `--no-auth` any client that can connect can use it.
 - **A failing or full disk is met with refusal**, not with acknowledgements
   the node cannot keep: writes answer `MISCONF`, reads are served, and each
-  executor resumes on its own once a snapshot of its memory is durable. A
-  start whose first write to the log fails begins the same way. The reply,
+  executor resumes on its own once a snapshot of its memory is durable; a
+  refusing executor appends nothing to the log meanwhile, not even a lazily
+  expired key's deletion (#85). A start whose first write to the log fails
+  begins the same way. The reply,
   and how it compares with Redis's on a failed AOF write, is in
   `docs/compatibility.md` (#72).
 - **A slow sync is visible.** A sync in flight for more than a second writes
@@ -61,9 +63,10 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ### Fixed
 
-- A refusing executor appends nothing to the log, not even a lazily expired
-  key's deletion, so a log that keeps failing is not refused twice for one
-  `log_fault` (#85).
+- A load that never lets an executor's queue run dry — clients walking the
+  keyspace with `KEYS` were enough — no longer holds off its housekeeping:
+  active expiry, rehashing and, under `--data-dir`, snapshots, compaction and
+  the end of a refusal now run every 100 ms whatever the load (#79).
 
 ## [0.2.0] - 2026-09-22
 
