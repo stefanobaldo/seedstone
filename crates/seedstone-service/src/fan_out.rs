@@ -610,4 +610,54 @@ mod tests {
         }
         assert_eq!(joined.await.unwrap(), (0..8u32).collect::<Vec<_>>());
     }
+
+    /// Every executor's answer to `BGSAVE`, fixed: what the fold sees when
+    /// some executors start an image and others are already in one.
+    #[derive(Clone)]
+    struct Answers(Vec<Reply>);
+
+    impl Router for Answers {
+        async fn dispatch(&self, _cmd: Command) -> Reply {
+            unreachable!("BGSAVE reaches every executor")
+        }
+
+        fn shards(&self) -> u16 {
+            1
+        }
+
+        async fn dispatch_at(&self, _shard: u16, _cmd: Command) -> Reply {
+            unreachable!("BGSAVE reaches every executor")
+        }
+
+        async fn dispatch_every(&self, _cmd: Command) -> Vec<Reply> {
+            self.0.clone()
+        }
+    }
+
+    /// `started` if any executor started, in whichever order the answers
+    /// come; the refusal only when every executor gave it.
+    #[tokio::test]
+    async fn bgsave_answers_started_when_some_executors_were_already_in_one() {
+        let started = Reply::Status("Background saving started");
+        let running = Reply::Error(ReplyError::SaveInProgress);
+        let bgsave = Command::Snapshot { wait: false };
+        for answers in [
+            vec![running.clone(), started.clone(), running.clone()],
+            vec![started.clone(), running.clone()],
+        ] {
+            assert_eq!(
+                broadcast(&Answers(answers), bgsave.clone(), Gather::Started).await,
+                Frame::Simple("Background saving started".into())
+            );
+        }
+        assert_eq!(
+            broadcast(
+                &Answers(vec![running.clone(), running]),
+                bgsave,
+                Gather::Started
+            )
+            .await,
+            Frame::Error("ERR Background save already in progress".into())
+        );
+    }
 }
