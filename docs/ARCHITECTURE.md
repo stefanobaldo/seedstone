@@ -116,11 +116,11 @@ interleaved. On start every segment is read through a reader that steps
 over damage, and each shard replays the gapless prefix of its sequence.
 Damage in that one file is charged to the shards it may have cost without a
 trace — those whose highest record precedes it, or that have none — and a
-gap behind damage is reported as a loss. A shard whose prefix was cut resumes there behind a
-*rebase* record, written and synced before the node serves, so the records
-the cut left on disk are never replayed by a later start. The same
-abstraction becomes a consensus log after that. Without the flag the log is
-a no-op, as it was, and a write encodes no record at all.
+gap behind damage is reported as a loss. A shard whose prefix was cut resumes
+there behind a *rebase* record, written and synced before the node serves, so
+the records the cut left on disk are never replayed by a later start. The same
+abstraction becomes a consensus log after that. Without the flag the log is a
+no-op, as it was, and a write encodes no record at all.
 
 **One sync stream, never in the way.** The writer keeps at most one sync of
 the segment in flight, issued on its cadence (`--fsync`) on a blocking
@@ -168,19 +168,19 @@ signals it answers and how its password is rotated — is documented in
 [operations.md](operations.md). Below it, the connection loop is generic over
 its transport; commands that concern the connection rather than the keyspace
 are answered there, and a command that names a key is routed to the executor
-that owns its shard. Two other routing shapes share that path: a command that names a *shard*
-instead of a key, which is how one step of a keyspace walk reaches the shard
-whose cursor it carries, and a command every shard must see, such as emptying
-the keyspace or counting it. Multi-key commands fan out from this layer, with
-one exception: an `MGET` of at most 128 keys — the most one batch to the
-executors carries — joins the batch of the commands pipelined around it and is
-folded back into one array when the batch is answered, which is what keeps a
-pipeline of `MGET`s at one message per batch rather than one per request. A
-longer `MGET` and a multi-key `DEL` or `EXISTS` fan out, and so does the walk —
-one cursor loop per shard, run concurrently. The
-command surface itself — every name the layer's table answers and every one it
-refuses — is documented in [compatibility.md](compatibility.md), and a test
-holds the two together.
+that owns its shard. Two other routing shapes share that path: a command that
+names a *shard* instead of a key, which is how one step of a keyspace walk
+reaches the shard whose cursor it carries, and a command every shard must see,
+such as emptying the keyspace or counting it. Multi-key commands fan out from
+this layer, with one exception: an `MGET` of at most 128 keys — the most one
+batch to the executors carries — joins the batch of the commands pipelined
+around it and is folded back into one array when the batch is answered, which is
+what keeps a pipeline of `MGET`s at one message per batch rather than one per
+request. A longer `MGET` and a multi-key `DEL` or `EXISTS` fan out, and so does
+the walk — one cursor loop per shard, run concurrently. The command surface
+itself — every name the layer's table answers and every one it refuses — is
+documented in [compatibility.md](compatibility.md), and a test holds the two
+together.
 
 Authentication is per-connection state in that same layer: one flag, and a gate
 a decoded command passes before the router ever sees it — so a peer that has
@@ -345,8 +345,9 @@ requests no shard sees whole — an `MGET`, a `KEYS`, an `INFO` — are timed at
 the edge where they are counted, and that reading is a different quantity: it
 spans the wait for every shard the request reached — for a multi-key read that
 travelled in the batch, that wait is the batch's, and it is what the request
-waited for — so it is what the request took rather than what it cost. The per-call figure is the quotient of the two
-totals beside it, not an average of per-shard averages.
+waited for — so it is what the request took rather than what it cost. The
+per-call figure is the quotient of the two totals beside it, not an average of
+per-shard averages.
 
 **A request this server splits is counted at both layers, and the totals are
 not additive.** An `MGET` over four keys is one `mget` at the edge and four

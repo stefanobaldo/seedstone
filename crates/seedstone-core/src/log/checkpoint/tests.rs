@@ -526,6 +526,54 @@ fn a_failed_footer_sync_abandons_the_file_and_restarts_with_the_same_bases() {
     assert_eq!(report.entries, 8);
 }
 
+/// A cycle whose footer sync fails abandons its file, and the file is gone
+/// from `wal/` by the end of the tick that failed: no half-written image is
+/// left for a later recovery to meet. The next cycle opens under the next
+/// number, with the same bases.
+#[test]
+fn a_cycle_whose_sync_fails_abandons_its_file_and_the_file_is_gone() {
+    let mut b = bench(
+        1,
+        CheckpointConfig {
+            floor: 64,
+            ratio: 1,
+            bytes_per_tick: 64,
+        },
+    );
+    for i in 0..8u8 {
+        put(&mut b.states[0], &[b'k', i], b"value-long-enough-to-cross");
+    }
+    let bytes = flush(&mut b.states);
+    let recorder = Recorder::default();
+    b.checkpoint
+        .tick(0, &mut b.states, now(), &recorder, at(bytes)); // opens
+    let abandoned = snapshot_name(1, 0, 0);
+    assert!(b.disk.list(Path::new(WAL)).unwrap().contains(&abandoned));
+    b.disk.fail_syncs(true);
+    let mut ticks = 0;
+    while recorder.faults.lock().unwrap().is_empty() {
+        b.checkpoint
+            .tick(0, &mut b.states, now(), &recorder, at(bytes));
+        ticks += 1;
+        assert!(ticks < 50, "the footer's sync is reached and fails");
+    }
+    b.disk.fail_syncs(false);
+    assert!(
+        !b.disk.list(Path::new(WAL)).unwrap().contains(&abandoned),
+        "the abandoned image is gone after the tick that failed it"
+    );
+    b.checkpoint
+        .tick(0, &mut b.states, now(), &recorder, at(bytes));
+    assert_eq!(b.checkpoint.open_bases(), vec![8], "the same bases");
+    assert!(
+        b.disk
+            .list(Path::new(WAL))
+            .unwrap()
+            .contains(&snapshot_name(1, 0, 1)),
+        "the next cycle, under the next number"
+    );
+}
+
 /// Keys in `state`'s dict and not in its log: what the image scans, with
 /// nothing handed over, so a cycle spans several ticks of a small budget
 /// without the live log moving.
