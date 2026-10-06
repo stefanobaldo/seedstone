@@ -17,7 +17,7 @@ use crate::fan_out::{broadcast, fan_out, keys, scan};
 use crate::hello::hello;
 use crate::info::info;
 use crate::node::{KIND_NAMES, NodeInfo, edge_slot, micros_since};
-use crate::options::{parse_u64, per_key, scan_options, set_options, wrong_arity};
+use crate::options::{SYNTAX_ERROR, parse_u64, per_key, scan_options, set_options, wrong_arity};
 use crate::reply::{CommandLabel, known_name, quote, safe_error};
 use crate::{INVALID_CURSOR, KEYS_REPLY_BYTES};
 use bytes::Bytes;
@@ -250,6 +250,9 @@ pub enum Gather {
     Sum,
     /// Every shard answers `+OK` and so does the peer, once — `FLUSHDB`.
     AllOk,
+    /// Every executor answers `started` or `already in progress`; the peer
+    /// gets `started` if any did, Redis's refusal if none did — `BGSAVE`.
+    Started,
 }
 
 impl Unbatched {
@@ -267,6 +270,12 @@ impl Unbatched {
             // command's own name is the request's: the table that names a
             // kind for `commandstats` is the same table, so there is no
             // second spelling to keep in step.
+            //
+            // `SAVE` and `BGSAVE` are the exception: one command, two names.
+            Self::Every {
+                cmd: Command::Snapshot { wait: false },
+                ..
+            } => "bgsave",
             Self::Every { cmd, .. } => KIND_NAMES[usize::from(cmd.kind())],
             Self::Keys(_) => "keys",
             Self::Scan { .. } => "scan",
@@ -389,6 +398,22 @@ pub fn take_bulk(frame: &mut Frame) -> Bytes {
 /// stops covering something.
 pub fn command_names() -> impl Iterator<Item = &'static [u8]> {
     COMMANDS.iter().map(|(name, _)| *name)
+}
+
+/// What `SAVE`, `BGSAVE` and `LASTSAVE` answer on a node started without
+/// `--data-dir`: there is no log to image and no image to date.
+pub const PERSISTENCE_OFF: &str = "ERR persistence is off: start the server with --data-dir";
+
+/// `SAVE` (`wait`) or `BGSAVE`: a snapshot asked of every executor, or the
+/// refusal of a node with no log.
+fn snapshot(node: &NodeInfo, wait: bool) -> Action {
+    if node.persistence.is_none() {
+        return Action::Reply(safe_error(PERSISTENCE_OFF));
+    }
+    Action::Unbatched(Unbatched::Every {
+        cmd: Command::Snapshot { wait },
+        gather: if wait { Gather::AllOk } else { Gather::Started },
+    })
 }
 
 /// Every command name this server accepts, and what each one does about its
@@ -619,6 +644,31 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
             gather: Gather::AllOk,
         })),
         _ => Err(wrong_arity("flushdb")),
+    }),
+    // Persistence: a request to every executor, folded once. Without a log
+    // there is nothing to save or to date, and the reply names the flag.
+    (b"BGSAVE", |args, node| match args {
+        // `SCHEDULE` defers a save behind an AOF rewrite, which this server
+        // does not have; behind a running save, 6.2.24 and 8.10.1 refuse
+        // it exactly as they refuse a plain `BGSAVE`, so it is the same
+        // request here. Anything else is their `ERR syntax error`.
+        [] => Ok(snapshot(node, false)),
+        [option] if bulk(option).eq_ignore_ascii_case(b"SCHEDULE") => Ok(snapshot(node, false)),
+        _ => Err(SYNTAX_ERROR.to_owned()),
+    }),
+    (b"SAVE", |args, node| match args {
+        [] => Ok(snapshot(node, true)),
+        _ => Err(wrong_arity("save")),
+    }),
+    (b"LASTSAVE", |args, node| match args {
+        [] => Ok(Action::Reply(node.persistence.as_ref().map_or_else(
+            || safe_error(PERSISTENCE_OFF),
+            |stats| {
+                let at = stats.last_save_unix().unwrap_or(0);
+                Frame::Integer(i64::try_from(at).unwrap_or(i64::MAX))
+            },
+        ))),
+        _ => Err(wrong_arity("lastsave")),
     }),
     // From here down: the connection's own business, answered without a shard
     // ever hearing of it, because there is no key to route on.

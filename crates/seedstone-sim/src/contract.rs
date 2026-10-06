@@ -274,6 +274,27 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
                      mid-workload rather than exercise anything.",
         },
     ),
+    (
+        b"SAVE",
+        Coverage::NotEmitted {
+            reason: "its reply waits for every executor's image, which would \
+                     park the client's burst for whole checkpoint cycles; \
+                     `BGSAVE` asks for the same cycle without the wait.",
+        },
+    ),
+    (
+        b"BGSAVE",
+        Coverage::NotEmitted {
+            reason: "not yet a rare operation of the simulated clients.",
+        },
+    ),
+    (
+        b"LASTSAVE",
+        Coverage::NotEmitted {
+            reason: "a reading of the node's clock, which no client model \
+                     predicts.",
+        },
+    ),
 ];
 
 // The form labels, named once and shared by the two halves. A literal spelled

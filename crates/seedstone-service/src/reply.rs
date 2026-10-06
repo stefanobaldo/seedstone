@@ -361,6 +361,8 @@ mod tests {
             ReplyError::ShardUnavailable,
             ReplyError::LogWriteFailed,
             ReplyError::OutOfMemory,
+            ReplyError::SaveInProgress,
+            ReplyError::SnapshotFailed,
         ];
         for error in every {
             // Exhaustiveness: adding a variant makes this match non-exhaustive
@@ -371,7 +373,9 @@ mod tests {
                 | ReplyError::WouldOverflow
                 | ReplyError::ShardUnavailable
                 | ReplyError::LogWriteFailed
-                | ReplyError::OutOfMemory => {}
+                | ReplyError::OutOfMemory
+                | ReplyError::SaveInProgress
+                | ReplyError::SnapshotFailed => {}
             }
 
             let text = error.wire_text();

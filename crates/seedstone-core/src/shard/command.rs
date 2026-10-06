@@ -276,6 +276,19 @@ pub enum Command {
     /// It is answered by the executor rather than by `apply::apply`, because what
     /// it reports lives beside the dict rather than in it.
     Stats,
+    /// Open a snapshot cycle on this executor — or ask for the next one, if
+    /// a cycle is already open — and answer at once (`wait: false`,
+    /// `BGSAVE`) or once an image taken after this command is durable
+    /// (`wait: true`, `SAVE`).
+    ///
+    /// Keyspace-wide: one reaches every shard, every copy on an executor
+    /// says the same, and the edge folds them. Answered by the executor
+    /// rather than by `apply::apply`, because the checkpoint is the
+    /// executor's and not the shard's.
+    Snapshot {
+        /// Whether the reply waits for the image.
+        wait: bool,
+    },
 }
 
 /// How a command reaches the shards that must run it.
@@ -349,7 +362,7 @@ impl Command {
             | Self::PTtl { key }
             | Self::ExpireAt { key, .. }
             | Self::PExpireAt { key, .. } => Route::Key(key),
-            Self::FlushDb | Self::DbSize | Self::Stats => Route::Every,
+            Self::FlushDb | Self::DbSize | Self::Stats | Self::Snapshot { .. } => Route::Every,
             // The one route that is not self-sufficient. A step knows where it
             // is in *a* shard's table and not which shard's, so it names no
             // shard and the caller supplies the real one through
@@ -378,7 +391,7 @@ impl Command {
     /// `every_kind_tag_is_contiguous_and_bounded` is what keeps it true when
     /// a variant is added: it fails, rather than the array growing silently
     /// or a panic waiting for the traffic that reaches the new command.
-    pub const KIND_MAX: u8 = 21;
+    pub const KIND_MAX: u8 = 22;
 
     /// A stable one-byte tag for this command's variant.
     ///
@@ -386,7 +399,7 @@ impl Command {
     /// `Exists` = 7, `FlushDb` = 8, `DbSize` = 9, `ScanStep` = 10,
     /// `PExpire` = 11, `Persist` = 12, `Type` = 13, `StrLen` = 14,
     /// `Stats` = 15, `SetEx` = 16, `SetNx` = 17, `PSetEx` = 18,
-    /// `PTtl` = 19, `ExpireAt` = 20, `PExpireAt` = 21. These
+    /// `PTtl` = 19, `ExpireAt` = 20, `PExpireAt` = 21, `Snapshot` = 22. These
     /// values are folded into the simulator's trace hash, so they are part of
     /// what a replay compares: changing one changes every recorded hash. A tag
     /// is therefore never reused and never renumbered.
@@ -414,6 +427,7 @@ impl Command {
             Self::PTtl { .. } => 19,
             Self::ExpireAt { .. } => 20,
             Self::PExpireAt { .. } => 21,
+            Self::Snapshot { .. } => 22,
         }
     }
 
@@ -550,6 +564,7 @@ mod tests {
                 key: Bytes::new(),
                 millis: 1,
             },
+            Command::Snapshot { wait: false },
         ];
         for cmd in &every {
             // No wildcard: a new variant fails to compile here.
@@ -574,7 +589,8 @@ mod tests {
                 | Command::PSetEx { .. }
                 | Command::PTtl { .. }
                 | Command::ExpireAt { .. }
-                | Command::PExpireAt { .. } => {}
+                | Command::PExpireAt { .. }
+                | Command::Snapshot { .. } => {}
             }
         }
         let mut tags: Vec<u8> = every.iter().map(Command::kind).collect();
@@ -664,10 +680,11 @@ mod tests {
             );
         }
 
-        let keyless: [(Command, Route<'_>); 4] = [
+        let keyless: [(Command, Route<'_>); 5] = [
             (Command::FlushDb, Route::Every),
             (Command::DbSize, Route::Every),
             (Command::Stats, Route::Every),
+            (Command::Snapshot { wait: true }, Route::Every),
             (
                 Command::ScanStep {
                     cursor: 0,

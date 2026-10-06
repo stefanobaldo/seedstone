@@ -112,3 +112,95 @@ pub async fn read_frames<R: AsyncRead + Unpin>(r: &mut R, n: usize) -> Vec<Frame
     }
     frames
 }
+
+/// A served connection over a node with a log: a pool with the real writer
+/// and checkpoint over a fresh directory, and a [`NodeInfo`] carrying its
+/// persistence counters. The directory is the caller's to remove.
+pub fn connected_with_log(
+    shards: u16,
+) -> (
+    tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ShardPool,
+    std::path::PathBuf,
+) {
+    use seedstone_core::log::checkpoint::{CheckpointConfig, CheckpointSpec, SegmentCheckpoint};
+    use seedstone_core::log::disk::{Disk, StdDisk};
+    use seedstone_core::log::file::{FileLog, next_generation};
+    use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, recover};
+    use seedstone_core::log::writer::{Writer, WriterPlants, WriterSpec};
+    use seedstone_core::memory::MemoryLimit;
+    use seedstone_core::shard::{
+        Deadlines, ExecutorPlants, Now, PersistenceStats, PoolSpec, SyncPolicy, frozen_clock,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "seedstone-service-log-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let wal = dir.join("wal");
+    StdDisk.create_dir_all(&wal).unwrap();
+    let seed = DictSeed { k0: 1, k1: 2 };
+    let executors = shards.min(4);
+    let recovery = recover(RecoverSpec {
+        disk: &StdDisk,
+        wal: &wal,
+        shards,
+        reader: ReaderMode::Resynchronising,
+        trust_unfinished: false,
+        seed,
+        now: Now::at(tokio::time::Instant::now()),
+    })
+    .unwrap();
+    let generation = next_generation(&StdDisk, &wal).unwrap();
+    let stats = PersistenceStats::new(executors);
+    let opened = Writer::open(WriterSpec {
+        disk: StdDisk,
+        wal: wal.clone(),
+        generation,
+        executors,
+        policy: SyncPolicy::INTERVAL,
+        segment_bytes: 1 << 20,
+        checkpoint: CheckpointConfig::PRODUCTION,
+        trace: NoTrace,
+        plants: WriterPlants::default(),
+        stats: stats.clone(),
+    })
+    .unwrap();
+    let pool = ShardPool::spawn_spec(PoolSpec {
+        shards,
+        executors,
+        seed,
+        trace: NoTrace,
+        make_log: FileLog::new,
+        policy: Deadlines,
+        limit: MemoryLimit::default(),
+        clock: frozen_clock,
+        recovered: recovery.shards,
+        make_checkpoint: move |executor| {
+            SegmentCheckpoint::new(CheckpointSpec {
+                disk: StdDisk,
+                wal: wal.clone(),
+                generation,
+                executor,
+                config: CheckpointConfig::PRODUCTION,
+            })
+        },
+        sync: SyncPolicy::INTERVAL,
+        plants: ExecutorPlants::default(),
+        writer_links: opened.links,
+        log_failed: false,
+        stats,
+    });
+    tokio::spawn(opened.writer.run(opened.inbox));
+    let mut node = NodeInfo::for_tests();
+    node.persistence = Some(pool.stats().clone());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(serve_connection(server, pool.clone(), node));
+    let (r, w) = tokio::io::split(client);
+    (r, w, pool, dir)
+}

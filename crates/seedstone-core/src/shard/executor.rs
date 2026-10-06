@@ -13,7 +13,8 @@ use crate::shard::apply::{append, apply};
 use crate::shard::durability::{Held, Mode, Sent, SyncState, send};
 use crate::shard::{
     Command, Envelope, EvictionPolicy, ExecutorPlants, ExpiryPolicy, KIND_SLOTS, PersistenceStats,
-    RefusalReport, Reply, ReplyError, Route, ShardPolicy, ShardStats, SyncPolicy, TraceSink,
+    RefusalReport, Reply, ReplyError, ReplyTo, Route, ShardPolicy, ShardStats, SyncPolicy,
+    TraceSink,
 };
 use bytes::Bytes;
 use std::sync::Arc;
@@ -473,6 +474,16 @@ struct Executor<T, L, P, C> {
     /// The cell's `changes` when the open cycle took its bases: what its
     /// image will cover. `None` while no cycle is open.
     changes_at_open: Option<u64>,
+    /// A client asked for a snapshot since the last tick, and the next
+    /// tick opens it: `BGSAVE` is already in progress from here.
+    snapshot_asked: bool,
+    /// `SAVE`s the next completed image answers: each arrived while no
+    /// cycle was open, so the cycle that answers it took its bases after.
+    saves: Vec<(ReplyTo, Vec<Reply>)>,
+    /// `SAVE`s that arrived while a cycle was open. That cycle's bases were
+    /// read before them, so a write acknowledged in between is not in its
+    /// image: they wait for the cycle after it.
+    saves_after: Vec<(ReplyTo, Vec<Reply>)>,
 }
 
 impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T, L, P, C> {
@@ -506,6 +517,9 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             stats,
             index: executor,
             changes_at_open: None,
+            snapshot_asked: false,
+            saves: Vec::new(),
+            saves_after: Vec::new(),
         };
         this.stats.executors[usize::from(executor)]
             .last_save_unix
@@ -662,6 +676,9 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             };
         }
         self.checkpoint.force();
+        // The open cycle is abandoned, and the forced one takes its bases
+        // after every `SAVE` waiting here.
+        self.saves.append(&mut self.saves_after);
     }
 
     /// The inverse of the envelope's `shard - first_shard`: these states
@@ -675,6 +692,19 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
     /// answers it — at once, or once the sync covering it completes when
     /// the policy holds a write's replies. A read-only envelope never waits.
     fn serve(&mut self, Envelope { mut cmds, reply }: Envelope) {
+        if let Some(wait) = cmds.first().and_then(|(_, cmd)| match cmd {
+            Command::Snapshot { wait } => Some(*wait),
+            _ => None,
+        }) {
+            // `Route::Every` commands travel alone: `dispatch_every` builds
+            // one envelope per executor carrying that command only.
+            debug_assert!(
+                cmds.iter()
+                    .all(|(_, cmd)| matches!(cmd, Command::Snapshot { .. }))
+            );
+            self.snapshot(wait, cmds.len(), reply);
+            return;
+        }
         // No `await` inside this loop, so a batch is applied as a unit:
         // nothing from another connection lands between its commands.
         let mut replies = Vec::with_capacity(cmds.len());
@@ -746,6 +776,57 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             });
         } else {
             send(reply, replies);
+        }
+    }
+
+    /// A client's `SAVE` or `BGSAVE`, one reply per shard of the envelope.
+    ///
+    /// `BGSAVE` asks the checkpoint for a cycle on the next tick and answers
+    /// at once — or answers Redis's refusal when one is open or already
+    /// asked for. `SAVE` asks the same and waits: for the next image if no
+    /// cycle is open, for the one after it if one is.
+    fn snapshot(&mut self, wait: bool, copies: usize, reply: ReplyTo) {
+        let open = self.checkpoint.is_open();
+        if !wait {
+            let answer = if open || self.snapshot_asked {
+                Reply::Error(ReplyError::SaveInProgress)
+            } else {
+                self.ask_for_snapshot();
+                Reply::Status("Background saving started")
+            };
+            send(reply, vec![answer; copies]);
+        } else if open {
+            self.saves_after.push((reply, vec![Reply::Ok; copies]));
+        } else {
+            self.ask_for_snapshot();
+            self.saves.push((reply, vec![Reply::Ok; copies]));
+        }
+    }
+
+    /// The checkpoint opens a cycle on the next tick, whatever the live log.
+    fn ask_for_snapshot(&mut self) {
+        if !self.snapshot_asked {
+            self.checkpoint.nudge();
+            self.snapshot_asked = true;
+        }
+    }
+
+    /// The waiting `SAVE`s, after a tick: answered by an image, refused by
+    /// a fault, or moved up behind the cycle that just completed.
+    fn answer_saves(&mut self, completed: bool, faulted: bool) {
+        if completed {
+            for (to, replies) in self.saves.drain(..) {
+                send(to, replies);
+            }
+            if !self.saves_after.is_empty() {
+                self.saves.append(&mut self.saves_after);
+                self.ask_for_snapshot();
+            }
+        } else if faulted {
+            let failed = Reply::Error(ReplyError::SnapshotFailed);
+            for (to, replies) in self.saves.drain(..).chain(self.saves_after.drain(..)) {
+                send(to, vec![failed.clone(); replies.len()]);
+            }
         }
     }
 
@@ -894,6 +975,8 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             &self.trace,
             position,
         );
+        // Whatever a client asked for, this tick opened.
+        self.snapshot_asked = false;
         let cell = &self.stats.executors[usize::from(self.index)];
         cell.cycle_open
             .store(u64::from(self.checkpoint.is_open()), Ordering::Relaxed);
@@ -938,6 +1021,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
                 self.stats.refusing.fetch_sub(1, Ordering::Relaxed);
             }
         }
+        self.answer_saves(tick.completed.is_some(), tick.faulted);
         // A cycle opened on this tick: its image will cover what was
         // counted until now, and not what comes after.
         if self.checkpoint.is_open() && self.changes_at_open.is_none() {

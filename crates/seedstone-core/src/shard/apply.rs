@@ -226,6 +226,9 @@ pub fn apply<L: ReplicationLog, P: ShardPolicy>(
         // an `INFO` that reads low, never a panicked executor and never a
         // figure nothing produced.
         Command::Stats => Reply::Stats(Box::new(keyspace_stats(dict))),
+        // The executor answers this before `apply` is reached: the
+        // checkpoint is its own. Nothing here to do if it ever were.
+        Command::Snapshot { .. } => Reply::Ok,
     }
 }
 
