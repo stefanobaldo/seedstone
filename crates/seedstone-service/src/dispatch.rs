@@ -90,7 +90,7 @@ pub enum Action {
     /// Answer with this frame, then hang up.
     ReplyThenClose(Frame),
     /// Stop the server: the connection fires the node's stop and hangs up
-    /// without a reply, as Redis does. The handler returns this rather than
+    /// without a reply, as 6.2.24 and 8.10.1 do. The handler returns this rather than
     /// firing the stop itself, so that the authentication gate runs first.
     Shutdown,
 }

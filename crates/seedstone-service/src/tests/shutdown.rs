@@ -14,7 +14,7 @@ fn encoded(parts: &[&str]) -> Vec<u8> {
 }
 
 /// The connection fires the node's stop and hangs up without a reply, as
-/// Redis does; both modifiers are the same request.
+/// 6.2.24 and 8.10.1 do; both modifiers are the same request.
 #[tokio::test]
 async fn shutdown_closes_the_connection_without_a_reply_and_fires_the_stop() {
     for form in [
@@ -38,7 +38,7 @@ async fn shutdown_closes_the_connection_without_a_reply_and_fires_the_stop() {
     }
 }
 
-/// Review of the gate: an unauthenticated client on a node with a password
+/// The authentication gate first: an unauthenticated client on a node with a password
 /// is told `NOAUTH`, and the node keeps running.
 #[tokio::test]
 async fn shutdown_is_noauth_on_a_node_with_a_password_and_fires_nothing() {
