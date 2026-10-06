@@ -157,6 +157,18 @@ impl TraceSink for HashSink {
                 tally.unreported_losses += 1;
             }
         }
+        drop(tally);
+        // What came back is the shard's durable point now: the loss below
+        // the old one was judged here, once. Left standing, a shard that
+        // syncs nothing before the next crash would be judged against it
+        // again — the same loss, reported here, counted unreported there.
+        // The date stays: the reads are judged by crash, not by this.
+        let mut points = lock(&self.shared.durable);
+        if let Some((seq, _)) = &mut points[usize::from(shard)]
+            && next_seq <= *seq
+        {
+            *seq = next_seq.saturating_sub(1);
+        }
     }
 
     /// Folded: which executor completed which cycle with how many entries.

@@ -917,3 +917,17 @@ fn the_honest_node_holds_on_the_standard_seeds_that_once_caught_the_model_out() 
         assert!(outcome.invariant_holds(), "seed {sim_seed}: {outcome:?}");
     }
 }
+
+/// Hostile seeds the sweep caught out, for a reason now written into the
+/// model: a shard whose recovery reported its loss came back below the
+/// durable point of the process before it, synced nothing before the next
+/// crash, and was judged again against that point — the same loss, already
+/// reported, counted as an unreported one (535, 633, 955, each crashed
+/// twice). The honest node holds on all three.
+#[test]
+fn the_honest_node_holds_on_the_hostile_seeds_that_once_caught_the_model_out() {
+    for sim_seed in [535, 633, 955] {
+        let outcome = run_sim(&SimConfig::hostile(1, sim_seed));
+        assert!(outcome.invariant_holds(), "seed {sim_seed}: {outcome:?}");
+    }
+}
