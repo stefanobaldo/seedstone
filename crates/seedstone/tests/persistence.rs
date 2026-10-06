@@ -8,7 +8,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use seedstone_resp::{Frame, encode, parse};
@@ -1012,6 +1013,119 @@ async fn without_a_data_dir_the_three_persistence_commands_name_the_flag() {
     }
     node.kill().unwrap();
     node.wait().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}
+
+/// `conns` connections each pipelining `depth` `SET`s of `value_len` bytes
+/// without pause until `stop` is set: an inbox that never runs dry. Each
+/// connection cycles over a thousand keys of its own, so the flood grows
+/// the log and not the keyspace.
+fn flood(
+    port: u16,
+    conns: usize,
+    depth: usize,
+    value_len: usize,
+    stop: &Arc<AtomicBool>,
+) -> Vec<tokio::task::JoinHandle<u64>> {
+    (0..conns)
+        .map(|c| {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                let value = "x".repeat(value_len);
+                let mut sent = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let keys: Vec<String> = (0..depth as u64)
+                        .map(|i| format!("f{c}-{}", (sent + i) % 1000))
+                        .collect();
+                    let commands: Vec<[&str; 3]> =
+                        keys.iter().map(|key| ["SET", key, &value]).collect();
+                    let refs: Vec<&[&str]> = commands.iter().map(<[&str; 3]>::as_slice).collect();
+                    pipelined(&mut stream, &refs).await;
+                    sent += depth as u64;
+                }
+                sent
+            })
+        })
+        .collect()
+}
+
+/// How many lines carry `evt` in `stderr` by the time `count` of them are
+/// there or `within` has passed, whichever is first.
+async fn event_count_within(stderr: &Path, evt: &str, count: usize, within: Duration) -> usize {
+    let needle = format!("\"evt\":\"{evt}\"");
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let text = std::fs::read_to_string(stderr).unwrap_or_default();
+        let found = text.lines().filter(|line| line.contains(&needle)).count();
+        if found >= count || tokio::time::Instant::now() >= deadline {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A refusal ends while sixteen connections keep pipelining writes at it:
+/// the housekeeping tick that lands the image is not starved by the inbox.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_ends_under_a_flood_of_writes() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let (mut node, port) = start_with(&dir, &stderr, &["--fsync", "never"]).await;
+    let wal = dir.join("wal");
+    std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(wal.join("probe"), b"").is_ok() {
+        eprintln!("this process writes to a read-only directory; nothing to provoke");
+        node.kill().expect("SIGKILL");
+        node.wait().expect("reaped");
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
+    let refused = write_spread(port, 80 * 1024 * 1024).await;
+    assert!(matches!(refused, Some(Frame::Error(_))), "{refused:?}");
+    let stop = Arc::new(AtomicBool::new(false));
+    let tasks = flood(port, 16, 128, 64, &stop);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let executors = available_parallelism();
+    let ended =
+        event_count_within(&stderr, "refusal_ended", executors, Duration::from_secs(20)).await;
+    stop.store(true, Ordering::Relaxed);
+    for task in tasks {
+        task.await.unwrap();
+    }
+    node.kill().expect("SIGKILL");
+    node.wait().expect("reaped");
+    assert_eq!(
+        ended, executors,
+        "{ended} of {executors} refusals ended under the flood within 20 s"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}
+
+/// The log compacts while a flood of writes runs, not only after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_log_compacts_under_a_flood_of_writes() {
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let (mut node, port) = start_with(&dir, &stderr, &["--fsync", "never"]).await;
+    let stop = Arc::new(AtomicBool::new(false));
+    let tasks = flood(port, 16, 128, 4096, &stop);
+    let compactions = event_count_within(&stderr, "compaction", 1, Duration::from_mins(1)).await;
+    stop.store(true, Ordering::Relaxed);
+    let mut sent = 0;
+    for task in tasks {
+        sent += task.await.unwrap();
+    }
+    node.kill().expect("SIGKILL");
+    node.wait().expect("reaped");
+    assert!(
+        compactions > 0,
+        "no compaction while the flood ran ({sent} writes sent)"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::remove_file(&stderr).unwrap();
 }
