@@ -1,4 +1,5 @@
-# Nightly DST sweep — two rotating 10,000-seed windows against `main`.
+# Nightly DST sweep — one rotating 10,000-seed window against `main`, swept
+# on two shapes.
 #
 # Two legs over the same window of seeds. The `standard` leg holds the
 # strong invariant on a disk that only tears what was never synced: every
