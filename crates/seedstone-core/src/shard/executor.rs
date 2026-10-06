@@ -470,6 +470,9 @@ struct Executor<T, L, P, C> {
     stats: Arc<PersistenceStats>,
     /// This executor's index: which of `stats`'s cells is its own.
     index: u16,
+    /// The cell's `changes` when the open cycle took its bases: what its
+    /// image will cover. `None` while no cycle is open.
+    changes_at_open: Option<u64>,
 }
 
 impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T, L, P, C> {
@@ -502,7 +505,11 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             sync,
             stats,
             index: executor,
+            changes_at_open: None,
         };
+        this.stats.executors[usize::from(executor)]
+            .last_save_unix
+            .store(newest_images_secs(&this.states), Ordering::Relaxed);
         if log_failed {
             this.refuse();
         }
@@ -648,6 +655,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         self.sync.sent.clear();
         self.sync.acked_bytes = self.sync.sent_bytes;
         if !self.sync.is_refusing() {
+            self.stats.refusing.fetch_add(1, Ordering::Relaxed);
             self.sync.mode = Mode::Refusing {
                 refused: 0,
                 ticks: 0,
@@ -694,6 +702,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         };
         let mut last = now.instant;
         let mut wrote = false;
+        let mut appended_count = 0;
         // By mutable reference, so a handler can move a command's value
         // into the dict instead of copying it — see `apply`. The trace
         // reads the command *after* the handler has had it, and reads
@@ -701,6 +710,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         for (shard, cmd) in &mut cmds {
             let (answer, appended) = self.answer(*shard, cmd, now, &mut last);
             wrote |= appended;
+            appended_count += u64::from(appended);
             replies.push(answer);
             if holds {
                 appended_each.push(appended);
@@ -708,6 +718,9 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         }
         let mut touched = Vec::new();
         if wrote {
+            self.stats.executors[usize::from(self.index)]
+                .changes
+                .fetch_add(appended_count, Ordering::Relaxed);
             // Into one buffer, in command order: one submission per batch.
             // A shard named twice hands over nothing the second time, and
             // records no second entry.
@@ -867,6 +880,10 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             bytes: self.sync.sent_bytes,
             batch: self.sync.batch.checked_sub(1),
         };
+        // A cycle forced away since the last tick took its count with it.
+        if !self.checkpoint.is_open() {
+            self.changes_at_open = None;
+        }
         let tick = self.checkpoint.tick(
             self.first_shard,
             &mut self.states,
@@ -887,6 +904,18 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             self.stats
                 .lossy_shards
                 .fetch_sub(done.cleared, Ordering::Relaxed);
+            // A cycle that opened on this very tick took its bases after
+            // every change counted so far.
+            let covered = self
+                .changes_at_open
+                .take()
+                .unwrap_or_else(|| cell.changes.load(Ordering::Relaxed));
+            cell.changes.fetch_sub(covered, Ordering::Relaxed);
+            cell.saves.fetch_add(1, Ordering::Relaxed);
+            cell.last_save_unix
+                .store(newest_images_secs(&self.states), Ordering::Relaxed);
+            cell.last_save_ticks.store(done.ticks, Ordering::Relaxed);
+            cell.last_save_failed.store(0, Ordering::Relaxed);
             if let Some(link) = &self.sync.link {
                 let _ = link.to_writer.send(ToWriter::Covered {
                     executor: link.executor,
@@ -906,9 +935,32 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
                     ticks,
                 });
                 self.sync.mode = Mode::Serving;
+                self.stats.refusing.fetch_sub(1, Ordering::Relaxed);
             }
         }
+        // A cycle opened on this tick: its image will cover what was
+        // counted until now, and not what comes after.
+        if self.checkpoint.is_open() && self.changes_at_open.is_none() {
+            self.changes_at_open = Some(
+                self.stats.executors[usize::from(self.index)]
+                    .changes
+                    .load(Ordering::Relaxed),
+            );
+        }
     }
+}
+
+/// The time of the oldest of these shards' newest durable images, in Unix
+/// seconds — "since when is every one of them covered" — or `0` while any
+/// has none. `0` is that absence, so an image taken in the epoch's first
+/// second reads as the next.
+fn newest_images_secs<L>(states: &[ShardState<L>]) -> u64 {
+    states
+        .iter()
+        .map(|state| state.image_unix_millis)
+        .try_fold(u64::MAX, |oldest, at| at.map(|at| oldest.min(at)))
+        .filter(|_| !states.is_empty())
+        .map_or(0, |millis| (millis / 1000).max(1))
 }
 
 /// Reclaims a budget's worth of expired keys from one shard, logging and

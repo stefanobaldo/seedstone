@@ -623,3 +623,29 @@ async fn a_lossy_shard_is_cleared_by_its_first_durable_image() {
     assert_eq!(cleared, 1, "shard 0 was the lossy one");
     assert_eq!(pool.stats().lossy_shards.load(Ordering::Relaxed), 0);
 }
+
+/// The counters a monitor reads: one save per durable image, the time of
+/// the newest, the records appended since, and how many executors refuse.
+#[tokio::test(start_paused = true)]
+async fn the_persistence_counters_follow_the_executor() {
+    let story = Story::default();
+    let (disk, pool) = disk_pool(SyncPolicy::ALWAYS, story.clone());
+    let stats = pool.stats().clone();
+    let (on_zero, on_one) = keys_on_each_executor();
+    assert_eq!(pool.dispatch(set(&on_zero, b"v")).await, Reply::Ok);
+    assert_eq!(pool.dispatch(set(&on_zero, b"w")).await, Reply::Ok);
+    assert_eq!(stats.changes_since_save(), 2);
+    assert_eq!(stats.last_save_unix(), None, "no image yet");
+    disk.fail_next_sync();
+    assert_eq!(pool.dispatch(set(&on_one, b"v")).await, refused());
+    assert_eq!(
+        stats.refusing.load(Ordering::Relaxed),
+        2,
+        "the node's log failed: both executors refuse"
+    );
+    tick(3).await;
+    assert_eq!(stats.refusing.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.saves(), 2, "one forced image per executor");
+    assert!(stats.last_save_unix().is_some());
+    assert_eq!(stats.changes_since_save(), 0);
+}
