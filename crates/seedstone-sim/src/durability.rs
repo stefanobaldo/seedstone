@@ -182,14 +182,20 @@ pub struct CrashSchedule {
 }
 
 impl CrashSchedule {
-    /// The schedule `plan` and `sim_seed` describe.
+    /// The schedule `plan` and `sim_seed` describe: empty for every plan
+    /// but [`CrashPlan::UnderLoad`].
     ///
     /// # Panics
     ///
-    /// Never: the crash window is a constant well inside a `u64` of
-    /// milliseconds.
+    /// On [`CrashPlan::PerSeed`], which names no schedule until
+    /// [`SimConfig::crash_plan`](crate::SimConfig::crash_plan) resolves it:
+    /// an empty one here would be a seed that silently never crashes.
     #[must_use]
     pub fn draw(plan: CrashPlan, sim_seed: u64) -> Self {
+        assert!(
+            !matches!(plan, CrashPlan::PerSeed { .. }),
+            "resolve a per-seed plan with SimConfig::crash_plan first"
+        );
         let CrashPlan::UnderLoad { max } = plan else {
             return Self {
                 instants: Vec::new(),

@@ -513,7 +513,10 @@ fn drive(sim: &mut turmoil::Sim<'_>, cfg: &SimConfig, shared: &Shared) {
         }
         let now = sim.elapsed();
         match plan {
-            CrashPlan::None | CrashPlan::PerSeed { .. } => {}
+            CrashPlan::None => {}
+            CrashPlan::PerSeed { .. } => {
+                unreachable!("SimConfig::crash_plan resolves a per-seed plan to one of the others")
+            }
             CrashPlan::UnderLoad { .. } => {
                 if schedule.next_due(now) {
                     crash_and_restart(sim, shared, now);
