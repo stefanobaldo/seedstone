@@ -649,3 +649,111 @@ async fn the_persistence_counters_follow_the_executor() {
     assert!(stats.last_save_unix().is_some());
     assert_eq!(stats.changes_since_save(), 0);
 }
+
+/// `BGSAVE` opens a cycle on every executor and answers at once; a second
+/// one before it has finished is refused the way Redis refuses it; `SAVE`
+/// holds its reply until the image is durable.
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_command_opens_a_cycle_and_a_waiting_one_is_answered_when_it_lands() {
+    let story = Story::default();
+    let (_disk, pool) = disk_pool(SyncPolicy::INTERVAL, story.clone());
+    let started = pool.dispatch_every(Command::Snapshot { wait: false }).await;
+    assert!(
+        started
+            .iter()
+            .all(|r| *r == Reply::Status("Background saving started")),
+        "{started:?}"
+    );
+    let again = pool.dispatch_every(Command::Snapshot { wait: false }).await;
+    assert!(
+        again
+            .iter()
+            .all(|r| *r == Reply::Error(ReplyError::SaveInProgress)),
+        "{again:?}"
+    );
+    tick(3).await;
+    assert_eq!(pool.stats().saves(), 2, "one image per executor");
+    let save = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.dispatch_every(Command::Snapshot { wait: true }).await }
+    });
+    settle().await;
+    assert!(!save.is_finished(), "SAVE waits for the images");
+    tick(3).await;
+    let saved = save.await.unwrap();
+    assert!(saved.iter().all(|r| *r == Reply::Ok), "{saved:?}");
+    assert_eq!(pool.stats().saves(), 4);
+}
+
+/// A `SAVE` that meets a cycle already open is not answered by it: that
+/// cycle's bases were read before the `SAVE` arrived, so a write
+/// acknowledged in between is not in its image. It waits for the next one.
+#[tokio::test(start_paused = true)]
+async fn a_save_that_meets_an_open_cycle_waits_for_the_next() {
+    let (_disk, pool) = disk_pool(SyncPolicy::INTERVAL, NoTrace);
+    let stats = pool.stats().clone();
+    let value = [b'x'; 64];
+    for i in 0..400 {
+        let key = format!("k{i}");
+        assert_eq!(pool.dispatch(set(key.as_bytes(), &value)).await, Reply::Ok);
+    }
+    tick(3).await;
+    pool.dispatch_every(Command::Snapshot { wait: false }).await;
+    tick(1).await;
+    let open = |e: usize| stats.executors[e].cycle_open.load(Ordering::Relaxed) == 1;
+    assert!(open(0) && open(1), "the scan spans ticks on both executors");
+    let at_save: Vec<u64> = (0..2)
+        .map(|e| stats.executors[e].saves.load(Ordering::Relaxed))
+        .collect();
+    assert_eq!(pool.dispatch(set(b"late", b"v")).await, Reply::Ok);
+    let save = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.dispatch_every(Command::Snapshot { wait: true }).await }
+    });
+    settle().await;
+    for _ in 0..100 {
+        if save.is_finished() {
+            break;
+        }
+        tick(1).await;
+    }
+    let saved = save.await.unwrap();
+    assert!(saved.iter().all(|r| *r == Reply::Ok), "{saved:?}");
+    for (e, before) in at_save.iter().enumerate() {
+        let now = stats.executors[e].saves.load(Ordering::Relaxed);
+        assert!(
+            now >= before + 2,
+            "executor {e}: answered after {} image(s); the open one predates the SAVE",
+            now - before
+        );
+    }
+}
+
+/// A `SAVE` whose image the disk refuses is told so; the executor keeps
+/// retrying on its own, and a `SAVE` after that is answered by the image
+/// the retry lands.
+#[tokio::test(start_paused = true)]
+async fn a_save_whose_image_fails_is_refused_and_the_next_one_lands() {
+    let story = Story::default();
+    let (disk, pool) = disk_pool(SyncPolicy::INTERVAL, story.clone());
+    disk.fail_next_sync();
+    let save = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.dispatch_every(Command::Snapshot { wait: true }).await }
+    });
+    tick(3).await;
+    let saved = save.await.unwrap();
+    assert!(
+        saved
+            .iter()
+            .any(|r| *r == Reply::Error(ReplyError::SnapshotFailed)),
+        "{saved:?}"
+    );
+    assert_eq!(story.faults_of(LogFault::Snapshot), 1);
+    tick(3).await;
+    let again =
+        tokio::spawn(async move { pool.dispatch_every(Command::Snapshot { wait: true }).await });
+    tick(3).await;
+    let again = again.await.unwrap();
+    assert!(again.iter().all(|r| *r == Reply::Ok), "{again:?}");
+}

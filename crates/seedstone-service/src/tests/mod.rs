@@ -10,5 +10,6 @@ mod commands;
 mod containers;
 mod errors;
 mod info;
+mod persistence;
 mod pipeline;
 mod walk;

@@ -68,6 +68,7 @@ pub const KIND_NAMES: [&str; KIND_SLOTS] = [
     "pttl",
     "expireat",
     "pexpireat",
+    "save",
 ];
 
 const _: () = assert!(
@@ -92,9 +93,9 @@ const _: () = assert!(
 /// track `dispatch::COMMANDS`: a name is appended here when a command is added there,
 /// and reordering the existing ones to match would move fields in a document
 /// operators already read for no reader's benefit.
-pub const EDGE_NAMES: [&str; 15] = [
+pub const EDGE_NAMES: [&str; 18] = [
     "mget", "keys", "dbsize", "flushdb", "ping", "echo", "auth", "hello", "info", "command",
-    "client", "quit", "config", "slowlog", "latency",
+    "client", "quit", "config", "slowlog", "latency", "save", "bgsave", "lastsave",
 ];
 
 /// The wall-clock reading a node with no wall clock reports: 2023-11-14

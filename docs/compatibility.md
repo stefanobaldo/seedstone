@@ -38,6 +38,9 @@ approximately.
 | `KEYS pattern` | a walk is at-least-once rather than a snapshot, and a reply above a per-request size ceiling is refused with `ERR KEYS reply exceeds the per-request limit; use SCAN` rather than truncated. Both are below |
 | `SCAN cursor [MATCH pattern] [COUNT count]` | no `TYPE` option, which 6.2.24 and 8.10.1 both take: it is refused with `ERR syntax error`. The walk is at-least-once, and the cursor is one this server issued, accepted only in the decimal it was issued in |
 | `FLUSHDB` | no `ASYNC` or `SYNC`, which 6.2.24 and 8.10.1 both accept. There is one behaviour here, so the word is refused as a wrong number of arguments rather than accepted and ignored |
+| `BGSAVE [SCHEDULE]` | every executor starts a snapshot of its shards: `Background saving started`, or `ERR Background save already in progress` when every executor already has one running — the two replies 6.2.24 and 8.10.1 give. `SCHEDULE` is accepted and changes nothing, since there is no AOF rewrite to wait behind; behind a running save both versions refuse it as they refuse a plain `BGSAVE`. Without `--data-dir`, an error naming the flag |
+| `SAVE` | the same request, answered `OK` once an image taken after it is durable on every executor — **without blocking the shards**, where 6.2.24 and 8.10.1 stop serving until the file is written. Behind a running save it waits for the next image, where both versions refuse it with `ERR Background save already in progress`. A failed image answers an error, and the executors keep retrying on their own. Without `--data-dir`, an error naming the flag |
+| `LASTSAVE` | the instant, in Unix seconds, since which every shard has a durable image — the same number as `INFO persistence`'s `rdb_last_save_time`; `0` while any shard has none. Without `--data-dir`, an error naming the flag |
 | `PING [message]` | — |
 | `ECHO message` | — |
 | `AUTH [username] password` | one password for the `default` user; no ACL users |

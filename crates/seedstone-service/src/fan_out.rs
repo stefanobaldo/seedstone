@@ -128,10 +128,22 @@ pub const INVALID_CURSOR: &str = "ERR invalid cursor";
 /// Short of an error, the fold is the [`Gather`] the command table chose:
 /// `DBSIZE` sums, which is what makes it the size of the keyspace rather than
 /// of a shard; `FLUSHDB` is answered `+OK` once every shard has.
+///
+/// `BGSAVE` is the one fold where a refusal does not win. An executor
+/// already imaging its shards answers "already in progress", and the
+/// request has still started a snapshot wherever another executor said
+/// so: the peer hears `started` if any did, and the refusal only when
+/// every executor gave it.
 pub async fn broadcast<R: Router>(router: &R, cmd: Command, gather: Gather) -> Frame {
     let mut total: i64 = 0;
+    let mut started = None;
+    let mut running = false;
     for reply in router.dispatch_every(cmd).await {
         match reply {
+            Reply::Status(text) if matches!(gather, Gather::Started) => started = Some(text),
+            Reply::Error(ReplyError::SaveInProgress) if matches!(gather, Gather::Started) => {
+                running = true;
+            }
             // Saturating for the reason [`fan_out`] saturates: a keyspace
             // larger than `i64::MAX` is not reachable, and wrapping into a
             // negative count would be a worse answer than the ceiling.
@@ -143,6 +155,12 @@ pub async fn broadcast<R: Router>(router: &R, cmd: Command, gather: Gather) -> F
     match gather {
         Gather::Sum => Frame::Integer(total),
         Gather::AllOk => Frame::Simple("OK".into()),
+        Gather::Started => match started {
+            Some(text) => Frame::Simple(text.into()),
+            None if running => reply_to_frame(Reply::Error(ReplyError::SaveInProgress)),
+            // No executor answered at all: a pool with none.
+            None => reply_to_frame(Reply::Error(ReplyError::ShardUnavailable)),
+        },
     }
 }
 

@@ -59,6 +59,17 @@ pub enum ReplyError {
     /// are never refused this way: refusing the operations that *reclaim* is
     /// how a full node stays full.
     OutOfMemory,
+    /// A `BGSAVE` that found a snapshot already running on its executor.
+    ///
+    /// Redis's text. Read on `redis:6-alpine` (6.2.24) and `redis:8-alpine`
+    /// (8.10.1) on 2026-10-06, with three million keys so the first save
+    /// was still running: both answer a second `BGSAVE`, and a `SAVE`,
+    /// `ERR Background save already in progress`.
+    SaveInProgress,
+    /// A `SAVE` whose image failed: the disk refused the snapshot. The
+    /// executor keeps retrying on its own; the client is told this one
+    /// did not land.
+    SnapshotFailed,
 }
 
 impl ReplyError {
@@ -79,6 +90,11 @@ impl ReplyError {
             }
             // Redis's text, trailing full stop and all: clients match on it.
             Self::OutOfMemory => "OOM command not allowed when used memory > 'maxmemory'.",
+            // Redis's text: see the variant for the reading.
+            Self::SaveInProgress => "ERR Background save already in progress",
+            Self::SnapshotFailed => {
+                "ERR Snapshot failed: the log directory refused the image; see snapshot_fault"
+            }
         }
     }
 }
