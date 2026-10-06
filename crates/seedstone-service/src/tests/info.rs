@@ -3,13 +3,13 @@
 
 use super::support::{connected, read_frames, req};
 use crate::connection::serve_connection;
-use crate::info::{errorstats_section, info};
+use crate::info::{PERSISTENCE_FIELDS, errorstats_section, info};
 use crate::node::{NodeInfo, RUN_ID_HEX};
 use crate::reply::{count_error_reply, logs_a_line};
 use bytes::Bytes;
 use seedstone_core::dict::DictSeed;
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
-use seedstone_core::shard::{NoTrace, ReplyError, ShardPool};
+use seedstone_core::shard::{NoTrace, PersistenceStats, ReplyError, ShardPool, SyncPolicy};
 use seedstone_resp::{Frame, encode};
 use std::sync::atomic::Ordering;
 use tokio::io::AsyncWriteExt;
@@ -591,4 +591,68 @@ fn a_refused_write_is_counted_and_writes_no_error_reply_line() {
     assert_eq!(node.error_replies.load(Ordering::Relaxed), 1);
     let text = errorstats_section(&node);
     assert!(text.contains("errorstat_MISCONF:count=1"), "{text}");
+}
+
+/// `INFO persistence` of the router-less kind: the section reads only the
+/// node's counters, so any pool serves.
+async fn persistence_text(node: &NodeInfo) -> String {
+    let router = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace);
+    info(&router, node, &[b"persistence".to_vec()]).await
+}
+
+/// Without `--data-dir` the section is the two lines a Redis with
+/// persistence off gives the `redisdb` check.
+#[tokio::test]
+async fn info_persistence_without_a_data_dir_is_two_lines() {
+    let text = persistence_text(&NodeInfo::for_tests()).await;
+    assert_eq!(text, "# Persistence\r\nloading:0\r\naof_enabled:0\r\n");
+}
+
+#[tokio::test]
+async fn info_persistence_with_a_log_prints_every_field_once_in_order() {
+    let mut node = NodeInfo::for_tests();
+    let stats = PersistenceStats::new(2);
+    node.persistence = Some(stats.clone());
+    node.fsync = SyncPolicy::INTERVAL;
+    let text = persistence_text(&node).await;
+    let names: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split(':').next().unwrap())
+        .collect();
+    let mut every: Vec<&str> = PERSISTENCE_FIELDS.to_vec();
+    every.retain(|field| *field != "rdb_last_save_time");
+    assert_eq!(names, every, "absent until every shard has an image");
+    assert!(text.contains("fsync_policy:interval\r\n"), "{text}");
+    assert!(text.contains("rdb_last_bgsave_time_sec:-1\r\n"), "{text}");
+    for cell in &stats.executors {
+        cell.last_save_unix.store(1_759_000_000, Ordering::Relaxed);
+        cell.saves.store(1, Ordering::Relaxed);
+        cell.last_save_ticks.store(25, Ordering::Relaxed);
+    }
+    stats.refusing.store(1, Ordering::Relaxed);
+    let text = persistence_text(&node).await;
+    let names: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .map(|line| line.split(':').next().unwrap())
+        .collect();
+    assert_eq!(names, PERSISTENCE_FIELDS);
+    assert!(text.contains("rdb_last_save_time:1759000000\r\n"), "{text}");
+    assert!(text.contains("rdb_saves:2\r\n"), "{text}");
+    assert!(text.contains("rdb_last_bgsave_time_sec:2\r\n"), "{text}");
+    assert!(text.contains("aof_last_write_status:err\r\n"), "{text}");
+    assert!(text.contains("refusing_executors:1\r\n"), "{text}");
+}
+
+/// `# Persistence` is in Redis's default set, between `# Memory` and
+/// `# Stats`.
+#[tokio::test]
+async fn info_carries_persistence_in_the_default_document_after_memory() {
+    let router = ShardPool::spawn(1, 1, DictSeed { k0: 1, k1: 2 }, NoTrace);
+    let text = info(&router, &NodeInfo::for_tests(), &[]).await;
+    let at = |section: &str| text.find(section).unwrap();
+    assert!(at("# Memory") < at("# Persistence"), "{text}");
+    assert!(at("# Persistence") < at("# Stats"), "{text}");
 }

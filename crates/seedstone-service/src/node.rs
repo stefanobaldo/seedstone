@@ -5,7 +5,7 @@
 
 use crate::auth::PasswordStore;
 use seedstone_core::memory::{MemoryGauge, MemoryLimit};
-use seedstone_core::shard::KIND_SLOTS;
+use seedstone_core::shard::{KIND_SLOTS, PersistenceStats, SyncPolicy};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -260,6 +260,12 @@ pub struct NodeInfo {
     /// shards' [`usec`](seedstone_core::shard::ShardStats::usec) is the
     /// second, and it is the one that reads zero under a simulated clock.
     pub edge_usec: Arc<[AtomicU64; EDGE_NAMES.len()]>,
+    /// The log's and the images' counters, shared with the writer and the
+    /// executors; `None` on a node without `--data-dir`, whose
+    /// `# Persistence` says only that persistence is off.
+    pub persistence: Option<Arc<PersistenceStats>>,
+    /// The `--fsync` policy the log runs under, for `fsync_policy`.
+    pub fsync: SyncPolicy,
 }
 
 impl NodeInfo {
@@ -305,6 +311,8 @@ impl NodeInfo {
             errorstats: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             edge_calls: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             edge_usec: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            persistence: None,
+            fsync: SyncPolicy::INTERVAL,
         }
     }
 

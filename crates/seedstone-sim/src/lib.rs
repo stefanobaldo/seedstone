@@ -687,6 +687,9 @@ async fn server(
     // reported a different `maxmemory` from the one its executors evicted by
     // would be a run whose invariants are checked against the wrong number.
     node.limit = pool.limit();
+    // And the persistence counters its executors and writer keep.
+    node.persistence = Some(pool.stats().clone());
+    node.fsync = shared.policy;
     loop {
         let (stream, _peer) = listener.accept().await?;
         // Onto the host's `LocalSet`, not the runtime's task list, and that is
