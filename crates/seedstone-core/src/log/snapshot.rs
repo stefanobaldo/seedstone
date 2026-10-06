@@ -5,7 +5,7 @@
 //! <generation:016x>-<executor:04x>-<cycle:08x>.snap
 //!
 //! header   SSNP · version u8 · generation u64 · executor u16 · cycle u32
-//!          · shards u16 · (shard u16, base u64) × shards · crc u32
+//!          · unix_millis u64 · shards u16 · (shard u16, base u64) × shards · crc u32
 //! entries  one record per key: shard, seq = the shard's base, payload Put
 //! footer   one record: shard 0xFFFF, seq = cycle,
 //!          payload (shard u16, entries u64) × shards
@@ -40,9 +40,9 @@ pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SSNP";
 /// reader that meets it counts the record malformed.
 pub const FOOTER_SHARD: u16 = u16::MAX;
 
-/// Magic, version, generation, executor, cycle, shard count: what has to
-/// be read before the header's length is known.
-pub const SNAPSHOT_HEADER_FIXED_LEN: usize = 4 + 1 + 8 + 2 + 4 + 2;
+/// Magic, version, generation, executor, cycle, time, shard count: what
+/// has to be read before the header's length is known.
+pub const SNAPSHOT_HEADER_FIXED_LEN: usize = 4 + 1 + 8 + 2 + 4 + 8 + 2;
 
 /// The name of `executor`'s snapshot of `cycle` in `generation`.
 #[must_use]
@@ -64,6 +64,9 @@ pub struct SnapshotHeader {
     pub generation: u64,
     pub executor: u16,
     pub cycle: u32,
+    /// When the image was taken — its cycle's open, the instant its bases
+    /// were read — in Unix milliseconds.
+    pub unix_millis: u64,
     /// `(shard, base)` for every shard the executor owned, in shard order.
     pub bases: Vec<(u16, u64)>,
 }
@@ -87,6 +90,7 @@ impl SnapshotHeader {
         out.extend_from_slice(&self.generation.to_le_bytes());
         out.extend_from_slice(&self.executor.to_le_bytes());
         out.extend_from_slice(&self.cycle.to_le_bytes());
+        out.extend_from_slice(&self.unix_millis.to_le_bytes());
         let shards = u16::try_from(self.bases.len()).expect("a node's shard count fits a u16");
         out.extend_from_slice(&shards.to_le_bytes());
         for (shard, base) in &self.bases {
@@ -116,7 +120,7 @@ impl SnapshotHeader {
             v if v < FORMAT_VERSION => return Err(HeaderError::OlderVersion(v)),
             _ => {}
         }
-        let shards = usize::from(u16::from_le_bytes([fixed[19], fixed[20]]));
+        let shards = usize::from(u16::from_le_bytes([fixed[27], fixed[28]]));
         Ok(SNAPSHOT_HEADER_FIXED_LEN + shards * 10 + 4)
     }
 
@@ -131,7 +135,7 @@ impl SnapshotHeader {
             Err(error @ (HeaderError::NewerVersion(_) | HeaderError::OlderVersion(_))) => {
                 // Read at this layout's length, the checksum says whether
                 // the version byte was damaged or written by another build.
-                let shards = usize::from(u16::from_le_bytes([buf[19], buf[20]]));
+                let shards = usize::from(u16::from_le_bytes([buf[27], buf[28]]));
                 let header = buf.get(..SNAPSHOT_HEADER_FIXED_LEN + shards * 10 + 4);
                 return Err(header.map_or(error, version_mismatch));
             }
@@ -146,7 +150,9 @@ impl SnapshotHeader {
         let executor = u16::from_le_bytes([header[13], header[14]]);
         let mut cycle = [0; 4];
         cycle.copy_from_slice(&header[15..19]);
-        let shards = usize::from(u16::from_le_bytes([header[19], header[20]]));
+        let mut unix_millis = [0; 8];
+        unix_millis.copy_from_slice(&header[19..27]);
+        let shards = usize::from(u16::from_le_bytes([header[27], header[28]]));
         let mut bases = Vec::with_capacity(shards);
         let mut at = SNAPSHOT_HEADER_FIXED_LEN;
         for _ in 0..shards {
@@ -160,6 +166,7 @@ impl SnapshotHeader {
             generation: u64::from_le_bytes(generation),
             executor,
             cycle: u32::from_le_bytes(cycle),
+            unix_millis: u64::from_le_bytes(unix_millis),
             bases,
         })
     }
@@ -281,6 +288,7 @@ mod tests {
             generation: 4,
             executor: 2,
             cycle: 11,
+            unix_millis: 1_759_000_000_000,
             bases: vec![(200, 15), (201, 0), (202, 7_000_000)],
         };
         let mut out = Vec::new();
@@ -321,6 +329,21 @@ mod tests {
                 "a damaged version byte {version} is damage, not another version"
             );
         }
+    }
+
+    #[test]
+    fn the_header_carries_the_instant_it_was_written() {
+        let header = SnapshotHeader {
+            generation: 7,
+            executor: 2,
+            cycle: 3,
+            unix_millis: 1_700_000_000_123,
+            bases: vec![(8, 10), (9, 0)],
+        };
+        let mut bytes = Vec::new();
+        header.encode(&mut bytes);
+        assert_eq!(bytes.len(), header.encoded_len());
+        assert_eq!(SnapshotHeader::decode(&bytes).unwrap(), header);
     }
 
     #[test]

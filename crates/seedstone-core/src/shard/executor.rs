@@ -220,6 +220,12 @@ pub struct ShardState<L> {
     /// Microseconds those commands spent, indexed the same way — see
     /// [`ShardStats::usec`], which is what this becomes.
     pub usec: [u64; KIND_SLOTS],
+    /// The start reported this shard lossy and no durable image has covered
+    /// it since.
+    pub lossy: bool,
+    /// When this shard's newest durable image was taken, Unix milliseconds;
+    /// `None` until it has one.
+    pub image_unix_millis: Option<u64>,
 }
 
 impl<L> ShardState<L> {
@@ -244,6 +250,8 @@ impl<L> ShardState<L> {
             expired: 0,
             calls: [0; KIND_SLOTS],
             usec: [0; KIND_SLOTS],
+            lossy: false,
+            image_unix_millis: None,
         }
     }
 
@@ -876,6 +884,9 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             cell.last_save_failed.store(1, Ordering::Relaxed);
         }
         if let Some(done) = tick.completed {
+            self.stats
+                .lossy_shards
+                .fetch_sub(done.cleared, Ordering::Relaxed);
             if let Some(link) = &self.sync.link {
                 let _ = link.to_writer.send(ToWriter::Covered {
                     executor: link.executor,

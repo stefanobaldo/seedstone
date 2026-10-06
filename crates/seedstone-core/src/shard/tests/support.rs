@@ -238,6 +238,7 @@ pub fn disk_pool_cut<T: TraceSink>(policy: SyncPolicy, trace: T) -> (MemDisk, Sh
             seq: 0,
             lossy: shard == 0,
             cut: shard == 0,
+            image_unix_millis: None,
         })
         .collect();
     let pool = start(&disk, policy, trace, recovered, true);

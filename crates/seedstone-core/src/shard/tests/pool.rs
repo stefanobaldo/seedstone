@@ -505,7 +505,8 @@ fn the_sink_hooks_for_snapshots_default_to_nothing() {
         bytes: 3,
         ticks: 4,
         disk_bytes: 5,
-        written_during: 6,
+        bytes_written: 6,
+        cleared: 0,
     };
     NoTrace.snapshot(&report);
     NoTrace.compaction(&CompactionReport { files: 1, bytes: 2 });

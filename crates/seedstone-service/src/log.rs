@@ -235,6 +235,8 @@ pub static SNAPSHOT: Event = Event {
         "bytes",
         "ticks",
         "disk_bytes",
+        "bytes_written",
+        "cleared",
     ],
 };
 

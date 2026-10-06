@@ -13,12 +13,13 @@ use crate::log::{Decoded, decode_record};
 use crate::memory::MemoryLimit;
 use crate::shard::{
     Command, Deadlines, ExecutorPlants, HOUSEKEEPING_TICK, LogFault, NoTrace, PoolSpec,
-    RefusalReport, Reply, ReplyError, Router, SHUTDOWN_GRACE, ShardPool, Shutdown, SyncPolicy,
-    TraceSink, frozen_clock,
+    RefusalReport, Reply, ReplyError, Router, SHUTDOWN_GRACE, ShardPool, Shutdown, SnapshotReport,
+    SyncPolicy, TraceSink, frozen_clock,
 };
 use crate::slot::{executor_of, shard_of};
 use bytes::Bytes;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -145,6 +146,7 @@ struct Story {
     log_faults: Arc<Mutex<Vec<LogFault>>>,
     held: Arc<Mutex<Vec<(u16, u64, bool)>>>,
     ended: Arc<Mutex<Vec<RefusalReport>>>,
+    snapshots: Arc<Mutex<Vec<SnapshotReport>>>,
 }
 
 impl Story {
@@ -164,6 +166,10 @@ impl Story {
     fn refusals_ended(&self) -> Vec<RefusalReport> {
         self.ended.lock().expect("story").clone()
     }
+
+    fn snapshots(&self) -> Vec<SnapshotReport> {
+        self.snapshots.lock().expect("story").clone()
+    }
 }
 
 impl TraceSink for Story {
@@ -182,6 +188,9 @@ impl TraceSink for Story {
     }
     fn refusal_ended(&self, report: &RefusalReport) {
         self.ended.lock().expect("story").push(*report);
+    }
+    fn snapshot(&self, report: &SnapshotReport) {
+        self.snapshots.lock().expect("story").push(*report);
     }
 }
 
@@ -598,4 +607,19 @@ async fn a_stop_whose_last_sync_fails_answers_its_held_writes_with_the_refusal()
     assert_eq!(first.await.unwrap(), Reply::Ok);
     assert_eq!(second.await.unwrap(), refused());
     assert_eq!(stopping.await.unwrap(), Shutdown::Clean);
+}
+
+/// A shard reported lossy at the start stops being so once an image of it
+/// is durable: the snapshot line says how many it cleared, and the count a
+/// monitor reads falls.
+#[tokio::test(start_paused = true)]
+async fn a_lossy_shard_is_cleared_by_its_first_durable_image() {
+    let story = Story::default();
+    let (disk, pool) = disk_pool_cut(SyncPolicy::INTERVAL, story.clone());
+    assert_eq!(pool.stats().lossy_shards.load(Ordering::Relaxed), 1);
+    disk.fail_writes(false); // the cut start refused; let the forced cycles land
+    tick(3).await;
+    let cleared: u64 = story.snapshots().iter().map(|report| report.cleared).sum();
+    assert_eq!(cleared, 1, "shard 0 was the lossy one");
+    assert_eq!(pool.stats().lossy_shards.load(Ordering::Relaxed), 0);
 }

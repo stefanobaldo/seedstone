@@ -143,6 +143,9 @@ pub struct RecoveredShard {
     /// Whether the shard's prefix was cut, or its loss is possible: the
     /// pool writes a `Rebase` before serving it.
     pub cut: bool,
+    /// When the image this shard was rebuilt from was taken, if any was:
+    /// Unix milliseconds, from the image's header.
+    pub image_unix_millis: Option<u64>,
 }
 
 impl std::fmt::Debug for RecoveredShard {
@@ -152,6 +155,7 @@ impl std::fmt::Debug for RecoveredShard {
             .field("seq", &self.seq)
             .field("lossy", &self.lossy)
             .field("cut", &self.cut)
+            .field("image_unix_millis", &self.image_unix_millis)
             .finish()
     }
 }
@@ -284,16 +288,21 @@ fn read_headers<D: Disk>(
             .map_or(0, |mut src| read_fully(&mut src, &mut chunk));
         let mut unreadable = false;
         let header = match SnapshotHeader::decode(&chunk[..read]) {
-            Ok(header) => Some(header).filter(|header| {
-                // Not this node's file, or damage the checksum happened to
-                // pass: refused, and nothing takes an image from it.
+            // Fields that disagree with the name: not this file's header,
+            // refused, and nothing takes an image from it.
+            Ok(header) if (header.generation, header.executor, header.cycle) != from_name => None,
+            Ok(header) => {
+                // The name matched, so a shard outside the node, or one
+                // listed twice, is damage the checksum happened to pass —
+                // of this file, and nobody can say which shards it imaged.
                 let mut seen = vec![false; usize::from(spec.shards)];
-                (header.generation, header.executor, header.cycle) == from_name
-                    && header.bases.iter().all(|(shard, _)| {
-                        seen.get_mut(usize::from(*shard))
-                            .is_some_and(|seen| !std::mem::replace(seen, true))
-                    })
-            }),
+                let sound = header.bases.iter().all(|(shard, _)| {
+                    seen.get_mut(usize::from(*shard))
+                        .is_some_and(|seen| !std::mem::replace(seen, true))
+                });
+                unreadable = !sound;
+                sound.then_some(header)
+            }
             Err(HeaderError::NewerVersion(version)) => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -563,6 +572,8 @@ impl Scan {
 struct Chosen {
     /// The base of the image the shard took, if it took one.
     images: Vec<Option<u64>>,
+    /// When each of those images was taken.
+    times: Vec<Option<u64>>,
     /// The highest base of an image of the shard that was refused. The
     /// shard is lossy if the log it falls back to stops short of it: what
     /// the image covered may have been compacted away.
@@ -595,6 +606,7 @@ fn read_images<D: Disk>(
     let shards = building.dicts.len();
     let mut chosen = Chosen {
         images: vec![None; shards],
+        times: vec![None; shards],
         refused: vec![None; shards],
     };
     for snap in snaps.iter_mut() {
@@ -617,6 +629,7 @@ fn read_images<D: Disk>(
         if verdict == Verdict::Usable {
             for (shard, base) in &wanted {
                 chosen.images[usize::from(*shard)] = Some(*base);
+                chosen.times[usize::from(*shard)] = Some(header.unix_millis);
             }
             snap.used = true;
             report.snapshots_used += 1;
@@ -803,6 +816,7 @@ fn replay_tails<D: Disk>(
             seq,
             lossy,
             cut: gap || lossy,
+            image_unix_millis: chosen.times[index],
         });
     }
     (shards, kept)

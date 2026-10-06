@@ -189,7 +189,7 @@ impl TraceSink for HashSink {
         let mut tally = lock(&self.shared.tally);
         tally.snapshot_cycles += 1;
         tally.max_snapshot_bytes = tally.max_snapshot_bytes.max(report.bytes);
-        tally.max_written_during = tally.max_written_during.max(report.written_during);
+        tally.max_written_during = tally.max_written_during.max(report.bytes_written);
         tally.disk_peak_bytes = tally.disk_peak_bytes.max(report.disk_bytes);
     }
 
