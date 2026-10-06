@@ -262,11 +262,15 @@ pub fn persistence_section(node: &NodeInfo) -> String {
     let _ = write!(text, "fsync_policy:{}\r\n", node.fsync.name());
     let _ = write!(text, "log_segments:{}\r\n", load(&stats.log_segments));
     let _ = write!(text, "syncs_total:{}\r\n", load(&stats.syncs_total));
-    let _ = write!(
-        text,
-        "last_sync_ms:{}\r\n",
-        load(&stats.last_sync_micros) / 1000
-    );
+    // Absent before the first sync, which under `--fsync never` can be the
+    // life of a quiet process: a zero would read as a sync that took none.
+    if load(&stats.syncs_total) > 0 {
+        let _ = write!(
+            text,
+            "last_sync_ms:{}\r\n",
+            load(&stats.last_sync_micros) / 1000
+        );
+    }
     let _ = write!(text, "refusing_executors:{}\r\n", load(&stats.refusing));
     let _ = write!(text, "lossy_shards:{}\r\n\r\n", load(&stats.lossy_shards));
     text
