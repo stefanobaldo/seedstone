@@ -442,6 +442,21 @@ impl Model {
             }
             _ => {
                 let slot = self.volatile.pick(rng);
+                // One roll in a hundred asks the node for a snapshot now, so
+                // images land mid-run where the clients put them and not only
+                // where the checkpoint's threshold does. Taken off TTL, which
+                // keeps two rolls, and the slot is drawn all the same: the
+                // draws after it are the ones they were, and only what this
+                // roll puts on the wire moves. The reply is `started` or
+                // Redis's "already in progress", neither of which the model
+                // checks.
+                if roll == 99 {
+                    return Op {
+                        frame: command(&["BGSAVE"]),
+                        check: Check::Ignored,
+                        form: contract::FORM_BGSAVE,
+                    };
+                }
                 Op {
                     frame: command(&["TTL", &volatile_key(self.volatile.key(slot))]),
                     check: Check::Ignored,

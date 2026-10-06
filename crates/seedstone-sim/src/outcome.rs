@@ -195,6 +195,9 @@ pub struct SimOutcome {
     /// Snapshot cycles that reached a durable footer, over every executor
     /// and every start.
     pub snapshot_cycles: u64,
+    /// Shards a completed cycle's image cleared of the lossy mark their
+    /// start left them with, over every executor and every start.
+    pub lossy_cleared: u64,
     /// Compactions reported, over every executor and every start.
     pub compactions: u64,
     /// Files compaction removed at run time.
@@ -436,6 +439,7 @@ pub const fn nothing_observed() -> SimOutcome {
         rotate_faults: 0,
         hostile: false,
         snapshot_cycles: 0,
+        lossy_cleared: 0,
         compactions: 0,
         files_removed: 0,
         max_snapshot_bytes: 0,
@@ -702,6 +706,7 @@ pub struct Tally {
     /// The checkpoint's reports and faults, and what each start refused and
     /// removed. See [`SimOutcome`], whose fields these become.
     pub snapshot_cycles: u64,
+    pub lossy_cleared: u64,
     pub compactions: u64,
     pub files_removed: u64,
     pub max_snapshot_bytes: u64,

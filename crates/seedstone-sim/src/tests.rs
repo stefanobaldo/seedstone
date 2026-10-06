@@ -209,7 +209,10 @@ fn the_trace_hash_is_pinned_across_processes_and_builds() {
     // Re-pinned: the writer task joined the schedule and a compaction report
     // names no executor. And again when a snapshot that made nothing
     // redundant stopped reporting a compaction of nothing.
-    const MINI_1_42: u64 = 0x73f9_4d12_77fe_7dc5;
+    //
+    // Re-pinned: the clients ask for a snapshot on one roll in a hundred
+    // (`BGSAVE`), taken off TTL.
+    const MINI_1_42: u64 = 0xf6e7_c967_9f41_f5f2;
 
     let outcome = run_sim(&SimConfig::mini(1, 42));
     assert_eq!(
@@ -264,6 +267,10 @@ fn the_trace_hash_is_pinned_across_processes_and_builds() {
         // Five reads sent inside it no longer decide anything.
         // `alive_checks`, `plain_checks`, `walk_checks` and `expected_sum`
         // held still.
+        //
+        // `BGSAVE` on roll 99 moved none of the four and not
+        // `expected_sum`: it draws the slot the `TTL` it replaced would
+        // have, and reads nothing the model judges.
         (46, 33, 149, 32),
         "the recorded workload decides a different number of checks"
     );
@@ -905,9 +912,12 @@ fn one_seed_per_durability_policy_is_pinned() {
     // Re-pinned, all three, when `hostile` went from a thousand shards to
     // sixteen, drew its crash at rest or under load per seed, and its disk
     // began to draw sync faults — one move for the three.
-    const HOSTILE_1_3_ALWAYS: u64 = 0xbcab_6e06_771a_2024;
-    const HOSTILE_1_3_INTERVAL: u64 = 0x1993_a816_ff88_3124;
-    const HOSTILE_1_3_NEVER: u64 = 0x72cd_472a_b03f_4ab5;
+    //
+    // Re-pinned, all three: the clients ask for a snapshot on one roll in
+    // a hundred (`BGSAVE`), taken off TTL.
+    const HOSTILE_1_3_ALWAYS: u64 = 0x676a_1ba9_4103_bb1c;
+    const HOSTILE_1_3_INTERVAL: u64 = 0x2f7e_329c_c918_aea2;
+    const HOSTILE_1_3_NEVER: u64 = 0x2495_bee7_97d3_492c;
     for (policy, pinned) in [
         (SyncPolicy::ALWAYS, HOSTILE_1_3_ALWAYS),
         (SyncPolicy::INTERVAL, HOSTILE_1_3_INTERVAL),
