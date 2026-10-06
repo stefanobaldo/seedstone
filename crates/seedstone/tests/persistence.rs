@@ -6,6 +6,7 @@
 //! exercised on an in-memory disk or the simulator's; this is what says the
 //! `std::fs` half of the seam was wired into the composition root.
 
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -31,21 +32,49 @@ fn scratch() -> PathBuf {
     dir
 }
 
+/// A running binary that is killed and reaped when it is dropped, so a test
+/// that fails before its own `kill` does not leave a server behind.
+struct Node(Child);
+
+impl Deref for Node {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl DerefMut for Node {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        // Either fails harmlessly on a child the test already reaped.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Starts the binary on an ephemeral port, in `cwd`, with `args` after the
 /// bind, its stderr written to `stderr`.
 ///
 /// Stderr goes to a file rather than a pipe: a pipe must be drained for as
 /// long as the child lives, and a file is also there to read when an
 /// assertion fails.
-fn spawn(cwd: &Path, args: &[&std::ffi::OsStr], stderr: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_seedstone"))
-        .args(["--bind", "127.0.0.1:0"])
-        .args(args)
-        .current_dir(cwd)
-        .stderr(std::fs::File::create(stderr).unwrap())
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("the binary starts")
+fn spawn(cwd: &Path, args: &[&std::ffi::OsStr], stderr: &Path) -> Node {
+    Node(
+        Command::new(env!("CARGO_BIN_EXE_seedstone"))
+            .args(["--bind", "127.0.0.1:0"])
+            .args(args)
+            .current_dir(cwd)
+            .stderr(std::fs::File::create(stderr).unwrap())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("the binary starts"),
+    )
 }
 
 /// Waits for the `listening` line in `stderr` and returns every line up to
@@ -78,7 +107,7 @@ fn port_of(listening: &str) -> u16 {
 
 /// Starts the binary over `dir` as its data directory and returns the child
 /// and its port.
-async fn start(dir: &Path, stderr: &Path) -> (Child, u16) {
+async fn start(dir: &Path, stderr: &Path) -> (Node, u16) {
     let child = spawn(dir, &["--data-dir".as_ref(), dir.as_os_str()], stderr);
     let lines = until_listening(stderr).await;
     let port = port_of(lines.last().unwrap());
@@ -437,7 +466,7 @@ async fn a_node_killed_at_its_snapshot_line_starts_again_clean() {
 
 /// Starts the binary over `dir` as its data directory with `extra` after
 /// the flag, and returns the child and its port.
-async fn start_with(dir: &Path, stderr: &Path, extra: &[&str]) -> (Child, u16) {
+async fn start_with(dir: &Path, stderr: &Path, extra: &[&str]) -> (Node, u16) {
     let mut args: Vec<&std::ffi::OsStr> = vec!["--data-dir".as_ref(), dir.as_os_str()];
     args.extend(extra.iter().map(|arg| std::ffi::OsStr::new(*arg)));
     let child = spawn(dir, &args, stderr);
@@ -478,7 +507,7 @@ async fn pipelined(stream: &mut TcpStream, commands: &[&[&str]]) -> Vec<Frame> {
 }
 
 /// Sends `SIGTERM` to `child` and reaps it.
-fn terminate_and_wait(mut child: Child) {
+fn terminate_and_wait(mut child: Node) {
     let status = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
         .status()
@@ -1222,4 +1251,25 @@ async fn writes_pipelined_ahead_of_shutdown_are_kept() {
             "round {round}: writes pipelined ahead of SHUTDOWN lost"
         );
     }
+}
+
+/// A test that fails between starting a node and killing it drops the
+/// handle on its way out; the node goes with it rather than serving on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_whose_handle_is_dropped_is_stopped() {
+    let dir = scratch();
+    let (node, _) = start(&dir, &dir.join("err")).await;
+    let pid = node.id().to_string();
+    drop(node);
+    let alive = Command::new("kill")
+        .args(["-0", &pid])
+        .stderr(Stdio::null())
+        .status()
+        .expect("kill runs")
+        .success();
+    assert!(
+        !alive,
+        "process {pid} still runs after its handle was dropped"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
