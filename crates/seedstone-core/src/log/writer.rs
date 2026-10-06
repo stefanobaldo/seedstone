@@ -31,6 +31,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -39,7 +40,9 @@ use tokio::time::Instant;
 use crate::log::checkpoint::CheckpointConfig;
 use crate::log::disk::{Disk, LogFile, SyncFuture};
 use crate::log::effect::Effect;
-use crate::log::file::{Segment, create_segment, parse_segment_name, segment_name};
+use crate::log::file::{
+    SEGMENT_HEADER_LEN, Segment, create_segment, parse_segment_name, segment_name,
+};
 use crate::log::recovery::RecoveredShard;
 use crate::log::snapshot::parse_snapshot_name;
 use crate::log::{Record, encode_record};
@@ -126,6 +129,13 @@ pub struct WriterPlants {
     /// it, not once every one has.
     pub removes_uncovered: bool,
 }
+
+/// How long a sync may be in flight before the writer says so.
+///
+/// A disk that hangs rather than erroring is otherwise invisible until
+/// clients time out (#77). `INFO` reports the count of such syncs as
+/// `aof_delayed_fsync`, and its documentation states this threshold.
+pub const SLOW_SYNC: Duration = Duration::from_secs(1);
 
 /// What [`Writer::open`] needs.
 pub struct WriterSpec<D: Disk, T: TraceSink> {
@@ -224,11 +234,18 @@ pub struct Writer<D: Disk, T: TraceSink> {
     /// issue, and the sync.
     in_flight: Option<(Vec<Option<u64>>, SyncFuture)>,
     issued_at: Instant,
+    /// The sync in flight was traced as slow: its end is traced too.
+    slow_warned: bool,
     round: u64,
     closed: VecDeque<Closed>,
     /// Bytes of older generations' files at the open — retained log whose
     /// holders are the executors without a snapshot in this generation.
     older_bytes: u64,
+    /// The older generations' segments among them, and their bytes: what
+    /// `INFO` counts as log, beside this generation's rotations.
+    older_segments: u64,
+    older_seg_bytes: u64,
+    stats: Arc<PersistenceStats>,
 }
 
 impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
@@ -241,18 +258,22 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
     pub fn open(spec: WriterSpec<D, T>) -> io::Result<Opened<D, T>> {
         let file = create_segment(&spec.disk, &spec.wal, spec.generation, 0)?;
         spec.disk.sync_dir(&spec.wal)?;
-        let older_bytes = spec
-            .disk
-            .list(&spec.wal)?
+        let names = spec.disk.list(&spec.wal)?;
+        let older = |name: &&String| {
+            parse_segment_name(name)
+                .map(|(generation, _)| generation)
+                .or_else(|| parse_snapshot_name(name).map(|(generation, _, _)| generation))
+                .is_some_and(|generation| generation < spec.generation)
+        };
+        let len = |name: &String| spec.disk.len(&spec.wal.join(name)).unwrap_or(0);
+        let older_bytes = names.iter().filter(older).map(len).sum();
+        let older_segs: Vec<&String> = names
             .iter()
-            .filter(|name| {
-                parse_segment_name(name)
-                    .map(|(generation, _)| generation)
-                    .or_else(|| parse_snapshot_name(name).map(|(generation, _, _)| generation))
-                    .is_some_and(|generation| generation < spec.generation)
-            })
-            .map(|name| spec.disk.len(&spec.wal.join(name)).unwrap_or(0))
-            .sum();
+            .filter(older)
+            .filter(|name| parse_segment_name(name).is_some())
+            .collect();
+        let older_segments = older_segs.len() as u64;
+        let older_seg_bytes = older_segs.into_iter().map(len).sum();
         let (to_writer, inbox) = mpsc::unbounded_channel();
         let (lanes, links) = (0..spec.executors)
             .map(|executor| {
@@ -291,10 +312,15 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
             in_flight: None,
             // One interval before now, so the first write is synced at once.
             issued_at: now.checked_sub(interval).unwrap_or(now),
+            slow_warned: false,
             round: 0,
             closed: VecDeque::new(),
             older_bytes,
+            older_segments,
+            older_seg_bytes,
+            stats: spec.stats,
         };
+        writer.publish_log_size();
         Ok(Opened {
             writer,
             inbox,
@@ -371,7 +397,10 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
                         break;
                     }
                 }
-                _ = tick.tick() => self.maybe_issue(Instant::now()),
+                _ = tick.tick() => {
+                    self.watch_slow(Instant::now());
+                    self.maybe_issue(Instant::now());
+                }
             }
         }
     }
@@ -419,6 +448,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         self.staged.clear();
         self.segment.bytes_written += len;
         self.segment.dirty = true;
+        self.publish_log_size();
         for lane in &mut self.lanes {
             lane.written = lane.received;
             lane.written_bytes += std::mem::take(&mut lane.pending_bytes);
@@ -448,6 +478,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         self.trace.sync_issued(self.round);
         self.in_flight = Some((frozen.clone(), self.segment.file.sync_later()));
         self.issued_at = now;
+        self.stats.sync_in_flight.store(1, Ordering::Relaxed);
         if self.plants.durable_on_issue {
             // The plant: answered at the issue, before anything is on disk.
             self.report_durable(&frozen);
@@ -466,6 +497,16 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
     /// node's refusal.
     fn settle(&mut self, frozen: Vec<Option<u64>>, result: io::Result<()>) {
         self.trace.sync_settled(self.round);
+        let took = Instant::now().saturating_duration_since(self.issued_at);
+        self.stats.sync_in_flight.store(0, Ordering::Relaxed);
+        self.stats.syncs_total.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .last_sync_micros
+            .store(as_u64(took.as_micros()), Ordering::Relaxed);
+        if std::mem::take(&mut self.slow_warned) {
+            self.trace
+                .sync_slow_ended(self.round, result.is_ok(), as_u64(took.as_millis()));
+        }
         match result {
             Ok(()) => {
                 let covered = if self.plants.durable_from_written_now {
@@ -522,6 +563,14 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         self.staged.clear();
         if self.in_flight.take().is_some() {
             self.trace.sync_settled(self.round);
+            self.stats.sync_in_flight.store(0, Ordering::Relaxed);
+            // Let go, not completed: a slow one's warning is closed as failed,
+            // the fault this is part of being the line that says why.
+            if std::mem::take(&mut self.slow_warned) {
+                let took = Instant::now().saturating_duration_since(self.issued_at);
+                self.trace
+                    .sync_slow_ended(self.round, false, as_u64(took.as_millis()));
+            }
         }
         for lane in &mut self.lanes {
             // Dropped bytes count as consumed: the executor lets go of
@@ -578,6 +627,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
             last_batch: self.lanes.iter().map(|lane| lane.written).collect(),
             bytes: closing.bytes_written,
         });
+        self.publish_log_size();
         self.nudge_if_due();
         true
     }
@@ -636,7 +686,8 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         let names = self.disk.list(&self.wal).unwrap_or_default();
         let round_closed = self.lanes.iter().all(|lane| lane.snapshot_bytes.is_some());
         let mut older_left = false;
-        for name in names.iter().filter(|name| self.is_older(name)) {
+        let older: Vec<&String> = names.iter().filter(|name| self.is_older(name)).collect();
+        for name in older {
             if !round_closed {
                 older_left = true;
                 continue;
@@ -645,6 +696,10 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
                 Ok(bytes) => {
                     removed.files += 1;
                     removed.bytes += bytes;
+                    if parse_segment_name(name).is_some() {
+                        self.older_segments = self.older_segments.saturating_sub(1);
+                        self.older_seg_bytes = self.older_seg_bytes.saturating_sub(bytes);
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -713,10 +768,42 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         if removed.files == 0 {
             return;
         }
+        self.publish_log_size();
         if let Err(error) = self.disk.sync_dir(&self.wal) {
             self.trace.log_fault(LogFault::Remove, &error);
         }
         self.trace.compaction(&removed);
+    }
+
+    /// What `INFO` reports as the log's size: the open rotation, the closed
+    /// ones still retained, and the older generations' segments — headers
+    /// included, so the figure is what the files hold.
+    fn publish_log_size(&self) {
+        let ours = 1 + self.closed.len() as u64;
+        let closed: u64 = self.closed.iter().map(|closed| closed.bytes).sum();
+        self.stats.log_bytes.store(
+            self.segment.bytes_written
+                + closed
+                + ours * SEGMENT_HEADER_LEN as u64
+                + self.older_seg_bytes,
+            Ordering::Relaxed,
+        );
+        self.stats
+            .log_segments
+            .store(ours + self.older_segments, Ordering::Relaxed);
+    }
+
+    /// The tick's look at the sync in flight: past [`SLOW_SYNC`], one line
+    /// and one count, once per sync.
+    fn watch_slow(&mut self, now: Instant) {
+        if self.in_flight.is_some() && !self.slow_warned {
+            let waited = now.saturating_duration_since(self.issued_at);
+            if waited >= SLOW_SYNC {
+                self.slow_warned = true;
+                self.stats.delayed_syncs.fetch_add(1, Ordering::Relaxed);
+                self.trace.sync_slow(self.round, as_u64(waited.as_millis()));
+            }
+        }
     }
 
     /// Removes `name`, and says how many bytes it held.
@@ -820,4 +907,10 @@ pub fn write_rebases<D: Disk + Send + 'static, T: TraceSink>(
     }
     writer.append_now(&bytes)?;
     writer.sync_now()
+}
+
+/// A duration's count in a counter's width: a sync that took longer than
+/// `u64::MAX` microseconds reads as that.
+fn as_u64(count: u128) -> u64 {
+    u64::try_from(count).unwrap_or(u64::MAX)
 }
