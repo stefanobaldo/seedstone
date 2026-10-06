@@ -26,7 +26,8 @@ use seedstone_resp::{Frame, encode};
 use seedstone_service::log::{
     COMPACTION, Event, FSYNC_IGNORED, Field, LOG_FAULT, PASSWORD_RELOAD_FAILED,
     PASSWORD_RELOAD_SKIPPED, PASSWORD_RELOADED, RECOVERY, RECOVERY_FAILED, RECOVERY_TRUNCATED,
-    REFUSAL_ENDED, SHUTDOWN_TIMEOUT, SNAPSHOT, SNAPSHOT_FAULT, STOPPING, line,
+    REFUSAL_ENDED, SHUTDOWN_TIMEOUT, SNAPSHOT, SNAPSHOT_FAULT, STOPPING, SYNC_SLOW,
+    SYNC_SLOW_ENDED, line,
 };
 use seedstone_service::{NodeInfo, PasswordStore, Passwords, Secret, serve_connection};
 use tokio::io::AsyncWriteExt;
@@ -841,6 +842,21 @@ impl TraceSink for FaultLines {
         emit(
             &LOG_FAULT,
             &[Field::Str(stage), Field::Str(&error.to_string())],
+        );
+    }
+
+    fn sync_slow(&self, round: u64, in_flight_ms: u64) {
+        emit(&SYNC_SLOW, &[Field::Num(round), Field::Num(in_flight_ms)]);
+    }
+
+    fn sync_slow_ended(&self, round: u64, ok: bool, duration_ms: u64) {
+        emit(
+            &SYNC_SLOW_ENDED,
+            &[
+                Field::Num(round),
+                Field::Str(if ok { "ok" } else { "failed" }),
+                Field::Num(duration_ms),
+            ],
         );
     }
 

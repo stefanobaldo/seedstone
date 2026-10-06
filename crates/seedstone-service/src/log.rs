@@ -197,6 +197,22 @@ pub static LOG_FAULT: Event = Event {
     fields: &["stage", "error"],
 };
 
+/// A sync of the log has been in flight for longer than the writer's
+/// threshold: the disk is slow or hung, and under `--fsync always` every
+/// write waits for it.
+pub static SYNC_SLOW: Event = Event {
+    name: "sync_slow",
+    level: Level::Warn,
+    fields: &["round", "in_flight_ms"],
+};
+
+/// The sync `sync_slow` warned about ended.
+pub static SYNC_SLOW_ENDED: Event = Event {
+    name: "sync_slow_ended",
+    level: Level::Info,
+    fields: &["round", "outcome", "duration_ms"],
+};
+
 /// One executor's snapshot could not be written or made durable.
 ///
 /// The scan starts over into a new file on a later tick. `shard` is the
@@ -268,6 +284,8 @@ pub static EVENTS: &[&Event] = &[
     &RECOVERY_FAILED,
     &LOG_FAULT,
     &SNAPSHOT_FAULT,
+    &SYNC_SLOW,
+    &SYNC_SLOW_ENDED,
     &REFUSAL_ENDED,
     &SNAPSHOT,
     &COMPACTION,

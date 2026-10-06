@@ -9,6 +9,7 @@ use crate::log::snapshot::snapshot_name;
 use crate::log::{Decoded, decode_record};
 use crate::shard::{CompactionReport, LogFault, NoTrace, SyncPolicy, TraceSink};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ struct Rig {
     disk: MemDisk,
     links: Vec<WriterLink>,
     task: tokio::task::JoinHandle<()>,
+    stats: Arc<PersistenceStats>,
 }
 
 fn open(
@@ -45,6 +47,7 @@ fn open_with<T: TraceSink>(
     trace: T,
 ) -> Rig {
     disk.create_dir_all(Path::new(WAL)).unwrap();
+    let stats = PersistenceStats::new(executors);
     let Opened {
         writer,
         inbox,
@@ -59,13 +62,14 @@ fn open_with<T: TraceSink>(
         checkpoint: SMALL,
         trace,
         plants,
-        stats: crate::shard::PersistenceStats::new(executors),
+        stats: stats.clone(),
     })
     .unwrap();
     Rig {
         disk: disk.clone(),
         links,
         task: tokio::spawn(writer.run(inbox)),
+        stats,
     }
 }
 
@@ -617,6 +621,8 @@ struct Recorder {
     compactions: Arc<Mutex<Vec<CompactionReport>>>,
     faults: Arc<Mutex<Vec<LogFault>>>,
     rounds: Arc<Mutex<Vec<u64>>>,
+    slow: Arc<Mutex<Vec<(u64, u64)>>>,
+    slow_ended: Arc<Mutex<Vec<(u64, bool, u64)>>>,
 }
 
 impl TraceSink for Recorder {
@@ -630,6 +636,128 @@ impl TraceSink for Recorder {
     fn sync_issued(&self, round: u64) {
         self.rounds.lock().unwrap().push(round);
     }
+    fn sync_slow(&self, round: u64, in_flight_ms: u64) {
+        self.slow.lock().unwrap().push((round, in_flight_ms));
+    }
+    fn sync_slow_ended(&self, round: u64, ok: bool, duration_ms: u64) {
+        self.slow_ended
+            .lock()
+            .unwrap()
+            .push((round, ok, duration_ms));
+    }
+}
+
+async fn yield_now_n(n: usize) {
+    for _ in 0..n {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A sync in flight past `SLOW_SYNC` is traced once, with how long it has
+/// waited, and once more when it ends — and counted.
+#[tokio::test(start_paused = true)]
+async fn a_slow_sync_is_traced_in_and_out_and_counted() {
+    let disk = MemDisk::default();
+    disk.set_sync_latency(Duration::from_millis(2_500));
+    let story = Recorder::default();
+    let mut rig = open_with(
+        &disk,
+        1,
+        SyncPolicy::ALWAYS,
+        1 << 20,
+        WriterPlants::default(),
+        story.clone(),
+    );
+    rig.submit(0, 0, record(0, 0, b"a")); // issues a sync
+    yield_now_n(8).await;
+    assert_eq!(rig.stats.sync_in_flight.load(Ordering::Relaxed), 1);
+    tokio::time::advance(Duration::from_millis(1_100)).await;
+    yield_now_n(8).await; // the writer's tick ran
+    let slow = story.slow.lock().unwrap().clone();
+    assert_eq!(slow.len(), 1, "one warning past one second");
+    assert_eq!(slow[0].0, 1);
+    assert!((1_000..1_200).contains(&slow[0].1), "{slow:?}");
+    assert_eq!(rig.stats.delayed_syncs.load(Ordering::Relaxed), 1);
+    // Slept, not advanced: the paused clock stops at every timer on the way,
+    // so the writer reads the instant its sync ended.
+    tokio::time::sleep(Duration::from_millis(1_450)).await;
+    assert_eq!(*story.slow_ended.lock().unwrap(), vec![(1, true, 2_500)]);
+    assert_eq!(
+        story.slow.lock().unwrap().len(),
+        1,
+        "warned once, not every tick"
+    );
+    assert_eq!(rig.stats.sync_in_flight.load(Ordering::Relaxed), 0);
+    assert_eq!(rig.stats.syncs_total.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        rig.stats.last_sync_micros.load(Ordering::Relaxed),
+        2_500_000
+    );
+    let _ = rig.durable(0).await;
+}
+
+/// A sync that ends inside `SLOW_SYNC` writes no line and counts no delay.
+#[tokio::test(start_paused = true)]
+async fn a_sync_inside_the_threshold_is_counted_and_not_traced() {
+    let disk = MemDisk::default();
+    disk.set_sync_latency(Duration::from_millis(900));
+    let story = Recorder::default();
+    let mut rig = open_with(
+        &disk,
+        1,
+        SyncPolicy::ALWAYS,
+        1 << 20,
+        WriterPlants::default(),
+        story.clone(),
+    );
+    rig.submit(0, 0, record(0, 0, b"a"));
+    let _ = rig.durable(0).await;
+    tokio::time::advance(Duration::from_millis(500)).await;
+    yield_now_n(8).await;
+    assert!(story.slow.lock().unwrap().is_empty());
+    assert!(story.slow_ended.lock().unwrap().is_empty());
+    assert_eq!(rig.stats.delayed_syncs.load(Ordering::Relaxed), 0);
+    assert_eq!(rig.stats.syncs_total.load(Ordering::Relaxed), 1);
+}
+
+/// What `INFO` reports as the log's size follows the segments on disk.
+#[tokio::test(start_paused = true)]
+async fn the_log_size_counts_every_segment_on_disk() {
+    let disk = MemDisk::default();
+    disk.create_dir_all(Path::new(WAL)).unwrap();
+    disk.write_file(&Path::new(WAL).join(segment_name(0, 0)), &[0u8; 30])
+        .unwrap(); // an older generation's segment
+    let rig = open(&disk, 1, SyncPolicy::NEVER, 64, WriterPlants::default());
+    let header = disk
+        .contents(&Path::new(WAL).join(segment_name(1, 0)))
+        .len() as u64;
+    assert_eq!(rig.stats.log_segments.load(Ordering::Relaxed), 2);
+    assert_eq!(rig.stats.log_bytes.load(Ordering::Relaxed), 30 + header);
+    rig.submit(0, 0, vec![1u8; 70]); // fills rotation 0
+    yield_now_n(4).await;
+    rig.submit(0, 1, vec![1u8; 10]); // opens rotation 1
+    yield_now_n(4).await;
+    let on_disk: u64 = names(&disk)
+        .iter()
+        .map(|name| disk.contents(&Path::new(WAL).join(name)).len() as u64)
+        .sum();
+    assert_eq!(rig.stats.log_segments.load(Ordering::Relaxed), 3);
+    assert_eq!(rig.stats.log_bytes.load(Ordering::Relaxed), on_disk);
+    covered(&rig, 0, 0, Some(1), 100);
+    yield_now_n(4).await;
+    let on_disk: u64 = names(&disk)
+        .iter()
+        .filter(|name| parse_segment_name(name).is_some())
+        .map(|name| disk.contents(&Path::new(WAL).join(name)).len() as u64)
+        .sum();
+    assert_eq!(
+        rig.stats.log_segments.load(Ordering::Relaxed),
+        names(&disk)
+            .iter()
+            .filter(|name| parse_segment_name(name).is_some())
+            .count() as u64
+    );
+    assert_eq!(rig.stats.log_bytes.load(Ordering::Relaxed), on_disk);
 }
 
 fn covered(

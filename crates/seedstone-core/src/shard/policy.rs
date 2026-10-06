@@ -107,6 +107,13 @@ pub trait TraceSink: Clone + Send + 'static {
     /// Called when that sync completed or failed.
     fn sync_settled(&self, _round: u64) {}
 
+    /// A sync in flight for longer than `SLOW_SYNC`; traced once per such
+    /// sync, from the writer's tick, with how long it had waited.
+    fn sync_slow(&self, _round: u64, _in_flight_ms: u64) {}
+
+    /// That sync ended: `ok`, and how long it took.
+    fn sync_slow_ended(&self, _round: u64, _ok: bool, _duration_ms: u64) {}
+
     /// Called when an executor answers the batches it held: `wrote` is how
     /// many of their commands appended to the log, `refused` whether they
     /// went out as the refusal rather than as their replies.
