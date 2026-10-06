@@ -499,6 +499,124 @@ fn a_segment_that_could_not_be_read_is_kept_for_the_next_start() {
     assert!(!recovery.shards[0].lossy);
 }
 
+/// Nor is one that read whole but whose records a cut discarded: the cut
+/// was made by damage elsewhere, and if that damage does not recur, the
+/// next start needs them. Removed, a start that failed before its `Rebase`
+/// was written leaves the next one a log that simply ends early — a loss
+/// it cannot see.
+#[test]
+fn a_segment_whose_records_a_cut_discarded_is_kept_for_the_next_start() {
+    let disk = MemDisk::default();
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write(&mut seg, 0, 1, &put(b"b", b"1"));
+    seg = rotate(&disk, 1, 1);
+    write(&mut seg, 0, 2, &put(b"c", b"1"));
+    write(&mut seg, 0, 3, &put(b"d", b"1"));
+    let path = Path::new("/data/wal").join(segment_name(1, 0));
+    let good = disk.contents(&path);
+    let mut bad = good.clone();
+    bad[0] ^= 0xFF;
+    disk.overwrite(&path, bad);
+    let recovery = recover(spec(&disk, 1)).unwrap();
+    assert_eq!(recovery.report.abandoned_segments, 1);
+    assert!(recovery.shards[0].lossy && recovery.shards[0].cut);
+    assert_eq!(recovery.report.files_removed, 0);
+    // This start fails before it writes anything; the header reads again.
+    disk.overwrite(&path, good);
+    let recovery = recover(spec(&disk, 1)).unwrap();
+    assert_eq!(
+        contents(&recovery.shards[0].dict),
+        pairs(&[(b"a", b"1"), (b"b", b"1"), (b"c", b"1"), (b"d", b"1")])
+    );
+    assert_eq!(recovery.shards[0].seq, 4);
+}
+
+/// Kept until a start writes its `Rebase`, and no longer: past it the cut
+/// records are dead, and the next start removes the segment they were in.
+#[test]
+fn a_segment_whose_records_a_cut_discarded_goes_once_a_rebase_kills_them() {
+    let disk = MemDisk::default();
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    seg = rotate(&disk, 1, 1);
+    write(&mut seg, 0, 1, &put(b"b", b"1"));
+    let path = Path::new("/data/wal").join(segment_name(1, 0));
+    let good = disk.contents(&path);
+    let mut bad = good.clone();
+    bad[0] ^= 0xFF;
+    disk.overwrite(&path, bad);
+    let first = recover(spec(&disk, 1)).unwrap();
+    assert_eq!(first.shards[0].seq, 0, "cut before its first record");
+    // This start succeeds: the next generation resumes at the cut.
+    let mut gen2 = wal(&disk, 2);
+    let mut rebase = Vec::new();
+    Effect::Rebase.encode(&mut rebase);
+    write(&mut gen2, 0, 0, &rebase);
+    disk.overwrite(&path, good);
+    let second = recover(spec(&disk, 1)).unwrap();
+    assert_eq!(second.shards[0].seq, 1);
+    let names = disk.list(Path::new("/data/wal")).unwrap();
+    assert!(!names.contains(&segment_name(1, 1)), "{names:?}");
+}
+
+/// A start whose `Rebase` could not be written still serves again, once a
+/// snapshot of its memory is durable: the cut records an older generation
+/// left past that snapshot's base are dead all the same, and are not
+/// replayed over what the newer generation wrote.
+#[test]
+fn a_newer_generations_snapshot_kills_the_cut_records_above_its_base() {
+    let disk = MemDisk::default();
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    seg = rotate(&disk, 1, 1);
+    write(&mut seg, 0, 1, &put(b"b", b"old"));
+    write(&mut seg, 0, 2, &put(b"c", b"old"));
+    write(&mut seg, 0, 3, &put(b"d", b"old"));
+    let path = Path::new("/data/wal").join(segment_name(1, 0));
+    let good = disk.contents(&path);
+    let mut bad = good.clone();
+    bad[0] ^= 0xFF;
+    disk.overwrite(&path, bad);
+    let first = recover(spec(&disk, 1)).unwrap();
+    assert_eq!(first.shards[0].seq, 0, "cut before its first record");
+    // The `Rebase` failed to write; the node refused, imaged its (empty)
+    // memory at 1, and served again.
+    let mut gen2 = wal(&disk, 2);
+    snapshot(&disk, 2, 0, 0, &[(0, 1)], &[], true);
+    write(&mut gen2, 0, 1, &put(b"b", b"new"));
+    disk.overwrite(&path, good);
+    let second = recover(spec(&disk, 1)).unwrap();
+    assert_eq!(contents(&second.shards[0].dict), pairs(&[(b"b", b"new")]));
+    assert_eq!(second.shards[0].seq, 2);
+}
+
+/// The same with nothing written after the snapshot: its base alone is
+/// the newer generation's front, and the snapshot that holds it stays.
+#[test]
+fn a_newer_generations_snapshot_base_alone_kills_the_cut_records_and_is_kept() {
+    let disk = MemDisk::default();
+    let mut seg = wal(&disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    seg = rotate(&disk, 1, 1);
+    write(&mut seg, 0, 1, &put(b"c", b"old"));
+    let path = Path::new("/data/wal").join(segment_name(1, 0));
+    let good = disk.contents(&path);
+    let mut bad = good.clone();
+    bad[0] ^= 0xFF;
+    disk.overwrite(&path, bad);
+    recover(spec(&disk, 1)).unwrap();
+    // An unfinished snapshot at 0: no image, but its header is still the
+    // generation's front.
+    snapshot(&disk, 2, 0, 0, &[(0, 0)], &[], false);
+    disk.overwrite(&path, good);
+    let second = recover(spec(&disk, 1)).unwrap();
+    assert!(contents(&second.shards[0].dict).is_empty());
+    assert_eq!(second.shards[0].seq, 0);
+    let names = disk.list(Path::new("/data/wal")).unwrap();
+    assert!(names.contains(&snapshot_name(2, 0, 0)), "{names:?}");
+}
+
 #[test]
 fn a_malformed_payload_ends_that_shards_prefix() {
     let disk = MemDisk::default();

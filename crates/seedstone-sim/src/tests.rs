@@ -931,3 +931,15 @@ fn the_honest_node_holds_on_the_hostile_seeds_that_once_caught_the_model_out() {
         assert!(outcome.invariant_holds(), "seed {sim_seed}: {outcome:?}");
     }
 }
+
+/// A hostile seed that caught the node out: a start met a segment header
+/// it could not read this once, cut every shard there, removed the next
+/// segment — read whole, every record in it cut — and failed before it
+/// wrote anything; the next start read the header and replayed a log that
+/// ended early, synced records gone with nothing reported (5410, at
+/// `always`, crashed once). The honest node holds on it.
+#[test]
+fn the_honest_node_holds_on_the_hostile_seed_whose_start_removed_a_cut_segment() {
+    let outcome = run_sim(&SimConfig::hostile(1, 5410));
+    assert!(outcome.invariant_holds(), "{outcome:?}");
+}

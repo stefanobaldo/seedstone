@@ -29,9 +29,10 @@
 //!    none. A shard with a record after the hole shows what it lost there
 //!    as a gap, and a gap on a disk with damage is reported as a loss.
 //! 5. **Garbage.** Every `.snap` no shard used and every `.seg` no kept
-//!    record came from is removed — unless damage was met reading it: a
-//!    read can fail where the next succeeds, and the file may be the only
-//!    copy of what it held.
+//!    or cut record came from is removed — unless damage was met reading
+//!    it: a read can fail where the next succeeds, and the file may be the
+//!    only copy of what it held. A record a gap cut is kept for the same
+//!    reason: the damage that cut it may not recur.
 //!
 //! **The prefix rule.** A shard applies sequence `base, base+1, …` and
 //! stops at the first number that is missing; everything of that shard
@@ -49,12 +50,21 @@
 //! is dead: never replayed, never counted as a gap. Where two generations
 //! still hold the same sequence number, the newer one's record is kept.
 //!
+//! The `Rebase` is not the only evidence. A process writes nothing below
+//! the sequence it resumed at, so any record a newer generation wrote for
+//! the shard, and any base in one of its snapshot headers, lies at or above
+//! where it resumed: an older record at or above that front is dead as
+//! well. It matters when the `Rebase` itself could not be written — that
+//! start refuses, images its memory, and serves again, and the records it
+//! cut may still be on disk, in a file kept because what cut them may not
+//! recur. The file a front was read from is kept while it kills anything.
+//!
 //! **A snapshot can be dead too.** Its image holds the effect of every
 //! record below its base — including records a later start declared dead
 //! by rebasing below that base, which can happen when that start refused
 //! the snapshot (read corruption is drawn per read, and can be transient)
 //! and cut the log. So a snapshot of generation `g` with base `b` is dead
-//! for a shard when a `Rebase` of a generation above `g` sits below `b`.
+//! for a shard when a front of a generation above `g` sits below `b`.
 //!
 //! **A refused image is a possible loss only where the log cannot make up
 //! for it.** Its shards are marked lossy if the log they fall back to stops
@@ -212,16 +222,32 @@ pub fn recover<D: Disk>(spec: RecoverSpec<'_, D>) -> io::Result<Recovery> {
         scan.segment(spec.disk, spec.wal, spec.reader, file, index)?;
     }
     scan.charge_holes();
-    let rebases = scan.rebases();
+    let fronts = fronts(&scan.buckets, &snaps, spec.shards);
+    let mut kept = vec![false; segments.len()];
     let mut building = Building {
         dicts: (0..spec.shards)
             .map(|shard| Dict::with_seed(shard_seed(spec.seed, shard)))
             .collect(),
         due: vec![Vec::new(); usize::from(spec.shards)],
     };
-    let chosen = read_images(&spec, &mut snaps, &rebases, &mut building, &mut report);
+    let chosen = read_images(
+        &spec,
+        &mut snaps,
+        &fronts,
+        &mut kept,
+        &mut building,
+        &mut report,
+    );
     let unread = std::mem::take(&mut scan.unread);
-    let (shards, kept) = replay_tails(&spec, scan, &chosen, building, segments.len(), &mut report);
+    let shards = replay_tails(
+        &spec,
+        scan,
+        &chosen,
+        fronts,
+        (&mut kept, &mut snaps),
+        building,
+        &mut report,
+    );
     for snap in &mut snaps {
         snap.damaged |= snap
             .unfinished_for
@@ -253,6 +279,9 @@ struct SnapFile {
     /// kept if the log of any of them stops short of its base: nothing on
     /// disk says it was never finished, and it may be the only copy.
     unfinished_for: Vec<(u16, u64)>,
+    /// A base in its header is the front that made a record or an older
+    /// image dead: it outlives what it killed, as a `Rebase` does.
+    kills: bool,
 }
 
 impl SnapFile {
@@ -326,6 +355,7 @@ fn read_headers<D: Disk>(
             header,
             used: false,
             unfinished_for: Vec::new(),
+            kills: false,
         });
     }
     snaps.sort_by_key(SnapFile::age);
@@ -543,20 +573,6 @@ impl Scan {
         self.unattributed_loss = true;
         self.unread[index] = true;
     }
-
-    /// Per shard, every `(generation, seq)` a `Rebase` was read at.
-    fn rebases(&self) -> Vec<Vec<(u64, u64)>> {
-        self.buckets
-            .iter()
-            .map(|bucket| {
-                bucket
-                    .iter()
-                    .filter(|(_, _, _, effect)| matches!(effect, Owned::Rebase))
-                    .map(|(seq, generation, _, _)| (*generation, *seq))
-                    .collect()
-            })
-            .collect()
-    }
 }
 
 /// What pass 3 chose, per shard.
@@ -584,11 +600,100 @@ enum Verdict {
     Damaged,
 }
 
+/// Where a [`Front`] was read: the file that must outlive what it kills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Segment(usize),
+    Snapshot(usize),
+}
+
+/// A sequence a generation is known to have held a shard at: its lowest
+/// record there — a `Rebase` after a cut — or the base of one of its
+/// snapshots. A process writes nothing below the sequence it resumed at,
+/// so the generation resumed at or below every front of it: an older
+/// generation's record at or above a front is not in its history, and an
+/// older image whose base lies above one includes what it never held.
+#[derive(Debug, Clone, Copy)]
+struct Front {
+    generation: u64,
+    seq: u64,
+    source: Source,
+}
+
+impl Front {
+    /// Whether this front makes `generation`'s record at `seq` dead.
+    const fn kills_record(&self, generation: u64, seq: u64) -> bool {
+        self.generation > generation && seq >= self.seq
+    }
+
+    /// Whether this front makes `generation`'s image with `base` dead.
+    const fn kills_image(&self, generation: u64, base: u64) -> bool {
+        self.generation > generation && self.seq < base
+    }
+}
+
+/// Per shard, the lowest record of each generation and every snapshot
+/// base: the fronts of [`Front`].
+fn fronts(
+    buckets: &[Vec<(u64, u64, usize, Owned)>],
+    snaps: &[SnapFile],
+    shards: u16,
+) -> Vec<Vec<Front>> {
+    let mut fronts: Vec<Vec<Front>> = buckets
+        .iter()
+        .map(|bucket| {
+            let mut lowest: Vec<Front> = Vec::new();
+            for (seq, generation, file, _) in bucket {
+                match lowest
+                    .iter_mut()
+                    .find(|front| front.generation == *generation)
+                {
+                    Some(front) if *seq < front.seq => {
+                        front.seq = *seq;
+                        front.source = Source::Segment(*file);
+                    }
+                    Some(_) => {}
+                    None => lowest.push(Front {
+                        generation: *generation,
+                        seq: *seq,
+                        source: Source::Segment(*file),
+                    }),
+                }
+            }
+            lowest
+        })
+        .collect();
+    for (index, snap) in snaps.iter().enumerate() {
+        let Some(header) = &snap.header else {
+            continue;
+        };
+        for (shard, base) in &header.bases {
+            if *shard < shards {
+                fronts[usize::from(*shard)].push(Front {
+                    generation: header.generation,
+                    seq: *base,
+                    source: Source::Snapshot(index),
+                });
+            }
+        }
+    }
+    fronts
+}
+
+/// Marks the file a front was read from as one to keep.
+fn keep(source: Source, kept: &mut [bool], kills: &mut [bool]) {
+    match source {
+        Source::Segment(file) => kept[file] = true,
+        Source::Snapshot(index) => kills[index] = true,
+    }
+}
+
 /// Pass 3: the newest usable image of every shard, streamed into its dict.
 fn read_images<D: Disk>(
     spec: &RecoverSpec<'_, D>,
     snaps: &mut [SnapFile],
-    rebases: &[Vec<(u64, u64)>],
+    fronts: &[Vec<Front>],
+    kept: &mut [bool],
     building: &mut Building,
     report: &mut Report,
 ) -> Chosen {
@@ -597,19 +702,24 @@ fn read_images<D: Disk>(
         images: vec![None; shards],
         refused: vec![None; shards],
     };
+    let mut kills = vec![false; snaps.len()];
     for snap in snaps.iter_mut() {
         let Some(header) = &snap.header else {
             continue; // refused in pass 1
         };
-        let wanted: Vec<(u16, u64)> = header
-            .bases
-            .iter()
-            .copied()
-            .filter(|(shard, base)| {
-                chosen.images[usize::from(*shard)].is_none()
-                    && !is_dead(header.generation, *base, &rebases[usize::from(*shard)])
-            })
-            .collect();
+        let mut wanted: Vec<(u16, u64)> = Vec::new();
+        for (shard, base) in header.bases.iter().copied() {
+            if chosen.images[usize::from(shard)].is_some() {
+                continue;
+            }
+            match fronts[usize::from(shard)]
+                .iter()
+                .find(|front| front.kills_image(header.generation, base))
+            {
+                Some(front) => keep(front.source, kept, &mut kills),
+                None => wanted.push((shard, base)),
+            }
+        }
         if wanted.is_empty() {
             continue;
         }
@@ -634,15 +744,10 @@ fn read_images<D: Disk>(
             report.snapshots_refused += 1;
         }
     }
+    for (snap, kills) in snaps.iter_mut().zip(kills) {
+        snap.kills |= kills;
+    }
     chosen
-}
-
-/// A snapshot of `generation` with `base` is dead for a shard when a
-/// newer generation rebased it below the base — see the module doc.
-fn is_dead(generation: u64, base: u64, rebases: &[(u64, u64)]) -> bool {
-    rebases
-        .iter()
-        .any(|(newer, at)| *newer > generation && *at < base)
 }
 
 /// Reads one snapshot's entries into the dicts of `wanted`, and says
@@ -749,17 +854,19 @@ fn take_entry(
     true
 }
 
-/// Pass 4: every shard's tail replayed over its image. Returns the shards
-/// and, per segment file, whether a kept record came from it.
+/// Pass 4: every shard's tail replayed over its image. Marks in `kept`
+/// the segments a kept or cut record came from, and every file a front
+/// that killed a record was read from.
 fn replay_tails<D: Disk>(
     spec: &RecoverSpec<'_, D>,
     scan: Scan,
     chosen: &Chosen,
+    fronts: Vec<Vec<Front>>,
+    (kept, snaps): (&mut [bool], &mut [SnapFile]),
     building: Building,
-    files: usize,
     report: &mut Report,
-) -> (Vec<RecoveredShard>, Vec<bool>) {
-    let mut kept = vec![false; files];
+) -> Vec<RecoveredShard> {
+    let mut kills = vec![false; snaps.len()];
     report.segments = scan.report.segments;
     report.records = scan.report.records;
     report.malformed = scan.report.malformed;
@@ -771,12 +878,12 @@ fn replay_tails<D: Disk>(
     let zipped = dicts
         .into_iter()
         .zip(due)
-        .zip(scan.buckets)
+        .zip(scan.buckets.into_iter().zip(fronts))
         .zip(scan.damaged);
-    for (shard, (((mut dict, due), bucket), damaged)) in (0u16..).zip(zipped) {
+    for (shard, (((mut dict, due), (bucket, fronts)), damaged)) in (0u16..).zip(zipped) {
         let index = usize::from(shard);
         let base = chosen.images[index].unwrap_or(0);
-        let (records, discarded) = prefix(bucket, base, &mut kept);
+        let (records, discarded) = prefix(bucket, base, &fronts, kept, &mut kills);
         let applied = records.len() as u64;
         report.applied += applied;
         report.discarded += discarded;
@@ -805,36 +912,43 @@ fn replay_tails<D: Disk>(
             cut: gap || lossy,
         });
     }
-    (shards, kept)
+    for (snap, kills) in snaps.iter_mut().zip(kills) {
+        snap.kills |= kills;
+    }
+    shards
 }
 
 /// A shard's records from `start` upwards to the first missing sequence,
 /// and how many came after it — once every record a newer generation's
-/// `Rebase` made dead is gone. Marks in `kept` the files the returned
-/// records came from, and the file of every `Rebase`, which must outlive
-/// the records it kills.
+/// front made dead is gone. Marks in `kept` the files the returned
+/// records came from; the files of the records the gap discarded, which
+/// the next start replays if whatever cut them does not recur; the file
+/// of every `Rebase`; and, in `kept` or `kills`, the file of every front
+/// that killed a record — a front must outlive the records it kills.
 fn prefix(
     bucket: Vec<(u64, u64, usize, Owned)>,
     start: u64,
+    fronts: &[Front],
     kept: &mut [bool],
+    kills: &mut [bool],
 ) -> (Vec<(u64, Owned)>, u64) {
-    let rebases: Vec<(u64, u64)> = bucket
-        .iter()
-        .filter(|(_, _, _, effect)| matches!(effect, Owned::Rebase))
-        .map(|(seq, generation, file, _)| {
+    for (_, _, file, effect) in &bucket {
+        if matches!(effect, Owned::Rebase) {
             kept[*file] = true;
-            (*seq, *generation)
-        })
-        .collect();
-    let mut live: Vec<(u64, u64, usize, Owned)> = bucket
-        .into_iter()
-        .filter(|(seq, generation, _, _)| {
-            *seq >= start
-                && !rebases
-                    .iter()
-                    .any(|(from, newer)| newer > generation && seq >= from)
-        })
-        .collect();
+        }
+    }
+    let mut live: Vec<(u64, u64, usize, Owned)> = Vec::with_capacity(bucket.len());
+    for record in bucket {
+        let (seq, generation, _, _) = &record;
+        if let Some(front) = fronts
+            .iter()
+            .find(|front| front.kills_record(*generation, *seq))
+        {
+            keep(front.source, kept, kills);
+        } else if *seq >= start {
+            live.push(record);
+        }
+    }
     // By sequence, the newest generation first within one: the duplicate
     // below is then the older record, and it is the one skipped.
     live.sort_by_key(|(seq, generation, _, _)| (*seq, std::cmp::Reverse(*generation)));
@@ -844,6 +958,7 @@ fn prefix(
     for (seq, _, file, effect) in live {
         if discarded > 0 || seq > expected {
             discarded += 1;
+            kept[file] = true;
         } else if seq == expected {
             kept[file] = true;
             records.push((seq, effect));
@@ -857,7 +972,7 @@ fn prefix(
 }
 
 /// Pass 5: remove every snapshot nothing used and every segment no kept
-/// record came from — of the files read whole without damage. A removal
+/// or cut record came from — of the files read whole without damage. A removal
 /// that fails is left for the next start.
 ///
 /// A file damage was met in stays: a read can fail where the next one
@@ -877,7 +992,7 @@ fn remove_garbage<D: Disk>(
 ) {
     let garbage = snaps
         .iter()
-        .filter(|snap| !snap.used && !snap.damaged)
+        .filter(|snap| !snap.used && !snap.damaged && !snap.kills)
         .map(|snap| snap.name.as_str())
         .chain(
             segments
