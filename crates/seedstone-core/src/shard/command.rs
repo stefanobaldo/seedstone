@@ -458,8 +458,9 @@ impl Command {
     /// the five `denied_when_full` names, `Del`, the four expiry setters,
     /// `Persist` and `FlushDb`. The lookups are not here, though one may
     /// append the deletion of a key whose deadline has passed: that record
-    /// replays to what a reader already sees, and refusing a read over it
-    /// would turn a disk fault into an outage of reads too.
+    /// replays to what a reader already sees, so a refusing executor removes
+    /// the key without it (`remove_if_expired`) and serves the read —
+    /// refusing it would turn a disk fault into an outage of reads too.
     #[must_use]
     pub const fn writes_the_log(&self) -> bool {
         matches!(
