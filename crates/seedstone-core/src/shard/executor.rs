@@ -417,7 +417,14 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
             // polled only when the inbox ran dry, so a busy executor would
             // hold its writes' replies for as long as the load lasted. The
             // stop comes next for the same reason, and is ready once. Then
-            // the inbox: work the shard was asked for outranks housekeeping.
+            // the tick, when it is due: it is ready at most once per
+            // `HOUSEKEEPING_TICK` and its work is bounded — a rehash step,
+            // an expiry sample, one slice of an image — so it takes one
+            // tick's share and no more. Behind the inbox it ran only when
+            // the inbox ran dry, and a keyspace walk queues its next step
+            // the moment the last returns, so a walk under load held off
+            // every image, every compaction and the end of every refusal
+            // for as long as it lasted (#79). The inbox comes last.
             biased;
 
             progress = next_progress(&mut this.sync.link), if this.sync.link.is_some() => {
@@ -435,6 +442,10 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
             // too: stopping on either is the same stop. What is still
             // queued is served by the stop itself.
             _ = stop.changed() => break,
+            // One ticker per executor rather than one per shard, advancing
+            // every owned dict by the same budget: the same per-dict drain
+            // rate, and the same aggregate work, as independent tickers.
+            _ = tick.tick() => this.housekeeping(),
             // Above the budget the inbox waits for the writer's progress:
             // the stall `write` gave the executor, one step later.
             envelope = inbox.recv(), if !this.sync.over_budget() => {
@@ -443,10 +454,6 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
                 };
                 this.serve(envelope);
             }
-            // One ticker per executor rather than one per shard, advancing
-            // every owned dict by the same budget: the same per-dict drain
-            // rate, and the same aggregate work, as independent tickers.
-            _ = tick.tick() => this.housekeeping(),
         }
     }
     this.stop(&mut inbox).await;

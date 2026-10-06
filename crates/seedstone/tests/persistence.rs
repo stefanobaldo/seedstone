@@ -1018,7 +1018,7 @@ async fn without_a_data_dir_the_three_persistence_commands_name_the_flag() {
 }
 
 /// `conns` connections each pipelining `depth` `SET`s of `value_len` bytes
-/// without pause until `stop` is set: an inbox that never runs dry. Each
+/// without pause until `stop` is set, as full an inbox as clients can keep. Each
 /// connection cycles over a thousand keys of its own, so the flood grows
 /// the log and not the keyspace.
 fn flood(
@@ -1125,6 +1125,53 @@ async fn the_log_compacts_under_a_flood_of_writes() {
     assert!(
         compactions > 0,
         "no compaction while the flood ran ({sent} writes sent)"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}
+
+/// A `SAVE` is answered while sixty-four connections keep walking the
+/// keyspace with `KEYS`. A walk queues each step of its cursor the moment
+/// the previous one returns, with no client round trip between them, so the
+/// executors' inboxes need never run dry — and the housekeeping tick that
+/// opens the asked-for image must run anyway (#79).
+#[tokio::test(flavor = "multi_thread")]
+async fn save_is_answered_while_the_keyspace_is_walked() {
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let (mut node, port) = start_with(&dir, &stderr, &["--fsync", "never"]).await;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let keys: Vec<String> = (0..200_000).map(|i| format!("w{i}")).collect();
+    for chunk in keys.chunks(1000) {
+        let commands: Vec<[&str; 3]> = chunk.iter().map(|key| ["SET", key, "v"]).collect();
+        let refs: Vec<&[&str]> = commands.iter().map(<[&str; 3]>::as_slice).collect();
+        pipelined(&mut stream, &refs).await;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let walkers: Vec<_> = (0..64)
+        .map(|_| {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    round_trip(&mut stream, &["KEYS", "zz*"]).await;
+                }
+            })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let saved =
+        tokio::time::timeout(Duration::from_secs(20), round_trip(&mut stream, &["SAVE"])).await;
+    stop.store(true, Ordering::Relaxed);
+    for walker in walkers {
+        walker.await.unwrap();
+    }
+    node.kill().expect("SIGKILL");
+    node.wait().expect("reaped");
+    assert_eq!(
+        saved.ok(),
+        Some(Frame::Simple("OK".into())),
+        "SAVE not answered within 20 s while the keyspace was walked"
     );
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::remove_file(&stderr).unwrap();

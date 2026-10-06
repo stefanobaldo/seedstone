@@ -212,7 +212,10 @@ fn the_trace_hash_is_pinned_across_processes_and_builds() {
     //
     // Re-pinned: the clients ask for a snapshot on one roll in a hundred
     // (`BGSAVE`), taken off TTL.
-    const MINI_1_42: u64 = 0xf6e7_c967_9f41_f5f2;
+    //
+    // Re-pinned: the housekeeping tick, when due, now outranks the inbox,
+    // which moves when each tick runs against the envelopes around it.
+    const MINI_1_42: u64 = 0x25c8_dc02_b641_1b48;
 
     let outcome = run_sim(&SimConfig::mini(1, 42));
     assert_eq!(
@@ -923,9 +926,12 @@ fn one_seed_per_durability_policy_is_pinned() {
     //
     // Re-pinned, all three: the clients ask for a snapshot on one roll in
     // a hundred (`BGSAVE`), taken off TTL.
+    //
+    // Re-pinned, `interval` and `never`, when the housekeeping tick began to
+    // outrank the inbox; `always` held still.
     const HOSTILE_1_3_ALWAYS: u64 = 0x676a_1ba9_4103_bb1c;
-    const HOSTILE_1_3_INTERVAL: u64 = 0x2f7e_329c_c918_aea2;
-    const HOSTILE_1_3_NEVER: u64 = 0x2495_bee7_97d3_492c;
+    const HOSTILE_1_3_INTERVAL: u64 = 0xf74b_2444_c09f_bb4f;
+    const HOSTILE_1_3_NEVER: u64 = 0xc5c1_dabc_6a7b_a4e9;
     for (policy, pinned) in [
         (SyncPolicy::ALWAYS, HOSTILE_1_3_ALWAYS),
         (SyncPolicy::INTERVAL, HOSTILE_1_3_INTERVAL),
