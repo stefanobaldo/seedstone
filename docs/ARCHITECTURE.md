@@ -39,7 +39,11 @@ nothing else can reach, its replication position, and its log. Shards are
 hosted by a smaller number of **executor** tasks — one per available core — and
 an executor is the only thing that ever touches the state of the shards it
 owns. Work arrives as a batch of `(shard, command)` pairs on an unbounded
-inbox, and an executor answers batches one at a time, in arrival order. Nothing
+inbox, and an executor answers batches one at a time, in arrival order. Its
+housekeeping tick, when due, comes ahead of the inbox: the tick is bounded
+work at most ten times a second, and behind the inbox a load that never let it
+run dry — a keyspace walk queues its next step the moment the last returns —
+would hold off every snapshot and compaction for as long as it lasted. Nothing
 is shared, so nothing is locked.
 
 Separating the two counts is deliberate. The shard count is a placement
