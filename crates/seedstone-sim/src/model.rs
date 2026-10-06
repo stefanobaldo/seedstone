@@ -492,7 +492,11 @@ impl Model {
                 // reads its reply the same way.
                 Check::Counter { key, delta } => {
                     if matches!(reply, Frame::Integer(_)) {
-                        lock(&self.shared.tally).expected += delta;
+                        {
+                            let mut tally = lock(&self.shared.tally);
+                            tally.expected += delta;
+                            tally.counter_acks += 1;
+                        }
                         let shard = shard_of(counter_key(*key).as_bytes(), self.shards);
                         // The crashes this client has not absorbed yet are
                         // the ones that came after the node that applied it

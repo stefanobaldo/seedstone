@@ -562,7 +562,7 @@ fn the_disk_bound_is_the_formula_and_a_peak_past_it_is_a_violation() {
 fn a_run_with_no_snapshot_cycle_exercised_nothing() {
     let mut outcome = crate::outcome::nothing_observed();
     // Everything else a run needs to have exercised, at one.
-    outcome.expected_sum = 1;
+    outcome.counter_acks = 1;
     outcome.dead_checks = 1;
     outcome.alive_checks = 1;
     outcome.plain_checks = 1;
@@ -570,6 +570,27 @@ fn a_run_with_no_snapshot_cycle_exercised_nothing() {
     assert!(!outcome.invariants_were_exercised(), "no cycle ran");
     outcome.snapshot_cycles = 1;
     assert!(outcome.invariants_were_exercised());
+}
+
+/// The counter was exercised when some increment was acknowledged, not when
+/// the acknowledged deltas happen to sum to something: they are drawn from
+/// -10..=10, and hostile seed 1 once acknowledged 59 that summed to zero.
+#[test]
+fn acknowledged_increments_summing_to_zero_still_exercised_the_counter() {
+    let mut outcome = crate::outcome::nothing_observed();
+    outcome.counter_acks = 59;
+    outcome.dead_checks = 1;
+    outcome.alive_checks = 1;
+    outcome.plain_checks = 1;
+    outcome.walk_checks = 1;
+    outcome.snapshot_cycles = 1;
+    assert!(outcome.invariants_were_exercised(), "{outcome:?}");
+    outcome.counter_acks = 0;
+    outcome.expected_sum = 1;
+    assert!(
+        !outcome.invariants_were_exercised(),
+        "a sum with no acknowledgement behind it exercised nothing"
+    );
 }
 
 /// The simulated node snapshots and compacts on every swept shape, and the
@@ -807,7 +828,7 @@ fn a_held_write_released_as_success_after_a_fault_is_a_violation() {
 #[test]
 fn a_run_that_refused_owes_its_expiration_checks_unless_no_volatile_write_was_taken() {
     let mut outcome = crate::outcome::nothing_observed();
-    outcome.expected_sum = 1;
+    outcome.counter_acks = 1;
     outcome.plain_checks = 1;
     outcome.walk_checks = 1;
     outcome.snapshot_cycles = 1;
