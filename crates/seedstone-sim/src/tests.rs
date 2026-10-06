@@ -458,6 +458,14 @@ fn the_crash_schedule_is_drawn_from_the_seed() {
     let _ = (a.next_due(Duration::ZERO), b.next_due(Duration::ZERO));
 }
 
+/// A per-seed plan names no schedule until the config resolves it: drawn
+/// unresolved it would be a seed that silently never crashes.
+#[test]
+#[should_panic(expected = "resolve a per-seed plan")]
+fn a_per_seed_plan_is_resolved_before_its_schedule_is_drawn() {
+    let _ = crate::durability::CrashSchedule::draw(CrashPlan::PerSeed { max: 2 }, 5);
+}
+
 /// The verdict's shape under a crash: the counter sum is a range, a lost
 /// durable write is a violation on the swept disk and an excused one on
 /// the hostile disk only when recovery reported the shard.
