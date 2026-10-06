@@ -53,13 +53,15 @@ fn bench(shards: u16, config: CheckpointConfig) -> Bench {
 
 /// One tick at `bytes` handed over, the last batch sent `batch`.
 fn tick(b: &mut Bench, bytes: u64, batch: Option<u64>) -> Option<Completed> {
-    b.checkpoint.tick(
-        0,
-        &mut b.states,
-        now(),
-        &NoTrace,
-        LogPosition { bytes, batch },
-    )
+    b.checkpoint
+        .tick(
+            0,
+            &mut b.states,
+            now(),
+            &NoTrace,
+            LogPosition { bytes, batch },
+        )
+        .completed
 }
 
 /// A position at `bytes`, the last batch sent the first.
@@ -228,16 +230,19 @@ fn the_image_is_complete_after_enough_ticks_and_the_footer_counts_it() {
     let mut ticks = 0u64;
     let mut done = None;
     while recorder.snapshots.lock().unwrap().is_empty() {
-        done = b.checkpoint.tick(
-            0,
-            &mut b.states,
-            now(),
-            &recorder,
-            LogPosition {
-                bytes,
-                batch: Some(7),
-            },
-        );
+        done = b
+            .checkpoint
+            .tick(
+                0,
+                &mut b.states,
+                now(),
+                &recorder,
+                LogPosition {
+                    bytes,
+                    batch: Some(7),
+                },
+            )
+            .completed;
         ticks += 1;
         assert!(ticks < 10, "a twenty-key image should not take ten ticks");
     }
@@ -282,6 +287,8 @@ fn the_image_is_complete_after_enough_ticks_and_the_footer_counts_it() {
             cycle: 0,
             through_batch: Some(7),
             bytes: report.bytes,
+            ticks: report.ticks,
+            cleared: 0,
         }),
         "the completing tick names the last batch sent before the open"
     );

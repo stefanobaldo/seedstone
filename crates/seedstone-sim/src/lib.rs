@@ -133,8 +133,8 @@ use seedstone_core::log::writer::{
 };
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
 use seedstone_core::shard::{
-    Deadlines, ExecutorPlants, LogFault, Now, PoolSpec, ShardPolicy, ShardPool, SyncPolicy,
-    TraceSink, parse_i64,
+    Deadlines, ExecutorPlants, LogFault, Now, PersistenceStats, PoolSpec, ShardPolicy, ShardPool,
+    SyncPolicy, TraceSink, parse_i64,
 };
 use seedstone_resp::Frame;
 use seedstone_service::{NodeInfo, serve_connection};
@@ -597,8 +597,10 @@ async fn server(
     // that fails I/O a start can fail on the header write of a segment, and
     // a node that gave up there would end the run with a harness error
     // rather than a finding.
+    // One set per start, shared by the writer and the pool, as the binary's.
+    let stats = PersistenceStats::new(executors);
     let (recovery, generation, opened, log_failed) = loop {
-        if let Ok(started) = start_log(shards, executors, seed, planted, &sink, &shared) {
+        if let Ok(started) = start_log(shards, executors, seed, planted, &sink, &shared, &stats) {
             break started;
         }
         lock(&shared.tally).start_failures += 1;
@@ -641,6 +643,7 @@ async fn server(
         plants: executor_plants(planted),
         links,
         log_failed,
+        stats,
     };
     let pool = match planted {
         Some(Plant::ServeExpired) => parts.spawn(ServeExpired),
@@ -758,6 +761,7 @@ fn start_log(
     planted: Option<Plant>,
     sink: &HashSink,
     shared: &Shared,
+    stats: &Arc<PersistenceStats>,
 ) -> std::io::Result<(Recovery, u64, Opened<SimDisk, HashSink>, bool)> {
     let disk = shared.disk.clone();
     let wal = Path::new(DATA_DIR).join("wal");
@@ -797,6 +801,7 @@ fn start_log(
         checkpoint: SIM_CHECKPOINT,
         trace: sink.clone(),
         plants: writer_plants(planted),
+        stats: stats.clone(),
     })?;
     // Reported as the binary reports it, so the run counts the fault its
     // refusals follow.
@@ -824,6 +829,7 @@ struct PoolParts<F, G> {
     plants: ExecutorPlants,
     links: Vec<WriterLink>,
     log_failed: bool,
+    stats: Arc<PersistenceStats>,
 }
 
 impl<F, G> PoolParts<F, G>
@@ -847,6 +853,7 @@ where
             plants: self.plants,
             writer_links: self.links,
             log_failed: self.log_failed,
+            stats: self.stats,
         })
     }
 }

@@ -47,6 +47,7 @@ fn pool_with_links_and_trace<T: TraceSink>(
         plants: ExecutorPlants::default(),
         writer_links: links,
         log_failed: false,
+        stats: crate::shard::PersistenceStats::new(1),
     })
 }
 
@@ -82,6 +83,7 @@ fn pool_with_links_and_checkpoint(policy: SyncPolicy, links: Vec<WriterLink>) ->
         plants: ExecutorPlants::default(),
         writer_links: links,
         log_failed: false,
+        stats: crate::shard::PersistenceStats::new(1),
     })
 }
 

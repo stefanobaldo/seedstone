@@ -54,6 +54,7 @@ mod apply;
 mod command;
 mod durability;
 pub(crate) mod executor;
+pub mod persistence;
 mod policy;
 mod pool;
 mod reply;
@@ -64,6 +65,7 @@ pub use durability::{ExecutorPlants, RefusalReport, SyncPolicy};
 pub use executor::{
     EVICTION_SAMPLES, HOUSEKEEPING_TICK, Now, Replayed, ShardState, frozen_clock, replay_into,
 };
+pub use persistence::{ExecutorCell, PersistenceStats};
 pub use policy::{
     CompactionReport, Deadlines, EvictionPolicy, ExpiryPolicy, LogFault, NoTrace, ShardPolicy,
     SnapshotReport, TraceSink,

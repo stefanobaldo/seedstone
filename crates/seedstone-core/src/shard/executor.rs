@@ -12,10 +12,12 @@ use crate::memory::{EvictionMode, MemoryGauge, MemoryLimit};
 use crate::shard::apply::{append, apply};
 use crate::shard::durability::{Held, Mode, Sent, SyncState, send};
 use crate::shard::{
-    Command, Envelope, EvictionPolicy, ExecutorPlants, ExpiryPolicy, KIND_SLOTS, RefusalReport,
-    Reply, ReplyError, Route, ShardPolicy, ShardStats, SyncPolicy, TraceSink,
+    Command, Envelope, EvictionPolicy, ExecutorPlants, ExpiryPolicy, KIND_SLOTS, PersistenceStats,
+    RefusalReport, Reply, ReplyError, Route, ShardPolicy, ShardStats, SyncPolicy, TraceSink,
 };
 use bytes::Bytes;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
@@ -343,6 +345,9 @@ pub struct ExecutorSpec<T, L, P, C> {
     pub link: Option<WriterLink>,
     /// Turns `true` when the pool is shut down.
     pub stop: watch::Receiver<bool>,
+    /// The node's persistence counters, and which cell is this executor's.
+    pub stats: Arc<PersistenceStats>,
+    pub executor: u16,
 }
 
 /// One executor task: own a contiguous range of shards, answer the inbox,
@@ -454,6 +459,9 @@ struct Executor<T, L, P, C> {
     clock: fn() -> u64,
     checkpoint: C,
     sync: SyncState,
+    stats: Arc<PersistenceStats>,
+    /// This executor's index: which of `stats`'s cells is its own.
+    index: u16,
 }
 
 impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T, L, P, C> {
@@ -471,6 +479,8 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             log_failed,
             link,
             stop,
+            stats,
+            executor,
         } = spec;
         let sync = SyncState::new(sync, plants, link);
         let mut this = Self {
@@ -482,6 +492,8 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             clock,
             checkpoint,
             sync,
+            stats,
+            index: executor,
         };
         if log_failed {
             this.refuse();
@@ -847,7 +859,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             bytes: self.sync.sent_bytes,
             batch: self.sync.batch.checked_sub(1),
         };
-        let completed = self.checkpoint.tick(
+        let tick = self.checkpoint.tick(
             self.first_shard,
             &mut self.states,
             Now {
@@ -857,7 +869,13 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             &self.trace,
             position,
         );
-        if let Some(done) = completed {
+        let cell = &self.stats.executors[usize::from(self.index)];
+        cell.cycle_open
+            .store(u64::from(self.checkpoint.is_open()), Ordering::Relaxed);
+        if tick.faulted {
+            cell.last_save_failed.store(1, Ordering::Relaxed);
+        }
+        if let Some(done) = tick.completed {
             if let Some(link) = &self.sync.link {
                 let _ = link.to_writer.send(ToWriter::Covered {
                     executor: link.executor,

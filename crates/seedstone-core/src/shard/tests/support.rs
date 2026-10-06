@@ -253,6 +253,7 @@ fn start<T: TraceSink>(
 ) -> ShardPool {
     let wal = Path::new(WAL);
     let generation = next_generation(disk, wal).unwrap();
+    let stats = crate::shard::PersistenceStats::new(2);
     let Opened {
         mut writer,
         inbox,
@@ -267,6 +268,7 @@ fn start<T: TraceSink>(
         checkpoint: SMALL,
         trace: trace.clone(),
         plants: WriterPlants::default(),
+        stats: stats.clone(),
     })
     .unwrap();
     disk.fail_writes(failing);
@@ -297,6 +299,7 @@ fn start<T: TraceSink>(
         plants: ExecutorPlants::default(),
         writer_links: links,
         log_failed,
+        stats,
     });
     tokio::spawn(writer.run(inbox));
     pool

@@ -19,8 +19,8 @@ use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, Recovery, recover};
 use seedstone_core::log::writer::{SEGMENT_BYTES, Writer, WriterPlants, WriterSpec, write_rebases};
 use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{
-    Command, CompactionReport, Deadlines, ExecutorPlants, LogFault, NoTrace, Now, PoolSpec,
-    RefusalReport, Reply, ShardPool, Shutdown, SnapshotReport, SyncPolicy, TraceSink,
+    Command, CompactionReport, Deadlines, ExecutorPlants, LogFault, NoTrace, Now, PersistenceStats,
+    PoolSpec, RefusalReport, Reply, ShardPool, Shutdown, SnapshotReport, SyncPolicy, TraceSink,
 };
 use seedstone_resp::{Frame, encode};
 use seedstone_service::log::{
@@ -935,6 +935,9 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
     let disk = StdDisk;
     let wal = dir.join("wal");
     let executors = executors();
+    // One set of counters for the node: the writer keeps the log's, the
+    // executors their own, and `INFO` reads both through the pool.
+    let stats = PersistenceStats::new(executors);
     let started = (|| {
         disk.create_dir_all(&wal)?;
         // `wal/` is a directory entry of `PATH`: a crash before this sync
@@ -964,6 +967,7 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
             checkpoint: CheckpointConfig::PRODUCTION,
             trace: FaultLines,
             plants: WriterPlants::default(),
+            stats: stats.clone(),
         })?;
         // A rebase the log refuses is reported and the node starts refusing
         // writes, as on any failed write of the log.
@@ -1007,6 +1011,7 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
         plants: ExecutorPlants::default(),
         writer_links: opened.links,
         log_failed,
+        stats,
     });
     tokio::spawn(opened.writer.run(opened.inbox));
     Ok((pool, Some(lock)))

@@ -402,6 +402,7 @@ async fn a_write_hands_its_records_to_the_writer_in_one_submission() {
         plants: crate::shard::ExecutorPlants::default(),
         writer_links: links,
         log_failed: false,
+        stats: crate::shard::PersistenceStats::new(1),
     });
     assert_eq!(pool.dispatch(set(b"k", b"v")).await, Reply::Ok);
     let Some(ToWriter::Submit { batch, bytes, .. }) = to_writer.recv().await else {
@@ -694,6 +695,7 @@ async fn a_pool_spawned_from_a_recovery_serves_the_recovered_keys() {
         plants: crate::shard::ExecutorPlants::default(),
         writer_links: Vec::new(),
         log_failed: false,
+        stats: crate::shard::PersistenceStats::new(1),
     });
     assert_eq!(
         pool.dispatch(Command::Get {
@@ -763,11 +765,11 @@ async fn the_checkpoint_is_ticked_once_per_executor_per_housekeeping_tick() {
             _now: Now,
             _trace: &T,
             _log: crate::log::checkpoint::LogPosition,
-        ) -> Option<crate::log::checkpoint::Completed> {
+        ) -> crate::log::checkpoint::Tick {
             self.ticks.fetch_add(1, Ordering::SeqCst);
             self.shards_seen
                 .fetch_max(states.len() as u64, Ordering::SeqCst);
-            None
+            crate::log::checkpoint::Tick::NONE
         }
     }
 
@@ -792,6 +794,7 @@ async fn the_checkpoint_is_ticked_once_per_executor_per_housekeeping_tick() {
         plants: crate::shard::ExecutorPlants::default(),
         writer_links: Vec::new(),
         log_failed: false,
+        stats: crate::shard::PersistenceStats::new(2),
     });
     // Let both executors start their interval, then step the clock one
     // period at a time: a single jump of three periods would fire one tick,
