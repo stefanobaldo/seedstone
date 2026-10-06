@@ -9,44 +9,61 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ### Added
 
-- `--data-dir PATH`: the node keeps a write-ahead log under `PATH/wal/`
-  and replays it on the next start. A shard whose log has a gap is
-  replayed up to the gap and reported. One node per directory: a second
-  one started on it is refused. A clean stop (`SIGTERM`, `SIGINT`) syncs
-  the log before the process ends. Ten new log events: `recovery`,
-  `recovery_truncated`, `recovery_failed`, `log_fault`, `snapshot_fault`,
-  `snapshot`, `compaction`, `refusal_ended`, `shutdown_timeout`,
-  `fsync_ignored` — see `docs/operations.md`.
-- `--fsync always|interval|never` under `--data-dir`: `always` acknowledges
-  a write only once it is on disk, `interval` (the default) syncs the log
-  every 100 ms while there is anything to sync, busy or idle, and `never`
-  leaves the log to the kernel and keeps the last snapshot. The sync runs
-  off the request path, and a read waits for one only when it is pipelined
-  with a write on its own connection. What each setting
-  promises is in `docs/operations.md`.
-- The log is written by one writer per node, so `--fsync always` issues
-  one sync at a time for the whole node, and each covers every write that
-  was ready when it was issued (#81). Measured on a cloud disk with 3 240
-  provisioned IOPS against Redis 8.10.0 with `appendfsync always`, `SET`
-  under `--fsync always` reads 1.63× Redis's throughput at pipeline depth
-  64 and level with it at depth 1.
-- A disk that fails or fills under `--data-dir` is met with refusal, not
-  with acknowledgements the node cannot keep: the node answers writes
-  `MISCONF`, serves reads, and each executor resumes on its own once a
-  snapshot of its memory is durable. A start whose first write to the log
-  fails begins the same way. The reply, and how it compares with Redis's on
-  a failed AOF write, is in `docs/compatibility.md` (#72).
-- Snapshots and compaction under `--data-dir`: past 64 MiB of log an
-  executor takes a snapshot of its shards without stopping them, and the
-  node removes the log every executor's snapshot covers. The directory
-  stays within a stated bound — about three times the snapshots plus
-  64 MiB per executor, plus one 64 MiB file — across restarts too: a
-  previous process's files are replaced once they exceed it. A start reads
-  the newest snapshot plus the log since it rather than the whole history.
-  `docs/operations.md` states the bound.
+- **Persistence.** `--data-dir PATH` keeps a write-ahead log under
+  `PATH/wal/` and recovers the keyspace on the next start from each shard's
+  newest snapshot plus the log since it. A shard whose log has a gap is
+  recovered up to the gap and reported. One node per directory: a second one
+  started on it is refused. A clean stop (`SIGTERM`, `SIGINT`, or `SHUTDOWN`
+  from a client) syncs the log before the process ends.
+- **`--fsync always|interval|never`** says when the log is synced and what a
+  crash can cost: `always` acknowledges a write only once it is on disk,
+  `interval` (the default) syncs every 100 ms while there is anything to
+  sync, busy or idle, and `never` leaves the log to the kernel and keeps the
+  last snapshot. The sync runs off the request path; a read waits for one
+  only when it is pipelined behind a write on its own connection.
+- **One sync at a time for the whole node.** The log is written by one
+  writer per node, so `--fsync always` issues one sync at a time, and each
+  covers every write that was ready when it was issued (#81). Measured on a
+  cloud disk with 3 240 provisioned IOPS against Redis 8.10.0 with
+  `appendfsync always`, `SET` under `--fsync always` reads 1.63× Redis's
+  throughput at pipeline depth 64 and level with it at depth 1.
+- **Snapshots and compaction.** Past 64 MiB of log an executor images its
+  shards without stopping them, and the node removes the log every image
+  covers. The directory stays within a stated bound — about three times the
+  snapshots plus 64 MiB per executor, plus one 64 MiB file — across restarts
+  too: a previous process's files are replaced once they exceed it.
+- **`SAVE`, `BGSAVE` and `LASTSAVE`.** `BGSAVE` asks for an image now; `SAVE`
+  answers once an image taken after it is durable, without blocking the
+  shards; `LASTSAVE` is the instant since which every shard has had one.
+- **`SHUTDOWN [NOSAVE|SAVE]`**: the clean stop, asked for by a client. Under
+  `--no-auth` any client that can connect can use it.
+- **A failing or full disk is met with refusal**, not with acknowledgements
+  the node cannot keep: writes answer `MISCONF`, reads are served, and each
+  executor resumes on its own once a snapshot of its memory is durable. A
+  start whose first write to the log fails begins the same way. The reply,
+  and how it compares with Redis's on a failed AOF write, is in
+  `docs/compatibility.md` (#72).
+- **A slow sync is visible.** A sync in flight for more than a second writes
+  `sync_slow`, and `sync_slow_ended` when it ends (#77).
+- **`INFO persistence`**: the log's size, syncs in flight and slow, images
+  taken and when, executors refusing, and shards whose recovered state may
+  miss writes until an image covers them — the count falls as images land,
+  and each `snapshot` line says how many it cleared (#73). Redis's field
+  names where the meaning matches, this server's own after them, nothing
+  filled in; `docs/operations.md` lists every field.
+- **Log events** for all of the above: `recovery`, `recovery_truncated`,
+  `recovery_failed`, `log_fault`, `snapshot_fault`, `sync_slow`,
+  `sync_slow_ended`, `refusal_ended`, `snapshot`, `compaction`,
+  `shutdown_timeout`, `fsync_ignored` — one table in `docs/operations.md`.
 - `bench/campaign.sh durability`: `SET` at two pipeline depths under each
   `--fsync` setting, against Redis with AOF at the matching `appendfsync`,
   and `GET` with the log synced on every write against no log.
+
+### Fixed
+
+- A refusing executor appends nothing to the log, not even a lazily expired
+  key's deletion, so a log that keeps failing is not refused twice for one
+  `log_fault` (#85).
 
 ## [0.2.0] - 2026-09-22
 
