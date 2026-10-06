@@ -1,7 +1,7 @@
 # Releasing
 
 Versions are annotated tags on `main`, named `vMAJOR.MINOR.PATCH` and
-following SemVer. The project is `0.x` until it persists data.
+following SemVer. The project is `0.x` while the keyspace holds only strings.
 
 ## Candidates first, for anything but a patch
 

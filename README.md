@@ -23,8 +23,9 @@ OK
 ```
 
 `--bind <addr:port>`, `--max-clients <n>`, `--maxmemory <size>`,
-`--maxmemory-policy allkeys-lru|noeviction`, `--requirepass-file <path>` and
-`--no-auth` are the only options a server takes; `--version` and `--help`
+`--maxmemory-policy allkeys-lru|noeviction`, `--requirepass-file <path>`,
+`--no-auth`, `--data-dir <path>` and `--fsync always|interval|never` are the
+only options a server takes; `--version` and `--help`
 answer and exit, in first position and nowhere else. The password may also
 arrive in `SEEDSTONE_REQUIREPASS`. It is never an argument — a command line is
 readable by every other process on the host. A bind outside loopback
@@ -44,7 +45,8 @@ in the environment for one.
 `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `PERSIST`, `TTL`, `PTTL`,
 `TYPE`, `STRLEN`, `INCRBY`, `SCAN`, `KEYS`, `DBSIZE`, `FLUSHDB`, `PING`,
 `ECHO`, `AUTH`, `HELLO`, `INFO`, `CONFIG GET`, `SLOWLOG`, `LATENCY`,
-`COMMAND`, `CLIENT`, `QUIT`. `DEL`, `EXISTS` and `MGET` take several keys.
+`COMMAND`, `CLIENT`, `SAVE`, `BGSAVE`, `LASTSAVE`, `SHUTDOWN`, `QUIT`.
+`DEL`, `EXISTS` and `MGET` take several keys.
 Keys with a deadline are removed when touched and by a background sweep that
 does not wait to be asked. With
 `--maxmemory`, the keyspace is held under a ceiling by evicting
@@ -52,8 +54,8 @@ least-recently-used keys, or by refusing writes under `noeviction`.
 
 `INFO`, `CONFIG GET`, `SLOWLOG` and `LATENCY` are the operational surface a
 monitoring agent reads: `INFO` in sections — `server`, `clients`, `memory`,
-`stats`, `keyspace` and `commandstats` with a call count and a measured
-per-command time, carrying only fields this node can state truthfully —
+`persistence`, `stats`, `keyspace` and `commandstats` with a call count and a
+measured per-command time, carrying only fields this node can state truthfully —
 `CONFIG GET` over the parameters that describe how it was
 started, and `SLOWLOG` and `LATENCY` answering as the switched-off monitors
 they are, so that a scrape completes rather than logging a refusal on every
@@ -61,11 +63,17 @@ pass. What the server itself writes while it runs — one JSON line per event,
 with a level — and how it is operated are in
 [docs/operations.md](docs/operations.md).
 
-**Persistence, first cut:** with `--data-dir PATH` every write is appended to a
-log and replayed on the next start; `--fsync always|interval|never` says
-when the log is synced and what a crash can cost (`interval`, every
-100 ms, by default), and snapshots keep the log bounded. The flag is
-off by default. See [docs/operations.md](docs/operations.md).
+**Persistence:** with `--data-dir PATH` every write is appended to a log and
+a restart recovers the keyspace from the newest snapshot of each shard plus
+the log since it; `--fsync always|interval|never` says when the log is synced
+and so what a crash can cost — `always` acknowledges nothing that is not on
+disk, `interval` (the default) syncs every 100 ms, `never` leaves it to the
+kernel. Snapshots are taken without stopping the shards and keep the
+directory within a stated bound; `SAVE`, `BGSAVE` and `LASTSAVE` ask for one
+and date it; `INFO persistence` is what a monitor reads about it. A disk that
+fails or fills is met with refusal, not with acknowledgements the node cannot
+keep. Without the flag nothing is written to disk. See
+[docs/operations.md](docs/operations.md).
 
 **What it does not have yet:** RESP3, replication,
 clustering, and every data type except strings.

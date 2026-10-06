@@ -2,7 +2,7 @@
 
 Notable changes to SeedStone, in the form of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
-SemVer and are `0.x` until the server persists data;
+SemVer and are `0.x` while the keyspace holds only strings;
 [docs/RELEASING.md](docs/RELEASING.md) is how one is cut.
 
 ## [Unreleased]
