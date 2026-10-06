@@ -61,8 +61,9 @@ use tokio::time::Instant;
 /// extraction has to respect: every extracted handler sits below in the order
 /// the match dispatches, so following a command from its arm to its handler is
 /// a pass rather than a search. The helpers that belong to no single arm —
-/// [`evict_if_expired`], [`deadline`], [`remaining_seconds`], [`append`] —
-/// follow those handlers as their own group.
+/// [`evict_if_expired`], [`remove_if_expired`], [`deadline`],
+/// [`remaining_seconds`], [`append`] — follow those handlers as their own
+/// group.
 pub fn apply<L: ReplicationLog, P: ShardPolicy>(
     state: &mut ShardState<L>,
     shard: u16,
@@ -80,6 +81,7 @@ pub fn apply<L: ReplicationLog, P: ShardPolicy>(
         log,
         seq,
         expired,
+        refusing,
         ..
     } = state;
     // Lazy expiry, once, before any arm has looked at the key. Here rather
@@ -93,12 +95,17 @@ pub fn apply<L: ReplicationLog, P: ShardPolicy>(
     // rather than an entry, so there is no single key whose deadline it could
     // be meeting.
     if let Route::Key(key) = cmd.route() {
-        match evict_if_expired(dict, log, seq, shard, key, now.instant, policy) {
-            Err(failed) => return failed,
-            // The lazy half of `expired_keys`. The active half is
-            // [`sweep_expired`]'s, and Redis counts both under the one field.
-            Ok(reclaimed) => *expired += u64::from(reclaimed),
-        }
+        let reclaimed = if *refusing {
+            remove_if_expired(dict, key, now.instant, policy)
+        } else {
+            match evict_if_expired(dict, log, seq, shard, key, now.instant, policy) {
+                Err(failed) => return failed,
+                Ok(reclaimed) => reclaimed,
+            }
+        };
+        // The lazy half of `expired_keys`. The active half is
+        // [`sweep_expired`]'s, and Redis counts both under the one field.
+        *expired += u64::from(reclaimed);
     }
 
     match cmd {
@@ -717,7 +724,8 @@ pub fn scan_step<P: ShardPolicy>(
 /// that cannot be logged does not: the alternative is a keyspace that has
 /// moved past a log which does not describe it. The entry stays, and the
 /// command that met it is refused rather than answered from a value that
-/// should be gone.
+/// should be gone. While the executor is refusing, the dispatch calls
+/// [`remove_if_expired`] instead.
 pub fn evict_if_expired<L: ReplicationLog, P: ExpiryPolicy>(
     dict: &mut Dict,
     log: &mut L,
@@ -727,6 +735,35 @@ pub fn evict_if_expired<L: ReplicationLog, P: ExpiryPolicy>(
     now: Instant,
     expiry: &P,
 ) -> Result<bool, Reply> {
+    if !is_due(dict, key, now, expiry) {
+        return Ok(false);
+    }
+    append(log, seq, shard, Effect::Del { key })?;
+    dict.remove(key);
+    Ok(true)
+}
+
+/// [`evict_if_expired`] for a shard whose executor is refusing writes: the
+/// key is removed and nothing is appended (#85). The log has already
+/// failed, the executor applies no client write, and the snapshot that ends
+/// the refusal images memory without the key; the deadline is past, so a
+/// replay of what the log does hold finds the key dead either way. A record
+/// would only be another write for a log that failed.
+pub fn remove_if_expired<P: ExpiryPolicy>(
+    dict: &mut Dict,
+    key: &[u8],
+    now: Instant,
+    expiry: &P,
+) -> bool {
+    if !is_due(dict, key, now, expiry) {
+        return false;
+    }
+    dict.remove(key);
+    true
+}
+
+/// Whether `key` holds an entry whose deadline has come due.
+fn is_due<P: ExpiryPolicy>(dict: &Dict, key: &[u8], now: Instant, expiry: &P) -> bool {
     // A keyspace with no deadlines in it — which is nearly every keyspace —
     // leaves here without hashing anything, so standing in front of every
     // command costs it a predictable branch and not a second lookup. The
@@ -734,17 +771,10 @@ pub fn evict_if_expired<L: ReplicationLog, P: ExpiryPolicy>(
     // holds can be expired. A policy that takes undated keys is the one case
     // where that shortcut would hide the answer, so it says so.
     if !dict.may_hold_deadlines() && !expiry.takes_undated() {
-        return Ok(false);
+        return false;
     }
-    let Some(entry) = dict.get(key) else {
-        return Ok(false);
-    };
-    if !expiry.due_on_read(entry.expires_at, now) {
-        return Ok(false);
-    }
-    append(log, seq, shard, Effect::Del { key })?;
-    dict.remove(key);
-    Ok(true)
+    dict.get(key)
+        .is_some_and(|entry| expiry.due_on_read(entry.expires_at, now))
 }
 
 /// The instant an expiry option lands on, or `None` for a key with no

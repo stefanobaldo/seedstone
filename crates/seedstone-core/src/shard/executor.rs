@@ -227,6 +227,9 @@ pub struct ShardState<L> {
     /// When this shard's newest durable image was taken, Unix milliseconds;
     /// `None` until it has one.
     pub image_unix_millis: Option<u64>,
+    /// The executor owning this shard is refusing writes: what lets a read
+    /// that expires its key remove it without a record for the failed log.
+    pub refusing: bool,
 }
 
 impl<L> ShardState<L> {
@@ -253,6 +256,7 @@ impl<L> ShardState<L> {
             usec: [0; KIND_SLOTS],
             lossy: false,
             image_unix_millis: None,
+            refusing: false,
         }
     }
 
@@ -674,6 +678,9 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
                 refused: 0,
                 ticks: 0,
             };
+            for state in &mut self.states {
+                state.refusing = true;
+            }
         }
         self.checkpoint.force();
         // The open cycle is abandoned, and the forced one takes its bases
@@ -1019,6 +1026,9 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
                 });
                 self.sync.mode = Mode::Serving;
                 self.stats.refusing.fetch_sub(1, Ordering::Relaxed);
+                for state in &mut self.states {
+                    state.refusing = false;
+                }
             }
         }
         self.answer_saves(tick.completed.is_some(), tick.faulted);
