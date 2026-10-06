@@ -651,6 +651,12 @@ where
                         chunk.slots.push(Slot::Ready(frame, label));
                         return Drained::HangUp;
                     }
+                    // No slot: Redis answers nothing, and closes. What was
+                    // pipelined ahead of it is still owed and still written.
+                    Action::Shutdown => {
+                        node.stop.notify_one();
+                        return Drained::HangUp;
+                    }
                 }
             }
             // A proper prefix of a valid frame: read more.

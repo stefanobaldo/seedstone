@@ -94,16 +94,16 @@ async fn command_subcommands_answer_without_breaking_the_session() {
 /// Each name is sent with no arguments and the reply is checked for one
 /// thing: that it is not `unknown command`. Most answer an arity error,
 /// which is exactly the point — an arity error is a command that was
-/// dispatched. `QUIT` is the one name left out, because it would end the
-/// connection the rest of the loop is using; it is covered by
-/// `connection_commands_never_reach_the_router`.
+/// dispatched. `QUIT` and `SHUTDOWN` are left out, because each ends the
+/// connection the rest of the loop is using; they are covered by
+/// `connection_commands_never_reach_the_router` and by the shutdown tests.
 #[tokio::test]
 async fn every_name_in_the_command_table_is_a_command_the_server_runs() {
     let (mut r, mut w, _pool) = connected(4);
     let names: Vec<&[u8]> = COMMANDS
         .iter()
         .map(|(name, _)| *name)
-        .filter(|name| *name != b"QUIT")
+        .filter(|name| *name != b"QUIT" && *name != b"SHUTDOWN")
         .collect();
     let mut out = Vec::new();
     for name in &names {

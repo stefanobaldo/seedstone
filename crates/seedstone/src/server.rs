@@ -32,7 +32,7 @@ use seedstone_service::log::{
 use seedstone_service::{NodeInfo, PasswordStore, Passwords, Secret, serve_connection};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 /// The address a node listens on when the command line says nothing.
 ///
@@ -495,9 +495,10 @@ impl Server {
     /// waiting silently on a connection the server will not read is worse than
     /// a peer that knows.
     ///
-    /// Shutdown is a clean exit from the accept loop, on Ctrl-C or on SIGTERM
-    /// — see `shutdown_requested`: connections already running finish on
-    /// their own tasks, and the process ends when the runtime does.
+    /// Shutdown is a clean exit from the accept loop, on Ctrl-C, on SIGTERM or
+    /// on a client's `SHUTDOWN` — see `shutdown_requested`: connections
+    /// already running finish on their own tasks, and the process ends when
+    /// the runtime does.
     ///
     /// `SIGHUP` re-reads the password file — see [`reload_passwords`] — and
     /// the result is one line, whichever way it went.
@@ -540,12 +541,13 @@ impl Server {
             edge_usec: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             persistence: self.fsync.map(|_| self.pool.stats().clone()),
             fsync: self.fsync.unwrap_or(SyncPolicy::INTERVAL),
+            stop: Arc::new(Notify::new()),
         };
         // Created once and polled across every turn of the loop, rather than
         // rebuilt inside the `select!`: a signal watcher registered afresh on
         // each iteration is one that can miss a signal delivered between two
         // registrations.
-        let shutdown = shutdown_requested();
+        let shutdown = shutdown_requested(node.stop.clone());
         tokio::pin!(shutdown);
         let mut hangups = Hangups::register();
         loop {
@@ -703,8 +705,9 @@ impl Drop for Attached {
     }
 }
 
-/// Resolves when the process is asked to stop — Ctrl-C from a terminal, or
-/// SIGTERM from a supervisor — with the name of the signal that asked.
+/// Resolves when the process is asked to stop — Ctrl-C from a terminal,
+/// SIGTERM from a supervisor, or a client's `SHUTDOWN` through `stop` — with
+/// the name of whichever asked.
 ///
 /// In a container this binary is PID 1, and PID 1 *ignores* every signal it has
 /// no handler for — so without the SIGTERM half a pod deletion sits out its
@@ -712,27 +715,30 @@ impl Drop for Attached {
 ///
 /// Registration failing is not a reason to refuse to start: Ctrl-C still works,
 /// and the alternative is a server that cannot be run at all.
-async fn shutdown_requested() -> &'static str {
+async fn shutdown_requested(stop: Arc<Notify>) -> &'static str {
+    tokio::select! {
+        // `biased` for the accept loop's reason: no runtime RNG on a path
+        // that has no fairness to buy. A client's `SHUTDOWN` first: a
+        // signal that arrived in the same poll leads to the same stop.
+        biased;
+        () = stop.notified() => "SHUTDOWN",
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        () = sigterm() => "SIGTERM",
+    }
+}
+
+/// Resolves on SIGTERM; never, where it cannot be registered or there is
+/// no such signal.
+async fn sigterm() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let Ok(mut term) = signal(SignalKind::terminate()) else {
-            let _ = tokio::signal::ctrl_c().await;
-            return "SIGINT";
-        };
-        tokio::select! {
-            // `biased` for the accept loop's reason: no runtime RNG on a path
-            // that has no fairness to buy.
-            biased;
-            _ = tokio::signal::ctrl_c() => "SIGINT",
-            _ = term.recv() => "SIGTERM",
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            term.recv().await;
+            return;
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        "SIGINT"
-    }
+    std::future::pending::<()>().await;
 }
 
 /// Applies the socket options an accepted connection needs before it is served.

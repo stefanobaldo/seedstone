@@ -289,6 +289,12 @@ pub const DECLARED: &[(&[u8], Coverage)] = &[
         },
     ),
     (
+        b"SHUTDOWN",
+        Coverage::NotEmitted {
+            reason: "it stops the node the whole run is being served by.",
+        },
+    ),
+    (
         b"LASTSAVE",
         Coverage::NotEmitted {
             reason: "a reading of the node's clock, which no client model \

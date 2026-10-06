@@ -12,4 +12,5 @@ mod errors;
 mod info;
 mod persistence;
 mod pipeline;
+mod shutdown;
 mod walk;

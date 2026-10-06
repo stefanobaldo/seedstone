@@ -9,6 +9,7 @@ use seedstone_core::shard::{KIND_SLOTS, PersistenceStats, SyncPolicy};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 /// What this server answers `HELLO` with, and what it calls itself.
@@ -93,9 +94,9 @@ const _: () = assert!(
 /// track `dispatch::COMMANDS`: a name is appended here when a command is added there,
 /// and reordering the existing ones to match would move fields in a document
 /// operators already read for no reader's benefit.
-pub const EDGE_NAMES: [&str; 18] = [
+pub const EDGE_NAMES: [&str; 19] = [
     "mget", "keys", "dbsize", "flushdb", "ping", "echo", "auth", "hello", "info", "command",
-    "client", "quit", "config", "slowlog", "latency", "save", "bgsave", "lastsave",
+    "client", "quit", "config", "slowlog", "latency", "save", "bgsave", "lastsave", "shutdown",
 ];
 
 /// The wall-clock reading a node with no wall clock reports: 2023-11-14
@@ -267,6 +268,9 @@ pub struct NodeInfo {
     pub persistence: Option<Arc<PersistenceStats>>,
     /// The `--fsync` policy the log runs under, for `fsync_policy`.
     pub fsync: SyncPolicy,
+    /// Fired by a client's `SHUTDOWN`; the accept loop stops on it as it
+    /// stops on `SIGTERM`.
+    pub stop: Arc<Notify>,
 }
 
 impl NodeInfo {
@@ -314,6 +318,7 @@ impl NodeInfo {
             edge_usec: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             persistence: None,
             fsync: SyncPolicy::INTERVAL,
+            stop: Arc::new(Notify::new()),
         }
     }
 

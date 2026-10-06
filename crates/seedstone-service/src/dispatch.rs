@@ -89,6 +89,10 @@ pub enum Action {
     Refuse(Frame),
     /// Answer with this frame, then hang up.
     ReplyThenClose(Frame),
+    /// Stop the server: the connection fires the node's stop and hangs up
+    /// without a reply, as Redis does. The handler returns this rather than
+    /// firing the stop itself, so that the authentication gate runs first.
+    Shutdown,
 }
 
 /// What an action becomes on a connection that has not authenticated yet.
@@ -117,7 +121,7 @@ pub fn gated(action: Action, authenticated: bool) -> Action {
         Action::Hello(_) => Action::Reply(safe_error(NOAUTH_HELLO)),
         Action::ReplyThenClose(frame) => Action::ReplyThenClose(frame),
         Action::Refuse(frame) => Action::Refuse(frame),
-        Action::Dispatch(_) | Action::Unbatched(_) | Action::Reply(_) => {
+        Action::Dispatch(_) | Action::Unbatched(_) | Action::Reply(_) | Action::Shutdown => {
             Action::Reply(safe_error(NOAUTH))
         }
     }
@@ -659,6 +663,20 @@ pub const COMMANDS: &[(&[u8], Handler)] = &[
     (b"SAVE", |args, node| match args {
         [] => Ok(snapshot(node, true)),
         _ => Err(wrong_arity("save")),
+    }),
+    (b"SHUTDOWN", |args, _| match args {
+        // `NOSAVE` and `SAVE` are accepted and change nothing: a clean stop
+        // syncs the log under every policy, and an operator who wants an
+        // image first sends `SAVE` first. Any other modifier, or two, is
+        // the `ERR syntax error` 6.2.24 and 8.10.1 give.
+        [] => Ok(Action::Shutdown),
+        [modifier]
+            if bulk(modifier).eq_ignore_ascii_case(b"NOSAVE")
+                || bulk(modifier).eq_ignore_ascii_case(b"SAVE") =>
+        {
+            Ok(Action::Shutdown)
+        }
+        _ => Err(SYNTAX_ERROR.to_owned()),
     }),
     (b"LASTSAVE", |args, node| match args {
         [] => Ok(Action::Reply(node.persistence.as_ref().map_or_else(

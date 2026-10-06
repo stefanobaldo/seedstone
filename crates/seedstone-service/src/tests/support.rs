@@ -87,6 +87,23 @@ pub fn connected(
     (r, w, pool)
 }
 
+/// A served connection over a node described by `node`, which the caller
+/// keeps a clone of.
+pub fn connected_to(
+    shards: u16,
+    node: NodeInfo,
+) -> (
+    tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ShardPool,
+) {
+    let pool = ShardPool::spawn(shards, shards.min(4), DictSeed { k0: 1, k1: 2 }, NoTrace);
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(serve_connection(server, pool.clone(), node));
+    let (r, w) = tokio::io::split(client);
+    (r, w, pool)
+}
+
 pub fn req(parts: &[&str]) -> Frame {
     Frame::Array(
         parts
