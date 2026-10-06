@@ -835,3 +835,49 @@ async fn a_log_that_cannot_rotate_is_one_line_for_the_node_and_one_return_per_ex
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::remove_file(&stderr).unwrap();
 }
+
+/// `SHUTDOWN` from a client is the clean stop: the process exits with
+/// success, says `stopping` with `SHUTDOWN` as its signal, and under
+/// `never` the log it synced on the way out holds the write.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_from_a_client_is_the_clean_stop() {
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let (mut node, port) = start_with(&dir, &stderr, &["--fsync", "never"]).await;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert_eq!(
+        round_trip(&mut stream, &["SET", "k", "v"]).await,
+        Frame::Simple("OK".into())
+    );
+    let mut out = Vec::new();
+    encode(
+        &Frame::Array(vec![Frame::Bulk("SHUTDOWN".into())]),
+        &mut out,
+    );
+    stream.write_all(&out).await.unwrap();
+    let mut buf = [0u8; 16];
+    assert_eq!(
+        stream.read(&mut buf).await.unwrap(),
+        0,
+        "closed with no reply"
+    );
+    let status = node.wait().unwrap();
+    assert!(status.success(), "{status}");
+    let lines = std::fs::read_to_string(&stderr).unwrap();
+    assert!(
+        lines.contains(r#""evt":"stopping","signal":"SHUTDOWN"}"#),
+        "{lines}"
+    );
+    assert!(!lines.contains("shutdown_timeout"), "{lines}");
+    let (mut again, port) = start_with(&dir, &stderr, &["--fsync", "never"]).await;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert_eq!(
+        round_trip(&mut stream, &["GET", "k"]).await,
+        Frame::Bulk("v".into()),
+        "the clean stop synced the log"
+    );
+    again.kill().unwrap();
+    again.wait().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}

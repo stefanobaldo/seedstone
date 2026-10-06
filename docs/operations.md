@@ -72,7 +72,7 @@ as the server writes them:
 | `listening` | `info` | `version`, `bind`, `port` | the listener is bound; `bind` and `port` are what the kernel gave, as `CONFIG GET bind` reports them |
 | `bind_failed` | `error` | `bind`, `port`, `error` | the address could not be bound; the process exits 1 after this line |
 | `error_reply` | `warn` | `code`, `cmd`, `msg` | one error reply was sent to a client; `code` is the reply's first word, `cmd` the command it answered. A write refused because the log failed writes no line: there is one per write under load, and `log_fault` and `refusal_ended` say what happened |
-| `stopping` | `info` | `signal` | the server is leaving on `SIGTERM` or `SIGINT` |
+| `stopping` | `info` | `signal` | the server is leaving on `SIGTERM` or `SIGINT`, or on a client's `SHUTDOWN` (`signal` is then `SHUTDOWN`) |
 | `shutdown_timeout` | `warn` | — | the stop that followed `stopping` gave up waiting for the log to be synced, after one second; the process exits anyway, and what was written since the last sync may not be on disk |
 | `password_reloaded` | `info` | `passwords` | `SIGHUP` re-read the password file; `passwords` is how many lines it holds now, 1 or 2 |
 | `password_reload_failed` | `error` | `error` | `SIGHUP` re-read the password file and refused it; the previous passwords stay in force |
@@ -108,6 +108,7 @@ notice, and nothing should match on it.
 | Signal | Effect | Writes |
 |---|---|---|
 | `SIGTERM`, `SIGINT` | The server stops accepting connections, answers what its executors had queued, syncs the log, and exits. | `stopping`, with the signal's name; then `shutdown_timeout` if the disk did not answer in time |
+| `SHUTDOWN` (a client command) | The same stop as `SIGTERM`, asked for over the wire, after the authentication gate. `NOSAVE` and `SAVE` are accepted and change nothing, because the stop syncs the log anyway. Under `--no-auth` any client that can connect can stop the server, as any client can stop a 6.2.24 or 8.10.1 with no password set; with one, an unauthenticated `SHUTDOWN` is `NOAUTH` on all three. | `stopping`, with `SHUTDOWN` as the signal |
 | `SIGHUP` | The password file is re-read; see *Password and rotation*. | `password_reloaded`, `password_reload_failed` or `password_reload_skipped` |
 
 In a container this binary is process 1, and process 1 ignores every signal
