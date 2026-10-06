@@ -28,12 +28,19 @@ use seedstone_sim::{FsyncDraw, Plant, SimConfig, SimOutcome, run_sim};
 /// How many hostile seeds each claim is given.
 const SEEDS: u64 = 12;
 
-/// How many of the twelve seeds the honest node must decide at least one
-/// durable read on. Read on 2026-10-05: 5 of 12 — seeds 4, 8, 10, 11 and
-/// 12, all but one crashed at rest. A seed crashed under load is charged a
-/// possible loss on every shard, so it decides only by luck. A change that
-/// lowers this is the finding — see the module doc.
-const DECIDING_SEEDS: u64 = 5;
+/// How many seeds of `1..=DECIDING_WINDOW` the honest node must decide at
+/// least one durable read on. A seed crashed under load is charged a
+/// possible loss on every shard and decides only by luck, so about four
+/// seeds in ten decide: read on 2026-10-06, 184 of 1..=400 (26 of 1..=48)
+/// before a refusing executor stopped appending lazy expiries, 177 (21)
+/// after. Any change to what the node appends moves every seed that
+/// refuses — most of them — onto another timeline, so the count is a share,
+/// read over a window wide enough that one such change does not decide it:
+/// a floor of 5 in 12 tripped on two in a row. The floor is the mean less
+/// two deviations. A change that lowers the share is the finding — see the
+/// module doc.
+const DECIDING_WINDOW: u64 = 48;
+const DECIDING_SEEDS: u64 = 14;
 
 fn hostile(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
     let mut cfg = SimConfig::hostile(1, sim_seed);
@@ -60,13 +67,12 @@ fn hostile_always(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
 /// expiration checks on a seed whose recoveries reported a loss: the model
 /// gives up a deadline kept across such a recovery, and a crash under load
 /// charges every shard, so such a seed may have none left to decide. Some
-/// seed of the range still decides them, and at least `DECIDING_SEEDS`
-/// decide a durable read.
+/// seed of the range still decides them. How many decide a durable read is
+/// the test below's.
 #[test]
 fn the_hostile_shape_faults_on_every_seed_and_the_honest_node_holds() {
     let mut any_recovered_lossy = false;
     let mut any_expiry_decided = false;
-    let mut deciding = 0u64;
     for sim_seed in 1..=SEEDS {
         let outcome = hostile(sim_seed, None);
         assert!(
@@ -93,12 +99,7 @@ fn the_hostile_shape_faults_on_every_seed_and_the_honest_node_holds() {
             "seed {sim_seed}: the hostile disk did nothing hostile; raise DiskFaults::HOSTILE: {outcome:?}"
         );
         any_recovered_lossy |= outcome.lost_durable_prefixes > 0;
-        deciding += u64::from(outcome.durable_checks > 0);
     }
-    assert!(
-        deciding >= DECIDING_SEEDS,
-        "only {deciding} of 1..={SEEDS} decided a durable read; the shape stopped deciding"
-    );
     assert!(
         any_expiry_decided,
         "no seed in 1..={SEEDS} decided an expiration check"
@@ -107,6 +108,21 @@ fn the_hostile_shape_faults_on_every_seed_and_the_honest_node_holds() {
         any_recovered_lossy,
         "no seed in 1..={SEEDS} put a hole inside the durable region, so nothing here \
          distinguishes the honest reader from a prefix scan; raise corruption_permille"
+    );
+}
+
+/// The shape still decides durable reads on a share of its seeds: at least
+/// `DECIDING_SEEDS` of `1..=DECIDING_WINDOW`, whatever each draws for its
+/// crash and its policy.
+#[test]
+fn the_hostile_shape_decides_a_durable_read_on_a_share_of_its_seeds() {
+    let deciding = (1..=DECIDING_WINDOW)
+        .filter(|sim_seed| hostile(*sim_seed, None).durable_checks > 0)
+        .count() as u64;
+    assert!(
+        deciding >= DECIDING_SEEDS,
+        "only {deciding} of 1..={DECIDING_WINDOW} decided a durable read; the shape stopped \
+         deciding"
     );
 }
 
