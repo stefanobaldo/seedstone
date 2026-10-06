@@ -96,11 +96,13 @@ jobs:
                 exit 1
               fi
             done
-            # 24 shards for `standard`: the slowest shard observed read 39 min
-            # of the 45-minute timeout on 16 (runs 37297676517 and 37193639390,
-            # 2026-10-04/05, one shard cancelled at 45), so 24 puts the same
-            # window near 26 min on the same runners.
-            shards=24
+            # 32 shards for `standard`: on 16 the slowest shard observed read
+            # 39 min of the 45-minute timeout (runs 37297676517 and
+            # 37193639390, 2026-10-04/05, one shard cancelled at 45); on 24 it
+            # read 31 min, with the next slowest at 24 (run 37513694256,
+            # 2026-10-06) — the spread is the runners'. 32 puts that outlier
+            # near 23 min, under 60 % of the timeout.
+            shards=32
             [ "$count" -ge "$shards" ] || shards=1
             # Hostile: 0.034 s per seed on ubuntu-latest (run 37390030306,
             # 2026-10-05, 1,000 seeds on one shard in 34 s), so one shard
