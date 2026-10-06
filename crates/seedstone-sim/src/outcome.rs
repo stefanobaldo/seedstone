@@ -370,6 +370,10 @@ pub const DISK_SLACK: u64 = 4096;
 /// that round closes: the simulator measures seeds where a start completed
 /// no cycle at all between two crashes, and three generations' files then
 /// share the directory.
+///
+/// The bound is loose by design: it is the operations page's statement, not
+/// a fit to the runs. Read on 2026-10-06, a run's peak over its bound is at
+/// most 0.29 over `hostile` seeds 1–12 and 0.57 over `standard` seeds 1–6.
 #[must_use]
 pub fn disk_bound(
     executors: u16,
