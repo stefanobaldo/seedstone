@@ -340,8 +340,10 @@ until then. All three answer an error naming `--data-dir` on a node started
 without it.
 
 `SHUTDOWN` is the stop `SIGTERM` asks for, asked for over the wire: the
-server stops accepting connections, answers what its executors had queued,
-syncs the log, writes `stopping` with `SHUTDOWN` as the signal, and exits 0.
+server writes `stopping` with `SHUTDOWN` as the signal, stops accepting
+connections, answers what its executors had queued — the writes pipelined
+ahead of `SHUTDOWN` on its own connection among them — syncs the log, and
+exits 0.
 `NOSAVE` and `SAVE` are accepted and ignored, since the stop syncs the log
 either way; send `SAVE` first for an image. **Under `--no-auth` any client
 that can connect can stop the server** — as any client can stop a 6.2.24 or

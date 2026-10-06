@@ -651,9 +651,14 @@ where
                         chunk.slots.push(Slot::Ready(frame, label));
                         return Drained::HangUp;
                     }
-                    // No slot: Redis answers nothing, and closes. What was
-                    // pipelined ahead of it is still owed and still written.
+                    // No slot: no reply, and the connection closes (6.2.24
+                    // and 8.10.1 alike). What was pipelined ahead of it is
+                    // still owed, so the open chunk is served *before* the
+                    // stop is asked for: fired first, the stop could close
+                    // the executors' inboxes ahead of the writes the peer
+                    // sent first. A peer already gone still asked to stop.
                     Action::Shutdown => {
+                        emit_chunk(stream, out, router, chunk, node).await;
                         node.stop.notify_one();
                         return Drained::HangUp;
                     }
