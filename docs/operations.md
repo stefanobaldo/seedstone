@@ -13,7 +13,7 @@ without this page saying so.
 ```
 seedstone [--bind ADDR:PORT] [--max-clients N] [--maxmemory SIZE]
           [--maxmemory-policy allkeys-lru|noeviction] [--requirepass-file PATH]
-          [--no-auth] [--data-dir PATH]
+          [--no-auth] [--data-dir PATH] [--fsync always|interval|never]
 seedstone --version | --help
 ```
 
@@ -326,10 +326,32 @@ The start does not count the keys it found expired, so
 `rdb_last_load_keys_expired` is absent. A number this server does not measure
 is absent here rather than zero.
 
+## Asking for a snapshot, and stopping from a client
+
+`BGSAVE` asks every executor for a snapshot of its shards now and answers
+`Background saving started`; the shards keep serving while the images are
+written, a slice per housekeeping tick, and each executor's `snapshot` line
+says when its image is durable. `SAVE` asks for the same and answers `OK`
+only once an image taken after it is durable on every executor — behind a
+running snapshot it waits for the next one — so a `SAVE` that returned is a
+keyspace that survives a crash under any `--fsync` setting. `LASTSAVE` is the
+instant since which every shard has had a durable image, in Unix seconds, `0`
+until then. All three answer an error naming `--data-dir` on a node started
+without it.
+
+`SHUTDOWN` is the stop `SIGTERM` asks for, asked for over the wire: the
+server stops accepting connections, answers what its executors had queued,
+syncs the log, writes `stopping` with `SHUTDOWN` as the signal, and exits 0.
+`NOSAVE` and `SAVE` are accepted and ignored, since the stop syncs the log
+either way; send `SAVE` first for an image. **Under `--no-auth` any client
+that can connect can stop the server** — as any client can stop a 6.2.24 or
+8.10.1 with no password set; a node reachable from a network should carry a
+password.
+
 ## What `INFO` gives a monitor
 
 `INFO` is the operational surface a monitoring agent reads, and
-[compatibility.md](compatibility.md) lists every field. Four matter to
+[compatibility.md](compatibility.md) lists every field. Five matter to
 someone watching the server rather than the keyspace:
 
 - `run_id` (section `server`) changes on every start. A monitor computing
@@ -346,3 +368,6 @@ someone watching the server rather than the keyspace:
 - `used_memory` and `maxmemory` (`memory`): the keyspace's size and the
   ceiling it is held under. There is no resident-set figure; this server does
   not read one.
+- `persistence`: the log's size, whether a sync is in flight or has been
+  slow, how many executors refuse, when every shard was last imaged; the
+  section above lists every field.

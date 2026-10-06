@@ -48,7 +48,7 @@ approximately.
 | `HELLO [protover [AUTH username password]]` | RESP2 only: `HELLO 3` is `NOPROTO unsupported protocol version`. `SETNAME` is refused, where 6.2.24 and 8.10.1 accept it, because there is no client name to set here. A refused version or option is answered before the connection's authentication is considered — the order 6.2.24 and 8.10.1 decide it in — so an unauthenticated client is told which of the two it got wrong |
 | `QUIT` | — |
 | `CLIENT SETNAME \| SETINFO` | both answered `OK` and both ignored: there is no `CLIENT LIST` here to show a name in. redis-py 8.1.0 and go-redis 9.22.0 send `SETINFO` while establishing a connection |
-| `INFO [section]` | sections `server`, `clients`, `memory`, `stats`, `keyspace` and `commandstats`, each carrying only the fields this node can state truthfully. `memory` is `used_memory`, `used_memory_human`, `maxmemory`, `maxmemory_human` and `maxmemory_policy`, and no resident-set family — see below |
+| `INFO [section]` | sections `server`, `clients`, `memory`, `persistence`, `stats`, `keyspace` and `commandstats`, each carrying only the fields this node can state truthfully. `memory` is `used_memory`, `used_memory_human`, `maxmemory`, `maxmemory_human` and `maxmemory_policy`, and no resident-set family — see below |
 | `CONFIG GET parameter [parameter …]` | a fixed table of the parameters that describe how the node was started, matched without regard to case; `CONFIG SET` is refused. See below for which spelling comes back |
 | `SLOWLOG GET \| LEN \| RESET` | answers as a monitor that is switched off: an empty list, `0`, `OK` |
 | `LATENCY LATEST \| HISTORY \| RESET \| HISTOGRAM` | as `SLOWLOG`, and for the same reason: the empty answers of a monitor that is off, so a scrape completes instead of logging a refusal every pass |
@@ -102,6 +102,19 @@ page was written. One shape covers all of them — `ERR unknown command
   compute the ratio as `used_memory_rss / used_memory`, and on idle containers
   it read 14.57 and 14.89 respectively, nowhere near 1: a field this server
   could only fill with a constant is absent rather than approximated.
+
+- **`INFO persistence` has no fork, copy-on-write or rewrite fields.** There
+  is no `fork()` here — an image is written a slice per housekeeping tick by
+  the executor that owns the shards, and the log is compacted by removing
+  files every image covers, not rewritten — so the `current_cow_*`,
+  `current_fork_perc`, `*_cow_size`, `module_fork_*` and `aof_*rewrite*`
+  fields are absent rather than zero, as are `aof_base_size` and
+  `aof_buffer_length`, which this server does not measure, and
+  `rdb_last_load_keys_expired`, which the start does not count. With the AOF
+  on, 6.2.24 prints 30 fields in the section and 8.10.1 prints 38 (read
+  2026-10-06); this server prints the thirteen whose meaning it can measure,
+  plus six of its own. Which ones, and what each measures, is on
+  [operations.md](operations.md).
 
 - **`CONFIG` has `GET` and no `SET`.** Every parameter it reports is a fact
   fixed at startup, and accepting a new one at runtime would mean moving a

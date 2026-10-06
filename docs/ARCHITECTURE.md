@@ -154,7 +154,11 @@ written while the child runs. Once the image's commit record is synced the
 executor tells the writer what it covers, and the writer removes every
 segment that every executor has covered; a start reads image plus tail. The
 image is ordinary log records in a file of its own, so the reader that steps
-over damage reads both.
+over damage reads both. A client's `BGSAVE` or `SAVE` reaches every
+executor the way a command every shard must see does, one envelope per
+executor, and is answered before any handler runs: it opens the same cycle at
+the next tick rather than at a bound, and a `SAVE` holds its reply until an
+image opened after it is durable.
 
 ## The edge is an adapter
 
