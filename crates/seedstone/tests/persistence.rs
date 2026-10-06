@@ -1176,3 +1176,50 @@ async fn save_is_answered_while_the_keyspace_is_walked() {
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::remove_file(&stderr).unwrap();
 }
+
+/// Writes pipelined ahead of `SHUTDOWN` on its own connection are applied
+/// and synced before the stop: they were sent first, so they are served
+/// first. Tried twenty times, since what it guards is an ordering between
+/// the connection and the stop it asks for.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_pipelined_ahead_of_shutdown_are_kept() {
+    const WRITES: i64 = 2000;
+    for round in 0..20 {
+        let dir = scratch();
+        let stderr = dir.with_extension("stderr");
+        let (mut node, port) = start_with(&dir, &stderr, &["--fsync", "never"]).await;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut out = Vec::new();
+        for i in 0..WRITES {
+            let set = ["SET".to_owned(), format!("p{i}"), "v".to_owned()];
+            encode(
+                &Frame::Array(
+                    set.into_iter()
+                        .map(|part| Frame::Bulk(part.into()))
+                        .collect(),
+                ),
+                &mut out,
+            );
+        }
+        encode(
+            &Frame::Array(vec![Frame::Bulk("SHUTDOWN".into())]),
+            &mut out,
+        );
+        stream.write_all(&out).await.unwrap();
+        let mut sink = Vec::new();
+        let _ = stream.read_to_end(&mut sink).await;
+        let status = node.wait().unwrap();
+        assert!(status.success(), "round {round}: {status}");
+        let (mut again, port) = start_with(&dir, &stderr, &["--fsync", "never"]).await;
+        let kept = dbsize(port).await;
+        again.kill().unwrap();
+        again.wait().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_file(&stderr).unwrap();
+        assert_eq!(
+            kept,
+            Frame::Integer(WRITES),
+            "round {round}: writes pipelined ahead of SHUTDOWN lost"
+        );
+    }
+}
