@@ -965,6 +965,12 @@ async fn save_lands_an_image_on_every_executor_and_lastsave_dates_it() {
             available_parallelism() as u64,
             "{policy}: {line}"
         );
+        // The start reports how long it spent with the directory before it
+        // listened: a number, present on every start, small on fifty keys.
+        assert!(
+            field(line, "elapsed_ms") < 10_000,
+            "{policy}: elapsed_ms is a number under ten seconds: {line}"
+        );
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         assert_eq!(
             round_trip(&mut stream, &["LASTSAVE"]).await,
