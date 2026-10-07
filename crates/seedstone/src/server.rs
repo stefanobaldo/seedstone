@@ -968,6 +968,7 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
     // One set of counters for the node: the writer keeps the log's, the
     // executors their own, and `INFO` reads both through the pool.
     let stats = PersistenceStats::new(executors);
+    let began = tokio::time::Instant::now();
     let started = (|| {
         disk.create_dir_all(&wal)?;
         // `wal/` is a directory entry of `PATH`: a crash before this sync
@@ -1017,7 +1018,7 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
             return Err(std::io::Error::new(error.kind(), RecoveryFailed(error)));
         }
     };
-    emit_recovery(&recovery);
+    emit_recovery(&recovery, began.elapsed());
     let pool = ShardPool::spawn_spec(PoolSpec {
         shards: SHARDS,
         executors,
@@ -1048,8 +1049,9 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
 }
 
 /// The start's report: one `recovery` line, and one `recovery_truncated`
-/// per shard the recovery cut.
-fn emit_recovery(recovery: &Recovery) {
+/// per shard the recovery cut. `elapsed` is the start's time on the
+/// directory, from the first `create_dir_all` to here.
+fn emit_recovery(recovery: &Recovery, elapsed: std::time::Duration) {
     let report = &recovery.report;
     emit(
         &RECOVERY,
@@ -1067,6 +1069,7 @@ fn emit_recovery(recovery: &Recovery) {
             Field::Num(report.snapshots_used),
             Field::Num(report.snapshots_refused),
             Field::Num(report.files_removed),
+            Field::Num(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
         ],
     );
     for cut in &report.truncated {

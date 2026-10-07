@@ -53,10 +53,11 @@ SemVer and are `0.x` while the keyspace holds only strings;
   and each `snapshot` line says how many it cleared (#73). Redis's field
   names where the meaning matches, this server's own after them, nothing
   filled in; `docs/operations.md` lists every field.
-- **Log events** for all of the above: `recovery`, `recovery_truncated`,
-  `recovery_failed`, `log_fault`, `snapshot_fault`, `sync_slow`,
-  `sync_slow_ended`, `refusal_ended`, `snapshot`, `compaction`,
-  `shutdown_timeout`, `fsync_ignored` — one table in `docs/operations.md`.
+- **Log events** for all of the above: `recovery` (with how long the start
+  took, `elapsed_ms`), `recovery_truncated`, `recovery_failed`, `log_fault`,
+  `snapshot_fault`, `sync_slow`, `sync_slow_ended`, `refusal_ended`,
+  `snapshot`, `compaction`, `shutdown_timeout`, `fsync_ignored` — one table
+  in `docs/operations.md`.
 - `bench/campaign.sh durability`: `SET` at two pipeline depths under each
   `--fsync` setting, against Redis with AOF at the matching `appendfsync`,
   and `GET` with the log synced on every write against no log.
