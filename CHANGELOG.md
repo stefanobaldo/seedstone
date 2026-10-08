@@ -7,6 +7,8 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-08
+
 ### Added
 
 - **Persistence.** `--data-dir PATH` keeps a write-ahead log under
@@ -42,9 +44,8 @@ SemVer and are `0.x` while the keyspace holds only strings;
   executor resumes on its own once a snapshot of its memory is durable; a
   refusing executor appends nothing to the log meanwhile, not even a lazily
   expired key's deletion (#85). A start whose first write to the log fails
-  begins the same way. The reply,
-  and how it compares with Redis's on a failed AOF write, is in
-  `docs/compatibility.md` (#72).
+  begins the same way. The reply, and how it compares with Redis's on a
+  failed AOF write, is in `docs/compatibility.md` (#72).
 - **A slow sync is visible.** A sync in flight for more than a second writes
   `sync_slow`, and `sync_slow_ended` when it ends (#77).
 - **`INFO persistence`**: the log's size, syncs in flight and slow, images
@@ -209,7 +210,8 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 <!-- [0.0.0] has no definition: it was a crates.io placeholder and was never
      tagged in git, so every URL for it would 404. -->
-[Unreleased]: https://github.com/stefanobaldo/seedstone/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/stefanobaldo/seedstone/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/stefanobaldo/seedstone/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/stefanobaldo/seedstone/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/stefanobaldo/seedstone/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/stefanobaldo/seedstone/releases/tag/v0.1.0
