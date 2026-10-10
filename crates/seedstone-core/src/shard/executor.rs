@@ -388,20 +388,27 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
     // `interval` yields its first tick immediately; consume it so the first
     // real tick is one period away.
     tick.tick().await;
-    // The stop is one future for the whole loop, polled in place by the
-    // `select!` below, not a fresh `changed()` per iteration. A fresh one is
-    // left pending on every iteration an envelope wins, and a pending
-    // `changed()` registers a waiter under the channel's lock on its first
-    // poll and removes it under the same lock when the `select!` drops it
-    // (tokio 1.53.2, `sync/notify.rs`): two lock acquisitions per envelope,
-    // on the one channel every executor of the pool shares. A future already
-    // registered costs one atomic load per poll. The difference read as 17 %
-    // of `KEYS`'s calls per second and 20 % of its CPU per call on the
-    // benchmark cell, where a call is one envelope per shard, and as nothing
-    // at pipeline depth 64, where an envelope carries many commands (#102).
-    let mut stopped = std::pin::pin!(stop.changed());
+    // The stop is read, not awaited, while there is work: `has_changed` is
+    // one atomic load of the channel's version, and it is checked at the top
+    // of every iteration, so a stop lands within one envelope of being sent
+    // however full the inbox is. The `changed()` arm below is the idle case,
+    // and it sits behind the inbox on purpose. Every `changed()` future is a
+    // `Notify` waiter, and a waiter takes the channel's lock to register on
+    // its first poll, on every later poll to guard its waker, and once more
+    // to leave when it is dropped (tokio 1.53.2, `sync/notify.rs`). Ahead of
+    // the inbox it was polled on every iteration an envelope won — a lock
+    // per envelope on the one channel every executor of the pool shares,
+    // and a `KEYS` call is one envelope per shard. That read as 17 % of
+    // `KEYS`'s calls per second and 20 % of its CPU per call on the
+    // benchmark cell when the future was fresh each iteration, and a third
+    // of that when one future was kept and re-polled (#102). Behind the
+    // inbox it is polled only when the inbox is empty, and the lock is paid
+    // once per idle spell rather than once per envelope.
 
     loop {
+        if stop.has_changed().unwrap_or(true) {
+            break;
+        }
         tokio::select! {
             // `biased` removes the runtime's RNG from this loop. Without it
             // `select!` picks among ready arms at random, seeded from OS
@@ -428,15 +435,17 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
             // at most a few times per round. Behind the inbox it would be
             // polled only when the inbox ran dry, so a busy executor would
             // hold its writes' replies for as long as the load lasted. The
-            // stop comes next for the same reason, and is ready once. Then
-            // the tick, when it is due: it is ready at most once per
+            // stop is read before the `select!` rather than awaited in it,
+            // for the reason the comment above the loop gives. Then the
+            // tick, when it is due: it is ready at most once per
             // `HOUSEKEEPING_TICK` and its work is bounded — a rehash step,
             // an expiry sample, one slice of an image — so it takes one
             // tick's share and no more. Behind the inbox it ran only when
             // the inbox ran dry, and a keyspace walk queues its next step
             // the moment the last returns, so a walk under load held off
             // every image, every compaction and the end of every refusal
-            // for as long as it lasted (#79). The inbox comes last.
+            // for as long as it lasted (#79). The inbox comes next, and
+            // the stop's idle arm last.
             biased;
 
             progress = next_progress(&mut this.sync.link), if this.sync.link.is_some() => {
@@ -450,10 +459,6 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
                     this.refuse();
                 }
             }
-            // A dropped sender is a dropped pool, which closes the inbox
-            // too: stopping on either is the same stop. What is still
-            // queued is served by the stop itself.
-            _ = &mut stopped => break,
             // One ticker per executor rather than one per shard, advancing
             // every owned dict by the same budget: the same per-dict drain
             // rate, and the same aggregate work, as independent tickers.
@@ -466,6 +471,11 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
                 };
                 this.serve(envelope);
             }
+            // The idle case, see the comment above the loop. A dropped
+            // sender is a dropped pool, which closes the inbox too:
+            // stopping on either is the same stop. What is still queued is
+            // served by the stop itself.
+            _ = stop.changed() => break,
         }
     }
     this.stop(&mut inbox).await;

@@ -7,6 +7,16 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ## [Unreleased]
 
+### Fixed
+
+- **The rest of the `KEYS` regression.** 0.3.1 recovered two thirds of
+  it on the benchmark cell (3 353 calls/s and 2 972 µs CPU per call against
+  0.2.0's 3 579 and 2 783.5): keeping one stop future across the loop
+  still took the pool-wide lock once per batch of commands, because a
+  registered waiter re-takes it on every poll to guard its waker. The
+  executor now reads the stop signal with one atomic load per batch and
+  awaits it only while its inbox is empty (#102).
+
 ## [0.3.1] - 2026-10-10
 
 ### Fixed
