@@ -17,12 +17,16 @@ No adjectives. Throughput and CPU are always printed side by side.
   report.py <log> [<log>...]      tables and pair readings, per log
   report.py --calibrate <log>     W, by the calibration rule
   report.py --selftest            the rule on fixed inputs
+  report.py --svg <out> [--theme light|dark] [--release vX.Y.Z]
+            [--engines name:ver,...] [--machine type] <log>...
+                                  the README's chart, from the logs
 
 Standard library only.
 """
 import re
 import statistics
 import sys
+import xml.dom.minidom
 from collections import defaultdict
 
 PRIMARY = ["seedstone", "redis-iot1", "redis-iot4", "valkey-iot1", "valkey-iot4"]
@@ -40,6 +44,33 @@ DURABILITY_ARMS = [arm for pair in DURABILITY for arm in pair]
 # none of.
 READ_PAIR = ("seedstone-always", "seedstone")
 TIE = 0.02
+
+# The README's chart: four cells, one panel each, throughput only. A reader
+# who stops here sees throughput and not the CPU per operation; the caption
+# names the page that carries the rest. Each panel's arms, in order, and the
+# arm whose presence on a row identifies the cell (Garnet is absent from
+# eviction; the durability panel's arms exist in no other stage).
+CHART = [
+    ("GET 64 B · depth 1", ("get", "-", "1"), PRIMARY + OTHER, "seedstone"),
+    ("GET 64 B · depth 64", ("get", "-", "64"), PRIMARY + OTHER, "seedstone"),
+    ("SET 10 KB · depth 64 · under a 384 MB ceiling, LRU", ("set-large", "10240", "64"),
+     PRIMARY + OTHER, "seedstone"),
+    ("SET 64 B · depth 1 · synced on every write", ("set", "-", "1"),
+     ["seedstone-always", "redis-aof-always"], "seedstone-always"),
+]
+LABEL = {"seedstone": "seedstone", "redis-iot1": "redis, io-threads 1",
+         "redis-iot4": "redis, io-threads 4", "valkey-iot1": "valkey, io-threads 1",
+         "valkey-iot4": "valkey, io-threads 4", "dragonfly": "dragonfly", "garnet": "garnet",
+         "seedstone-always": "seedstone --fsync always",
+         "redis-aof-always": "redis appendfsync always"}
+# GitHub's own light and dark palettes, so the chart sits on the README as
+# if it were part of the page.
+THEMES = {
+    "light": dict(bg="#ffffff", text="#1f2328", muted="#59636e", bar="#afb8c1",
+                  ours="#1a7f5a", grid="#d1d9e0"),
+    "dark": dict(bg="#0d1117", text="#e6edf3", muted="#9198a1", bar="#3d444d",
+                 ours="#3fb950", grid="#30363d"),
+}
 
 FIELD = re.compile(r"(\w+)=(\S+)")
 
@@ -256,6 +287,175 @@ def calibrate(path):
     return W
 
 
+def header(path):
+    """The run's date (the stage's start, from the log's first line) and the
+    kernel line, so the caption states what the log states and nothing the
+    clock says."""
+    date = machine = ""
+    with open(path) as f:
+        for line in f:
+            if line.startswith("### stage ") and " start " in line:
+                date = line.split(" start ", 1)[1].strip()[:10]
+            elif line.startswith("### kernel "):
+                machine = line[4:].strip()
+            if date and machine:
+                break
+    return date, machine
+
+
+def cpu_count(spec):
+    """How many cpus a taskset list such as `0-9` or `0-3,8` names."""
+    n = 0
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        n += int(hi or lo) - int(lo) + 1
+    return n
+
+
+def log_facts(lines):
+    """What the logs say about the caption's facts: the release this server
+    echoed, every `<engine>_version:` line, and the two cpusets."""
+    facts = {"release": "", "versions": set(), "cores": None}
+    for line in lines:
+        if line.startswith("### seedstone seedstone "):
+            facts["release"] = "v" + line.split()[3]
+        elif line.startswith("### kernel ") and " cpus server=" in line:
+            server, client = line.split(" cpus server=", 1)[1].split()[:2]
+            facts["cores"] = (cpu_count(server), cpu_count(client.removeprefix("client=")))
+        elif "_version:" in line:
+            facts["versions"].add(line.strip())
+    return facts
+
+
+def caption_errors(opts, facts):
+    """Each way the typed caption disagrees with the logs; empty when it agrees."""
+    errors = []
+    if opts["release"] != facts["release"]:
+        errors.append(f"release {opts['release']}, logs {facts['release']}")
+    if not opts["engines"]:
+        errors.append("no engines named")
+    for e in filter(None, opts["engines"].split(",")):
+        name, _, ver = e.partition(":")
+        if f"{name}_version:{ver}" not in facts["versions"]:
+            errors.append(f"engine {e} not in the logs")
+    return errors
+
+
+def find_cell(summaries, prefix, anchor):
+    """The first log whose row matches the cell's shape, argument and depth and
+    carries the anchor arm; None when no log ran the cell."""
+    for s in summaries:
+        for key, present in s.items():
+            if key[:3] == prefix and anchor in present:
+                return present
+    return None
+
+
+def short(n):
+    if n >= 1e6:
+        return f"{n / 1e6:.2f} M"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f} k"
+    return f"{n:.0f}"
+
+
+def esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def svg_from_summaries(summaries, date, machine_line, release, engines, theme,
+                       machine="c4a-standard-16", cores=(10, 6)):
+    t = THEMES[theme]
+    W, PW, PH, ROW, LEFT, GAP = 960, 460, 200, 22, 200, 20
+    arch = machine_line.split()[2] if len(machine_line.split()) > 2 else ""
+    body = []
+    for i, (title, prefix, arms, anchor) in enumerate(CHART):
+        x0 = GAP + (i % 2) * (PW + GAP)
+        y0 = 44 + (i // 2) * (PH + GAP)
+        body.append(f'<text x="{x0}" y="{y0}" class="t">{esc(title)}</text>')
+        present = find_cell(summaries, prefix, anchor)
+        if present is None:
+            body.append(f'<text x="{x0}" y="{y0 + 28}" class="m">not measured in this run</text>')
+            continue
+        rows = [a for a in arms if a in present]
+        top = max(present[a]["ops"] for a in rows)
+        scale = (PW - LEFT - 64) / top
+        for j, a in enumerate(rows):
+            y = y0 + 12 + j * ROW
+            w = present[a]["ops"] * scale
+            fill = t["ours"] if a.startswith("seedstone") else t["bar"]
+            body.append(f'<text x="{x0 + LEFT - 8}" y="{y + 13}" class="l" text-anchor="end">'
+                        f'{esc(LABEL.get(a, a))}</text>')
+            body.append(f'<rect x="{x0 + LEFT}" y="{y}" width="{w:.1f}" height="16" rx="2" fill="{fill}"/>')
+            body.append(f'<text x="{x0 + LEFT + w + 6:.1f}" y="{y + 13}" class="v">'
+                        f'{short(present[a]["ops"])}</text>')
+    H = 44 + 2 * (PH + GAP) + 50
+    names = ", ".join(f"{n.capitalize()} {v}" for n, v in
+                      (e.split(":", 1) for e in engines.split(",")))
+    cap1 = (f"Throughput, operations per second, the median of three kept runs. "
+            f"seedstone {release} against {names}.")
+    cap2 = (f"GCP {machine} ({arch}), server on {cores[0]} cores, redis-benchmark on "
+            f"{cores[1]}, over loopback, {date}.")
+    cap3 = "Every table, the CPU per operation and what the numbers do not say: docs/benchmarks.md"
+    style = (f".t{{font:600 13px ui-sans-serif,system-ui,sans-serif;fill:{t['text']}}}"
+             f".l,.v,.m{{font:12px ui-sans-serif,system-ui,sans-serif;fill:{t['text']}}}"
+             f".m,.c{{fill:{t['muted']}}}.c{{font:11px ui-sans-serif,system-ui,sans-serif}}")
+    return "\n".join([
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+        f'viewBox="0 0 {W} {H}" role="img" aria-label="Benchmark throughput, seedstone {release}">',
+        f"<style>{style}</style>",
+        f'<rect width="{W}" height="{H}" fill="{t["bg"]}"/>',
+        *body,
+        f'<text x="{GAP}" y="{H - 36}" class="c">{esc(cap1)}</text>',
+        f'<text x="{GAP}" y="{H - 22}" class="c">{esc(cap2)}</text>',
+        f'<text x="{GAP}" y="{H - 8}" class="c">{esc(cap3)}</text>',
+        "</svg>", ""])
+
+
+def svg_args(argv):
+    """The options and logs of `--svg`, from `--key value` or `key=value`: the
+    file's first line writes the second form, since an XML comment may not
+    hold "--", and the check passes that line back as it reads it."""
+    opts = {"theme": "light", "release": "", "engines": "", "machine": "c4a-standard-16"}
+    logs = []
+    it = iter(argv)
+    for a in it:
+        key, eq, value = a.partition("=")
+        if a.startswith("--") and a[2:] in opts:
+            opts[a[2:]] = next(it)
+        elif eq and key in opts:
+            opts[key] = value
+        else:
+            logs.append(a)
+    for v in [*opts.values(), *logs]:
+        if " " in v or "--" in v:
+            sys.exit(f"an --svg input may not contain a space or a double hyphen: {v!r}")
+    return opts, logs
+
+
+def inputs_comment(opts, logs):
+    return "<!-- inputs: " + " ".join([f"{k}={v}" for k, v in opts.items()] + logs) + " -->"
+
+
+def svg_chart(out, argv):
+    """`--svg <out> [--theme T] [--release R] [--engines E] [--machine M] <log>...`.
+    The first line of the file names every input, so the file says what it
+    was rendered from and a check can regenerate it."""
+    opts, logs = svg_args(argv)
+    if not logs:
+        sys.exit("--svg needs at least one log")
+    date, machine = header(logs[0])
+    lines = [line for p in logs for line in open(p)]
+    facts = log_facts(lines)
+    errors = caption_errors(opts, facts)
+    if errors:
+        sys.exit("--svg: the caption disagrees with the logs: " + "; ".join(errors))
+    summaries = [summarise(parse(p)) for p in logs]
+    svg = svg_from_summaries(summaries, date, machine, opts["release"], opts["engines"],
+                             opts["theme"], opts["machine"], facts["cores"])
+    with open(out, "w") as f:
+        f.write(f"{inputs_comment(opts, logs)}\n{svg}")
+
 def selftest():
     assert word(1.009, 0.005, "ops") == "indistinguishable"
     assert word(1.469, 0.01, "ops") == "ahead 1.47x"
@@ -291,6 +491,47 @@ def selftest():
     assert durability_pairs(reads) == (
         "- seedstone-always vs seedstone: behind 0.50x on throughput; "
         "more expensive per operation 2.00x (spreads 1.00 % / 1.00 %)")
+    # --svg: the chart is a function of the summaries and the header, nothing else.
+    assert short(4587156) == "4.59 M" and short(143906) == "144 k" and short(950) == "950"
+    base_row = {"ops": 100.0, "user_us": 0.5, "sys_us": 0.5, "total_us": 1.0, "cores": 1.0,
+                "client_cores": 0.5, "spread_ops": 0.01, "spread_cpu": 0.01, "evicted_per_op": None}
+    field = {("get", "-", "1", "50", "100000", "64"): {"seedstone": dict(base_row, ops=140000.0),
+                                                        "redis-iot1": dict(base_row, ops=130000.0)},
+             ("get", "-", "64", "50", "100000", "64"): {"seedstone": dict(base_row, ops=4500000.0),
+                                                         "redis-iot1": dict(base_row, ops=2600000.0)}}
+    assert find_cell([field], ("get", "-", "64"), "seedstone")["seedstone"]["ops"] == 4500000.0
+    assert find_cell([field], ("set-large", "10240", "64"), "seedstone") is None
+    svg = svg_from_summaries([field], "2026-09-23", "kernel 7.0.0-1011-gcp aarch64",
+                             "v0.2.0", "redis:8.10.0,valkey:9.1.1", "light")
+    assert svg.startswith("<svg "), svg[:40]
+    assert "4.50 M" in svg and "144 k" not in svg and "140 k" in svg
+    assert svg.count("not measured in this run") == 2          # eviction and durability panels
+    assert "Redis 8.10.0, Valkey 9.1.1" in svg and "2026-09-23" in svg and "v0.2.0" in svg
+    assert svg == svg_from_summaries([field], "2026-09-23", "kernel 7.0.0-1011-gcp aarch64",
+                                     "v0.2.0", "redis:8.10.0,valkey:9.1.1", "light")
+    dark = svg_from_summaries([field], "2026-09-23", "kernel 7.0.0-1011-gcp aarch64",
+                              "v0.2.0", "redis:8.10.0,valkey:9.1.1", "dark")
+    assert dark != svg and THEMES["dark"]["ours"] in dark
+    # The first line names the inputs in a comment, which XML forbids to hold
+    # "--": the options are written key=value, and read back in either form.
+    opts, logs = svg_args(["--theme", "dark", "--release", "v0.2.0", "a.log", "b.log"])
+    line = inputs_comment(opts, logs)
+    assert "--" not in line[4:-3], line
+    assert svg_args(line[len("<!-- inputs: "):-len(" -->")].split()) == (opts, logs)
+    xml.dom.minidom.parseString(line + "\n" + dark)
+    # The caption's facts are read from the logs; an argument that disagrees is refused.
+    facts = log_facts(["### seedstone seedstone 0.3.0  benchmark redis-benchmark 8.10.0",
+                       "### kernel 7.0.0-1011-gcp aarch64  cpus server=0-9 client=10-15",
+                       "    redis_version:8.10.0", "    valkey_version:9.1.1"])
+    assert facts["cores"] == (10, 6) and facts["release"] == "v0.3.0", facts
+    assert caption_errors({"release": "v0.3.0", "engines": "redis:8.10.0,valkey:9.1.1"}, facts) == []
+    bad = caption_errors({"release": "v0.2.0", "engines": "redis:8.10.0,valkey:9.2.0"}, facts)
+    assert len(bad) == 2 and "v0.2.0" in bad[0] and "valkey:9.2.0" in bad[1], bad
+    assert caption_errors({"release": "v0.3.0", "engines": ""}, facts)        # no engines named
+    assert log_facts(["### kernel x aarch64  cpus server=0-3,8 client=4-7"])["cores"] == (5, 4)
+    eight = svg_from_summaries([field], "2026-09-23", "kernel 7.0.0-1011-gcp aarch64",
+                               "v0.2.0", "redis:8.10.0", "light", cores=(8, 8))
+    assert "server on 8 cores, redis-benchmark on 8," in eight
     print("selftest ok")
 
 
@@ -302,6 +543,8 @@ if __name__ == "__main__":
         selftest()
     elif args[0] == "--calibrate":
         sys.exit(0 if calibrate(args[1]) is not None else 1)
+    elif args[0] == "--svg":
+        svg_chart(args[1], args[2:])
     else:
         for p in args:
             report(p)
