@@ -7,6 +7,8 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-10
+
 ### Fixed
 
 - **`KEYS` is back to 0.2.0's calls per second and CPU per call.** Since
@@ -219,7 +221,8 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 <!-- [0.0.0] has no definition: it was a crates.io placeholder and was never
      tagged in git, so every URL for it would 404. -->
-[Unreleased]: https://github.com/stefanobaldo/seedstone/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/stefanobaldo/seedstone/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/stefanobaldo/seedstone/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/stefanobaldo/seedstone/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/stefanobaldo/seedstone/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/stefanobaldo/seedstone/compare/v0.1.0...v0.1.1
