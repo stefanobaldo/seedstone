@@ -388,6 +388,18 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
     // `interval` yields its first tick immediately; consume it so the first
     // real tick is one period away.
     tick.tick().await;
+    // The stop is one future for the whole loop, polled in place by the
+    // `select!` below, not a fresh `changed()` per iteration. A fresh one is
+    // left pending on every iteration an envelope wins, and a pending
+    // `changed()` registers a waiter under the channel's lock on its first
+    // poll and removes it under the same lock when the `select!` drops it
+    // (tokio 1.53.2, `sync/notify.rs`): two lock acquisitions per envelope,
+    // on the one channel every executor of the pool shares. A future already
+    // registered costs one atomic load per poll. The difference read as 17 %
+    // of `KEYS`'s calls per second and 20 % of its CPU per call on the
+    // benchmark cell, where a call is one envelope per shard, and as nothing
+    // at pipeline depth 64, where an envelope carries many commands (#102).
+    let mut stopped = std::pin::pin!(stop.changed());
 
     loop {
         tokio::select! {
@@ -441,7 +453,7 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
             // A dropped sender is a dropped pool, which closes the inbox
             // too: stopping on either is the same stop. What is still
             // queued is served by the stop itself.
-            _ = stop.changed() => break,
+            _ = &mut stopped => break,
             // One ticker per executor rather than one per shard, advancing
             // every owned dict by the same budget: the same per-dict drain
             // rate, and the same aggregate work, as independent tickers.

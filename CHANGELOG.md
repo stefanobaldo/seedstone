@@ -7,6 +7,15 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ## [Unreleased]
 
+### Fixed
+
+- **`KEYS` is back to 0.2.0's calls per second and CPU per call.** Since
+  0.3.0 every executor re-armed its stop signal after each batch of
+  commands, and arming it took a lock the whole pool shares, twice. A `KEYS`
+  call reaches every shard, so it paid that once per shard: 17 % fewer calls
+  per second and 20 % more CPU per call on the benchmark cell, and nothing
+  measurable on commands that reach one shard (#102).
+
 ## [0.3.0] - 2026-10-08
 
 ### Added
