@@ -1,70 +1,75 @@
-<!-- inputs: theme=light release=v0.2.0 engines=redis:8.10.0,valkey:9.1.1,dragonfly:df-v1.40.2,garnet:2.1.5 machine=c4a-standard-16 bench/results/v0.2.0/03-field.log bench/results/v0.2.0/05-eviction.log -->
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="534" viewBox="0 0 960 534" role="img" aria-label="Benchmark throughput, seedstone v0.2.0">
+<!-- inputs: theme=light release=v0.3.0 engines=redis:8.10.0,valkey:9.1.1,dragonfly:df-v1.40.2,garnet:2.1.5 machine=c4a-standard-16 bench/results/v0.3.0/03-field.log bench/results/v0.3.0/05-eviction.log bench/results/v0.3.0/08-durability.log -->
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="534" viewBox="0 0 960 534" role="img" aria-label="Benchmark throughput, seedstone v0.3.0">
 <style>.t{font:600 13px ui-sans-serif,system-ui,sans-serif;fill:#1f2328}.l,.v,.m{font:12px ui-sans-serif,system-ui,sans-serif;fill:#1f2328}.m,.c{fill:#59636e}.c{font:11px ui-sans-serif,system-ui,sans-serif}</style>
 <rect width="960" height="534" fill="#ffffff"/>
 <text x="20" y="44" class="t">GET 64 B · depth 1</text>
 <text x="212" y="69" class="l" text-anchor="end">seedstone</text>
-<rect x="220" y="56" width="196.0" height="16" rx="2" fill="#1a7f5a"/>
-<text x="422.0" y="69" class="v">144 k</text>
+<rect x="220" y="56" width="190.2" height="16" rx="2" fill="#1a7f5a"/>
+<text x="416.2" y="69" class="v">141 k</text>
 <text x="212" y="91" class="l" text-anchor="end">redis, io-threads 1</text>
-<rect x="220" y="78" width="186.1" height="16" rx="2" fill="#afb8c1"/>
-<text x="412.1" y="91" class="v">137 k</text>
+<rect x="220" y="78" width="158.4" height="16" rx="2" fill="#afb8c1"/>
+<text x="384.4" y="91" class="v">118 k</text>
 <text x="212" y="113" class="l" text-anchor="end">redis, io-threads 4</text>
-<rect x="220" y="100" width="173.9" height="16" rx="2" fill="#afb8c1"/>
-<text x="399.9" y="113" class="v">128 k</text>
+<rect x="220" y="100" width="155.6" height="16" rx="2" fill="#afb8c1"/>
+<text x="381.6" y="113" class="v">116 k</text>
 <text x="212" y="135" class="l" text-anchor="end">valkey, io-threads 1</text>
-<rect x="220" y="122" width="184.7" height="16" rx="2" fill="#afb8c1"/>
-<text x="410.7" y="135" class="v">136 k</text>
+<rect x="220" y="122" width="187.2" height="16" rx="2" fill="#afb8c1"/>
+<text x="413.2" y="135" class="v">139 k</text>
 <text x="212" y="157" class="l" text-anchor="end">valkey, io-threads 4</text>
-<rect x="220" y="144" width="192.9" height="16" rx="2" fill="#afb8c1"/>
-<text x="418.9" y="157" class="v">142 k</text>
+<rect x="220" y="144" width="196.0" height="16" rx="2" fill="#afb8c1"/>
+<text x="422.0" y="157" class="v">146 k</text>
 <text x="212" y="179" class="l" text-anchor="end">dragonfly</text>
-<rect x="220" y="166" width="179.4" height="16" rx="2" fill="#afb8c1"/>
-<text x="405.4" y="179" class="v">132 k</text>
+<rect x="220" y="166" width="180.0" height="16" rx="2" fill="#afb8c1"/>
+<text x="406.0" y="179" class="v">134 k</text>
 <text x="212" y="201" class="l" text-anchor="end">garnet</text>
-<rect x="220" y="188" width="172.1" height="16" rx="2" fill="#afb8c1"/>
-<text x="398.1" y="201" class="v">126 k</text>
+<rect x="220" y="188" width="168.1" height="16" rx="2" fill="#afb8c1"/>
+<text x="394.1" y="201" class="v">125 k</text>
 <text x="500" y="44" class="t">GET 64 B · depth 64</text>
 <text x="692" y="69" class="l" text-anchor="end">seedstone</text>
-<rect x="700" y="56" width="192.4" height="16" rx="2" fill="#1a7f5a"/>
-<text x="898.4" y="69" class="v">4.59 M</text>
+<rect x="700" y="56" width="189.8" height="16" rx="2" fill="#1a7f5a"/>
+<text x="895.8" y="69" class="v">4.48 M</text>
 <text x="692" y="91" class="l" text-anchor="end">redis, io-threads 1</text>
-<rect x="700" y="78" width="110.1" height="16" rx="2" fill="#afb8c1"/>
-<text x="816.1" y="91" class="v">2.62 M</text>
+<rect x="700" y="78" width="111.1" height="16" rx="2" fill="#afb8c1"/>
+<text x="817.1" y="91" class="v">2.62 M</text>
 <text x="692" y="113" class="l" text-anchor="end">redis, io-threads 4</text>
-<rect x="700" y="100" width="139.3" height="16" rx="2" fill="#afb8c1"/>
-<text x="845.3" y="113" class="v">3.32 M</text>
+<rect x="700" y="100" width="140.7" height="16" rx="2" fill="#afb8c1"/>
+<text x="846.7" y="113" class="v">3.32 M</text>
 <text x="692" y="135" class="l" text-anchor="end">valkey, io-threads 1</text>
-<rect x="700" y="122" width="95.3" height="16" rx="2" fill="#afb8c1"/>
-<text x="801.3" y="135" class="v">2.27 M</text>
+<rect x="700" y="122" width="95.8" height="16" rx="2" fill="#afb8c1"/>
+<text x="801.8" y="135" class="v">2.26 M</text>
 <text x="692" y="157" class="l" text-anchor="end">valkey, io-threads 4</text>
-<rect x="700" y="144" width="153.6" height="16" rx="2" fill="#afb8c1"/>
-<text x="859.6" y="157" class="v">3.66 M</text>
+<rect x="700" y="144" width="154.5" height="16" rx="2" fill="#afb8c1"/>
+<text x="860.5" y="157" class="v">3.65 M</text>
 <text x="692" y="179" class="l" text-anchor="end">dragonfly</text>
 <rect x="700" y="166" width="196.0" height="16" rx="2" fill="#afb8c1"/>
-<text x="902.0" y="179" class="v">4.67 M</text>
+<text x="902.0" y="179" class="v">4.63 M</text>
 <text x="692" y="201" class="l" text-anchor="end">garnet</text>
-<rect x="700" y="188" width="184.0" height="16" rx="2" fill="#afb8c1"/>
-<text x="890.0" y="201" class="v">4.39 M</text>
+<rect x="700" y="188" width="181.7" height="16" rx="2" fill="#afb8c1"/>
+<text x="887.7" y="201" class="v">4.29 M</text>
 <text x="20" y="264" class="t">SET 10 KB · depth 64 · under a 384 MB ceiling, LRU</text>
 <text x="212" y="289" class="l" text-anchor="end">seedstone</text>
-<rect x="220" y="276" width="188.3" height="16" rx="2" fill="#1a7f5a"/>
-<text x="414.3" y="289" class="v">615 k</text>
+<rect x="220" y="276" width="190.9" height="16" rx="2" fill="#1a7f5a"/>
+<text x="416.9" y="289" class="v">617 k</text>
 <text x="212" y="311" class="l" text-anchor="end">redis, io-threads 1</text>
-<rect x="220" y="298" width="81.8" height="16" rx="2" fill="#afb8c1"/>
-<text x="307.8" y="311" class="v">267 k</text>
+<rect x="220" y="298" width="82.0" height="16" rx="2" fill="#afb8c1"/>
+<text x="308.0" y="311" class="v">265 k</text>
 <text x="212" y="333" class="l" text-anchor="end">redis, io-threads 4</text>
 <rect x="220" y="320" width="196.0" height="16" rx="2" fill="#afb8c1"/>
-<text x="422.0" y="333" class="v">640 k</text>
+<text x="422.0" y="333" class="v">633 k</text>
 <text x="212" y="355" class="l" text-anchor="end">valkey, io-threads 1</text>
-<rect x="220" y="342" width="80.4" height="16" rx="2" fill="#afb8c1"/>
-<text x="306.4" y="355" class="v">263 k</text>
+<rect x="220" y="342" width="81.8" height="16" rx="2" fill="#afb8c1"/>
+<text x="307.8" y="355" class="v">264 k</text>
 <text x="212" y="377" class="l" text-anchor="end">valkey, io-threads 4</text>
-<rect x="220" y="364" width="195.5" height="16" rx="2" fill="#afb8c1"/>
-<text x="421.5" y="377" class="v">639 k</text>
+<rect x="220" y="364" width="194.6" height="16" rx="2" fill="#afb8c1"/>
+<text x="420.6" y="377" class="v">629 k</text>
 <text x="500" y="264" class="t">SET 64 B · depth 1 · synced on every write</text>
-<text x="500" y="292" class="m">not measured in this run</text>
-<text x="20" y="498" class="c">Throughput, operations per second, the median of three kept runs. seedstone v0.2.0 against Redis 8.10.0, Valkey 9.1.1, Dragonfly df-v1.40.2, Garnet 2.1.5.</text>
-<text x="20" y="512" class="c">GCP c4a-standard-16 (aarch64), server on 10 cores, redis-benchmark on 6, over loopback, 2026-09-23.</text>
+<text x="692" y="289" class="l" text-anchor="end">seedstone --fsync always</text>
+<rect x="700" y="276" width="189.9" height="16" rx="2" fill="#1a7f5a"/>
+<text x="895.9" y="289" class="v">17 k</text>
+<text x="692" y="311" class="l" text-anchor="end">redis appendfsync always</text>
+<rect x="700" y="298" width="196.0" height="16" rx="2" fill="#afb8c1"/>
+<text x="902.0" y="311" class="v">18 k</text>
+<text x="20" y="498" class="c">Throughput, operations per second, the median of three kept runs. seedstone v0.3.0 against Redis 8.10.0, Valkey 9.1.1, Dragonfly df-v1.40.2, Garnet 2.1.5.</text>
+<text x="20" y="512" class="c">GCP c4a-standard-16 (aarch64), server on 10 cores, redis-benchmark on 6, over loopback, 2026-10-10.</text>
 <text x="20" y="526" class="c">Every table, the CPU per operation and what the numbers do not say: docs/benchmarks.md</text>
 </svg>
