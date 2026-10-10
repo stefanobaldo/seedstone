@@ -303,6 +303,44 @@ def header(path):
     return date, machine
 
 
+def cpu_count(spec):
+    """How many cpus a taskset list such as `0-9` or `0-3,8` names."""
+    n = 0
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        n += int(hi or lo) - int(lo) + 1
+    return n
+
+
+def log_facts(lines):
+    """What the logs say about the caption's facts: the release this server
+    echoed, every `<engine>_version:` line, and the two cpusets."""
+    facts = {"release": "", "versions": set(), "cores": None}
+    for line in lines:
+        if line.startswith("### seedstone seedstone "):
+            facts["release"] = "v" + line.split()[3]
+        elif line.startswith("### kernel ") and " cpus server=" in line:
+            server, client = line.split(" cpus server=", 1)[1].split()[:2]
+            facts["cores"] = (cpu_count(server), cpu_count(client.removeprefix("client=")))
+        elif "_version:" in line:
+            facts["versions"].add(line.strip())
+    return facts
+
+
+def caption_errors(opts, facts):
+    """Each way the typed caption disagrees with the logs; empty when it agrees."""
+    errors = []
+    if opts["release"] != facts["release"]:
+        errors.append(f"release {opts['release']}, logs {facts['release']}")
+    if not opts["engines"]:
+        errors.append("no engines named")
+    for e in filter(None, opts["engines"].split(",")):
+        name, _, ver = e.partition(":")
+        if f"{name}_version:{ver}" not in facts["versions"]:
+            errors.append(f"engine {e} not in the logs")
+    return errors
+
+
 def find_cell(summaries, prefix, anchor):
     """The first log whose row matches the cell's shape, argument and depth and
     carries the anchor arm; None when no log ran the cell."""
@@ -326,7 +364,7 @@ def esc(s):
 
 
 def svg_from_summaries(summaries, date, machine_line, release, engines, theme,
-                       machine="c4a-standard-16"):
+                       machine="c4a-standard-16", cores=(10, 6)):
     t = THEMES[theme]
     W, PW, PH, ROW, LEFT, GAP = 960, 460, 200, 22, 200, 20
     arch = machine_line.split()[2] if len(machine_line.split()) > 2 else ""
@@ -356,8 +394,8 @@ def svg_from_summaries(summaries, date, machine_line, release, engines, theme,
                       (e.split(":", 1) for e in engines.split(",")))
     cap1 = (f"Throughput, operations per second, the median of three kept runs. "
             f"seedstone {release} against {names}.")
-    cap2 = (f"GCP {machine} ({arch}), server on 10 cores, redis-benchmark on 6, over "
-            f"loopback, {date}.")
+    cap2 = (f"GCP {machine} ({arch}), server on {cores[0]} cores, redis-benchmark on "
+            f"{cores[1]}, over loopback, {date}.")
     cap3 = "Every table, the CPU per operation and what the numbers do not say: docs/benchmarks.md"
     style = (f".t{{font:600 13px ui-sans-serif,system-ui,sans-serif;fill:{t['text']}}}"
              f".l,.v,.m{{font:12px ui-sans-serif,system-ui,sans-serif;fill:{t['text']}}}"
@@ -407,9 +445,14 @@ def svg_chart(out, argv):
     if not logs:
         sys.exit("--svg needs at least one log")
     date, machine = header(logs[0])
+    lines = [line for p in logs for line in open(p)]
+    facts = log_facts(lines)
+    errors = caption_errors(opts, facts)
+    if errors:
+        sys.exit("--svg: the caption disagrees with the logs: " + "; ".join(errors))
     summaries = [summarise(parse(p)) for p in logs]
     svg = svg_from_summaries(summaries, date, machine, opts["release"], opts["engines"],
-                             opts["theme"], opts["machine"])
+                             opts["theme"], opts["machine"], facts["cores"])
     with open(out, "w") as f:
         f.write(f"{inputs_comment(opts, logs)}\n{svg}")
 
@@ -476,6 +519,19 @@ def selftest():
     assert "--" not in line[4:-3], line
     assert svg_args(line[len("<!-- inputs: "):-len(" -->")].split()) == (opts, logs)
     xml.dom.minidom.parseString(line + "\n" + dark)
+    # The caption's facts are read from the logs; an argument that disagrees is refused.
+    facts = log_facts(["### seedstone seedstone 0.3.0  benchmark redis-benchmark 8.10.0",
+                       "### kernel 7.0.0-1011-gcp aarch64  cpus server=0-9 client=10-15",
+                       "    redis_version:8.10.0", "    valkey_version:9.1.1"])
+    assert facts["cores"] == (10, 6) and facts["release"] == "v0.3.0", facts
+    assert caption_errors({"release": "v0.3.0", "engines": "redis:8.10.0,valkey:9.1.1"}, facts) == []
+    bad = caption_errors({"release": "v0.2.0", "engines": "redis:8.10.0,valkey:9.2.0"}, facts)
+    assert len(bad) == 2 and "v0.2.0" in bad[0] and "valkey:9.2.0" in bad[1], bad
+    assert caption_errors({"release": "v0.3.0", "engines": ""}, facts)        # no engines named
+    assert log_facts(["### kernel x aarch64  cpus server=0-3,8 client=4-7"])["cores"] == (5, 4)
+    eight = svg_from_summaries([field], "2026-09-23", "kernel 7.0.0-1011-gcp aarch64",
+                               "v0.2.0", "redis:8.10.0", "light", cores=(8, 8))
+    assert "server on 8 cores, redis-benchmark on 8," in eight
     print("selftest ok")
 
 
