@@ -48,6 +48,11 @@ jobs:
       # Every source file stays under a size a reader can hold in one sitting;
       # the script says which and why.
       - run: bash scripts/module-bound.sh
+      # The benchmark chart on the README is rendered from the committed raw
+      # logs; the script regenerates it and refuses a byte of difference. The
+      # renderer's own selftest runs first, so a chart rule that changed is
+      # caught before a chart that changed.
+      - run: python3 bench/report.py --selftest && bash scripts/check-benchmark-chart.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # `--workspace` unifies Cargo features across every crate in the build, so
       # the features the simulator turns on leak into the production crates and
