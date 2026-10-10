@@ -15,7 +15,9 @@ this directory is what produced them.
   like a page cache's, 10 240-byte values, the same keys every run, loaded
   through `redis-cli --pipe`.
 - `report.py` — turns the raw logs into the tables, applies the reading rule,
-  and derives `W` from the calibration log. Standard library only.
+  and derives `W` from the calibration log. Standard library only. `--svg`
+  renders the README's chart from the logs; the file's first line names its
+  inputs.
 - `results/<tag>/` — the raw logs of each published run, one per stage,
   unedited.
 
