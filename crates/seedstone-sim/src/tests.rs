@@ -215,7 +215,15 @@ fn the_trace_hash_is_pinned_across_processes_and_builds() {
     //
     // Re-pinned: the housekeeping tick, when due, now outranks the inbox,
     // which moves when each tick runs against the envelopes around it.
-    const MINI_1_42: u64 = 0x25c8_dc02_b641_1b48;
+    //
+    // And back to the value before that: the tick is now read after each
+    // envelope, against the clock reading the envelope already took, and
+    // awaited only when the inbox is empty. Under the simulator's paused
+    // clock time advances only when every task is idle, so the tick lands
+    // where it did behind the inbox, and the hash is the one from before
+    // the tick outranked it. The real-time guarantee the re-ordering bought
+    // (#79) is held by the inline check and by its own test.
+    const MINI_1_42: u64 = 0xf6e7_c967_9f41_f5f2;
 
     let outcome = run_sim(&SimConfig::mini(1, 42));
     assert_eq!(
@@ -929,9 +937,14 @@ fn one_seed_per_durability_policy_is_pinned() {
     //
     // Re-pinned, `interval` and `never`, when the housekeeping tick began to
     // outrank the inbox; `always` held still.
+    //
+    // And back, `interval` and `never`, to the values before that, when the
+    // tick came to be read after each envelope and awaited only when idle:
+    // under the paused clock that is the schedule the tick had behind the
+    // inbox (see `MINI_1_42`). `always` held still again.
     const HOSTILE_1_3_ALWAYS: u64 = 0x676a_1ba9_4103_bb1c;
-    const HOSTILE_1_3_INTERVAL: u64 = 0xf74b_2444_c09f_bb4f;
-    const HOSTILE_1_3_NEVER: u64 = 0xc5c1_dabc_6a7b_a4e9;
+    const HOSTILE_1_3_INTERVAL: u64 = 0x2f7e_329c_c918_aea2;
+    const HOSTILE_1_3_NEVER: u64 = 0x2495_bee7_97d3_492c;
     for (policy, pinned) in [
         (SyncPolicy::ALWAYS, HOSTILE_1_3_ALWAYS),
         (SyncPolicy::INTERVAL, HOSTILE_1_3_INTERVAL),
