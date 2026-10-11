@@ -388,22 +388,32 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
     // `interval` yields its first tick immediately; consume it so the first
     // real tick is one period away.
     tick.tick().await;
-    // The stop is read, not awaited, while there is work: `has_changed` is
-    // one atomic load of the channel's version, and it is checked at the top
-    // of every iteration, so a stop lands within one envelope of being sent
-    // however full the inbox is. The `changed()` arm below is the idle case,
-    // and it sits behind the inbox on purpose. Every `changed()` future is a
-    // `Notify` waiter, and a waiter takes the channel's lock to register on
-    // its first poll, on every later poll to guard its waker, and once more
-    // to leave when it is dropped (tokio 1.53.2, `sync/notify.rs`). Ahead of
-    // the inbox it was polled on every iteration an envelope won — a lock
-    // per envelope on the one channel every executor of the pool shares,
-    // and a `KEYS` call is one envelope per shard. That read as 17 % of
-    // `KEYS`'s calls per second and 20 % of its CPU per call on the
-    // benchmark cell when the future was fresh each iteration, and a third
-    // of that when one future was kept and re-polled (#102). Behind the
-    // inbox it is polled only when the inbox is empty, and the lock is paid
-    // once per idle spell rather than once per envelope.
+    // Two signals are read, not awaited, while there is work, and awaited
+    // only when the inbox is empty: the stop and the housekeeping tick.
+    //
+    // The stop: `has_changed` is one atomic load of the channel's version,
+    // checked at the top of every iteration, so a stop lands within one
+    // envelope of being sent however full the inbox is. Every `changed()`
+    // future is a `Notify` waiter, and a waiter takes the channel's lock to
+    // register on its first poll, on every later poll to guard its waker,
+    // and once more to leave when it is dropped (tokio 1.53.2,
+    // `sync/notify.rs`). Ahead of the inbox it was polled on every iteration
+    // an envelope won — a lock per envelope on the one channel every
+    // executor of the pool shares, and a `KEYS` call is one envelope per
+    // shard. That read as 17 % of `KEYS`'s calls per second and 20 % of its
+    // CPU per call on the benchmark cell when the future was fresh each
+    // iteration, and a third of that when one future was kept and
+    // re-polled (#102).
+    //
+    // The tick: `serve` already reads the clock once per envelope, for the
+    // commands; the loop compares that reading with `next_tick` and runs the
+    // housekeeping inline when it is due, so under load the tick costs one
+    // comparison per envelope and lands within one envelope of its time.
+    // Polled ahead of the inbox as a `Sleep`, it re-registered its waker and
+    // spent cooperative budget on every envelope, which read as about 1 % of
+    // `KEYS`'s figure on the same cell. Both arms sit behind the inbox as the
+    // idle case, where they are polled only when there is nothing to serve.
+    let mut next_tick = Instant::now() + HOUSEKEEPING_TICK;
 
     loop {
         if stop.has_changed().unwrap_or(true) {
@@ -435,17 +445,17 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
             // at most a few times per round. Behind the inbox it would be
             // polled only when the inbox ran dry, so a busy executor would
             // hold its writes' replies for as long as the load lasted. The
-            // stop is read before the `select!` rather than awaited in it,
-            // for the reason the comment above the loop gives. Then the
-            // tick, when it is due: it is ready at most once per
-            // `HOUSEKEEPING_TICK` and its work is bounded — a rehash step,
-            // an expiry sample, one slice of an image — so it takes one
-            // tick's share and no more. Behind the inbox it ran only when
-            // the inbox ran dry, and a keyspace walk queues its next step
-            // the moment the last returns, so a walk under load held off
-            // every image, every compaction and the end of every refusal
-            // for as long as it lasted (#79). The inbox comes next, and
-            // the stop's idle arm last.
+            // inbox comes next. The tick and the stop come last, as the
+            // idle case: under load both are read after each envelope
+            // instead — see the comment above the loop — because a tick
+            // behind a busy inbox once ran only when the inbox ran dry,
+            // and a keyspace walk queues its next step the moment the last
+            // returns, so a walk under load held off every image, every
+            // compaction and the end of every refusal for as long as it
+            // lasted (#79); and because a tick ahead of the inbox was paid
+            // on every envelope (#102). The tick's work is bounded — a
+            // rehash step, an expiry sample, one slice of an image — so
+            // wherever it runs it takes one tick's share and no more.
             biased;
 
             progress = next_progress(&mut this.sync.link), if this.sync.link.is_some() => {
@@ -459,20 +469,30 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
                     this.refuse();
                 }
             }
-            // One ticker per executor rather than one per shard, advancing
-            // every owned dict by the same budget: the same per-dict drain
-            // rate, and the same aggregate work, as independent tickers.
-            _ = tick.tick() => this.housekeeping(),
             // Above the budget the inbox waits for the writer's progress:
             // the stall `write` gave the executor, one step later.
             envelope = inbox.recv(), if !this.sync.over_budget() => {
                 let Some(envelope) = envelope else {
                     break;
                 };
-                this.serve(envelope);
+                if let Some(now) = this.serve(envelope)
+                    && now >= next_tick
+                {
+                    this.housekeeping();
+                    tick.reset();
+                    next_tick = now + HOUSEKEEPING_TICK;
+                }
             }
-            // The idle case, see the comment above the loop. A dropped
-            // sender is a dropped pool, which closes the inbox too:
+            // The tick's idle case. One ticker per executor rather than one
+            // per shard, advancing every owned dict by the same budget: the
+            // same per-dict drain rate, and the same aggregate work, as
+            // independent tickers.
+            _ = tick.tick() => {
+                this.housekeeping();
+                next_tick = Instant::now() + HOUSEKEEPING_TICK;
+            }
+            // The stop's idle case, see the comment above the loop. A
+            // dropped sender is a dropped pool, which closes the inbox too:
             // stopping on either is the same stop. What is still queued is
             // served by the stop itself.
             _ = stop.changed() => break,
@@ -727,7 +747,11 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
     /// Applies one envelope, hands what it appended to the writer, and
     /// answers it — at once, or once the sync covering it completes when
     /// the policy holds a write's replies. A read-only envelope never waits.
-    fn serve(&mut self, Envelope { mut cmds, reply }: Envelope) {
+    ///
+    /// Returns the clock reading the batch was served at, so the loop can
+    /// tell whether the housekeeping tick is due without reading the clock
+    /// again; `None` for a snapshot request, which takes no reading.
+    fn serve(&mut self, Envelope { mut cmds, reply }: Envelope) -> Option<Instant> {
         if let Some(wait) = cmds.first().and_then(|(_, cmd)| match cmd {
             Command::Snapshot { wait } => Some(*wait),
             _ => None,
@@ -739,7 +763,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
                     .all(|(_, cmd)| matches!(cmd, Command::Snapshot { .. }))
             );
             self.snapshot(wait, cmds.len(), reply);
-            return;
+            return None;
         }
         // No `await` inside this loop, so a batch is applied as a unit:
         // nothing from another connection lands between its commands.
@@ -813,6 +837,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         } else {
             send(reply, replies);
         }
+        Some(now.instant)
     }
 
     /// A client's `SAVE` or `BGSAVE`, one reply per shard of the envelope.

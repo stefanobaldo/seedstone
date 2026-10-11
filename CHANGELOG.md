@@ -15,7 +15,10 @@ SemVer and are `0.x` while the keyspace holds only strings;
   still took the pool-wide lock once per batch of commands, because a
   registered waiter re-takes it on every poll to guard its waker. The
   executor now reads the stop signal with one atomic load per batch and
-  awaits it only while its inbox is empty (#102).
+  awaits it only while its inbox is empty. The housekeeping tick, which was
+  polled ahead of every batch for the same reason and cost about one
+  percent of the same figure, is checked the same way, against the clock
+  reading each batch already takes (#102).
 
 ## [0.3.1] - 2026-10-10
 
