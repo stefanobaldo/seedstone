@@ -7,18 +7,16 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-11
+
 ### Fixed
 
-- **The rest of the `KEYS` regression.** 0.3.1 recovered two thirds of
-  it on the benchmark cell (3 353 calls/s and 2 972 µs CPU per call against
-  0.2.0's 3 579 and 2 783.5): keeping one stop future across the loop
-  still took the pool-wide lock once per batch of commands, because a
-  registered waiter re-takes it on every poll to guard its waker. The
-  executor now reads the stop signal with one atomic load per batch and
-  awaits it only while its inbox is empty. The housekeeping tick, which was
-  polled ahead of every batch for the same reason and cost about one
-  percent of the same figure, is checked the same way, against the clock
-  reading each batch already takes (#102).
+- **`KEYS` is back to 0.2.0's figure.** 0.3.1 recovered two thirds of the
+  regression 0.3.0 introduced; this release recovers the rest. On the
+  benchmark cell `KEYS` now reads the same calls per second and CPU per call
+  as 0.2.0, within run-to-run variation. The cause was two signals each
+  executor checked ahead of every batch of commands, which a `KEYS` call,
+  reaching every shard, paid once per shard (#102).
 
 ## [0.3.1] - 2026-10-10
 
@@ -234,7 +232,8 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 <!-- [0.0.0] has no definition: it was a crates.io placeholder and was never
      tagged in git, so every URL for it would 404. -->
-[Unreleased]: https://github.com/stefanobaldo/seedstone/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/stefanobaldo/seedstone/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/stefanobaldo/seedstone/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/stefanobaldo/seedstone/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/stefanobaldo/seedstone/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/stefanobaldo/seedstone/compare/v0.1.1...v0.2.0
