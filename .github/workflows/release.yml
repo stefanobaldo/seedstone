@@ -97,3 +97,88 @@ jobs:
           name: dist-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
+
+  # One image per architecture, built natively on its runner (no emulation:
+  # an emulated build is slow and is not what a user runs), smoked before
+  # anything leaves the runner, pushed by digest, then joined into one index
+  # under the tag. A dispatch builds and smokes and pushes nothing.
+  image:
+    needs: meta
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-24.04,     arch: amd64 }
+          - { os: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: build and smoke
+        run: |
+          docker buildx build --load --platform linux/${{ matrix.arch }} -t seedstone-smoke .
+          reported="$(docker run --rm seedstone-smoke --version)"
+          case "$reported" in 'seedstone '?*) ;; *) echo "the image does not report its version: $reported" >&2; exit 1;; esac
+      # The digest travels to the join as a file rather than a job output: a
+      # matrix job has one set of outputs for all its legs.
+      - name: push by digest
+        if: needs.meta.outputs.publish == 'true'
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx build --platform linux/${{ matrix.arch }} \
+            --output type=image,name=ghcr.io/stefanobaldo/seedstone,push-by-digest=true,name-canonical=true,push=true \
+            --metadata-file meta.json .
+          mkdir digest
+          jq -r '."containerimage.digest"' meta.json > digest/${{ matrix.arch }}
+          grep -q '^sha256:' digest/${{ matrix.arch }} || { echo "no digest in meta.json" >&2; cat meta.json >&2; exit 1; }
+      - if: needs.meta.outputs.publish == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digest/*
+          if-no-files-found: error
+
+  # The join: one index under the tag, on GHCR (canonical) and on Docker Hub
+  # (the mirror: the same index, a shorter name). The digest to record in a
+  # deployment is the index's, printed by the GHCR step.
+  image-index:
+    needs: [meta, image]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digest
+          merge-multiple: true
+      - name: the index on GHCR
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          repo=ghcr.io/stefanobaldo/seedstone
+          tags="-t $repo:${GITHUB_REF_NAME}"
+          [ "${{ needs.meta.outputs.final }}" = true ] && tags="$tags -t $repo:latest"
+          docker buildx imagetools create $tags "$repo@$(cat digest/amd64)" "$repo@$(cat digest/arm64)"
+          docker buildx imagetools inspect "$repo:${GITHUB_REF_NAME}"
+      # The mirror comes last and after the release has what it needs: a
+      # Docker Hub token that expired fails this step visibly, not the release.
+      - name: the mirror on Docker Hub
+        env:
+          NS: ${{ vars.DOCKERHUB_NAMESPACE }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          [ -n "$NS" ] || { echo "the repository variable DOCKERHUB_NAMESPACE is not set" >&2; exit 1; }
+          echo "$DOCKERHUB_TOKEN" | docker login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
+          src=ghcr.io/stefanobaldo/seedstone:${GITHUB_REF_NAME}
+          tags="-t docker.io/$NS/seedstone:${GITHUB_REF_NAME}"
+          [ "${{ needs.meta.outputs.final }}" = true ] && tags="$tags -t docker.io/$NS/seedstone:latest"
+          docker buildx imagetools create $tags "$src"
+          docker buildx imagetools inspect "docker.io/$NS/seedstone:${GITHUB_REF_NAME}"
