@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "SeedStone RESP2 codec."
+readme = "README.md"
+keywords = ["redis", "resp"]
+categories = ["database-implementations"]
 
 [dependencies]
 # The bulk's bytes travel on as a `Bytes` so the layers above can share
