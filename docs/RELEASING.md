@@ -124,12 +124,11 @@ step 3 below insists on the candidate suffix.
   the key and re-run the job. A re-run that renders the formula already on
   the tap pushes nothing, and a re-run of an older final once a newer one
   is on the tap leaves the tap alone.
-
 - **GHCR**: the workflow's own token pushes the image and the chart; no
-  secret. A package GHCR creates on its first push may be private: the
-  image's package is public, and the chart's, `charts/seedstone`, must be
-  made public in its package settings after the first tag that pushes it,
-  or every `helm install` outside this account is refused.
+  secret. Both packages are public and linked to this repository; the
+  chart's, `charts/seedstone`, was created that way by its first push, at
+  `v0.3.3`, and read anonymously right after. A package made private later
+  refuses every `docker pull` or `helm install` outside this account.
 
 ## Cutting one
 
