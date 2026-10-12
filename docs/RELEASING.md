@@ -98,10 +98,10 @@ step 3 below insists on the candidate suffix.
 
 - **Docker Hub**: the repository variable `DOCKERHUB_NAMESPACE` and the
   secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (an access token with
-  read and write scope). Without them, or with an expired token, the mirror
-  step fails — after the GHCR index exists and independently of the GitHub
-  Release, so the release itself is complete and only the mirror is missing.
-  Fix the credential and re-run the `image-index` job.
+  read and write scope). Without them, or with an expired token, the
+  `image-mirror` job fails — after the GHCR index exists and independently
+  of the GitHub Release and the chart, so the release itself is complete and
+  only the mirror is missing. Fix the credential and re-run that job.
 - **crates.io**: the four crates exist there, and trusted publishing is
   configured on each — repository `stefanobaldo/seedstone`, workflow
   `release.yml`, no environment. A trusted-publishing token cannot create a
