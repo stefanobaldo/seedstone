@@ -26,10 +26,14 @@ artifacts and not one:
   `sha256`. The packaging itself is `scripts/package-release.sh`, which CI also
   runs on every pull request so that the day a tag is pushed is not the first
   day the script runs.
-- **The container image**, `ghcr.io/stefanobaldo/seedstone:<tag>` — built,
-  smoke-tested and pushed by the same run. It is the artifact a deployment
-  pins, usually by the digest the run prints rather than by the tag, so record
-  the digest wherever the deployment lives.
+- **The container image**, built once per architecture (`linux/amd64` and
+  `linux/arm64`) on native runners, smoke-tested, pushed by digest, and
+  joined into one index under the tag on `ghcr.io/stefanobaldo/seedstone`,
+  then mirrored to `docker.io/<namespace>/seedstone` — the same index, the
+  same digests. `latest` moves on both only for a final. It is the artifact
+  a deployment pins, usually by digest rather than by tag: the digest to
+  record is the **index's**, printed by the `image-index` job, and a
+  deployment that pins by digest keeps pinning GHCR.
 - **The GitHub Release**, carrying the binary and its checksum, and marked as a
   pre-release when the tag contains a `-`. Its notes are the changelog's
   section for this version, cut out by name; a candidate has no section of its
@@ -38,6 +42,15 @@ artifacts and not one:
 The workflow also refuses to publish a tag whose name disagrees with
 `cargo pkgid -p seedstone`, character for character. That check is the reason
 step 3 below insists on the candidate suffix.
+
+## What a release depends on outside this repository
+
+- **Docker Hub**: the repository variable `DOCKERHUB_NAMESPACE` and the
+  secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (an access token with
+  read and write scope). Without them, or with an expired token, the mirror
+  step fails — after the GHCR index exists and independently of the GitHub
+  Release, so the release itself is complete and only the mirror is missing.
+  Fix the credential and re-run the `image-index` job.
 
 ## Cutting one
 
