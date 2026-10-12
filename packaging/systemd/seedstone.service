@@ -1,0 +1,33 @@
+# The server as a system service. A dynamic user, so the package creates no
+# account; the state directory is created and owned by the unit, which is
+# where `--data-dir` points. Loopback and no password are the server's own
+# defaults and the only ones it accepts without a password; a bind outside
+# loopback needs SEEDSTONE_REQUIREPASS in the environment file, or
+# `--no-auth` in SEEDSTONE_OPTS, said deliberately. The server writes its
+# events to stderr, which is the journal: `journalctl -u seedstone`.
+[Unit]
+Description=SeedStone in-memory key-value store
+Documentation=https://github.com/stefanobaldo/seedstone/blob/main/docs/operations.md
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=seedstone
+EnvironmentFile=-/etc/default/seedstone
+EnvironmentFile=-/etc/sysconfig/seedstone
+ExecStart=/usr/bin/seedstone --bind 127.0.0.1:6379 --data-dir /var/lib/seedstone $SEEDSTONE_OPTS
+# A clean stop syncs the log before the process ends; give it time to.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+# The default --max-clients is 10 000 connections; each is a descriptor.
+LimitNOFILE=65536
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
