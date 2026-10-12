@@ -60,7 +60,10 @@ sudo dnf install ./seedstone-0.3.3-1.x86_64.rpm
 helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --version 0.3.3 --set auth.noAuth=true
 ```
 
-Every channel, with checksums, the packaged defaults and the service
+The packages start a service on loopback. After Homebrew or Cargo, start
+the server with `seedstone` (or `brew services start seedstone`); on
+Kubernetes, reach it with `kubectl port-forward svc/seedstone-seedstone
+6379`. Every channel, with checksums, the packaged defaults and the service
 units, is on [docs/install.md](docs/install.md). Then, with any client:
 
 ```console
