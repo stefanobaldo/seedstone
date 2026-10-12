@@ -1,0 +1,120 @@
+### stage expiry start 2026-10-11T23:59:33Z
+### load at start: 5.39 2.71 1.16
+### kernel 7.0.0-1014-gcp aarch64  cpus server=0-9 client=10-15
+### os Ubuntu 24.04.4 LTS  memtotal 62.7 GiB
+### seedstone seedstone 0.3.2  benchmark redis-benchmark 8.10.0
+
+### expiry: SET 64 B at depth 64, without and with EX 60; 50 clients; 100 000 spread keys; W=1
+--- seedstone [populate] pid=9462 threads=11 load:5.39
+    cmd: /home/stefanobaldo/src/seedstone-v0.3.2/target/release/seedstone --bind 127.0.0.1:6390 --max-clients 2000 --no-auth
+    redis_version:0.3.2
+    probe: 48/50 hits on key:%012d  dbsize=94997
+cell arm=seedstone kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.380 sys_us=0.230 total_us=1.610 cores=7.45 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.350 sys_us=0.270 total_us=1.620 cores=7.50 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4651162.50 user_us=1.360 sys_us=0.230 total_us=1.590 cores=7.40 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4608295.00 user_us=1.350 sys_us=0.260 total_us=1.610 cores=7.42 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=warmup shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4608295.00 user_us=1.500 sys_us=0.230 total_us=1.730 cores=7.97 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4608295.00 user_us=1.510 sys_us=0.230 total_us=1.740 cores=8.02 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.500 sys_us=0.220 total_us=1.720 cores=7.96 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4545454.50 user_us=1.500 sys_us=0.240 total_us=1.740 cores=7.91 client_cores=1.01 evicted=0 evicted_per_op=0.000
+    ttl probe: 60 (a deadline reached the server)
+
+--- redis-iot1 [populate] pid=9832 threads=6 load:4.96
+    cmd: /home/stefanobaldo/redis-8.10.0/src/redis-server --port 6391 --save  --appendonly no --io-threads 1
+    redis_version:8.10.0
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    probe: 48/50 hits on key:%012d  dbsize=95023
+cell arm=redis-iot1 kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2096436.12 user_us=0.390 sys_us=0.090 total_us=0.480 cores=1.01 client_cores=0.43 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2100840.25 user_us=0.410 sys_us=0.070 total_us=0.480 cores=1.01 client_cores=0.43 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2092050.25 user_us=0.410 sys_us=0.070 total_us=0.480 cores=1.00 client_cores=0.43 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2087682.62 user_us=0.410 sys_us=0.070 total_us=0.480 cores=1.00 client_cores=0.43 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=warmup shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1490313.00 user_us=0.600 sys_us=0.070 total_us=0.670 cores=1.00 client_cores=0.32 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1569858.62 user_us=0.550 sys_us=0.090 total_us=0.640 cores=1.00 client_cores=0.33 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1557632.38 user_us=0.560 sys_us=0.080 total_us=0.640 cores=1.00 client_cores=0.33 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1552795.00 user_us=0.550 sys_us=0.100 total_us=0.650 cores=1.01 client_cores=0.33 evicted=0 evicted_per_op=0.000
+    ttl probe: 60 (a deadline reached the server)
+
+--- redis-iot4 [populate] pid=10258 threads=9 load:4.72
+    cmd: /home/stefanobaldo/redis-8.10.0/src/redis-server --port 6391 --save  --appendonly no --io-threads 4
+    redis_version:8.10.0
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    probe: 49/50 hits on key:%012d  dbsize=95016
+cell arm=redis-iot4 kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2475247.50 user_us=0.480 sys_us=0.110 total_us=0.590 cores=1.46 client_cores=0.58 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2487562.25 user_us=0.490 sys_us=0.090 total_us=0.580 cores=1.44 client_cores=0.58 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2487562.25 user_us=0.490 sys_us=0.100 total_us=0.590 cores=1.47 client_cores=0.58 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2493765.75 user_us=0.480 sys_us=0.110 total_us=0.590 cores=1.47 client_cores=0.59 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=warmup shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1715265.88 user_us=0.680 sys_us=0.100 total_us=0.780 cores=1.34 client_cores=0.39 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1814882.00 user_us=0.650 sys_us=0.110 total_us=0.760 cores=1.38 client_cores=0.42 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1818181.75 user_us=0.640 sys_us=0.110 total_us=0.750 cores=1.36 client_cores=0.43 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1824817.62 user_us=0.650 sys_us=0.110 total_us=0.760 cores=1.39 client_cores=0.42 evicted=0 evicted_per_op=0.000
+    ttl probe: 60 (a deadline reached the server)
+
+--- valkey-iot1 [populate] pid=10629 threads=7 load:4.07
+    cmd: /home/stefanobaldo/valkey-9.1.1/src/valkey-server --port 6393 --save  --appendonly no --io-threads 1
+    redis_version:7.2.4
+    valkey_version:9.1.1
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    probe: 48/50 hits on key:%012d  dbsize=94950
+cell arm=valkey-iot1 kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1776198.88 user_us=0.500 sys_us=0.060 total_us=0.560 cores=0.99 client_cores=0.37 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1779359.50 user_us=0.500 sys_us=0.070 total_us=0.570 cores=1.01 client_cores=0.37 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1779359.50 user_us=0.490 sys_us=0.060 total_us=0.550 cores=0.98 client_cores=0.37 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1782531.25 user_us=0.490 sys_us=0.080 total_us=0.570 cores=1.02 client_cores=0.37 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=warmup shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1158748.62 user_us=0.780 sys_us=0.090 total_us=0.870 cores=1.01 client_cores=0.24 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1180637.50 user_us=0.760 sys_us=0.080 total_us=0.840 cores=0.99 client_cores=0.25 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1183431.88 user_us=0.770 sys_us=0.070 total_us=0.840 cores=0.99 client_cores=0.25 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1176470.50 user_us=0.770 sys_us=0.080 total_us=0.850 cores=1.00 client_cores=0.25 evicted=0 evicted_per_op=0.000
+    ttl probe: 60 (a deadline reached the server)
+
+--- valkey-iot4 [populate] pid=10996 threads=13 load:3.90
+    cmd: /home/stefanobaldo/valkey-9.1.1/src/valkey-server --port 6393 --save  --appendonly no --io-threads 4
+    redis_version:7.2.4
+    valkey_version:9.1.1
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    probe: 48/50 hits on key:%012d  dbsize=95051
+cell arm=valkey-iot4 kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2403846.00 user_us=0.890 sys_us=0.090 total_us=0.980 cores=2.36 client_cores=0.53 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2617801.00 user_us=1.440 sys_us=0.110 total_us=1.550 cores=4.06 client_cores=0.61 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2617801.00 user_us=1.460 sys_us=0.100 total_us=1.560 cores=4.08 client_cores=0.62 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2624671.75 user_us=1.450 sys_us=0.090 total_us=1.540 cores=4.04 client_cores=0.62 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=warmup shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1592356.62 user_us=2.440 sys_us=0.090 total_us=2.530 cores=4.03 client_cores=0.39 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1639344.25 user_us=2.350 sys_us=0.110 total_us=2.460 cores=4.03 client_cores=0.40 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1652892.50 user_us=2.330 sys_us=0.100 total_us=2.430 cores=4.02 client_cores=0.40 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1663893.50 user_us=2.150 sys_us=0.120 total_us=2.270 cores=3.78 client_cores=0.40 evicted=0 evicted_per_op=0.000
+    ttl probe: 60 (a deadline reached the server)
+
+--- dragonfly [populate] pid=11369 threads=11 load:3.60
+    cmd: /home/stefanobaldo/dragonfly/dragonfly-aarch64 --port=6392 --proactor_threads=10 --dbfilename= --logtostderr=false
+    redis_version:7.4.0
+    dragonfly_version:df-v1.40.2
+    os:Linux 7.0.0-1014-gcp aarch64
+    probe: 45/50 hits on key:%012d  dbsize=95084
+cell arm=dragonfly kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4608295.00 user_us=1.280 sys_us=0.260 total_us=1.540 cores=7.10 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4651162.50 user_us=1.290 sys_us=0.250 total_us=1.540 cores=7.16 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4651162.50 user_us=1.270 sys_us=0.270 total_us=1.540 cores=7.16 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4672897.00 user_us=1.290 sys_us=0.230 total_us=1.520 cores=7.10 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=warmup shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4651162.50 user_us=1.460 sys_us=0.190 total_us=1.650 cores=7.67 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.440 sys_us=0.210 total_us=1.650 cores=7.64 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4587156.00 user_us=1.450 sys_us=0.210 total_us=1.660 cores=7.61 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4651162.50 user_us=1.460 sys_us=0.210 total_us=1.670 cores=7.77 client_cores=1.01 evicted=0 evicted_per_op=0.000
+    ttl probe: 60 (a deadline reached the server)
+
+--- garnet [populate] pid=11822 threads=27 load:3.39
+    cmd: /home/stefanobaldo/garnet/net8.0/GarnetServer --port 6394
+    garnet_version:2.1.5
+    os:Unix 7.0.0.1014
+    redis_version:7.4.3
+    probe: 49/50 hits on key:%012d  dbsize=95054
+cell arm=garnet kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3184713.25 user_us=2.890 sys_us=0.250 total_us=3.140 cores=10.00 client_cores=0.68 evicted=- evicted_per_op=-
+cell arm=garnet kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4255319.00 user_us=2.100 sys_us=0.230 total_us=2.330 cores=9.91 client_cores=0.94 evicted=- evicted_per_op=-
+cell arm=garnet kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4694835.50 user_us=1.870 sys_us=0.260 total_us=2.130 cores=10.00 client_cores=1.01 evicted=- evicted_per_op=-
+cell arm=garnet kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.830 sys_us=0.330 total_us=2.160 cores=10.00 client_cores=1.00 evicted=- evicted_per_op=-
+cell arm=garnet kind=warmup shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3731343.25 user_us=1.970 sys_us=0.610 total_us=2.580 cores=9.63 client_cores=0.90 evicted=- evicted_per_op=-
+cell arm=garnet kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4310345.00 user_us=1.330 sys_us=0.860 total_us=2.190 cores=9.44 client_cores=1.01 evicted=- evicted_per_op=-
+cell arm=garnet kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4219409.00 user_us=1.100 sys_us=0.520 total_us=1.620 cores=6.84 client_cores=1.01 evicted=- evicted_per_op=-
+cell arm=garnet kind=kept shape=set-ex arg=60 depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4329004.00 user_us=1.080 sys_us=0.800 total_us=1.880 cores=8.14 client_cores=1.01 evicted=- evicted_per_op=-
+    ttl probe: 60 (a deadline reached the server)
+
+### stage expiry done 2026-10-12T00:00:15Z  load:3.39 2.52 1.17

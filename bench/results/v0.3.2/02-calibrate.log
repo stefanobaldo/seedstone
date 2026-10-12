@@ -1,0 +1,146 @@
+### stage calibrate start 2026-10-11T23:53:31Z
+### load at start: 0.76 0.20 0.07
+### kernel 7.0.0-1014-gcp aarch64  cpus server=0-9 client=10-15
+### os Ubuntu 24.04.4 LTS  memtotal 62.7 GiB
+### seedstone seedstone 0.3.2  benchmark redis-benchmark 8.10.0
+
+### calibrate: how many runs until each arm settles. NOTHING HERE IS A MEASUREMENT.
+### Every figure below is discarded; this stage's output is one integer, W.
+### Rule, fixed in advance: per arm, the smallest i such that runs i, i+1, i+2 lie
+### within 2 % (max - min <= 2 % of their median); that arm needs i-1 discarded runs.
+### W is the largest i-1 across all arms. Cap 12 runs; an arm that never
+### settles inside the cap is a finding, not a number to round.
+--- seedstone [populate] pid=2452 threads=11 load:0.76
+    cmd: /home/stefanobaldo/src/seedstone-v0.3.2/target/release/seedstone --bind 127.0.0.1:6390 --max-clients 2000 --no-auth
+    redis_version:0.3.2
+    probe: 45/50 hits on key:%012d  dbsize=95104
+cell arm=seedstone kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4672897.00 user_us=1.160 sys_us=0.270 total_us=1.430 cores=6.68 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4608295.00 user_us=1.130 sys_us=0.280 total_us=1.410 cores=6.50 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4672897.00 user_us=1.180 sys_us=0.240 total_us=1.420 cores=6.64 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.190 sys_us=0.250 total_us=1.440 cores=6.67 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4694835.50 user_us=1.190 sys_us=0.270 total_us=1.460 cores=6.85 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4608295.00 user_us=1.230 sys_us=0.250 total_us=1.480 cores=6.82 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4587156.00 user_us=1.190 sys_us=0.240 total_us=1.430 cores=6.56 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4672897.00 user_us=1.160 sys_us=0.280 total_us=1.440 cores=6.73 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4608295.00 user_us=1.140 sys_us=0.280 total_us=1.420 cores=6.54 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.180 sys_us=0.260 total_us=1.440 cores=6.67 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4672897.00 user_us=1.190 sys_us=0.250 total_us=1.440 cores=6.73 client_cores=1.02 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.210 sys_us=0.270 total_us=1.480 cores=6.85 client_cores=1.02 evicted=0 evicted_per_op=0.000
+
+--- redis-iot1 [populate] pid=2874 threads=6 load:0.70
+    cmd: /home/stefanobaldo/redis-8.10.0/src/redis-server --port 6391 --save  --appendonly no --io-threads 1
+    redis_version:8.10.0
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    probe: 49/50 hits on key:%012d  dbsize=95083
+cell arm=redis-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2645502.75 user_us=0.280 sys_us=0.090 total_us=0.370 cores=0.98 client_cores=0.54 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2652519.75 user_us=0.300 sys_us=0.080 total_us=0.380 cores=1.01 client_cores=0.55 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2645502.75 user_us=0.300 sys_us=0.090 total_us=0.390 cores=1.03 client_cores=0.54 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2652519.75 user_us=0.300 sys_us=0.070 total_us=0.370 cores=0.98 client_cores=0.54 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2652519.75 user_us=0.290 sys_us=0.080 total_us=0.370 cores=0.98 client_cores=0.54 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2652519.75 user_us=0.300 sys_us=0.080 total_us=0.380 cores=1.01 client_cores=0.54 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2659574.50 user_us=0.290 sys_us=0.090 total_us=0.380 cores=1.01 client_cores=0.55 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2645502.75 user_us=0.310 sys_us=0.080 total_us=0.390 cores=1.03 client_cores=0.54 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2645502.75 user_us=0.300 sys_us=0.070 total_us=0.370 cores=0.98 client_cores=0.54 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2631579.00 user_us=0.300 sys_us=0.080 total_us=0.380 cores=1.00 client_cores=0.54 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2645502.75 user_us=0.300 sys_us=0.080 total_us=0.380 cores=1.01 client_cores=0.54 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2631579.00 user_us=0.300 sys_us=0.090 total_us=0.390 cores=1.03 client_cores=0.54 evicted=0 evicted_per_op=0.000
+
+--- redis-iot4 [populate] pid=3292 threads=9 load:0.80
+    cmd: /home/stefanobaldo/redis-8.10.0/src/redis-server --port 6391 --save  --appendonly no --io-threads 4
+    redis_version:8.10.0
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    probe: 48/50 hits on key:%012d  dbsize=94961
+cell arm=redis-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3289473.75 user_us=0.370 sys_us=0.110 total_us=0.480 cores=1.58 client_cores=0.77 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3278688.50 user_us=0.380 sys_us=0.090 total_us=0.470 cores=1.54 client_cores=0.76 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3278688.50 user_us=0.370 sys_us=0.100 total_us=0.470 cores=1.54 client_cores=0.77 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3300330.00 user_us=0.370 sys_us=0.100 total_us=0.470 cores=1.55 client_cores=0.76 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3289473.75 user_us=0.370 sys_us=0.090 total_us=0.460 cores=1.51 client_cores=0.77 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3300330.00 user_us=0.370 sys_us=0.090 total_us=0.460 cores=1.52 client_cores=0.77 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3322259.25 user_us=0.370 sys_us=0.100 total_us=0.470 cores=1.56 client_cores=0.77 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3322259.25 user_us=0.370 sys_us=0.090 total_us=0.460 cores=1.53 client_cores=0.77 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3322259.25 user_us=0.370 sys_us=0.100 total_us=0.470 cores=1.56 client_cores=0.76 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3311258.50 user_us=0.360 sys_us=0.100 total_us=0.460 cores=1.52 client_cores=0.76 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3322259.25 user_us=0.360 sys_us=0.110 total_us=0.470 cores=1.56 client_cores=0.77 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3322259.25 user_us=0.380 sys_us=0.090 total_us=0.470 cores=1.56 client_cores=0.78 evicted=0 evicted_per_op=0.000
+
+--- valkey-iot1 [populate] pid=3715 threads=7 load:0.90
+    cmd: /home/stefanobaldo/valkey-9.1.1/src/valkey-server --port 6393 --save  --appendonly no --io-threads 1
+    redis_version:7.2.4
+    valkey_version:9.1.1
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    probe: 47/50 hits on key:%012d  dbsize=94991
+cell arm=valkey-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2288329.50 user_us=0.370 sys_us=0.080 total_us=0.450 cores=1.03 client_cores=0.48 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2288329.50 user_us=0.360 sys_us=0.070 total_us=0.430 cores=0.98 client_cores=0.47 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2293578.00 user_us=0.360 sys_us=0.080 total_us=0.440 cores=1.01 client_cores=0.47 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2283105.00 user_us=0.370 sys_us=0.070 total_us=0.440 cores=1.00 client_cores=0.47 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2288329.50 user_us=0.360 sys_us=0.070 total_us=0.430 cores=0.98 client_cores=0.47 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2288329.50 user_us=0.370 sys_us=0.080 total_us=0.450 cores=1.03 client_cores=0.47 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2288329.50 user_us=0.370 sys_us=0.060 total_us=0.430 cores=0.98 client_cores=0.47 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2293578.00 user_us=0.360 sys_us=0.080 total_us=0.440 cores=1.01 client_cores=0.47 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2293578.00 user_us=0.370 sys_us=0.060 total_us=0.430 cores=0.99 client_cores=0.47 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2288329.50 user_us=0.370 sys_us=0.080 total_us=0.450 cores=1.03 client_cores=0.47 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2288329.50 user_us=0.370 sys_us=0.070 total_us=0.440 cores=1.01 client_cores=0.47 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2277904.25 user_us=0.350 sys_us=0.090 total_us=0.440 cores=1.00 client_cores=0.47 evicted=0 evicted_per_op=0.000
+
+--- valkey-iot4 [populate] pid=4134 threads=13 load:0.91
+    cmd: /home/stefanobaldo/valkey-9.1.1/src/valkey-server --port 6393 --save  --appendonly no --io-threads 4
+    redis_version:7.2.4
+    valkey_version:9.1.1
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    probe: 48/50 hits on key:%012d  dbsize=95020
+cell arm=valkey-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3215434.25 user_us=0.560 sys_us=0.070 total_us=0.630 cores=2.03 client_cores=0.68 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3649635.25 user_us=0.810 sys_us=0.070 total_us=0.880 cores=3.21 client_cores=0.78 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3717472.25 user_us=1.020 sys_us=0.080 total_us=1.100 cores=4.09 client_cores=0.81 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3717472.25 user_us=1.030 sys_us=0.070 total_us=1.100 cores=4.09 client_cores=0.80 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3703703.50 user_us=1.020 sys_us=0.070 total_us=1.090 cores=4.04 client_cores=0.81 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3717472.25 user_us=0.990 sys_us=0.100 total_us=1.090 cores=4.05 client_cores=0.80 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3717472.25 user_us=1.030 sys_us=0.070 total_us=1.100 cores=4.09 client_cores=0.80 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3717472.25 user_us=1.030 sys_us=0.060 total_us=1.090 cores=4.05 client_cores=0.80 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3703703.50 user_us=1.030 sys_us=0.070 total_us=1.100 cores=4.07 client_cores=0.80 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3703703.50 user_us=1.020 sys_us=0.080 total_us=1.100 cores=4.07 client_cores=0.80 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3676470.50 user_us=1.020 sys_us=0.080 total_us=1.100 cores=4.04 client_cores=0.79 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3690037.00 user_us=1.020 sys_us=0.090 total_us=1.110 cores=4.10 client_cores=0.80 evicted=0 evicted_per_op=0.000
+
+--- dragonfly [populate] pid=4559 threads=11 load:1.24
+    cmd: /home/stefanobaldo/dragonfly/dragonfly-aarch64 --port=6392 --proactor_threads=10 --dbfilename= --logtostderr=false
+    redis_version:7.4.0
+    dragonfly_version:df-v1.40.2
+    os:Linux 7.0.0-1014-gcp aarch64
+    probe: 50/50 hits on key:%012d  dbsize=94988
+cell arm=dragonfly kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4651162.50 user_us=1.240 sys_us=0.300 total_us=1.540 cores=7.16 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4716981.00 user_us=1.210 sys_us=0.320 total_us=1.530 cores=7.22 client_cores=1.02 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.210 sys_us=0.340 total_us=1.550 cores=7.18 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4566210.00 user_us=1.240 sys_us=0.320 total_us=1.560 cores=7.12 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.210 sys_us=0.340 total_us=1.550 cores=7.18 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4545454.50 user_us=1.220 sys_us=0.350 total_us=1.570 cores=7.14 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4608295.00 user_us=1.230 sys_us=0.320 total_us=1.550 cores=7.14 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.210 sys_us=0.360 total_us=1.570 cores=7.27 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4694835.50 user_us=1.210 sys_us=0.340 total_us=1.550 cores=7.28 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4651162.50 user_us=1.220 sys_us=0.330 total_us=1.550 cores=7.21 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4504504.50 user_us=1.240 sys_us=0.340 total_us=1.580 cores=7.12 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4608295.00 user_us=1.240 sys_us=0.330 total_us=1.570 cores=7.24 client_cores=1.01 evicted=0 evicted_per_op=0.000
+
+--- garnet [populate] pid=4986 threads=27 load:1.86
+    cmd: /home/stefanobaldo/garnet/net8.0/GarnetServer --port 6394
+    garnet_version:2.1.5
+    os:Unix 7.0.0.1014
+    redis_version:7.4.3
+    probe: 47/50 hits on key:%012d  dbsize=95114
+cell arm=garnet kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4219409.00 user_us=2.090 sys_us=0.250 total_us=2.340 cores=9.87 client_cores=0.91 evicted=- evicted_per_op=-
+cell arm=garnet kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4385965.00 user_us=1.320 sys_us=0.570 total_us=1.890 cores=8.29 client_cores=1.01 evicted=- evicted_per_op=-
+cell arm=garnet kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4366812.00 user_us=1.000 sys_us=0.530 total_us=1.530 cores=6.68 client_cores=1.01 evicted=- evicted_per_op=-
+cell arm=garnet kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4347826.00 user_us=1.080 sys_us=0.480 total_us=1.560 cores=6.78 client_cores=1.01 evicted=- evicted_per_op=-
+cell arm=garnet kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4310345.00 user_us=0.920 sys_us=0.540 total_us=1.460 cores=6.29 client_cores=1.01 evicted=- evicted_per_op=-
+cell arm=garnet kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4385965.00 user_us=0.940 sys_us=0.560 total_us=1.500 cores=6.58 client_cores=1.01 evicted=- evicted_per_op=-
+cell arm=garnet kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4366812.00 user_us=0.970 sys_us=0.560 total_us=1.530 cores=6.68 client_cores=1.01 evicted=- evicted_per_op=-
+cell arm=garnet kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4366812.00 user_us=0.960 sys_us=0.550 total_us=1.510 cores=6.59 client_cores=1.01 evicted=- evicted_per_op=-
+cell arm=garnet kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4366812.00 user_us=0.930 sys_us=0.550 total_us=1.480 cores=6.46 client_cores=1.01 evicted=- evicted_per_op=-
+cell arm=garnet kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4347826.00 user_us=0.900 sys_us=0.470 total_us=1.370 cores=5.96 client_cores=1.01 evicted=- evicted_per_op=-
+cell arm=garnet kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4329004.00 user_us=0.970 sys_us=0.540 total_us=1.510 cores=6.54 client_cores=1.01 evicted=- evicted_per_op=-
+cell arm=garnet kind=cal shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4347826.00 user_us=0.950 sys_us=0.480 total_us=1.430 cores=6.22 client_cores=1.01 evicted=- evicted_per_op=-
+
+### stage calibrate done 2026-10-11T23:54:15Z  load:1.64 0.50 0.18
