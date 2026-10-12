@@ -333,7 +333,8 @@ jobs:
       # The chart: linted and rendered on every code change (cheap), and
       # installed into a kind cluster when the chart or the image changed —
       # the image this job just built, loaded into the cluster, and a
-      # client container that must get PONG through the Service.
+      # client container that must get PONG through the Service. `code` too,
+      # because the image is built only then: a chart README edit is prose.
       - name: the chart lints and renders both ways
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: |
@@ -343,12 +344,14 @@ jobs:
           test "$(helm template s charts/seedstone -f charts/seedstone/ci/no-persistence-values.yaml | grep -c -- '--data-dir')" = 0
           test "$(helm template s charts/seedstone -f charts/seedstone/ci/persistence-values.yaml | grep -c -- '--data-dir')" = 1
           ! helm template s charts/seedstone >/dev/null 2>&1
+          ! helm template s charts/seedstone --set auth.noAuth=true --set auth.password=x >/dev/null 2>&1
+          ! helm template s charts/seedstone --set auth.password=x --set auth.existingSecret=e >/dev/null 2>&1
       - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.chart == 'true'
+        if: github.event_name != 'pull_request' || (steps.relevant.outputs.code == 'true' && steps.relevant.outputs.chart == 'true')
         with:
           cluster_name: ci
       - name: the chart installs and answers
-        if: github.event_name != 'pull_request' || steps.relevant.outputs.chart == 'true'
+        if: github.event_name != 'pull_request' || (steps.relevant.outputs.code == 'true' && steps.relevant.outputs.chart == 'true')
         run: |
           set -euo pipefail
           kind load docker-image seedstone-pr:latest --name ci
