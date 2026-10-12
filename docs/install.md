@@ -66,6 +66,13 @@ flag go in the environment file — `/etc/default/seedstone` on Debian,
 which. A flag given twice takes its last value, so a `--bind` there
 replaces the unit's. The service can write nowhere but its own directory:
 to move the data directory, override the unit (`systemctl edit seedstone`).
+The environment file is readable by root alone, so a password there is not
+visible to other users on the host.
+
+An upgrade restarts the service if it is running and leaves it alone if it
+is not; a service you disabled stays disabled. Removing the package stops
+the service and keeps the environment file and the data; purging a `.deb`
+removes the environment file too, and still keeps the data.
 
 The packages need glibc 2.34 or newer, as the archives do.
 

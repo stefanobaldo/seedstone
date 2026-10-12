@@ -296,7 +296,7 @@ jobs:
           docker run --rm -v "$RUNNER_TEMP/pkg:/pkg:ro" debian:12@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858 sh -ec '
             apt-get update -qq >/dev/null && apt-get install -y -qq /pkg/*.deb >/dev/null
             seedstone --version
-            test -f /etc/default/seedstone && test -f /lib/systemd/system/seedstone.service'
+            test -f /etc/default/seedstone && test -f /usr/lib/systemd/system/seedstone.service'
       - name: the rpm installs and answers
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: |
