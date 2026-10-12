@@ -34,7 +34,9 @@ mimalloc = "0.1.52"
 workspace = true
 
 # The Debian and RPM packages: the binary, the unit, the environment file
-# as a conffile, the licenses and the docs. Asset sources are relative to
+# as a conffile readable by root alone (it is where the password goes, and
+# systemd reads it before the service drops to its user), the licenses and
+# the docs. Asset sources are relative to
 # this manifest for cargo-deb and to the workspace root for
 # cargo-generate-rpm; `target/release/...` is the build output for both.
 # A pre-release `-rc.N` becomes `~rc.N` in both, so a candidate sorts before
@@ -50,11 +52,18 @@ password; /etc/default/seedstone is where a password and further flags go."""
 section = "database"
 priority = "optional"
 depends = "$auto"
-maintainer-scripts = "../../packaging/deb"
+# The unit is installed, enabled and started by the maintainer scripts
+# cargo-deb generates from Debian's own snippets (deb-systemd-helper): a
+# first install enables and starts it, an upgrade restarts it only if it is
+# running, a service the administrator disabled stays disabled across
+# upgrades and reinstalls, and nothing is started where systemd is not
+# running. cargo-deb writes them only when `maintainer-scripts` names a
+# directory; it holds no script of its own, only the unit.
+maintainer-scripts = "../../packaging/systemd"
+systemd-units = { unit-scripts = "../../packaging/systemd", enable = true, start = true, restart-after-upgrade = true }
 assets = [
   ["target/release/seedstone", "usr/bin/", "755"],
-  ["../../packaging/systemd/seedstone.service", "lib/systemd/system/", "644"],
-  ["../../packaging/systemd/seedstone.env", "etc/default/seedstone", "644"],
+  ["../../packaging/systemd/seedstone.env", "etc/default/seedstone", "600"],
   ["../../LICENSE-MIT", "usr/share/doc/seedstone/", "644"],
   ["../../LICENSE-APACHE", "usr/share/doc/seedstone/", "644"],
   ["../../README.md", "usr/share/doc/seedstone/", "644"],
@@ -70,7 +79,7 @@ license = "MIT OR Apache-2.0"
 assets = [
   { source = "target/release/seedstone", dest = "/usr/bin/seedstone", mode = "755" },
   { source = "packaging/systemd/seedstone.service", dest = "/usr/lib/systemd/system/seedstone.service", mode = "644" },
-  { source = "packaging/systemd/seedstone.env", dest = "/etc/sysconfig/seedstone", mode = "644", config = "noreplace" },
+  { source = "packaging/systemd/seedstone.env", dest = "/etc/sysconfig/seedstone", mode = "600", config = "noreplace" },
   { source = "LICENSE-MIT", dest = "/usr/share/doc/seedstone/LICENSE-MIT", mode = "644", doc = true },
   { source = "LICENSE-APACHE", dest = "/usr/share/doc/seedstone/LICENSE-APACHE", mode = "644", doc = true },
   { source = "README.md", dest = "/usr/share/doc/seedstone/README.md", mode = "644", doc = true },
@@ -78,14 +87,25 @@ assets = [
   { source = "docs/install.md", dest = "/usr/share/doc/seedstone/install.md", mode = "644", doc = true },
   { source = "docs/operations.md", dest = "/usr/share/doc/seedstone/operations.md", mode = "644", doc = true },
 ]
+# `$1` is how many instances of the package will be installed once the
+# transaction is done: 1 in %post is a first install, 0 in %preun is a
+# removal, 1 or more in %postun is an upgrade. As the Debian scripts do, the service is enabled and started on
+# a first install only, and an upgrade restarts it only if it is running —
+# a service the administrator stopped or disabled stays that way.
 post_install_script = """
 if [ -d /run/systemd/system ]; then
   systemctl daemon-reload || :
-  systemctl enable --now seedstone.service || :
+  if [ "$1" -eq 1 ]; then systemctl enable --now seedstone.service || :; fi
 fi
 """
 pre_uninstall_script = """
-if [ "$1" = 0 ] && [ -d /run/systemd/system ]; then
+if [ "$1" -eq 0 ] && [ -d /run/systemd/system ]; then
   systemctl disable --now seedstone.service || :
+fi
+"""
+post_uninstall_script = """
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload || :
+  if [ "$1" -ge 1 ]; then systemctl try-restart seedstone.service || :; fi
 fi
 """

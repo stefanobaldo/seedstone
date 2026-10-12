@@ -1,8 +1,0 @@
-#!/bin/sh
-set -e
-if [ "$1" = configure ] && [ -d /run/systemd/system ]; then
-  systemctl daemon-reload || true
-  systemctl enable seedstone.service || true
-  if [ -z "$2" ]; then systemctl start seedstone.service || true
-  else systemctl try-restart seedstone.service || true; fi
-fi
