@@ -1,0 +1,4 @@
+auth:
+  noAuth: true
+persistence:
+  enabled: false
