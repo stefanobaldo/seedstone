@@ -109,9 +109,10 @@ security belongs to the deployment, in front of the node. The full list —
 what is answered, what is refused, and where this server differs from Redis on
 purpose — is [docs/compatibility.md](docs/compatibility.md).
 
-**Releases:** a tag publishes a GitHub Release carrying an x86_64 Linux binary
-and its `sha256`, and a container image,
-`ghcr.io/stefanobaldo/seedstone:<tag>`. [CHANGELOG.md](CHANGELOG.md) is what
+**Releases:** a tag publishes a GitHub Release carrying binaries for Linux
+and macOS on both architectures, each with its `sha256`, and a
+multi-architecture container image, `ghcr.io/stefanobaldo/seedstone:<tag>`;
+[docs/install.md](docs/install.md) lists every way to get it. [CHANGELOG.md](CHANGELOG.md) is what
 changed; [docs/RELEASING.md](docs/RELEASING.md) is how a version is cut. The
 current release is `v0.2.0`.
 
