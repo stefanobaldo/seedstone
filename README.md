@@ -1,18 +1,69 @@
-# SeedStone
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/stefanobaldo/seedstone/main/docs/assets/wordmark-dark.svg">
+    <img alt="SeedStone" src="https://raw.githubusercontent.com/stefanobaldo/seedstone/main/docs/assets/wordmark-light.svg" width="400">
+  </picture>
+</p>
 
-An in-memory key-value store, written from scratch in Rust, with optional
-on-disk persistence — built for high performance, memory safety, and
-correctness that can be demonstrated rather than argued.
+<p align="center">
+An in-memory key-value store, written from scratch in Rust, that speaks the
+Redis protocol and keeps its data on disk when asked to — with correctness
+that is demonstrated rather than argued.
+</p>
 
-## Status: early — a server you can connect to
+<p align="center">
+  <a href="https://github.com/stefanobaldo/seedstone/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/stefanobaldo/seedstone/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/stefanobaldo/seedstone/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/stefanobaldo/seedstone?display_name=tag&label=release"></a>
+  <a href="https://crates.io/crates/seedstone"><img alt="crates.io" src="https://img.shields.io/crates/v/seedstone"></a>
+  <a href="https://github.com/stefanobaldo/seedstone/pkgs/container/seedstone"><img alt="Container image" src="https://img.shields.io/docker/image-size/seedstone/seedstone/latest?label=container"></a>
+  <a href="LICENSE-MIT"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue"></a>
+  <img alt="Rust 1.97.1" src="https://img.shields.io/badge/rust-1.97.1-orange">
+</p>
 
-There is a server now. It speaks RESP2 over TCP, so `redis-cli` and the
-ordinary client libraries reach it without modification:
+## Why
+
+- **Correctness you can replay.** The whole server runs inside a
+  deterministic simulation — a virtual clock, a simulated network,
+  scheduled clients — and every completed command is folded into a trace
+  hash that is a function of two seeds and nothing else. A concurrency bug
+  is reproduced from its seed, in a fresh process, byte for byte. CI sweeps
+  seeds on every code change and proves the machinery on fourteen defects
+  planted in the server itself. → [docs/testing.md](docs/testing.md)
+- **Measured against the engines it stands beside, with the method next to
+  the number.** Redis, Valkey, Dragonfly and Garnet on the same machine
+  under the same harness, raw logs committed, and where this server is
+  behind, the page says so. → [docs/benchmarks.md](docs/benchmarks.md)
+- **Built to be operated.** `INFO` in sections that carry only what the
+  node can state truthfully; one JSON line per event; a password that
+  rotates without a restart; a disk that fails or fills met with refusal,
+  not with acknowledgements the node cannot keep. A stock Prometheus
+  exporter scrapes it in CI. → [docs/operations.md](docs/operations.md)
+
+## Quick start
+
+```sh
+# Container (also on GHCR as ghcr.io/stefanobaldo/seedstone)
+docker run -p 6379:6379 seedstone/seedstone --bind 0.0.0.0:6379 --no-auth
+
+# macOS and Linux
+brew install seedstonelabs/tap/seedstone
+
+# Cargo: the release archive in seconds, or from source
+cargo binstall seedstone
+cargo install seedstone
+
+# Debian, Ubuntu / Fedora, RHEL — a package with a systemd unit, from the release page
+sudo apt install ./seedstone_0.3.3-1_amd64.deb
+sudo dnf install ./seedstone-0.3.3-1.x86_64.rpm
+
+# Kubernetes
+helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --version 0.3.3 --set auth.noAuth=true
+```
+
+Every channel, with checksums, the packaged defaults and the service
+units, is on [docs/install.md](docs/install.md). Then, with any client:
 
 ```console
-$ cargo run --release -p seedstone
-{"ts":1757800000000,"level":"info","evt":"listening","version":"0.0.0","bind":"127.0.0.1","port":6379}
-
 $ redis-cli
 127.0.0.1:6379> set greeting hello ex 60
 OK
@@ -22,152 +73,84 @@ OK
 "hello"
 ```
 
-`--bind <addr:port>`, `--max-clients <n>`, `--maxmemory <size>`,
-`--maxmemory-policy allkeys-lru|noeviction`, `--requirepass-file <path>`,
-`--no-auth`, `--data-dir <path>` and `--fsync always|interval|never` are the
-only options a server takes; `--version` and `--help`
-answer and exit, in first position and nowhere else. The password may also
-arrive in `SEEDSTONE_REQUIREPASS`. It is never an argument — a command line is
-readable by every other process on the host. A bind outside loopback
-refuses to start without a password from either source, unless `--no-auth`
-says so deliberately. [docs/operations.md](docs/operations.md) has every flag,
-the signals, and how a password is rotated without a restart.
+A server started with no arguments listens on loopback with no password.
+`--bind`, `--maxmemory`, `--requirepass-file`, `--data-dir` and the rest
+are on [docs/operations.md](docs/operations.md).
 
-The same server ships as a container image, `ghcr.io/stefanobaldo/seedstone`,
-tagged per release. It runs as a non-root user and holds nothing but the
-binary, so the options above are the container's arguments:
-`docker run -p 6379:6379 ghcr.io/stefanobaldo/seedstone:<tag> --bind 0.0.0.0:6379 --no-auth`
-serves on the published port with no password — pass `SEEDSTONE_REQUIREPASS`
-in the environment for one.
+## Benchmarks
 
-**What it answers:** `GET`, `SET` (with `EX`, `PX`, `EXAT`, `PXAT`, `NX`, `XX`,
-`KEEPTTL`, `GET`), `SETEX`, `SETNX`, `PSETEX`, `MGET`, `DEL`, `EXISTS`,
-`EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `PERSIST`, `TTL`, `PTTL`,
-`TYPE`, `STRLEN`, `INCRBY`, `SCAN`, `KEYS`, `DBSIZE`, `FLUSHDB`, `PING`,
-`ECHO`, `AUTH`, `HELLO`, `INFO`, `CONFIG GET`, `SLOWLOG`, `LATENCY`,
-`COMMAND`, `CLIENT`, `SAVE`, `BGSAVE`, `LASTSAVE`, `SHUTDOWN`, `QUIT`.
-`DEL`, `EXISTS` and `MGET` take several keys.
-Keys with a deadline are removed when touched and by a background sweep that
-does not wait to be asked. With
-`--maxmemory`, the keyspace is held under a ceiling by evicting
-least-recently-used keys, or by refusing writes under `noeviction`.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/stefanobaldo/seedstone/main/docs/assets/benchmarks-dark.svg">
+    <img alt="Throughput of seedstone against Redis, Valkey, Dragonfly and Garnet on four cells" src="https://raw.githubusercontent.com/stefanobaldo/seedstone/main/docs/assets/benchmarks.svg">
+  </picture>
+</p>
 
-`INFO`, `CONFIG GET`, `SLOWLOG` and `LATENCY` are the operational surface a
-monitoring agent reads: `INFO` in sections — `server`, `clients`, `memory`,
-`persistence`, `stats`, `keyspace` and `commandstats` with a call count and a
-measured per-command time, carrying only fields this node can state truthfully —
-`CONFIG GET` over the parameters that describe how it was
-started, and `SLOWLOG` and `LATENCY` answering as the switched-off monitors
-they are, so that a scrape completes rather than logging a refusal on every
-pass. What the server itself writes while it runs — one JSON line per event,
-with a level — and how it is operated are in
-[docs/operations.md](docs/operations.md).
+Four of the cells, throughput only, rendered from the raw logs by the
+harness itself: `v0.3.2` on a GCP `c4a-standard-16`, against Redis 8.10.0,
+Valkey 9.1.1, Dragonfly `df-v1.40.2` and Garnet 2.1.5. The page carries
+every cell at every pipeline depth, the CPU per operation — where this
+server spends more than Redis at one I/O thread on every cell measured —
+the method fixed before the run, and what the numbers do not say.
+→ [docs/benchmarks.md](docs/benchmarks.md)
 
-**Persistence:** with `--data-dir PATH` every write is appended to a log and
-a restart recovers the keyspace from the newest snapshot of each shard plus
-the log since it; `--fsync always|interval|never` says when the log is synced
-and so what a crash can cost — `always` acknowledges nothing that is not on
-disk, `interval` (the default) syncs every 100 ms, `never` leaves it to the
-kernel. Snapshots are taken without stopping the shards and keep the
-directory within a stated bound; `SAVE`, `BGSAVE` and `LASTSAVE` ask for one
-and date it; `INFO persistence` is what a monitor reads about it. A disk that
-fails or fills is met with refusal, not with acknowledgements the node cannot
-keep. Without the flag nothing is written to disk. See
-[docs/operations.md](docs/operations.md).
+## What it speaks
 
-**What it does not have yet:** RESP3, replication,
-clustering, and every data type except strings.
+RESP2 over TCP, so `redis-cli` and the ordinary client libraries connect
+unmodified. The surface is a named list, chosen for the workloads this
+server targets:
 
-**Performance:** measured on a 16-core ARM instance against Redis and Valkey at
-one and four I/O threads, and against Dragonfly and Garnet. On pipelined reads
-of small values at depth 64 this server is ahead of Redis and ahead of Valkey,
-at both of their I/O-thread settings; the word changes with the depth — at
-depth 4 it is behind Redis at one I/O thread and ahead of it at four, and
-behind Valkey at both — and the tables carry all four depths. On unpipelined
-reads, the shape a cache client actually runs, it is ahead of Redis at both
-settings, ahead of Valkey at one I/O thread and indistinguishable from it at
-four. On 10 KB writes under a memory ceiling with eviction it is ahead of Redis
-and of Valkey at one I/O thread and indistinguishable from both at four. On
-multi-key reads of four and sixteen keys it is ahead of Redis and of Valkey at
-both settings, and ahead of or indistinguishable from the other two engines;
-and on every cell measured it spends more CPU per operation than Redis at one
-I/O thread. Every figure,
-the method that produced it, the raw logs and what the numbers do not say are in
-[docs/benchmarks.md](docs/benchmarks.md). No figure appears here, because a
-figure without its method beside it is a marketing number.
+| | commands |
+|---|---|
+| strings | `GET` `SET` `SETEX` `SETNX` `PSETEX` `MGET` `INCRBY` `STRLEN` `TYPE` |
+| keys and expiry | `DEL` `EXISTS` `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` `PERSIST` `TTL` `PTTL` `SCAN` `KEYS` `DBSIZE` `FLUSHDB` |
+| server | `PING` `ECHO` `AUTH` `HELLO` `INFO` `CONFIG` `SLOWLOG` `LATENCY` `COMMAND` `CLIENT` `QUIT` |
+| persistence | `SAVE` `BGSAVE` `LASTSAVE` `SHUTDOWN` |
 
-**What it deliberately does not answer:** the inline command protocol, server-
-side scripting, transactions, and `CONFIG SET` — every parameter `CONFIG GET`
-reports is a fact about a node that is already running, and accepting a new
-ceiling at runtime would mean moving a keyspace under one. The surface is a
-named list chosen for the workloads this project targets; anything outside it
-is refused with an error naming the command, rather than answered
-approximately. The same line is drawn outside the command set: authentication
-is one password for the `default` user, with no ACL users beside it — access
-control this server does not model. Nor does it terminate TLS: transport
-security belongs to the deployment, in front of the node. The full list —
-what is answered, what is refused, and where this server differs from Redis on
-purpose — is [docs/compatibility.md](docs/compatibility.md).
+`SET` takes `EX`, `PX`, `EXAT`, `PXAT`, `NX`, `XX`, `KEEPTTL` and `GET`;
+`DEL`, `EXISTS` and `MGET` take several keys. Anything outside the list is
+refused with an error naming the command, never answered approximately.
+Every option, every refusal and every deliberate difference from Redis:
+[docs/compatibility.md](docs/compatibility.md).
 
-**Releases:** a tag publishes a GitHub Release carrying binaries for Linux
-and macOS on both architectures, each with its `sha256`, and a
-multi-architecture container image, `ghcr.io/stefanobaldo/seedstone:<tag>`;
-[docs/install.md](docs/install.md) lists every way to get it. [CHANGELOG.md](CHANGELOG.md) is what
-changed; [docs/RELEASING.md](docs/RELEASING.md) is how a version is cut. The
-current release is `v0.2.0`.
+## Persistence
 
-## How it is built
+`--data-dir PATH` appends every write to a log and recovers the keyspace on
+the next start from each shard's newest snapshot plus the log since it.
+`--fsync always|interval|never` says when the log is synced and so what a
+crash can cost; snapshots are taken without stopping the shards and keep
+the directory within a stated bound. A disk that fails or fills is met
+with refusal, and `INFO persistence` is what a monitor reads about it.
+→ [docs/operations.md](docs/operations.md#what---data-dir-promises)
 
-- `seedstone` — the edge: the process, its configuration, and the only socket,
-  signal handler and entropy draw in the workspace.
-- `seedstone-core` — the deterministic core: a keyspace dict with seeded
-  hashing, incremental rehashing and a scan cursor stable across table growth;
-  a replication-log record format that tolerates holes; and a runtime of
-  message-passing shards whose command handlers cannot await. The codec is not
-  among its dependencies, so a handler cannot reach for a wire frame — the
-  core's independence from the protocol is a property of the build rather than
-  a rule to remember.
-- `seedstone-resp` — a RESP2 codec: a resumable decoder that never revisits a
-  byte it has consumed, an iterative encoder, and the wire and memory limits a
-  server needs at its edge.
-- `seedstone-service` — the connection layer: RESP2 frames in, core commands
-  out, replies back. Netless by construction — nothing in it opens a socket —
-  and generic over its transport, which is what lets the binary hand it a real
-  connection and the harness hand it a simulated one, with the same code in
-  between.
-- `seedstone-sim` — a deterministic simulation harness: the real server and
-  real clients over a simulated network and clock, folding every completed
-  command into a trace hash that is a function of two seeds and nothing else.
+## Status
 
-The project is built around deterministic simulation testing, so a concurrency
-bug is meant to be reproducible from a seed. CI sweeps a range of simulator
-seeds on every change that touches code, enforces the determinism rules that
-make that reproducibility possible, and runs a self-test that plants six
-genuine defects inside the server itself: a lost-update race, two broken expiry
-decisions, a keyspace walk that outruns its own cursor, and two broken eviction
-decisions — a node that never reclaims, and one that reclaims what it should be
-keeping. Each has to be caught by the counter that owns it. Reproducibility is
-checked on its own, and on the shapes that carry the work: the shape the sweep
-actually runs, the shape under a memory ceiling, and the one that catches the
-race all have to replay byte for byte in a second process, against the hash the
-first process computed. CI then drives the release
-binary with `redis-cli`, `redis-benchmark`, redis-py and go-redis —
-every one of them but `redis-cli` against a server that requires a password,
-so the authenticated path is the one the gate exercises and the open one stays
-exercised too — and then points a third party's cache-backend test suite at
-it, run against a digest-verified archive in a container pinned by digest to
-the interpreter that client pair needs. A stock Prometheus exporter scrapes
-the server last, from a container pinned the same way: it must log no refused
-command, and the metrics it publishes must carry the values this gate
-predicts.
+`0.x`: the keyspace holds strings, and this server has served a Django
+application's cache in production since August 2026. Not here yet:
+other data types, RESP3, replication, clustering, transactions, scripting,
+ACL users, TLS. Next: hashes, lists, sets and sorted sets, Pub/Sub, RESP3.
+[CHANGELOG.md](CHANGELOG.md) is what changed; the current release is
+`v0.3.3`.
 
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains the decisions and why
-they were made; [docs/coding-guide.md](docs/coding-guide.md) is what a reviewer
-reads first.
+## Documentation
+
+- [docs/install.md](docs/install.md) — every way to install, and the packaged defaults
+- [docs/operations.md](docs/operations.md) — flags, output, signals, password, persistence, `INFO`
+- [docs/compatibility.md](docs/compatibility.md) — what it answers, refuses, and where it differs on purpose
+- [docs/benchmarks.md](docs/benchmarks.md) — the measurements, the method, the raw logs
+- [docs/testing.md](docs/testing.md) — the crates, deterministic simulation, the client lanes
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the decisions and why
+- [docs/coding-guide.md](docs/coding-guide.md) — what a reviewer reads first
+- [docs/RELEASING.md](docs/RELEASING.md) — how a version is cut
+
+## Contributing
+
+Issues and questions are welcome; open one before a large change so we can
+talk first. Commits carry a `Signed-off-by` line (DCO) and follow
+Conventional Commits — [CONTRIBUTING.md](CONTRIBUTING.md) has the ground
+rules.
 
 ## License
 
 Dual-licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at
-your option. Contributions are accepted under the DCO — see
-[CONTRIBUTING.md](CONTRIBUTING.md). "SeedStone" is a trademark — see
-[TRADEMARK.md](TRADEMARK.md).
+your option. "SeedStone" is a trademark — see [TRADEMARK.md](TRADEMARK.md).
