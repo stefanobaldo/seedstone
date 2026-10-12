@@ -45,9 +45,11 @@ seven kinds of artifact and not one:
   `packaging/systemd/`, enable and start the service on a first install,
   and restart it on an upgrade only if it is running — the `.deb`'s
   maintainer scripts are the ones cargo-deb generates from Debian's own,
-  the `.rpm`'s are in the manifest. A candidate's `-rc.N` becomes `~rc.N` in both, so a candidate
-  sorts before its final. CI builds both on every pull request and installs
-  them in a Debian and a Fedora container.
+  the `.rpm`'s are in the manifest. A candidate's `-rc.N` becomes `~rc.N` in
+  both, so a candidate sorts before its final; its file names carry `.rc.N`
+  instead, because a GitHub release renames `~` to `.` and the checksum must
+  name the file as downloaded. CI builds both on every pull request and
+  installs them in a Debian and a Fedora container.
 - **The container image**, built once per architecture (`linux/amd64` and
   `linux/arm64`) on native runners, smoke-tested, pushed by digest, and
   joined into one index under the tag on `ghcr.io/stefanobaldo/seedstone`,

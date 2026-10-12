@@ -23,5 +23,12 @@ cargo deb -p seedstone --no-build --no-strip --output "$out/"
 # sources in its metadata are relative to that root.
 cargo generate-rpm -p crates/seedstone -s "version = \"${version/-/\~}\"" --output "$out/"
 cd "$out"
+# A GitHub release stores `~` in an asset's name as `.` (measured 2026-10-12),
+# so a checksum naming the `~` file would not match the file downloaded. The
+# file is renamed to what the release will call it; the version inside the
+# package keeps its `~`, which is what the ordering reads.
+for p in *.deb *.rpm; do
+  [ "$p" = "${p//\~/.}" ] || mv -- "$p" "${p//\~/.}"
+done
 for p in *.deb *.rpm; do sha256sum "$p" > "$p.sha256"; done
 ls -l
