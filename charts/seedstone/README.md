@@ -14,7 +14,7 @@ The chart's version is the server's: chart `0.3.3` runs image `v0.3.3`.
 ## The password
 
 The server refuses to listen outside loopback with no password, and so does
-the chart: it fails to render until one of these is set.
+the chart: it fails to render until exactly one of these is set.
 
 - `auth.existingSecret` — a Secret you own; the password is its key
   `auth.secretKey`. The way to run it.
@@ -49,6 +49,7 @@ keyspace behind the same Service.
 | `persistence.storageClass` | `""` | empty: the cluster's default |
 | `persistence.mountPath` | `/data` | where the volume is mounted and `--data-dir` points |
 | `fsync` | `interval` | `always`, `interval` or `never`; applies with persistence only |
+| `startupTimeoutSeconds` | `600` | how long a start, log replay included, may take before the pod is restarted |
 | `extraArgs` | `[]` | further flags, verbatim, e.g. `["--maxmemory", "2gb"]` |
 | `resources` | `{}` | |
 | `nodeSelector` | `{}` | |
@@ -56,5 +57,7 @@ keyspace behind the same Service.
 | `affinity` | `{}` | |
 | `podAnnotations` | `{}` | |
 
-Readiness and liveness are TCP probes on the port: the image has no shell and
-no client to run a command with.
+Startup, readiness and liveness are TCP probes on the port: the image has no
+shell and no client to run a command with. The server listens only once it
+has replayed its log, so the startup probe gives it `startupTimeoutSeconds`
+before liveness takes over.

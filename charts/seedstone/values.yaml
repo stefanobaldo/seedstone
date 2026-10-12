@@ -29,6 +29,10 @@ persistence:
   # Where the volume is mounted and where --data-dir points.
   mountPath: /data
 
+# How long a start may take before the pod is restarted. The server
+# listens only after replaying its log, which grows with the data.
+startupTimeoutSeconds: 600
+
 # Fsync policy for the log: always | interval | never (docs/operations.md).
 fsync: interval
 

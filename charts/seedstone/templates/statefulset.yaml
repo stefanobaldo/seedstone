@@ -1,6 +1,9 @@
 {{- if and (not .Values.auth.noAuth) (not .Values.auth.existingSecret) (not .Values.auth.password) }}
 {{- fail "set one of auth.existingSecret, auth.password or auth.noAuth=true: the server refuses a network bind with no password" }}
 {{- end }}
+{{- if or (and .Values.auth.noAuth (or .Values.auth.existingSecret .Values.auth.password)) (and .Values.auth.existingSecret .Values.auth.password) }}
+{{- fail "set only one of auth.existingSecret, auth.password or auth.noAuth=true: the server refuses two password sources, and a password beside --no-auth" }}
+{{- end }}
 {{- if and .Values.auth.password (not .Values.auth.existingSecret) }}
 apiVersion: v1
 kind: Secret
@@ -64,13 +67,18 @@ spec:
             - name: resp
               containerPort: {{ .Values.service.port }}
           # TCP probes: the image has no shell and no client. A probe that
-          # speaks the protocol is the server's to offer.
+          # speaks the protocol is the server's to offer. The server listens
+          # only once it has recovered its log, so the startup probe holds
+          # liveness off for as long as a large log may take to replay.
+          startupProbe:
+            tcpSocket: { port: resp }
+            periodSeconds: 5
+            failureThreshold: {{ div .Values.startupTimeoutSeconds 5 | max 1 }}
           readinessProbe:
             tcpSocket: { port: resp }
             periodSeconds: 5
           livenessProbe:
             tcpSocket: { port: resp }
-            initialDelaySeconds: 10
             periodSeconds: 10
           {{- with .Values.resources }}
           resources: {{- toYaml . | nindent 12 }}
