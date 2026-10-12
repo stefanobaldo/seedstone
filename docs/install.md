@@ -50,8 +50,8 @@ cargo install seedstone         # from source: a release build, minutes
 seedstone --version
 ```
 
-`cargo binstall` (from the `cargo-binstall` crate) downloads the archive a
-release carries for the host and verifies its checksum; `cargo install`
+`cargo binstall` (from the `cargo-binstall` crate) downloads, over HTTPS,
+the archive a release carries for the host; `cargo install`
 compiles the crate and its three library crates from crates.io with the
 toolchain on the machine. Both put the binary under `~/.cargo/bin`. The
 library crates — `seedstone-core`, `seedstone-resp`, `seedstone-service` —
