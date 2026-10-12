@@ -314,6 +314,18 @@ jobs:
             dnf install -y -q /pkg/*.rpm >/dev/null
             seedstone --version
             test -f /etc/sysconfig/seedstone && test -f /usr/lib/systemd/system/seedstone.service'
+      # The formula renders from placeholder checksums and parses; `brew
+      # style` runs on the macOS leg of the release workflow, where Homebrew
+      # is, on every dispatch.
+      - name: the Homebrew formula renders
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: |
+          d="$RUNNER_TEMP/formula"; mkdir -p "$d"
+          for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+            printf '%064d  seedstone-0.0.0-%s.tar.gz\n' 0 "$t" > "$d/seedstone-0.0.0-$t.tar.gz.sha256"
+          done
+          bash scripts/render-formula.sh 0.0.0 "$d" > "$d/seedstone.rb"
+          ruby -c "$d/seedstone.rb"
       # Every client lane but redis-cli authenticates. The password is a
       # literal: it protects nothing and exists so the authenticated path is
       # the one these lanes exercise. The redis-cli lane runs open on purpose,
