@@ -98,6 +98,45 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # The GitHub Release, carrying every archive and checksum the matrix built.
+  # Its notes are the changelog's section for this version; a candidate has
+  # none of its own and falls back to `[Unreleased]`, as `docs/RELEASING.md`
+  # says.
+  publish:
+    needs: [meta, build]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: every archive has its checksum, and the checksums verify
+        run: |
+          cd dist && ls -l
+          for a in *.tar.gz; do [ -f "$a.sha256" ] || { echo "$a has no checksum" >&2; exit 1; }; done
+          sha256sum -c -- *.sha256
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          section() {
+            awk -v want="## [$1]" 'index($0, want) == 1 { inside = 1; next }
+                                   inside && /^## \[/ { exit }
+                                   inside { print }' CHANGELOG.md
+          }
+          section "${GITHUB_REF_NAME#v}" > notes.md
+          [ -s notes.md ] || section Unreleased > notes.md
+          prerelease=""
+          [ "${{ needs.meta.outputs.final }}" = true ] || prerelease="--prerelease"
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md $prerelease
+
   # One image per architecture, built natively on its runner (no emulation:
   # an emulated build is slow and is not what a user runs), smoked before
   # anything leaves the runner, pushed by digest, then joined into one index

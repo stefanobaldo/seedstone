@@ -20,12 +20,17 @@ of its own was not a patch; cut it as a minor.
 ## What a tag does
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which produces three
-artifacts and not one:
+kinds of artifact and not one:
 
-- **The binary**, built for x86_64 Linux with `--locked` and packaged with its
-  `sha256`. The packaging itself is `scripts/package-release.sh`, which CI also
-  runs on every pull request so that the day a tag is pushed is not the first
-  day the script runs.
+- **The binary**, built with `--locked` on a native runner for each of four
+  targets — `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+  `aarch64-apple-darwin` and `x86_64-apple-darwin` (the last cross-compiled
+  on Apple silicon and smoke-tested under Rosetta) — and packaged as one
+  archive per target with its `sha256`. Each archive is named after the
+  architecture read from the binary it contains, not after the runner. The
+  packaging itself is `scripts/package-release.sh`, which CI also runs on
+  every pull request so that the day a tag is pushed is not the first day
+  the script runs.
 - **The container image**, built once per architecture (`linux/amd64` and
   `linux/arm64`) on native runners, smoke-tested, pushed by digest, and
   joined into one index under the tag on `ghcr.io/stefanobaldo/seedstone`,
@@ -34,13 +39,14 @@ artifacts and not one:
   a deployment pins, usually by digest rather than by tag: the digest to
   record is the **index's**, printed by the `image-index` job, and a
   deployment that pins by digest keeps pinning GHCR.
-- **The GitHub Release**, carrying the binary and its checksum, and marked as a
-  pre-release when the tag contains a `-`. Its notes are the changelog's
+- **The GitHub Release**, carrying every archive and its checksum, and marked
+  as a pre-release when the tag contains a `-`. Its notes are the changelog's
   section for this version, cut out by name; a candidate has no section of its
   own and falls back to `[Unreleased]`.
 
 The workflow also refuses to publish a tag whose name disagrees with
-`cargo pkgid -p seedstone`, character for character. That check is the reason
+`cargo pkgid -p seedstone`, character for character
+(`scripts/set-version.sh --check`). That check is the reason
 step 3 below insists on the candidate suffix.
 
 ## What a release depends on outside this repository
@@ -156,6 +162,7 @@ step 3 below insists on the candidate suffix.
    rewriting a published tag creates a new object under the same name, and
    `git fetch` does not update a tag a clone already has, so every existing
    clone would silently disagree with the repository about what that tag is.)*
-6. Watch the release workflow. It ends with the archive and its checksum
-   attached to the release, and the image pushed — all three artifacts of
-   "What a tag does", not just the one the release page shows.
+6. Watch the release workflow — every job, not the release page. It ends
+   with the four archives and their checksums attached to the release, and
+   the image index on GHCR and Docker Hub — every artifact of "What a tag
+   does", not just the ones the release page shows.

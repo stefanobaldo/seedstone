@@ -7,6 +7,14 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ## [Unreleased]
 
+### Added
+
+- **More ways to install the same binary.** A release now carries archives
+  for Linux x86_64 and aarch64 and for macOS on Apple silicon and Intel,
+  each with its checksum, and the container image is built for `amd64` and
+  `arm64` under one tag — on `ghcr.io/stefanobaldo/seedstone` as before, and
+  mirrored to Docker Hub. `docs/install.md` is the list.
+
 ## [0.3.2] - 2026-10-11
 
 ### Fixed
