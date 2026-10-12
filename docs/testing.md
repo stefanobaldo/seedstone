@@ -71,8 +71,9 @@ metrics it publishes must carry the values this gate predicts.
 
 The same job builds the container image and the Linux packages and makes
 each answer where it would be installed, renders the Homebrew formula,
-lints the Helm chart, and installs the chart into a cluster whenever it or
-the image changed — so that the day a release is tagged is never the first
+lints the Helm chart, and installs the chart into a cluster — on every
+push to `main`, and on a pull request that changes the chart or the
+`Dockerfile` — so that the day a release is tagged is never the first
 day any of them is built.
 
 ## Reproducing a failure
