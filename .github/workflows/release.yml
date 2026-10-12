@@ -155,10 +155,12 @@ jobs:
   # After the release, because a crate version cannot be taken back (only
   # yanked, and its number is spent), and because `cargo binstall` resolves
   # the release's archives: a crate goes up only once everything it points
-  # at exists.
+  # at exists. Finals only: a candidate is for testing, from the GitHub
+  # Release and GHCR, and a crate version it spent would stay on crates.io
+  # for good.
   crates:
     needs: [meta, publish]
-    if: needs.meta.outputs.publish == 'true'
+    if: needs.meta.outputs.publish == 'true' && needs.meta.outputs.final == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -245,7 +247,10 @@ jobs:
           docker buildx imagetools inspect "$repo:${GITHUB_REF_NAME}"
       # The mirror comes last and after the release has what it needs: a
       # Docker Hub token that expired fails this step visibly, not the release.
+      # Finals only: a candidate is tested from GHCR, and the mirror is where
+      # people who are not testing anything pull from.
       - name: the mirror on Docker Hub
+        if: needs.meta.outputs.final == 'true'
         env:
           NS: ${{ vars.DOCKERHUB_NAMESPACE }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -254,7 +259,6 @@ jobs:
           [ -n "$NS" ] || { echo "the repository variable DOCKERHUB_NAMESPACE is not set" >&2; exit 1; }
           echo "$DOCKERHUB_TOKEN" | docker login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
           src=ghcr.io/stefanobaldo/seedstone:${GITHUB_REF_NAME}
-          tags="-t docker.io/$NS/seedstone:${GITHUB_REF_NAME}"
-          [ "${{ needs.meta.outputs.final }}" = true ] && tags="$tags -t docker.io/$NS/seedstone:latest"
+          tags="-t docker.io/$NS/seedstone:${GITHUB_REF_NAME} -t docker.io/$NS/seedstone:latest"
           docker buildx imagetools create $tags "$src"
           docker buildx imagetools inspect "docker.io/$NS/seedstone:${GITHUB_REF_NAME}"

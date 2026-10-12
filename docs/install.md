@@ -40,7 +40,8 @@ deployment pins the digest of that index, which
 `docker buildx imagetools inspect ghcr.io/stefanobaldo/seedstone:<tag>`
 prints.
 
-The same image is on Docker Hub as `<namespace>/seedstone:<tag>`.
+The same image is on Docker Hub as `<namespace>/seedstone:<tag>` for every
+final release; a release candidate is on GHCR only.
 
 ## Cargo
 

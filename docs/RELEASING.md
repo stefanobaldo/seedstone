@@ -13,6 +13,11 @@ suite. So it is cut as a sequence of release candidates — `v0.2.0-rc.1`,
 environment it was cut for. A correction to a candidate is the next
 candidate, never a direct final.
 
+A candidate is published for the people testing it and nobody else: as a
+GitHub pre-release and as an image on GHCR under its tag. Docker Hub and
+crates.io receive finals only, and once the final is out its candidates'
+release pages are deleted (step 6 of "Cutting one").
+
 A **patch** version is a correction with no new behaviour. It is tagged
 directly and published as a normal release. A patch that would need a window
 of its own was not a patch; cut it as a minor.
@@ -45,8 +50,8 @@ kinds of artifact and not one:
 - **The container image**, built once per architecture (`linux/amd64` and
   `linux/arm64`) on native runners, smoke-tested, pushed by digest, and
   joined into one index under the tag on `ghcr.io/stefanobaldo/seedstone`,
-  then mirrored to `docker.io/<namespace>/seedstone` — the same index, the
-  same digests. `latest` moves on both only for a final. It is the artifact
+  and, for a final, mirrored to `docker.io/<namespace>/seedstone` — the same
+  index, the same digests. `latest` moves only for a final. It is the artifact
   a deployment pins, usually by digest rather than by tag: the digest to
   record is the **index's**, printed by the `image-index` job, and a
   deployment that pins by digest keeps pinning GHCR.
@@ -54,7 +59,7 @@ kinds of artifact and not one:
   checksum, and marked as a pre-release when the tag contains a `-`. Its
   notes are the changelog's section for this version, cut out by name; a
   candidate has no section of its own and falls back to `[Unreleased]`.
-- **The four crates on crates.io** — `seedstone-resp`, `seedstone-core`,
+- **The four crates on crates.io**, for a final — `seedstone-resp`, `seedstone-core`,
   `seedstone-service` and `seedstone`, all at the workspace's version —
   published by `cargo publish --workspace` in dependency order, with a
   short-lived token from crates.io's trusted publishing and no stored
@@ -195,6 +200,18 @@ step 3 below insists on the candidate suffix.
    clone would silently disagree with the repository about what that tag is.)*
 5. Watch the release workflow — every job, not the release page. It ends
    with the four archives and their checksums attached to the release, and
-   the image index on GHCR and Docker Hub, and the four crates on crates.io
-   (`cargo info seedstone@X.Y.Z`) — every artifact of "What a tag does", not
-   just the ones the release page shows.
+   the image index on GHCR and, for a final, on Docker Hub, with the four
+   crates on crates.io (`cargo info seedstone@X.Y.Z`) — every artifact of
+   "What a tag does", not just the ones the release page shows.
+6. After a final is published, delete its candidates' release pages, which
+   only served the testing that is now over — the tags stay:
+
+   ```sh
+   gh release list --limit 50 --json tagName --jq '.[].tagName | select(test("^vX\\.Y\\.Z-rc\\."))'
+   gh release delete vX.Y.Z-rc.N --yes     # once per candidate, no --cleanup-tag
+   ```
+
+   The tags are kept for the reason step 4 gives for never rewriting one,
+   and the candidates' images on GHCR are kept because a deployment that
+   ran a candidate pinned its digest, and deleting the image deletes the
+   digest.
