@@ -347,3 +347,27 @@ jobs:
           tags="-t docker.io/$NS/seedstone:${GITHUB_REF_NAME} -t docker.io/$NS/seedstone:latest"
           docker buildx imagetools create $tags "$src"
           docker buildx imagetools inspect "docker.io/$NS/seedstone:${GITHUB_REF_NAME}"
+
+  # The chart, versioned with the tag and pushed as an OCI artifact beside
+  # the image. `helm install` without --version picks the newest final; a
+  # candidate is reachable with --devel or by version. A candidate pushes it
+  # as it pushes the image, to GHCR and nowhere else. After the index, so a
+  # chart never names an image tag that does not exist yet.
+  chart:
+    needs: [meta, image-index]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: package and push
+        run: |
+          v="${{ needs.meta.outputs.version }}"
+          helm version
+          helm package charts/seedstone --version "$v" --app-version "$v" --destination out
+          echo "${{ github.token }}" | helm registry login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          helm push "out/seedstone-$v.tgz" oci://ghcr.io/stefanobaldo/charts
+          helm show chart oci://ghcr.io/stefanobaldo/charts/seedstone --version "$v"
