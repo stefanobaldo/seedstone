@@ -26,8 +26,9 @@ kinds of artifact and not one:
   targets — `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
   `aarch64-apple-darwin` and `x86_64-apple-darwin` (the last cross-compiled
   on Apple silicon and smoke-tested under Rosetta) — and packaged as one
-  archive per target with its `sha256`. Each archive is named after the
-  architecture read from the binary it contains, not after the runner. The
+  archive per target with its `sha256`. An archive is refused unless the
+  binary it contains is for the target it is named after — the architecture
+  is read from the binary, not taken from the runner. The
   packaging itself is `scripts/package-release.sh`, which CI also runs on
   every pull request so that the day a tag is pushed is not the first day
   the script runs.
@@ -46,7 +47,10 @@ kinds of artifact and not one:
 
 The workflow also refuses to publish a tag whose name disagrees with
 `cargo pkgid -p seedstone`, character for character
-(`scripts/set-version.sh --check`). That check is the reason
+(`scripts/set-version.sh --check`), before it builds anything. Nothing is
+published unless everything was built: the release waits for every archive
+and both images, and the image index — and `latest` — waits for the
+release. That check is the reason
 step 3 below insists on the candidate suffix.
 
 ## What a release depends on outside this repository
