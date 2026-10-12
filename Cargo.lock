@@ -278,7 +278,7 @@ checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 
 [[package]]
 name = "seedstone"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "getrandom 0.4.3",
  "mimalloc",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "seedstone-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bytes",
  "siphasher",
@@ -299,14 +299,14 @@ dependencies = [
 
 [[package]]
 name = "seedstone-resp"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bytes",
 ]
 
 [[package]]
 name = "seedstone-service"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bytes",
  "seedstone-core",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "seedstone-sim"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bytes",
  "rand 0.10.3",

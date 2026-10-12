@@ -7,6 +7,8 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-12
+
 ### Added
 
 - **More ways to install the same binary.** A release now carries archives
@@ -259,7 +261,8 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 <!-- [0.0.0] has no definition: it was a crates.io placeholder and was never
      tagged in git, so every URL for it would 404. -->
-[Unreleased]: https://github.com/stefanobaldo/seedstone/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/stefanobaldo/seedstone/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/stefanobaldo/seedstone/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/stefanobaldo/seedstone/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/stefanobaldo/seedstone/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/stefanobaldo/seedstone/compare/v0.2.0...v0.3.0
