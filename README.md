@@ -127,8 +127,10 @@ with refusal, and `INFO persistence` is what a monitor reads about it.
 
 `0.x`: the keyspace holds strings, and this server has served a Django
 application's cache in production since August 2026. Not here yet:
-other data types, RESP3, replication, clustering, transactions, scripting,
-ACL users, TLS. Next: hashes, lists, sets and sorted sets, Pub/Sub, RESP3.
+other data types, RESP3, replication, clustering, transactions, scripting.
+Next: hashes, lists, sets and sorted sets, Pub/Sub, RESP3. Not modelled at
+all: users beside the one password, and TLS — transport security belongs
+to the deployment, in front of the node.
 [CHANGELOG.md](CHANGELOG.md) is what changed; the current release is
 `v0.3.3`.
 
