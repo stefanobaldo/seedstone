@@ -2,7 +2,7 @@
 
 This document describes the decisions that shape SeedStone and the reasoning
 behind them. It is about structure, not about a feature list; what the server
-currently answers is in the [README](../README.md).
+currently answers is in [compatibility.md](compatibility.md).
 
 ## Why determinism is the architecture
 
@@ -479,3 +479,6 @@ true.
   project did not write, and the last two judge what they are — one pinned
   client pair, one pinned exporter — rather than the protocol in the
   abstract.
+
+The crates, the planted defects and the client lanes are described on
+[testing.md](testing.md).
