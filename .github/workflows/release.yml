@@ -96,6 +96,13 @@ jobs:
           file -b "$BIN" | grep -E -q "$want" || { echo "$(file "$BIN") is not ${{ matrix.target }}" >&2; exit 1; }
       - name: package
         run: bash scripts/package-release.sh "$BIN" "${{ needs.meta.outputs.version }}" "${{ matrix.target }}" dist
+      # The Debian and RPM packages, from the binary this job just built,
+      # with their checksums beside the archive's. They carry the workspace
+      # version, not the archive's name: on a dispatch, that is the version
+      # being rehearsed.
+      - name: deb and rpm
+        if: runner.os == 'Linux'
+        run: bash scripts/linux-packages.sh dist
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.target }}

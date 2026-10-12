@@ -271,6 +271,39 @@ jobs:
       - name: the release packaging runs
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
         run: bash scripts/package-release.sh target/release/seedstone ci x86_64-unknown-linux-gnu "$RUNNER_TEMP/dist"
+      # The packages are built and installed on every pull request, for the
+      # reason the packaging script is: the day a tag is pushed must not be
+      # the first day they build. Installed in containers of the two
+      # families, pinned by digest, where there is no systemd — which is
+      # exactly the install the maintainer scripts must survive.
+      - name: deb and rpm build
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: bash scripts/linux-packages.sh "$RUNNER_TEMP/pkg"
+      # `verify` refuses a unit whose command does not exist, so the binary
+      # is put where the package puts it for the length of the check. The
+      # package itself is not installed on the runner: its unit would start
+      # a server on the port the lanes below use.
+      - name: the unit parses
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: |
+          sudo install -m 755 target/release/seedstone /usr/bin/seedstone
+          status=0; systemd-analyze verify packaging/systemd/seedstone.service || status=$?
+          sudo rm /usr/bin/seedstone
+          exit "$status"
+      - name: the deb installs and answers
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: |
+          docker run --rm -v "$RUNNER_TEMP/pkg:/pkg:ro" debian:12@sha256:2c037a04925515fdd6ea85ea14a682d0e79931f5e9f5d07b6dbfc6ba12f9e858 sh -ec '
+            apt-get update -qq >/dev/null && apt-get install -y -qq /pkg/*.deb >/dev/null
+            seedstone --version
+            test -f /etc/default/seedstone && test -f /lib/systemd/system/seedstone.service'
+      - name: the rpm installs and answers
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: |
+          docker run --rm -v "$RUNNER_TEMP/pkg:/pkg:ro" fedora:42@sha256:99e203b80b1c3d8f7e161ec10a68fd02b081ef83a3963553e513c82846b97814 sh -ec '
+            dnf install -y -q /pkg/*.rpm >/dev/null
+            seedstone --version
+            test -f /etc/sysconfig/seedstone && test -f /usr/lib/systemd/system/seedstone.service'
       # Every client lane but redis-cli authenticates. The password is a
       # literal: it protects nothing and exists so the authenticated path is
       # the one these lanes exercise. The redis-cli lane runs open on purpose,
