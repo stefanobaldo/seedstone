@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "SeedStone deterministic core: shard runtime, keyspace, log abstraction."
+readme = "README.md"
+keywords = ["key-value", "deterministic"]
+categories = ["database-implementations"]
 
 [dependencies]
 tokio.workspace = true

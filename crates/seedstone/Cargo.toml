@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "An in-memory key-value store, written from scratch in Rust. Speaks RESP2 over TCP."
+readme = "../../README.md"
+keywords = ["redis", "key-value", "cache", "in-memory", "resp"]
+categories = ["database-implementations", "caching"]
 
 [dependencies]
 seedstone-core.workspace = true
@@ -32,6 +35,14 @@ mimalloc = "0.1.52"
 
 [lints]
 workspace = true
+
+# `cargo binstall seedstone` fetches the release archive instead of
+# building: the URL is the one the release workflow produces, and the
+# binary sits under the archive's one directory.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/seedstone-{ version }-{ target }.tar.gz"
+bin-dir = "seedstone-{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
 
 # The Debian and RPM packages: the binary, the unit, the environment file
 # as a conffile readable by root alone (it is where the password goes, and

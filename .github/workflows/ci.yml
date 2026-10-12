@@ -101,6 +101,15 @@ jobs:
             echo "turmoil reached the production dependency graph" >&2
             exit 1
           fi
+      # What crates.io would refuse is found here, not on the day a tag is
+      # pushed and immovable: the manifest metadata, the readme paths, the
+      # dependency versions. `--workspace` orders the four crates itself,
+      # skips the simulator, which is `publish = false`, and resolves the
+      # libraries a dependent needs from a local registry of the ones it has
+      # just packaged, so the dry run needs nothing on crates.io (cargo
+      # 1.97.1, 2026-10-12).
+      - name: the crates would publish
+        run: cargo publish --workspace --dry-run --locked
 
   # The sweeps, in a job of their own beside the one above, so the two
   # budgets are separate and a pull request waits for the slower of them,

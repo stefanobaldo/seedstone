@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "SeedStone connection layer: RESP2 frames in, core commands out. Netless by construction."
+readme = "README.md"
+keywords = ["redis", "resp", "key-value"]
+categories = ["database-implementations"]
 
 [dependencies]
 seedstone-core.workspace = true
