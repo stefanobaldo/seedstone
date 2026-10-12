@@ -54,13 +54,21 @@ kinds of artifact and not one:
   checksum, and marked as a pre-release when the tag contains a `-`. Its
   notes are the changelog's section for this version, cut out by name; a
   candidate has no section of its own and falls back to `[Unreleased]`.
+- **The four crates on crates.io** — `seedstone-resp`, `seedstone-core`,
+  `seedstone-service` and `seedstone`, all at the workspace's version —
+  published by `cargo publish --workspace` in dependency order, with a
+  short-lived token from crates.io's trusted publishing and no stored
+  secret. After the release, because a published crate version cannot be
+  withdrawn, only yanked, and because `cargo binstall seedstone` resolves
+  the release's archives. CI runs the same command with `--dry-run` on
+  every pull request.
 
 The workflow also refuses to publish a tag that disagrees with any of the
 four published crates' versions, character for character
 (`scripts/set-version.sh --check`), before it builds anything. Nothing is
 published unless everything was built: the release waits for every archive
-and both images, and the image index — and `latest` — waits for the
-release. That check is the reason
+and both images, and the image index — and `latest` — and the crates wait
+for the release. That check is the reason
 step 3 below insists on the candidate suffix.
 
 ## What a release depends on outside this repository
@@ -71,6 +79,14 @@ step 3 below insists on the candidate suffix.
   step fails — after the GHCR index exists and independently of the GitHub
   Release, so the release itself is complete and only the mirror is missing.
   Fix the credential and re-run the `image-index` job.
+- **crates.io**: trusted publishing configured on crates.io for the four
+  crates, repository `stefanobaldo/seedstone`, workflow `release.yml`, no
+  environment. A crate whose publisher is not configured fails the `crates`
+  job after the release and the image exist, and the fix is to configure it
+  and re-run the job — a tag is not re-pushed. A job that failed part-way
+  may have published some of the four: crates.io accepts a version once, so
+  read which ones are up (`cargo info <crate>@X.Y.Z`) before deciding how
+  to publish the rest.
 
 ## Cutting one
 

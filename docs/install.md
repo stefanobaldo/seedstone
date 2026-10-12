@@ -42,6 +42,21 @@ prints.
 
 The same image is on Docker Hub as `<namespace>/seedstone:<tag>`.
 
+## Cargo
+
+```sh
+cargo binstall seedstone        # the release archive for this machine, in seconds
+cargo install seedstone         # from source: a release build, minutes
+seedstone --version
+```
+
+`cargo binstall` (from the `cargo-binstall` crate) downloads the archive a
+release carries for the host and verifies its checksum; `cargo install`
+compiles the crate and its three library crates from crates.io with the
+toolchain on the machine. Both put the binary under `~/.cargo/bin`. The
+library crates — `seedstone-core`, `seedstone-resp`, `seedstone-service` —
+are published because the server is; their APIs carry no stability promise.
+
 ## Debian, Ubuntu (`.deb`) and Fedora, RHEL (`.rpm`)
 
 A release carries a package for each family and each architecture. It
