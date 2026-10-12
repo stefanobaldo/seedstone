@@ -21,7 +21,9 @@ SemVer and are `0.x` while the keyspace holds only strings;
   is built from are published beside it, with no API stability promise.
   On macOS and Linux, `brew install seedstonelabs/tap/seedstone` installs
   the release archive, and on macOS `brew services start seedstone` runs
-  it as a service.
+  it as a service. A Helm chart, `oci://ghcr.io/stefanobaldo/charts/seedstone`,
+  runs one node on Kubernetes with optional persistence and the password
+  from a Secret you own.
   `docs/install.md` is the list.
 
 ## [0.3.2] - 2026-10-11

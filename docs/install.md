@@ -10,7 +10,10 @@ The packaged defaults, wherever a package starts the server for you, are
 the server's own: it listens on loopback, takes no password, and keeps its
 log under a directory the package owns. Anything else — a bind outside
 loopback, a password, a memory ceiling — is a flag, and the package says
-where to put it.
+where to put it. The Helm chart is the one exception: on Kubernetes the
+server must listen beyond loopback to be reached at all, so the chart binds
+every interface and asks for a password, or for its absence, said
+deliberately.
 
 ## Container image
 
@@ -129,6 +132,23 @@ tar -xzf "seedstone-$v-$t.tar.gz"
 
 The Linux archives need glibc 2.34 or newer: Ubuntu 22.04, Debian 12 and
 the distributions released since.
+
+## Kubernetes (Helm)
+
+```sh
+kubectl create secret generic seedstone-auth --from-literal=password='change-me'
+helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --version <version> \
+  --set auth.existingSecret=seedstone-auth
+```
+
+One node, a StatefulSet with a volume for `--data-dir` (`persistence.size`,
+`persistence.storageClass`; `persistence.enabled=false` for a cache that
+may start empty), the password from a Secret you own, TCP probes on the
+port. `auth.noAuth=true` runs without a password, deliberately. The image
+is GHCR's, at the tag the chart was released with; `image.digest` pins it.
+The chart's version is the server's. Every value is in the chart's
+[README](../charts/seedstone/README.md); the ten-second check runs from a
+client pod, as `helm install` prints.
 
 ## The ten-second check
 

@@ -14,7 +14,8 @@ environment it was cut for. A correction to a candidate is the next
 candidate, never a direct final.
 
 A candidate is published for the people testing it and nobody else: as a
-GitHub pre-release and as an image on GHCR under its tag. Docker Hub,
+GitHub pre-release and as an image and a Helm chart on GHCR under its
+version. Docker Hub,
 crates.io and the Homebrew tap receive finals only, and once the final is out its candidates'
 release pages are deleted (step 6 of "Cutting one").
 
@@ -24,8 +25,8 @@ of its own was not a patch; cut it as a minor.
 
 ## What a tag does
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`, which produces six
-kinds of artifact and not one:
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which produces
+seven kinds of artifact and not one:
 
 - **The binary**, built with `--locked` on a native runner for each of four
   targets — `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
@@ -75,13 +76,22 @@ kinds of artifact and not one:
   after the push on purpose, because the tap is mutable and a bad formula
   is corrected by the next commit there. Every rehearsal runs `brew style`
   on a formula rendered from placeholder checksums.
+- **The Helm chart**, `charts/seedstone`, packaged with the tag's version
+  (without its `v`) as both the chart's version and its `appVersion`, and
+  pushed to `oci://ghcr.io/stefanobaldo/charts/seedstone` after the image
+  index, so the image tag it defaults to already exists. A candidate pushes
+  it too, to GHCR as its image is; `helm install` without `--version`
+  ignores a candidate unless given `--devel`. CI lints and renders it on
+  every pull request, and when the chart or the `Dockerfile` changes,
+  installs it into a kind cluster with the image the job built and asks it
+  for `PONG`.
 
 The workflow also refuses to publish a tag that disagrees with any of the
 four published crates' versions, character for character
 (`scripts/set-version.sh --check`), before it builds anything. Nothing is
 published unless everything was built: the release waits for every archive
 and both images, and the image index — and `latest` — the crates and the
-formula wait for the release. That check is the reason
+formula wait for the release; the chart waits for the index. That check is the reason
 step 3 below insists on the candidate suffix.
 
 ## What a release depends on outside this repository
@@ -112,6 +122,12 @@ step 3 below insists on the candidate suffix.
   the key and re-run the job. A re-run that renders the formula already on
   the tap pushes nothing, and a re-run of an older final once a newer one
   is on the tap leaves the tap alone.
+
+- **GHCR**: the workflow's own token pushes the image and the chart; no
+  secret. A package GHCR creates on its first push may be private: the
+  image's package is public, and the chart's, `charts/seedstone`, must be
+  made public in its package settings after the first tag that pushes it,
+  or every `helm install` outside this account is refused.
 
 ## Cutting one
 
