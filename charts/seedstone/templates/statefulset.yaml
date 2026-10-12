@@ -1,0 +1,104 @@
+{{- if and (not .Values.auth.noAuth) (not .Values.auth.existingSecret) (not .Values.auth.password) }}
+{{- fail "set one of auth.existingSecret, auth.password or auth.noAuth=true: the server refuses a network bind with no password" }}
+{{- end }}
+{{- if and .Values.auth.password (not .Values.auth.existingSecret) }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "seedstone.fullname" . }}
+  labels: {{- include "seedstone.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  {{ .Values.auth.secretKey }}: {{ .Values.auth.password | quote }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "seedstone.fullname" . }}
+  labels: {{- include "seedstone.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  serviceName: {{ include "seedstone.fullname" . }}
+  selector:
+    matchLabels: {{- include "seedstone.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "seedstone.selector" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+        - name: seedstone
+          image: {{ include "seedstone.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --bind
+            - 0.0.0.0:{{ .Values.service.port }}
+            {{- if .Values.auth.noAuth }}
+            - --no-auth
+            {{- end }}
+            {{- if .Values.persistence.enabled }}
+            - --data-dir
+            - {{ .Values.persistence.mountPath }}
+            - --fsync
+            - {{ .Values.fsync }}
+            {{- end }}
+            {{- range .Values.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- if not .Values.auth.noAuth }}
+          env:
+            - name: SEEDSTONE_REQUIREPASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "seedstone.secretName" . }}
+                  key: {{ .Values.auth.secretKey }}
+          {{- end }}
+          ports:
+            - name: resp
+              containerPort: {{ .Values.service.port }}
+          # TCP probes: the image has no shell and no client. A probe that
+          # speaks the protocol is the server's to offer.
+          readinessProbe:
+            tcpSocket: { port: resp }
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: resp }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          {{- with .Values.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.persistence.enabled }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

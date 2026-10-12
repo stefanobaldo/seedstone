@@ -1,0 +1,42 @@
+image:
+  repository: ghcr.io/stefanobaldo/seedstone
+  # Empty means the chart's appVersion, which is the release the chart was
+  # published with. A deployment that pins a digest sets `digest`.
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# The server replicates nothing; one replica is the only shape that makes
+# sense, and the StatefulSet exists for the stable volume, not for scale.
+service:
+  type: ClusterIP
+  port: 6379
+
+auth:
+  # One of the three: an existing Secret holding the password, a password
+  # written here (it lands in a Secret the chart creates), or no password
+  # at all, said deliberately. With none of the three set the server
+  # refuses to start on a non-loopback bind, which is the right default.
+  existingSecret: ""
+  secretKey: password
+  password: ""
+  noAuth: false
+
+persistence:
+  enabled: true
+  size: 8Gi
+  storageClass: ""
+  # Where the volume is mounted and where --data-dir points.
+  mountPath: /data
+
+# Fsync policy for the log: always | interval | never (docs/operations.md).
+fsync: interval
+
+# Any further flag, verbatim, e.g. ["--maxmemory", "2gb", "--maxmemory-policy", "allkeys-lru"].
+extraArgs: []
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

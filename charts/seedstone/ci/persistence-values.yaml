@@ -1,0 +1,5 @@
+auth:
+  password: ci-password
+persistence:
+  enabled: true
+  size: 1Gi

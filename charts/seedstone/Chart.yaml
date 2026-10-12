@@ -1,0 +1,14 @@
+apiVersion: v2
+name: seedstone
+description: An in-memory key-value store speaking the Redis protocol, with optional persistence
+type: application
+# Both versions are set by the release workflow to the tag's; the values
+# here are what a checkout renders.
+version: 0.0.0
+appVersion: "0.0.0"
+home: https://github.com/stefanobaldo/seedstone
+sources:
+  - https://github.com/stefanobaldo/seedstone
+keywords: [redis, cache, key-value, in-memory]
+maintainers:
+  - name: Stefano Baldo

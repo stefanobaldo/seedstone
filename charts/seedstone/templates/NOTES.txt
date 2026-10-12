@@ -1,0 +1,12 @@
+seedstone is starting as {{ include "seedstone.fullname" . }} on port {{ .Values.service.port }}.
+{{- if .Values.auth.noAuth }}
+No password: every client that can reach the service can use it, SHUTDOWN included.
+{{- else }}
+Password: key {{ .Values.auth.secretKey }} of Secret {{ include "seedstone.secretName" . }}.
+{{- end }}
+{{- if .Values.persistence.enabled }}
+Persistence: {{ .Values.persistence.size }} at {{ .Values.persistence.mountPath }}, --fsync {{ .Values.fsync }}.
+{{- else }}
+No persistence: a restart is an empty keyspace.
+{{- end }}
+Check: kubectl run -it --rm cli --image=redis:8-alpine --restart=Never -- redis-cli -h {{ include "seedstone.fullname" . }}{{ if not .Values.auth.noAuth }} -a <password>{{ end }} ping
