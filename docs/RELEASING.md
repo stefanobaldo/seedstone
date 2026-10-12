@@ -19,7 +19,7 @@ of its own was not a patch; cut it as a minor.
 
 ## What a tag does
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`, which produces four
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which produces five
 kinds of artifact and not one:
 
 - **The binary**, built with `--locked` on a native runner for each of four
@@ -79,14 +79,18 @@ step 3 below insists on the candidate suffix.
   step fails — after the GHCR index exists and independently of the GitHub
   Release, so the release itself is complete and only the mirror is missing.
   Fix the credential and re-run the `image-index` job.
-- **crates.io**: trusted publishing configured on crates.io for the four
-  crates, repository `stefanobaldo/seedstone`, workflow `release.yml`, no
-  environment. A crate whose publisher is not configured fails the `crates`
-  job after the release and the image exist, and the fix is to configure it
-  and re-run the job — a tag is not re-pushed. A job that failed part-way
-  may have published some of the four: crates.io accepts a version once, so
-  read which ones are up (`cargo info <crate>@X.Y.Z`) before deciding how
-  to publish the rest.
+- **crates.io**: the four crates exist there, and trusted publishing is
+  configured on each — repository `stefanobaldo/seedstone`, workflow
+  `release.yml`, no environment. A trusted-publishing token cannot create a
+  crate, and a publisher can only be configured on a crate that exists, so
+  a crate new to the workspace is published once by hand, by its owner,
+  before the first tag that carries it. A crate whose publisher is not
+  configured fails the `crates` job after the release and the image exist;
+  a tag is not re-pushed. If nothing was uploaded, configure it and re-run
+  the job. If the job failed part-way, a re-run stops at the first crate
+  already up, since crates.io accepts a version once: read which are up
+  (`cargo info <crate>@X.Y.Z`) and publish the rest by hand from the tagged
+  commit, in the order above, with `cargo publish -p <crate> --locked`.
 
 ## Cutting one
 
@@ -191,5 +195,6 @@ step 3 below insists on the candidate suffix.
    clone would silently disagree with the repository about what that tag is.)*
 5. Watch the release workflow — every job, not the release page. It ends
    with the four archives and their checksums attached to the release, and
-   the image index on GHCR and Docker Hub — every artifact of "What a tag
-   does", not just the ones the release page shows.
+   the image index on GHCR and Docker Hub, and the four crates on crates.io
+   (`cargo info seedstone@X.Y.Z`) — every artifact of "What a tag does", not
+   just the ones the release page shows.
