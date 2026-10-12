@@ -42,6 +42,33 @@ prints.
 
 The same image is on Docker Hub as `<namespace>/seedstone:<tag>`.
 
+## Debian, Ubuntu (`.deb`) and Fedora, RHEL (`.rpm`)
+
+A release carries a package for each family and each architecture. It
+installs the binary at `/usr/bin/seedstone` and a systemd unit, and starts
+the service:
+
+```sh
+sudo apt install ./seedstone_<version>-1_<arch>.deb        # Debian, Ubuntu
+sudo dnf install ./seedstone-<version>-1.<arch>.rpm        # Fedora, RHEL
+systemctl status seedstone
+```
+
+`<arch>` is `amd64` or `arm64` in a `.deb`'s name and `x86_64` or
+`aarch64` in an `.rpm`'s.
+
+The service runs as a dynamic user, listens on `127.0.0.1:6379` with no
+password, keeps its log under `/var/lib/seedstone`, and writes its events
+to the journal (`journalctl -u seedstone`). A password and any further
+flag go in the environment file — `/etc/default/seedstone` on Debian,
+`/etc/sysconfig/seedstone` on RPM systems — followed by
+`systemctl restart seedstone`; the file's comments say which variable is
+which. A flag given twice takes its last value, so a `--bind` there
+replaces the unit's. The service can write nowhere but its own directory:
+to move the data directory, override the unit (`systemctl edit seedstone`).
+
+The packages need glibc 2.34 or newer, as the archives do.
+
 ## Archives
 
 A release carries four archives, one per platform, each with its `sha256`:

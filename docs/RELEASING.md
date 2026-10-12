@@ -19,7 +19,7 @@ of its own was not a patch; cut it as a minor.
 
 ## What a tag does
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`, which produces three
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which produces four
 kinds of artifact and not one:
 
 - **The binary**, built with `--locked` on a native runner for each of four
@@ -32,6 +32,14 @@ kinds of artifact and not one:
   packaging itself is `scripts/package-release.sh`, which CI also runs on
   every pull request so that the day a tag is pushed is not the first day
   the script runs.
+- **The Debian and RPM packages**, one of each per Linux target, built from
+  the same binary by `scripts/linux-packages.sh` (`cargo-deb` and
+  `cargo-generate-rpm`, with the metadata in `crates/seedstone/Cargo.toml`),
+  each with its `sha256`. They install the binary and the systemd unit in
+  `packaging/systemd/`, and enable and start the service where systemd is
+  running. A candidate's `-rc.N` becomes `~rc.N` in both, so a candidate
+  sorts before its final. CI builds both on every pull request and installs
+  them in a Debian and a Fedora container.
 - **The container image**, built once per architecture (`linux/amd64` and
   `linux/arm64`) on native runners, smoke-tested, pushed by digest, and
   joined into one index under the tag on `ghcr.io/stefanobaldo/seedstone`,
@@ -40,10 +48,10 @@ kinds of artifact and not one:
   a deployment pins, usually by digest rather than by tag: the digest to
   record is the **index's**, printed by the `image-index` job, and a
   deployment that pins by digest keeps pinning GHCR.
-- **The GitHub Release**, carrying every archive and its checksum, and marked
-  as a pre-release when the tag contains a `-`. Its notes are the changelog's
-  section for this version, cut out by name; a candidate has no section of its
-  own and falls back to `[Unreleased]`.
+- **The GitHub Release**, carrying every archive and package with its
+  checksum, and marked as a pre-release when the tag contains a `-`. Its
+  notes are the changelog's section for this version, cut out by name; a
+  candidate has no section of its own and falls back to `[Unreleased]`.
 
 The workflow also refuses to publish a tag whose name disagrees with
 `cargo pkgid -p seedstone`, character for character

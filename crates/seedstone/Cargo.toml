@@ -32,3 +32,60 @@ mimalloc = "0.1.52"
 
 [lints]
 workspace = true
+
+# The Debian and RPM packages: the binary, the unit, the environment file
+# as a conffile, the licenses and the docs. Asset sources are relative to
+# this manifest for cargo-deb and to the workspace root for
+# cargo-generate-rpm; `target/release/...` is the build output for both.
+# A pre-release `-rc.N` becomes `~rc.N` in both, so a candidate sorts before
+# its final: `scripts/linux-packages.sh` builds both and says how.
+[package.metadata.deb]
+maintainer = "Stefano Baldo <stefano@companyhero.com>"
+copyright = "Stefano Baldo"
+license-file = ["../../LICENSE-MIT", "0"]
+extended-description = """\
+An in-memory key-value store speaking the Redis protocol (RESP2) over TCP,
+with optional on-disk persistence. The service listens on loopback with no
+password; /etc/default/seedstone is where a password and further flags go."""
+section = "database"
+priority = "optional"
+depends = "$auto"
+maintainer-scripts = "../../packaging/deb"
+assets = [
+  ["target/release/seedstone", "usr/bin/", "755"],
+  ["../../packaging/systemd/seedstone.service", "lib/systemd/system/", "644"],
+  ["../../packaging/systemd/seedstone.env", "etc/default/seedstone", "644"],
+  ["../../LICENSE-MIT", "usr/share/doc/seedstone/", "644"],
+  ["../../LICENSE-APACHE", "usr/share/doc/seedstone/", "644"],
+  ["../../README.md", "usr/share/doc/seedstone/", "644"],
+  ["../../CHANGELOG.md", "usr/share/doc/seedstone/", "644"],
+  ["../../docs/install.md", "usr/share/doc/seedstone/", "644"],
+  ["../../docs/operations.md", "usr/share/doc/seedstone/", "644"],
+]
+conf-files = ["/etc/default/seedstone"]
+
+[package.metadata.generate-rpm]
+summary = "In-memory key-value store speaking the Redis protocol"
+license = "MIT OR Apache-2.0"
+assets = [
+  { source = "target/release/seedstone", dest = "/usr/bin/seedstone", mode = "755" },
+  { source = "packaging/systemd/seedstone.service", dest = "/usr/lib/systemd/system/seedstone.service", mode = "644" },
+  { source = "packaging/systemd/seedstone.env", dest = "/etc/sysconfig/seedstone", mode = "644", config = "noreplace" },
+  { source = "LICENSE-MIT", dest = "/usr/share/doc/seedstone/LICENSE-MIT", mode = "644", doc = true },
+  { source = "LICENSE-APACHE", dest = "/usr/share/doc/seedstone/LICENSE-APACHE", mode = "644", doc = true },
+  { source = "README.md", dest = "/usr/share/doc/seedstone/README.md", mode = "644", doc = true },
+  { source = "CHANGELOG.md", dest = "/usr/share/doc/seedstone/CHANGELOG.md", mode = "644", doc = true },
+  { source = "docs/install.md", dest = "/usr/share/doc/seedstone/install.md", mode = "644", doc = true },
+  { source = "docs/operations.md", dest = "/usr/share/doc/seedstone/operations.md", mode = "644", doc = true },
+]
+post_install_script = """
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload || :
+  systemctl enable --now seedstone.service || :
+fi
+"""
+pre_uninstall_script = """
+if [ "$1" = 0 ] && [ -d /run/systemd/system ]; then
+  systemctl disable --now seedstone.service || :
+fi
+"""
