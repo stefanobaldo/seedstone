@@ -16,7 +16,10 @@ SemVer and are `0.x` while the keyspace holds only strings;
   mirrored to Docker Hub. Debian and RPM packages install the server with
   a systemd unit: the service runs as a dynamic user on loopback, with its
   log under `/var/lib/seedstone`; a password goes in `/etc/default/seedstone`
-  or `/etc/sysconfig/seedstone`. `docs/install.md` is the list.
+  or `/etc/sysconfig/seedstone`. `cargo install seedstone` and
+  `cargo binstall seedstone` work too; the three library crates the server
+  is built from are published beside it, with no API stability promise.
+  `docs/install.md` is the list.
 
 ## [0.3.2] - 2026-10-11
 
