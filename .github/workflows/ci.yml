@@ -53,6 +53,10 @@ jobs:
       # renderer's own selftest runs first, so a chart rule that changed is
       # caught before a chart that changed.
       - run: python3 bench/report.py --selftest && bash scripts/check-benchmark-chart.sh
+      # Every relative link in the documentation resolves and the README's
+      # Rust badge matches the toolchain; neither is a claim any other gate
+      # reads.
+      - run: bash scripts/check-docs.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # `--workspace` unifies Cargo features across every crate in the build, so
       # the features the simulator turns on leak into the production crates and
