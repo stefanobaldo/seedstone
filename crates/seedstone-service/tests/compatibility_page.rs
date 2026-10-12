@@ -4,7 +4,7 @@
 //! *Answers* table, none has a row in *Refuses*, and nothing in *Refuses* is
 //! served. A command added without a row is a red test, which is the same
 //! mechanics that make `COMMAND COUNT` the table's length rather than a
-//! literal.
+//! literal. The README's command table is held to the same list, both ways.
 //!
 //! The parse is deliberately narrow — the first backticked token of each row
 //! of two named tables — and is not a Markdown parser. Keep the page's shape
@@ -57,5 +57,49 @@ fn the_compatibility_page_matches_the_command_table() {
     assert!(
         phantom.is_empty(),
         "in the Answers table but not served: {phantom:?}"
+    );
+}
+
+/// The README's "What it speaks" table names every command the server
+/// answers and nothing else, at the command level (`CONFIG`, not
+/// `CONFIG GET`). The parse is the backticked tokens of the table rows
+/// under that heading, nothing more.
+fn readme_commands(page: &str) -> BTreeSet<String> {
+    let start = page
+        .find("## What it speaks")
+        .expect("README.md has no \"What it speaks\" heading");
+    let section = &page[start..];
+    let end = section[3..].find("\n## ").map_or(section.len(), |i| i + 3);
+    section[..end]
+        .lines()
+        .filter(|line| line.starts_with("| ") && line.contains('`'))
+        .flat_map(|line| {
+            line.split('`')
+                .skip(1)
+                .step_by(2)
+                .map(|tok| tok.split_whitespace().next().unwrap_or("").to_owned())
+                .collect::<Vec<_>>()
+        })
+        .filter(|tok| !tok.is_empty())
+        .collect()
+}
+
+#[test]
+fn the_readme_table_matches_the_command_table() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md");
+    let page = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let listed = readme_commands(&page);
+    let served: BTreeSet<String> = seedstone_service::command_names()
+        .map(|n| String::from_utf8(n.to_vec()).unwrap())
+        .collect();
+    let unlisted: Vec<_> = served.difference(&listed).collect();
+    assert!(
+        unlisted.is_empty(),
+        "served but not on the README's table: {unlisted:?}"
+    );
+    let phantom: Vec<_> = listed.difference(&served).collect();
+    assert!(
+        phantom.is_empty(),
+        "on the README's table but not served: {phantom:?}"
     );
 }
