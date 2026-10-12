@@ -14,8 +14,8 @@ environment it was cut for. A correction to a candidate is the next
 candidate, never a direct final.
 
 A candidate is published for the people testing it and nobody else: as a
-GitHub pre-release and as an image on GHCR under its tag. Docker Hub and
-crates.io receive finals only, and once the final is out its candidates'
+GitHub pre-release and as an image on GHCR under its tag. Docker Hub,
+crates.io and the Homebrew tap receive finals only, and once the final is out its candidates'
 release pages are deleted (step 6 of "Cutting one").
 
 A **patch** version is a correction with no new behaviour. It is tagged
@@ -24,7 +24,7 @@ of its own was not a patch; cut it as a minor.
 
 ## What a tag does
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`, which produces five
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which produces six
 kinds of artifact and not one:
 
 - **The binary**, built with `--locked` on a native runner for each of four
@@ -67,13 +67,21 @@ kinds of artifact and not one:
   withdrawn, only yanked, and because `cargo binstall seedstone` resolves
   the release's archives. CI runs the same command with `--dry-run` on
   every pull request.
+- **The Homebrew formula**, for a final — rendered by
+  `scripts/render-formula.sh` from `packaging/homebrew/seedstone.rb.tmpl`
+  and the release's four archive checksums, checked by `brew style`, and
+  pushed to `Formula/seedstone.rb` on `seedstonelabs/homebrew-tap`. The job
+  then installs it from the tap on a macOS runner and runs `brew test`:
+  after the push on purpose, because the tap is mutable and a bad formula
+  is corrected by the next commit there. Every rehearsal runs `brew style`
+  on a formula rendered from placeholder checksums.
 
 The workflow also refuses to publish a tag that disagrees with any of the
 four published crates' versions, character for character
 (`scripts/set-version.sh --check`), before it builds anything. Nothing is
 published unless everything was built: the release waits for every archive
-and both images, and the image index — and `latest` — and the crates wait
-for the release. That check is the reason
+and both images, and the image index — and `latest` — the crates and the
+formula wait for the release. That check is the reason
 step 3 below insists on the candidate suffix.
 
 ## What a release depends on outside this repository
@@ -96,6 +104,12 @@ step 3 below insists on the candidate suffix.
   already up, since crates.io accepts a version once: read which are up
   (`cargo info <crate>@X.Y.Z`) and publish the rest by hand from the tagged
   commit, in the order above, with `cargo publish -p <crate> --locked`.
+- **The Homebrew tap**: the repository `seedstonelabs/homebrew-tap`, with a
+  deploy key that has write access, and its private half in this
+  repository's secret `HOMEBREW_TAP_DEPLOY_KEY`. Without it the `homebrew`
+  job fails after the release, the image and the crates exist, and the tap
+  stays at the previous version; restore the key and re-run the job. A
+  re-run that renders the formula already on the tap pushes nothing.
 
 ## Cutting one
 
@@ -201,7 +215,8 @@ step 3 below insists on the candidate suffix.
 5. Watch the release workflow — every job, not the release page. It ends
    with the four archives and their checksums attached to the release, and
    the image index on GHCR and, for a final, on Docker Hub, with the four
-   crates on crates.io (`cargo info seedstone@X.Y.Z`) — every artifact of
+   crates on crates.io (`cargo info seedstone@X.Y.Z`) and the formula on the
+   tap (`brew info seedstonelabs/tap/seedstone`) — every artifact of
    "What a tag does", not just the ones the release page shows.
 6. After a final is published, delete its candidates' release pages, which
    only served the testing that is now over — the tags stay:

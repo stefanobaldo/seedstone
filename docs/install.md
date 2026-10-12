@@ -43,6 +43,21 @@ prints.
 The same image is on Docker Hub as `<namespace>/seedstone:<tag>` for every
 final release; a release candidate is on GHCR only.
 
+## Homebrew (macOS and Linux)
+
+```sh
+brew install seedstonelabs/tap/seedstone
+seedstone --version
+brew services start seedstone      # as a service: loopback, no password
+```
+
+The formula installs the release archive for the machine (Apple silicon
+or Intel; Linux x86_64 or aarch64) and verifies its checksum; nothing is
+compiled. `brew services` runs the server with `--data-dir
+$(brew --prefix)/var/seedstone`, and its output goes to
+`$(brew --prefix)/var/log/seedstone.log`. A password or any other flag
+means running the binary yourself. The tap carries final releases only.
+
 ## Cargo
 
 ```sh

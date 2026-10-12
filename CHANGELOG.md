@@ -19,6 +19,8 @@ SemVer and are `0.x` while the keyspace holds only strings;
   or `/etc/sysconfig/seedstone`. `cargo install seedstone` and
   `cargo binstall seedstone` work too; the three library crates the server
   is built from are published beside it, with no API stability promise.
+  On macOS and Linux, `brew install seedstonelabs/tap/seedstone` installs
+  the release archive, and `brew services start seedstone` runs it.
   `docs/install.md` is the list.
 
 ## [0.3.2] - 2026-10-11
