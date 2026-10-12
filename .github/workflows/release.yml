@@ -13,15 +13,24 @@ permissions:
   contents: read
 
 jobs:
-  # One place the version is computed, so the jobs cannot disagree about it.
+  # One place the version is computed, so the jobs cannot disagree about it,
+  # and the one place a tag is refused: every other job needs this one.
   meta:
     runs-on: ubuntu-24.04
-    timeout-minutes: 2
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.v.outputs.version }}
       publish: ${{ steps.v.outputs.publish }}
       final: ${{ steps.v.outputs.final }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The binary reports its version in `INFO` and `HELLO`, so a tag that
+      # disagrees with the workspace would publish an archive and an image
+      # that lie about themselves. First, before any build: the check is
+      # cheap and a tag is not movable once pushed.
+      - name: the tag and the workspace agree
+        if: github.event_name == 'push'
+        run: bash scripts/set-version.sh --check "${GITHUB_REF_NAME#v}"
       - id: v
         run: |
           if [ "${{ github.event_name }}" = push ]; then
@@ -54,13 +63,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
-      # The binary reports its version in `INFO` and `HELLO`, so a tag that
-      # disagrees with the workspace would publish an archive that lies about
-      # itself. Before the build, not after: the check is cheap and a tag is
-      # not movable once pushed.
-      - name: the tag and the workspace agree
-        if: github.event_name == 'push'
-        run: bash scripts/set-version.sh --check "${GITHUB_REF_NAME#v}"
       - name: the cross target's toolchain
         if: matrix.cross
         run: rustup target add ${{ matrix.target }}
@@ -75,10 +77,12 @@ jobs:
             cargo build --release -p seedstone --locked
             echo "BIN=target/release/seedstone" >> "$GITHUB_ENV"
           fi
-      # The archive is named after what it contains: the triple a native
-      # build was compiled for is read from the compiler, and the binary's
-      # own architecture is read from the file. The day a runner label moves,
-      # a literal would mislabel the archive instead of failing.
+      # The archive is named after its target, and refused unless that is
+      # what it contains: the triple a native build was compiled for is read
+      # from the compiler, and the binary's own architecture from the file
+      # (`-b`, so the path, which names the target, is not what matches). The
+      # day a runner label moves, the archive fails instead of being
+      # mislabelled.
       - name: the binary is for the target it is named after
         run: |
           if [ "${{ matrix.cross }}" != true ]; then
@@ -89,7 +93,7 @@ jobs:
             x86_64-*)  want='x86_64|x86-64' ;;
             aarch64-*) want='aarch64|arm64' ;;
           esac
-          file "$BIN" | grep -E -q "$want" || { echo "$(file "$BIN") is not ${{ matrix.target }}" >&2; exit 1; }
+          file -b "$BIN" | grep -E -q "$want" || { echo "$(file "$BIN") is not ${{ matrix.target }}" >&2; exit 1; }
       - name: package
         run: bash scripts/package-release.sh "$BIN" "${{ needs.meta.outputs.version }}" "${{ matrix.target }}" dist
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -101,9 +105,10 @@ jobs:
   # The GitHub Release, carrying every archive and checksum the matrix built.
   # Its notes are the changelog's section for this version; a candidate has
   # none of its own and falls back to `[Unreleased]`, as `docs/RELEASING.md`
-  # says.
+  # says. It waits for the images too: a release whose image failed its
+  # smoke is not published under a tag that cannot be moved.
   publish:
-    needs: [meta, build]
+    needs: [meta, build, image]
     if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -182,9 +187,10 @@ jobs:
 
   # The join: one index under the tag, on GHCR (canonical) and on Docker Hub
   # (the mirror: the same index, a shorter name). The digest to record in a
-  # deployment is the index's, printed by the GHCR step.
+  # deployment is the index's, printed by the GHCR step. After the release,
+  # so a tag and `latest` name an image only once the release exists.
   image-index:
-    needs: [meta, image]
+    needs: [meta, image, publish]
     if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10

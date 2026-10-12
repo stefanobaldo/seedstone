@@ -21,8 +21,9 @@ docker run -p 6379:6379 ghcr.io/stefanobaldo/seedstone:<tag> --bind 0.0.0.0:6379
 The image holds nothing but the binary and runs as a non-root user (uid
 65532), so the options above are the container's arguments.
 `--bind 0.0.0.0:6379` is what makes the published port reachable;
-`--no-auth` says, deliberately, that no password guards it — pass
-`SEEDSTONE_REQUIREPASS` in the environment for one.
+`--no-auth` says, deliberately, that no password guards it. For a
+password, pass `SEEDSTONE_REQUIREPASS` in the environment instead of
+`--no-auth`: the server refuses both together.
 
 For persistence, give `--data-dir` a directory that user can write. A new
 named volume is owned by root, so hand it over once before the first start:
