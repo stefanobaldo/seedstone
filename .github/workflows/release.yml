@@ -103,6 +103,19 @@ jobs:
       - name: deb and rpm
         if: runner.os == 'Linux'
         run: bash scripts/linux-packages.sh dist
+      # The Homebrew formula, rendered from placeholder checksums, on the one
+      # leg that has Homebrew. Under a `Formula/` directory, because that is
+      # what makes `brew style` apply its formula rules; anywhere else it
+      # lints the file as plain Ruby.
+      - name: the formula passes brew style
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          d="$RUNNER_TEMP/formula"; mkdir -p "$d/Formula"
+          for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+            printf '%064d  seedstone-0.0.0-%s.tar.gz\n' 0 "$t" > "$d/seedstone-0.0.0-$t.tar.gz.sha256"
+          done
+          bash scripts/render-formula.sh 0.0.0 "$d" > "$d/Formula/seedstone.rb"
+          brew style "$d/Formula/seedstone.rb"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.target }}
