@@ -107,9 +107,11 @@ step 3 below insists on the candidate suffix.
 - **The Homebrew tap**: the repository `seedstonelabs/homebrew-tap`, with a
   deploy key that has write access, and its private half in this
   repository's secret `HOMEBREW_TAP_DEPLOY_KEY`. Without it the `homebrew`
-  job fails after the release, the image and the crates exist, and the tap
-  stays at the previous version; restore the key and re-run the job. A
-  re-run that renders the formula already on the tap pushes nothing.
+  job fails after the GitHub Release exists, independently of the crates
+  and the image index, and the tap stays at the previous version; restore
+  the key and re-run the job. A re-run that renders the formula already on
+  the tap pushes nothing, and a re-run of an older final once a newer one
+  is on the tap leaves the tap alone.
 
 ## Cutting one
 

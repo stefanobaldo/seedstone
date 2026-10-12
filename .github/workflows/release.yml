@@ -198,6 +198,10 @@ jobs:
     if: needs.meta.outputs.publish == 'true' && needs.meta.outputs.final == 'true'
     runs-on: macos-15
     timeout-minutes: 15
+    # Two finals' jobs never push at once; the second waits for the first.
+    concurrency:
+      group: homebrew-tap
+      cancel-in-progress: false
     permissions:
       contents: read
     steps:
@@ -215,15 +219,26 @@ jobs:
           bash scripts/render-formula.sh "${{ needs.meta.outputs.version }}" dist > formula/Formula/seedstone.rb
           brew style formula/Formula/seedstone.rb
       # A re-run that renders the formula already on the tap commits nothing
-      # and pushes nothing, rather than failing on an empty commit.
+      # and pushes nothing, rather than failing on an empty commit. A re-run
+      # of an older final, once a newer one is on the tap, leaves the tap
+      # alone: it would otherwise move everyone back a version.
       - name: push to the tap
+        id: tap
         env:
           KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
           [ -n "$KEY" ] || { echo "the secret HOMEBREW_TAP_DEPLOY_KEY is not set" >&2; exit 1; }
           mkdir -p ~/.ssh && printf '%s\n' "$KEY" > ~/.ssh/tap && chmod 600 ~/.ssh/tap
           export GIT_SSH_COMMAND='ssh -i ~/.ssh/tap -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
           git clone --quiet git@github.com:seedstonelabs/homebrew-tap.git tap
+          current="$(sed -n 's/^  version "\(.*\)"$/\1/p' tap/Formula/seedstone.rb 2>/dev/null || true)"
+          if [ -n "$current" ] && [ "$current" != "$VERSION" ] &&
+             [ "$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -1)" = "$current" ]; then
+            echo "the tap already carries $current, newer than $VERSION; left as it is"
+            echo "newer=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           mkdir -p tap/Formula && cp formula/Formula/seedstone.rb tap/Formula/seedstone.rb
           cd tap
           git add Formula/seedstone.rb
@@ -236,6 +251,7 @@ jobs:
             git push --quiet
           fi
       - name: install from the tap
+        if: steps.tap.outputs.newer != 'true'
         env:
           HOMEBREW_NO_AUTO_UPDATE: '1'
         run: |
