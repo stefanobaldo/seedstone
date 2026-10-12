@@ -28,15 +28,17 @@ The image holds nothing but the binary and runs as a non-root user (uid
 password, pass `SEEDSTONE_REQUIREPASS` in the environment instead of
 `--no-auth`: the server refuses both together.
 
-For persistence, give `--data-dir` a directory that user can write. A new
-named volume is owned by root, so hand it over once before the first start:
+For persistence, mount a volume on `/data` and point `--data-dir` at it.
+The image's `/data` belongs to that user, and a new named volume takes its
+ownership on first mount:
 
 ```sh
-docker volume create seedstone-data
-docker run --rm -v seedstone-data:/data busybox chown 65532:65532 /data
 docker run -p 6379:6379 -v seedstone-data:/data ghcr.io/stefanobaldo/seedstone:<tag> \
   --bind 0.0.0.0:6379 --no-auth --data-dir /data
 ```
+
+A host directory mounted instead keeps its own ownership: make it writable
+by uid 65532 first.
 
 The image is built for `linux/amd64` and `linux/arm64` under one tag. A
 deployment pins the digest of that index, which
