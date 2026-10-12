@@ -245,6 +245,10 @@ jobs:
               - '!LICENSE*'
               - '!.gitignore'
               - '!docs/**/*.md'
+            # One pattern, braced: under `every`, two lines here would have to
+            # match the same file at once.
+            chart:
+              - '{charts/**,Dockerfile}'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -326,6 +330,40 @@ jobs:
           done
           bash scripts/render-formula.sh 0.0.0 "$d" > "$d/seedstone.rb"
           ruby -c "$d/seedstone.rb"
+      # The chart: linted and rendered on every code change (cheap), and
+      # installed into a kind cluster when the chart or the image changed —
+      # the image this job just built, loaded into the cluster, and a
+      # client container that must get PONG through the Service.
+      - name: the chart lints and renders both ways
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
+        run: |
+          helm version
+          helm lint charts/seedstone -f charts/seedstone/ci/no-persistence-values.yaml
+          helm lint charts/seedstone -f charts/seedstone/ci/persistence-values.yaml
+          test "$(helm template s charts/seedstone -f charts/seedstone/ci/no-persistence-values.yaml | grep -c -- '--data-dir')" = 0
+          test "$(helm template s charts/seedstone -f charts/seedstone/ci/persistence-values.yaml | grep -c -- '--data-dir')" = 1
+          ! helm template s charts/seedstone >/dev/null 2>&1
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.chart == 'true'
+        with:
+          cluster_name: ci
+      - name: the chart installs and answers
+        if: github.event_name != 'pull_request' || steps.relevant.outputs.chart == 'true'
+        run: |
+          set -euo pipefail
+          kind load docker-image seedstone-pr:latest --name ci
+          helm install s charts/seedstone -f charts/seedstone/ci/persistence-values.yaml \
+            --set image.repository=seedstone-pr --set image.tag=latest --set image.pullPolicy=Never --wait --timeout 120s
+          # Not `run -i`: an attach after a pull can miss a short reply.
+          # redis-cli exits 0 on NOAUTH, so the reply is what is checked.
+          kubectl run cli --restart=Never \
+            --image=redis:8-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0 \
+            -- redis-cli -h s-seedstone -a ci-password --no-auth-warning ping
+          kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/cli --timeout=120s
+          kubectl logs pod/cli | tee ping.out
+          grep -qx PONG ping.out
+          kubectl logs statefulset/s-seedstone | tee server.log
+          grep -q '"evt":"listening"' server.log
       # Every client lane but redis-cli authenticates. The password is a
       # literal: it protects nothing and exists so the authenticated path is
       # the one these lanes exercise. The redis-cli lane runs open on purpose,
