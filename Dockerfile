@@ -12,10 +12,17 @@ FROM rust:1-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p seedstone --locked
+# The directory a volume is mounted on for `--data-dir`, made here because
+# the runtime image has no shell to make it with.
+RUN mkdir /data
 
 # `nonroot` runs the server as uid 65532. There is no shell in this image:
 # `redis-cli` from any other container is how one talks to it.
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=builder /src/target/release/seedstone /usr/local/bin/seedstone
+# Owned by the user the server runs as, so that a new named volume mounted
+# here starts out writable: Docker copies the directory into the volume,
+# ownership included.
+COPY --from=builder --chown=65532:65532 /data /data
 EXPOSE 6379
 ENTRYPOINT ["/usr/local/bin/seedstone"]

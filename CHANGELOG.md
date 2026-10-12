@@ -26,6 +26,14 @@ SemVer and are `0.x` while the keyspace holds only strings;
   from a Secret you own.
   `docs/install.md` is the list.
 
+### Fixed
+
+- **A new Docker volume works for `--data-dir` as it is.** The image now
+  ships `/data` owned by the user the server runs as, so a named volume
+  mounted there is writable from its first start; before, the server
+  stopped at startup with `recovery_failed` until the volume was handed
+  over with a `chown`.
+
 ## [0.3.2] - 2026-10-11
 
 ### Fixed

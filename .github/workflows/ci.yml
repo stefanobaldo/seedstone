@@ -278,6 +278,13 @@ jobs:
         run: |
           docker build -t seedstone-pr .
           docker run --rm seedstone-pr --version
+          # A new named volume on /data must be writable by the server's
+          # user with no step before it.
+          docker run -d --name vol -v ci-data:/data seedstone-pr --no-auth --data-dir /data
+          for _ in $(seq 50); do docker logs vol 2>&1 | grep -q '"evt":"listening"' && break; sleep 0.1; done
+          docker logs vol 2>&1 | tee vol.log
+          grep -q '"evt":"listening"' vol.log
+          docker rm -f vol; docker volume rm ci-data
       # Here rather than in `release.yml` alone, so that the day a tag is
       # pushed is not the first day this script runs. It packages the binary
       # this job already built, unpacks it again and makes the result answer
