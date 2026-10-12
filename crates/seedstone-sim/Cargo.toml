@@ -1,16 +1,17 @@
 [package]
 name = "seedstone-sim"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "SeedStone simulation harness: deterministic testing under turmoil."
 publish = false
 
 [dependencies]
-seedstone-core = { path = "../seedstone-core" }
-seedstone-resp = { path = "../seedstone-resp" }
-seedstone-service = { path = "../seedstone-service" }
+seedstone-core.workspace = true
+seedstone-resp.workspace = true
+seedstone-service.workspace = true
 # The codec's bulk payload, which the workload builds its requests from.
 bytes.workspace = true
 # `unstable-fs` is what makes turmoil's filesystem exist: the simulated log

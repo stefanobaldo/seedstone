@@ -1,16 +1,16 @@
 [package]
 name = "seedstone"
-version = "0.3.2"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "An in-memory key-value store, written from scratch in Rust. Speaks RESP2 over TCP."
-publish = false
 
 [dependencies]
-seedstone-core = { path = "../seedstone-core" }
-seedstone-resp = { path = "../seedstone-resp" }
-seedstone-service = { path = "../seedstone-service" }
+seedstone-core.workspace = true
+seedstone-resp.workspace = true
+seedstone-service.workspace = true
 # The `net` feature exists here and nowhere else: this crate is the only one
 # that touches an operating-system socket, and the CI step asserting that the
 # library crates compile without simulator features keeps meaning what it says

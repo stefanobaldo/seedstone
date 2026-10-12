@@ -55,8 +55,8 @@ kinds of artifact and not one:
   notes are the changelog's section for this version, cut out by name; a
   candidate has no section of its own and falls back to `[Unreleased]`.
 
-The workflow also refuses to publish a tag whose name disagrees with
-`cargo pkgid -p seedstone`, character for character
+The workflow also refuses to publish a tag that disagrees with any of the
+four published crates' versions, character for character
 (`scripts/set-version.sh --check`), before it builds anything. Nothing is
 published unless everything was built: the release waits for every archive
 and both images, and the image index — and `latest` — waits for the
@@ -116,21 +116,18 @@ step 3 below insists on the candidate suffix.
    links, and a missing definition is invisible to every gate this repository
    has.
 
-3. `crates/seedstone/Cargo.toml`: set `version` to the tag without its `v`,
+3. `bash scripts/set-version.sh X.Y.Z`, with the tag without its `v`,
    **verbatim, candidate suffix included** — `v0.1.0-rc.1` means
-   `version = "0.1.0-rc.1"`, not the `0.1.0` it is being cut toward. That
-   manifest and no other: the five crates carry independent versions, and this
-   is the one the binary reports in `INFO` and `HELLO`, and the one
-   `cargo pkgid -p seedstone` answers with — which is what the workflow
-   compares the tag against, character for character.
-4. `cargo build -p seedstone`, and commit the refreshed `Cargo.lock` together
-   with the manifest. The lock records the crate's own version too, and the
-   release job's first step is `cargo build --release -p seedstone --locked`,
-   which refuses to update a lock file that disagrees with the manifest. A
-   lock left behind therefore fails the release at its first step, with the
-   tag already pushed and no longer movable. (`cargo update -p seedstone
-   --precise X.Y.Z` does the same job if a build is not wanted.)
-5. Tag `main`, signed, **carrying the changelog section as its message** — cut
+   `0.1.0-rc.1`, not the `0.1.0` it is being cut toward. The version lives in
+   the root `Cargo.toml`, shared by every crate; the four published crates
+   carry it and point at each other with `=`, and the script refreshes
+   `Cargo.lock` and checks the result. Commit both files. It is the version
+   the binary reports in `INFO` and `HELLO`, and the one the workflow compares
+   the tag against, character for character. The release builds with
+   `--locked`, which refuses a lock file that disagrees with the manifests,
+   so a manifest edited by hand without the lock fails the release at its
+   first build, with the tag already pushed and no longer movable.
+4. Tag `main`, signed, **carrying the changelog section as its message** — cut
    by the same `awk` the release workflow uses for the notes, so that the tag
    and the release cannot drift apart:
 
@@ -176,7 +173,7 @@ step 3 below insists on the candidate suffix.
    rewriting a published tag creates a new object under the same name, and
    `git fetch` does not update a tag a clone already has, so every existing
    clone would silently disagree with the repository about what that tag is.)*
-6. Watch the release workflow — every job, not the release page. It ends
+5. Watch the release workflow — every job, not the release page. It ends
    with the four archives and their checksums attached to the release, and
    the image index on GHCR and Docker Hub — every artifact of "What a tag
    does", not just the ones the release page shows.

@@ -1,15 +1,15 @@
 [package]
 name = "seedstone-service"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "SeedStone connection layer: RESP2 frames in, core commands out. Netless by construction."
-publish = false
 
 [dependencies]
-seedstone-core = { path = "../seedstone-core" }
-seedstone-resp = { path = "../seedstone-resp" }
+seedstone-core.workspace = true
+seedstone-resp.workspace = true
 # A bulk's payload, as the codec carries it: requests hand it to the core and
 # replies take it back without a copy.
 bytes.workspace = true
