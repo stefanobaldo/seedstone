@@ -15,7 +15,7 @@ use seedstone_core::dict::DictSeed;
 use seedstone_core::log::checkpoint::{CheckpointConfig, CheckpointSpec, SegmentCheckpoint};
 use seedstone_core::log::disk::{Disk, StdDisk};
 use seedstone_core::log::file::{FileLog, next_generation};
-use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, Recovery, recover};
+use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, Recovery, recover, sync_recovered};
 use seedstone_core::log::writer::{SEGMENT_BYTES, Writer, WriterPlants, WriterSpec, write_rebases};
 use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{
@@ -952,8 +952,8 @@ pub fn leave(runtime: tokio::runtime::Runtime) {
 ///
 /// # Errors
 ///
-/// Whatever recovery, opening the segments or writing the cut shards'
-/// rebases reports, marked for [`is_recovery_failure`]; `recovery_failed`
+/// Whatever recovery, syncing what it read, opening the segments or
+/// writing the cut shards' rebases reports, marked for [`is_recovery_failure`]; `recovery_failed`
 /// is written first.
 fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Option<std::fs::File>)> {
     let Some(dir) = &cfg.data_dir else {
@@ -991,6 +991,8 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
         // Reported before anything after it can fail the start: a start
         // that cut shards and then fails has still cut them.
         emit_recovery(&recovery, began.elapsed());
+        // What it read may not be durable: a failed start's rebase, say.
+        sync_recovered(&disk, &wal)?;
         let generation = next_generation(&disk, &wal)?;
         let mut opened = Writer::open(WriterSpec {
             disk: StdDisk,

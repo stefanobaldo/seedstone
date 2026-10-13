@@ -127,7 +127,9 @@ use seedstone_core::dict::DictSeed;
 use seedstone_core::log::checkpoint::{CheckpointConfig, CheckpointSpec, SegmentCheckpoint};
 use seedstone_core::log::disk::Disk;
 use seedstone_core::log::file::{FileLog, next_generation};
-use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, RecoveredShard, Recovery, recover};
+use seedstone_core::log::recovery::{
+    ReaderMode, RecoverSpec, RecoveredShard, Recovery, recover, sync_recovered,
+};
 use seedstone_core::log::writer::{
     Opened, Writer, WriterLink, WriterPlants, WriterSpec, write_rebases,
 };
@@ -756,8 +758,8 @@ const fn executor_plants(planted: Option<Plant>) -> ExecutorPlants {
     }
 }
 
-/// Reads the log, opens the node's writer on this generation's first
-/// segment, and writes the cut shards' rebases through it. Any failure
+/// Reads the log, syncs what it read, opens the node's writer on this
+/// generation's first segment, and writes the cut shards' rebases through it. Any failure
 /// fails the start, as it fails the binary's.
 ///
 /// A start that fails after recovery returned reports that recovery to
@@ -817,6 +819,9 @@ fn start_log(
         }
         error
     };
+    // What this start read may not be durable — a rebase whose sync failed
+    // in the start before it — and it serves on it from here.
+    sync_recovered(&disk, &wal).map_err(failed)?;
     let generation = next_generation(&disk, &wal).map_err(failed)?;
     let mut opened = Writer::open(WriterSpec {
         disk,

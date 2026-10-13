@@ -237,6 +237,37 @@ pub fn recover<D: Disk>(spec: RecoverSpec<'_, D>) -> io::Result<Recovery> {
     Ok(Recovery { shards, report })
 }
 
+/// Syncs every segment and snapshot in `wal`, then `wal` itself: what a
+/// start does after recovery and before it serves.
+///
+/// Recovery reads what an earlier process wrote, which may be readable
+/// without being durable: a `Rebase` whose sync failed, say, after its
+/// bytes reached the file. A start that resumed behind such a record and
+/// served on it would let a power loss take the record back, and with it
+/// the line between the records it killed and the ones this start writes.
+///
+/// A file listed and gone by its sync is skipped: a removal retried, an
+/// operator. Nothing else is.
+///
+/// # Errors
+///
+/// The listing, any sync but a `NotFound`, or the directory's sync.
+pub fn sync_recovered<D: Disk>(disk: &D, wal: &Path) -> io::Result<()> {
+    for name in disk.list(wal)? {
+        let logged = parse_segment_name(&name).is_some()
+            || parse_name(&name, ".seg").is_some()
+            || parse_snapshot_name(&name).is_some();
+        if !logged {
+            continue;
+        }
+        match disk.sync_file(&wal.join(&name)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            other => other?,
+        }
+    }
+    disk.sync_dir(wal)
+}
+
 /// The dicts being rebuilt, and per shard the image keys whose deadline
 /// had already passed — removed after the tail unless the tail moved them.
 struct Building {

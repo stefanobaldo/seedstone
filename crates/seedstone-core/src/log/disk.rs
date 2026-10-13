@@ -73,6 +73,14 @@ pub trait Disk {
     /// Whatever the store reports.
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
 
+    /// Opens the file at `path` and syncs its data: how a start makes
+    /// durable what an earlier process wrote and may not have synced.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports, `NotFound` included.
+    fn sync_file(&self, path: &Path) -> io::Result<()>;
+
     /// The names of the files in `dir`, in no particular order.
     ///
     /// # Errors
@@ -172,6 +180,10 @@ impl Disk for StdDisk {
         std::fs::File::open(dir)?.sync_all()
     }
 
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        std::fs::File::open(path)?.sync_data()
+    }
+
     fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
         let mut names = Vec::new();
         for entry in std::fs::read_dir(dir)? {
@@ -238,6 +250,11 @@ pub(crate) mod mem {
         synced: BTreeMap<PathBuf, usize>,
         /// How many syncs of each file succeeded.
         syncs: BTreeMap<PathBuf, u32>,
+        /// How many syncs of each directory succeeded.
+        dir_syncs: BTreeMap<PathBuf, u32>,
+        /// Files removed by the next `sync_file` of them, which then
+        /// reports `NotFound`: a file gone between a listing and its sync.
+        vanishing: BTreeSet<PathBuf>,
         /// How long a deferred sync takes to answer: zero unless a test
         /// holds a round in flight.
         sync_latency: std::time::Duration,
@@ -326,6 +343,18 @@ pub(crate) mod mem {
         /// How many syncs of `path` succeeded.
         pub fn sync_count(&self, path: &Path) -> u32 {
             self.lock().syncs.get(path).copied().unwrap_or(0)
+        }
+
+        /// How many syncs of the directory `dir` succeeded.
+        pub fn dir_sync_count(&self, dir: &Path) -> u32 {
+            self.lock().dir_syncs.get(dir).copied().unwrap_or(0)
+        }
+
+        /// Removes `path` when it is next synced by name, and fails that
+        /// sync with `NotFound`: how a test removes a file between a listing
+        /// and the sync of what it listed.
+        pub fn vanish_on_sync(&self, path: &Path) {
+            self.lock().vanishing.insert(path.to_path_buf());
         }
 
         /// Makes every deferred sync answer `latency` after its call, on
@@ -449,10 +478,28 @@ pub(crate) mod mem {
                 return Err(io::Error::other("injected directory sync failure"));
             }
             if fs.dirs.contains(dir) {
+                *fs.dir_syncs.entry(dir.to_path_buf()).or_default() += 1;
+                drop(fs);
                 Ok(())
             } else {
                 Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"))
             }
+        }
+
+        fn sync_file(&self, path: &Path) -> io::Result<()> {
+            let mut fs = self.lock();
+            if fs.vanishing.remove(path) {
+                fs.files.remove(path);
+            }
+            if !fs.files.contains_key(path) {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no such file"));
+            }
+            if fs.sync_fails() {
+                return Err(io::Error::other("injected sync failure"));
+            }
+            fs.mark_synced(path);
+            drop(fs);
+            Ok(())
         }
 
         fn list(&self, dir: &Path) -> io::Result<Vec<String>> {

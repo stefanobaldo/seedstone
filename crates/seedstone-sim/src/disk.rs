@@ -139,6 +139,16 @@ impl Disk for SimDisk {
         sim_fs::sync_dir(dir)
     }
 
+    /// turmoil's sync of a file opened anew, failing at the same drawn
+    /// rate as a sync through a handle the log holds.
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        let file = File::open(path)?;
+        if self.sync_fails() {
+            return Err(io::Error::other("injected sync failure"));
+        }
+        file.sync_data()
+    }
+
     fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
         let mut names = Vec::new();
         for entry in sim_fs::read_dir(dir)? {
