@@ -210,7 +210,6 @@ pub fn connected_with_log(
         sync: SyncPolicy::INTERVAL,
         plants: ExecutorPlants::default(),
         writer_links: opened.links,
-        log_failed: false,
         stats,
     });
     tokio::spawn(opened.writer.run(opened.inbox));

@@ -401,7 +401,6 @@ async fn a_write_hands_its_records_to_the_writer_in_one_submission() {
         sync: crate::shard::SyncPolicy::INTERVAL,
         plants: crate::shard::ExecutorPlants::default(),
         writer_links: links,
-        log_failed: false,
         stats: crate::shard::PersistenceStats::new(1),
     });
     assert_eq!(pool.dispatch(set(b"k", b"v")).await, Reply::Ok);
@@ -696,7 +695,6 @@ async fn a_pool_spawned_from_a_recovery_serves_the_recovered_keys() {
         sync: crate::shard::SyncPolicy::INTERVAL,
         plants: crate::shard::ExecutorPlants::default(),
         writer_links: Vec::new(),
-        log_failed: false,
         stats: crate::shard::PersistenceStats::new(1),
     });
     assert_eq!(
@@ -795,7 +793,6 @@ async fn the_checkpoint_is_ticked_once_per_executor_per_housekeeping_tick() {
         sync: crate::shard::SyncPolicy::INTERVAL,
         plants: crate::shard::ExecutorPlants::default(),
         writer_links: Vec::new(),
-        log_failed: false,
         stats: crate::shard::PersistenceStats::new(2),
     });
     // Let both executors start their interval, then step the clock one

@@ -145,6 +145,22 @@ impl TraceSink for HashSink {
         if lossy && self.shared.disk_lies {
             lock(&self.shared.truncated)[usize::from(shard)] = Some(crash);
         }
+        // A start since the same crash may already have said the shard was
+        // lossy and failed after: what this one lost down to where that one
+        // resumed was reported then.
+        let reported = {
+            let mut reports = lock(&self.shared.reported_lossy);
+            let report = &mut reports[usize::from(shard)];
+            let earlier = report.is_some_and(|(at, from)| at == crash && next_seq >= from);
+            if lossy {
+                *report = match *report {
+                    Some((at, from)) if at == crash => Some((crash, from.min(next_seq))),
+                    _ => Some((crash, next_seq)),
+                };
+            }
+            drop(reports);
+            lossy || earlier
+        };
         let mut tally = lock(&self.shared.tally);
         if shard == 0 {
             tally.recoveries += 1;
@@ -153,7 +169,7 @@ impl TraceSink for HashSink {
             && next_seq <= durable_seq
         {
             tally.lost_durable_prefixes += 1;
-            if !lossy {
+            if !reported {
                 tally.unreported_losses += 1;
             }
         }

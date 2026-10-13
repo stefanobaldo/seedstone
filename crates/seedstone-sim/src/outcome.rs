@@ -160,6 +160,8 @@ pub struct SimOutcome {
     pub sync_faults: u64,
     /// Server host starts that failed on the disk and were retried.
     pub start_failures: u64,
+    /// Of those, the starts that failed writing the cut shards' rebases.
+    pub rebase_failures_at_start: u64,
     /// Crashes that landed with a sync issued and not yet completed: the
     /// ones that test what a flight's acknowledgements promised.
     pub crashes_in_flight: u64,
@@ -432,6 +434,7 @@ pub const fn nothing_observed() -> SimOutcome {
         write_faults: 0,
         sync_faults: 0,
         start_failures: 0,
+        rebase_failures_at_start: 0,
         crashes_in_flight: 0,
         refused: 0,
         refusals_ended: 0,
@@ -457,6 +460,10 @@ pub const fn nothing_observed() -> SimOutcome {
         fsync: SyncPolicy::INTERVAL,
     }
 }
+
+/// A crash's index, and the lowest sequence a recovery after it resumed a
+/// shard at while reporting the shard lossy.
+pub type LossyReport = (usize, u64);
 
 /// What the client hosts and the verifier write into, and the run reads out.
 ///
@@ -501,6 +508,12 @@ pub struct Shared {
     /// Per shard, the index of the latest crash whose recovery reported it
     /// as having lost records, or `None` if none has.
     pub truncated: Arc<Mutex<Vec<Option<usize>>>>,
+    /// Per shard, the latest crash a recovery reported it lossy after, and
+    /// the lowest sequence such a recovery resumed it at. A start that
+    /// reports its recovery and then fails has told the operator what the
+    /// next start may resume below: down to there, that start's loss was
+    /// reported, whatever its own report says.
+    pub reported_lossy: Arc<Mutex<Vec<Option<LossyReport>>>>,
     /// Every acknowledged increment — what the verifier needs to say which
     /// of them a crash could not have taken.
     pub increments: Arc<Mutex<Vec<Increment>>>,
@@ -608,6 +621,7 @@ impl Shared {
             durable: Arc::new(Mutex::new(vec![None; usize::from(shards)])),
             crashes: Arc::default(),
             truncated: Arc::new(Mutex::new(vec![None; usize::from(shards)])),
+            reported_lossy: Arc::new(Mutex::new(vec![None; usize::from(shards)])),
             increments: Arc::default(),
             disk: SimDisk::new(
                 disk.sync_latency_ms,
@@ -665,6 +679,8 @@ pub struct Tally {
     pub sync_faults: u64,
     /// Server host starts that failed and were retried.
     pub start_failures: u64,
+    /// Of those, the starts that failed writing the cut shards' rebases.
+    pub rebase_failures_at_start: u64,
     /// Crashes that landed with a sync in flight.
     pub crashes_in_flight: u64,
     /// Replies that were the refusal.

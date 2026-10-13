@@ -952,8 +952,9 @@ pub fn leave(runtime: tokio::runtime::Runtime) {
 ///
 /// # Errors
 ///
-/// Whatever recovery or opening the segments reports, marked for
-/// [`is_recovery_failure`]; `recovery_failed` is written first.
+/// Whatever recovery, opening the segments or writing the cut shards'
+/// rebases reports, marked for [`is_recovery_failure`]; `recovery_failed`
+/// is written first.
 fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Option<std::fs::File>)> {
     let Some(dir) = &cfg.data_dir else {
         if cfg.fsync_given {
@@ -1003,18 +1004,14 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
             plants: WriterPlants::default(),
             stats: stats.clone(),
         })?;
-        // A rebase the log refuses is reported and the node starts refusing
-        // writes, as on any failed write of the log.
-        let log_failed = match write_rebases(&mut opened.writer, &mut recovery.shards) {
-            Ok(()) => false,
-            Err(error) => {
-                FaultLines.log_fault(LogFault::Write, &error);
-                true
-            }
-        };
-        Ok::<_, std::io::Error>((recovery, generation, opened, log_failed, lock))
+        // A cut shard serves no write until its rebase is durable: the
+        // records the cut left on disk would otherwise come back under
+        // those writes at a later start. A rebase the log refuses fails the
+        // start, and whatever supervises the node starts it again.
+        write_rebases(&mut opened.writer, &mut recovery.shards)?;
+        Ok::<_, std::io::Error>((recovery, generation, opened, lock))
     })();
-    let (recovery, generation, opened, log_failed, lock) = match started {
+    let (recovery, generation, opened, lock) = match started {
         Ok(started) => started,
         Err(error) => {
             emit(&RECOVERY_FAILED, &[Field::Str(&error.to_string())]);
@@ -1043,7 +1040,6 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
         sync: cfg.fsync,
         plants: ExecutorPlants::default(),
         writer_links: opened.links,
-        log_failed,
         stats,
     });
     tokio::spawn(opened.writer.run(opened.inbox));

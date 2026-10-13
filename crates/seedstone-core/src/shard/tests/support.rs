@@ -221,14 +221,12 @@ pub fn disk_pool<T: TraceSink>(policy: SyncPolicy, trace: T) -> (MemDisk, ShardP
         now: Now::at(Instant::now()),
     })
     .unwrap();
-    let pool = start(&disk, policy, trace, recovery.shards, false);
+    let pool = start(&disk, policy, trace, recovery.shards);
     (disk, pool)
 }
 
-/// [`disk_pool`] from a recovery that cut shard 0, on a disk that fails
-/// every write from the moment the writer's segment is open: the rebase
-/// fails, and the node starts refusing. Writes stay failing until the test
-/// says otherwise.
+/// [`disk_pool`] from a recovery that cut shard 0, reported lossy: its
+/// rebase is written before the pool serves.
 pub fn disk_pool_cut<T: TraceSink>(policy: SyncPolicy, trace: T) -> (MemDisk, ShardPool) {
     let disk = MemDisk::default();
     disk.create_dir_all(Path::new(WAL)).unwrap();
@@ -241,7 +239,7 @@ pub fn disk_pool_cut<T: TraceSink>(policy: SyncPolicy, trace: T) -> (MemDisk, Sh
             image_unix_millis: None,
         })
         .collect();
-    let pool = start(&disk, policy, trace, recovered, true);
+    let pool = start(&disk, policy, trace, recovered);
     (disk, pool)
 }
 
@@ -250,7 +248,6 @@ fn start<T: TraceSink>(
     policy: SyncPolicy,
     trace: T,
     mut recovered: Vec<RecoveredShard>,
-    failing: bool,
 ) -> ShardPool {
     let wal = Path::new(WAL);
     let generation = next_generation(disk, wal).unwrap();
@@ -272,8 +269,7 @@ fn start<T: TraceSink>(
         stats: stats.clone(),
     })
     .unwrap();
-    disk.fail_writes(failing);
-    let log_failed = write_rebases(&mut writer, &mut recovered).is_err();
+    write_rebases(&mut writer, &mut recovered).expect("the test disk writes its rebases");
     let pool = ShardPool::spawn_spec(PoolSpec {
         shards: 4,
         executors: 2,
@@ -299,7 +295,6 @@ fn start<T: TraceSink>(
         sync: policy,
         plants: ExecutorPlants::default(),
         writer_links: links,
-        log_failed,
         stats,
     });
     tokio::spawn(writer.run(inbox));
