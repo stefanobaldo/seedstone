@@ -987,6 +987,9 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
                 unix_millis: wall_clock(),
             },
         })?;
+        // Reported before anything after it can fail the start: a start
+        // that cut shards and then fails has still cut them.
+        emit_recovery(&recovery, began.elapsed());
         let generation = next_generation(&disk, &wal)?;
         let mut opened = Writer::open(WriterSpec {
             disk: StdDisk,
@@ -1018,7 +1021,6 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
             return Err(std::io::Error::new(error.kind(), RecoveryFailed(error)));
         }
     };
-    emit_recovery(&recovery, began.elapsed());
     let pool = ShardPool::spawn_spec(PoolSpec {
         shards: SHARDS,
         executors,
@@ -1050,7 +1052,7 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
 
 /// The start's report: one `recovery` line, and one `recovery_truncated`
 /// per shard the recovery cut. `elapsed` is the start's time on the
-/// directory, from the first `create_dir_all` to here.
+/// directory, from the first `create_dir_all` to the end of recovery.
 fn emit_recovery(recovery: &Recovery, elapsed: std::time::Duration) {
     let report = &recovery.report;
     emit(
