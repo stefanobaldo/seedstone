@@ -55,6 +55,105 @@ impl HashSink {
     pub const fn new(hash: Arc<Mutex<u64>>, shared: Shared) -> Self {
         Self { hash, shared }
     }
+
+    /// A start that recovered and then failed, reported as the binary
+    /// writes its `recovery` lines before `recovery_failed`. Its own resume
+    /// is judged like any other; `rebase_written` says whether its cut can
+    /// outlive it. One that failed before its rebases cannot cut anything
+    /// for good: what it cut is still in the segments it kept, and the next
+    /// start replays it. Its report then excuses nothing the next start
+    /// loses and leaves the durable points as they were — honoured, it
+    /// would hide exactly the loss of a start that destroyed what it cut.
+    pub fn failed_start(&self, shard: u16, next_seq: u64, lossy: bool, rebase_written: bool) {
+        self.judge_recovery(shard, next_seq, lossy, rebase_written);
+    }
+
+    /// Folded: two runs that recovered different prefixes are different
+    /// runs. Checked: a shard that resumed at or below the sequence that was
+    /// durable when the node last crashed lost a durable record — the
+    /// invariant the log makes, measured on the server's own numbers.
+    /// `stands` is false for a start that failed before its cut could
+    /// persist: judged, but neither an excuse nor a new durable point.
+    fn judge_recovery(&self, shard: u16, next_seq: u64, lossy: bool, stands: bool) {
+        // A new process: whatever its predecessor was refusing, it is not.
+        self.shared.set_refusing(shard, false);
+        {
+            let mut h = lock(&self.hash);
+            *h = mix(
+                mix(
+                    mix(mix(*h, 0x5EED_0000_0000_0001), u64::from(shard)),
+                    next_seq,
+                ),
+                u64::from(lossy),
+            );
+        }
+        // A start with no crash before it is the node's first: nothing was
+        // durable, so nothing can have been lost.
+        let Some((crash, durable)) = ({
+            let crashes = lock(&self.shared.crashes);
+            crashes
+                .last()
+                .map(|last| (crashes.len() - 1, last.durable[usize::from(shard)]))
+        }) else {
+            return;
+        };
+        // Which crash's recovery last reported the shard: a later clean
+        // restart does not clear it, because a client may read a key the
+        // earlier one lost only after it.
+        //
+        // Only on a disk that fails or lies. On one that only tears, what a
+        // sync covered is intact by construction, and a crash nearly always
+        // lands with an unsynced tail the tear leaves holes in — which the
+        // recovery, knowing nothing of syncs, rightly reports as a possible
+        // loss for every shard of that segment. Honoured there, the report
+        // would excuse exactly the loss the strong invariant forbids.
+        if stands && lossy && self.shared.disk_lies {
+            lock(&self.shared.truncated)[usize::from(shard)] = Some(crash);
+        }
+        // A start since the same crash may already have said the shard was
+        // lossy and failed after: what this one lost down to where that one
+        // resumed was reported then.
+        let reported = {
+            let mut reports = lock(&self.shared.reported_lossy);
+            let report = &mut reports[usize::from(shard)];
+            let earlier = report.is_some_and(|(at, from)| at == crash && next_seq >= from);
+            if stands && lossy {
+                *report = match *report {
+                    Some((at, from)) if at == crash => Some((crash, from.min(next_seq))),
+                    _ => Some((crash, next_seq)),
+                };
+            }
+            drop(reports);
+            lossy || earlier
+        };
+        let mut tally = lock(&self.shared.tally);
+        if shard == 0 {
+            tally.recoveries += 1;
+        }
+        if let Some((durable_seq, _)) = durable
+            && next_seq <= durable_seq
+        {
+            tally.lost_durable_prefixes += 1;
+            if !reported {
+                tally.unreported_losses += 1;
+            }
+        }
+        drop(tally);
+        // What came back is the shard's durable point now: the loss below
+        // the old one was judged here, once. Left standing, a shard that
+        // syncs nothing before the next crash would be judged against it
+        // again — the same loss, reported here, counted unreported there.
+        // The date stays: the reads are judged by crash, not by this.
+        if !stands {
+            return;
+        }
+        let mut points = lock(&self.shared.durable);
+        if let Some((seq, _)) = &mut points[usize::from(shard)]
+            && next_seq <= *seq
+        {
+            *seq = next_seq.saturating_sub(1);
+        }
+    }
 }
 
 impl TraceSink for HashSink {
@@ -105,86 +204,9 @@ impl TraceSink for HashSink {
         }
     }
 
-    /// Folded: two runs that recovered different prefixes are different
-    /// runs. Checked: a shard that resumed at or below the sequence that was
-    /// durable when the node last crashed lost a durable record — the
-    /// invariant the log makes, measured on the server's own numbers.
+    /// A start that serves: see [`HashSink::judge_recovery`].
     fn recovered(&self, shard: u16, next_seq: u64, lossy: bool) {
-        // A new process: whatever its predecessor was refusing, it is not.
-        self.shared.set_refusing(shard, false);
-        {
-            let mut h = lock(&self.hash);
-            *h = mix(
-                mix(
-                    mix(mix(*h, 0x5EED_0000_0000_0001), u64::from(shard)),
-                    next_seq,
-                ),
-                u64::from(lossy),
-            );
-        }
-        // A start with no crash before it is the node's first: nothing was
-        // durable, so nothing can have been lost.
-        let Some((crash, durable)) = ({
-            let crashes = lock(&self.shared.crashes);
-            crashes
-                .last()
-                .map(|last| (crashes.len() - 1, last.durable[usize::from(shard)]))
-        }) else {
-            return;
-        };
-        // Which crash's recovery last reported the shard: a later clean
-        // restart does not clear it, because a client may read a key the
-        // earlier one lost only after it.
-        //
-        // Only on a disk that fails or lies. On one that only tears, what a
-        // sync covered is intact by construction, and a crash nearly always
-        // lands with an unsynced tail the tear leaves holes in — which the
-        // recovery, knowing nothing of syncs, rightly reports as a possible
-        // loss for every shard of that segment. Honoured there, the report
-        // would excuse exactly the loss the strong invariant forbids.
-        if lossy && self.shared.disk_lies {
-            lock(&self.shared.truncated)[usize::from(shard)] = Some(crash);
-        }
-        // A start since the same crash may already have said the shard was
-        // lossy and failed after: what this one lost down to where that one
-        // resumed was reported then.
-        let reported = {
-            let mut reports = lock(&self.shared.reported_lossy);
-            let report = &mut reports[usize::from(shard)];
-            let earlier = report.is_some_and(|(at, from)| at == crash && next_seq >= from);
-            if lossy {
-                *report = match *report {
-                    Some((at, from)) if at == crash => Some((crash, from.min(next_seq))),
-                    _ => Some((crash, next_seq)),
-                };
-            }
-            drop(reports);
-            lossy || earlier
-        };
-        let mut tally = lock(&self.shared.tally);
-        if shard == 0 {
-            tally.recoveries += 1;
-        }
-        if let Some((durable_seq, _)) = durable
-            && next_seq <= durable_seq
-        {
-            tally.lost_durable_prefixes += 1;
-            if !reported {
-                tally.unreported_losses += 1;
-            }
-        }
-        drop(tally);
-        // What came back is the shard's durable point now: the loss below
-        // the old one was judged here, once. Left standing, a shard that
-        // syncs nothing before the next crash would be judged against it
-        // again — the same loss, reported here, counted unreported there.
-        // The date stays: the reads are judged by crash, not by this.
-        let mut points = lock(&self.shared.durable);
-        if let Some((seq, _)) = &mut points[usize::from(shard)]
-            && next_seq <= *seq
-        {
-            *seq = next_seq.saturating_sub(1);
-        }
+        self.judge_recovery(shard, next_seq, lossy, true);
     }
 
     /// Folded: which executor completed which cycle with how many entries.
