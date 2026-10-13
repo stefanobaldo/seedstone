@@ -995,6 +995,9 @@ impl Model {
         self.record_form(contract::FORM_DBSIZE);
 
         for (burst, checks) in frames.chunks(depth).zip(checks.chunks(depth)) {
+            // A crash already recorded comes before every read in this
+            // burst: see `Model::absorb_crashes`.
+            self.absorb_crashes();
             let sent = Instant::now();
             let Some(replies) = conn.request_or_reconnect(burst).await? else {
                 self.in_flight(checks);

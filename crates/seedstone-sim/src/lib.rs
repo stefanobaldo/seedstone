@@ -910,6 +910,9 @@ async fn client(id: u16, cfg: SimConfig, shared: Shared) -> turmoil::Result {
     let mut issued = 0u32;
     while issued < cfg.ops_per_client {
         let this_burst = depth.min(cfg.ops_per_client - issued);
+        // A crash already recorded comes before every write this burst can
+        // carry: see `Model::absorb_crashes`.
+        model.absorb_crashes();
         // Sampled before the burst is even composed, so every deadline it
         // hands out is one the server cannot have reached earlier than.
         let sent = Instant::now();
