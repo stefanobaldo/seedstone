@@ -61,12 +61,18 @@ impl Model {
     /// acknowledged before the durable point: the family holds deadlines,
     /// not values, and a two-candidate deadline decides nothing.
     ///
-    /// Called *after* a burst's replies are observed, never before. A burst
-    /// that came back was served by the node its connection was opened to,
-    /// and its replies can reach the client after that node crashed —
-    /// turmoil delivers what was already on the wire. Absorbed first, the
-    /// crash would make those writes look like writes to the node that
-    /// replaced it, which no crash has touched.
+    /// Called before a burst is composed and again after its replies are
+    /// observed, never in between. A crash already recorded when the burst
+    /// is composed precedes every command in it: the burst can only reach
+    /// the node that replaced the crashed one. Left for the call after the
+    /// replies, it would put that node's writes before the crash, and a
+    /// read narrowing the key to one of them would forget a state the
+    /// crash may have restored. A crash during the burst is the call
+    /// after's: a burst that came back was served by the node its
+    /// connection was opened to, and its replies can reach the client after
+    /// that node crashed — turmoil delivers what was already on the wire.
+    /// Absorbed before them, the crash would make those writes look like
+    /// writes to the node that replaced it, which no crash has touched.
     ///
     /// Whatever the node recovered is on its disk from the moment it
     /// restarts, so the history is reset to that one entry, acknowledged at
