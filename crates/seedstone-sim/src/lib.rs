@@ -136,7 +136,7 @@ use seedstone_core::log::writer::{
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
 use seedstone_core::shard::{
     Deadlines, ExecutorPlants, Now, PersistenceStats, PoolSpec, ShardPolicy, ShardPool, SyncPolicy,
-    TraceSink, parse_i64,
+    parse_i64,
 };
 use seedstone_resp::Frame;
 use seedstone_service::{NodeInfo, serve_connection};
@@ -813,16 +813,16 @@ fn start_log(
         .iter()
         .map(|state| (state.seq, state.lossy))
         .collect();
-    let failed = |error: std::io::Error| {
+    let failed = |error: std::io::Error, rebase_written: bool| {
         for (shard, (seq, lossy)) in (0u16..).zip(&read) {
-            sink.recovered(shard, *seq, *lossy);
+            sink.failed_start(shard, *seq, *lossy, rebase_written);
         }
         error
     };
     // What this start read may not be durable — a rebase whose sync failed
     // in the start before it — and it serves on it from here.
-    sync_recovered(&disk, &wal).map_err(failed)?;
-    let generation = next_generation(&disk, &wal).map_err(failed)?;
+    sync_recovered(&disk, &wal).map_err(|error| failed(error, false))?;
+    let generation = next_generation(&disk, &wal).map_err(|error| failed(error, false))?;
     let mut opened = Writer::open(WriterSpec {
         disk,
         wal,
@@ -835,10 +835,11 @@ fn start_log(
         plants: writer_plants(planted),
         stats: stats.clone(),
     })
-    .map_err(failed)?;
+    .map_err(|error| failed(error, false))?;
     if let Err(error) = write_rebases(&mut opened.writer, &mut recovery.shards) {
         lock(&shared.tally).rebase_failures_at_start += 1;
-        return Err(failed(error));
+        // Some of its rebases may be on disk, readable by the next start.
+        return Err(failed(error, true));
     }
     Ok((recovery, generation, opened))
 }

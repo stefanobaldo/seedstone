@@ -1014,6 +1014,8 @@ fn the_honest_node_holds_on_the_hostile_seed_whose_start_removed_a_cut_segment()
 /// read what the failed one could not, resumed shards below what was
 /// durable and nothing reported it. The segments are kept now, the failed
 /// start reports its recovery before it fails, and the honest node holds.
+/// That report excuses nothing the next start loses — it wrote no rebase,
+/// so its cut could not stand — and without the keep both seeds violate.
 #[test]
 fn the_honest_node_holds_on_the_hostile_seeds_whose_start_failed_after_its_cut() {
     for sim_seed in [14240, 21840] {
