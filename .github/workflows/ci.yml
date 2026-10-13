@@ -268,8 +268,8 @@ jobs:
           # `setup-go` pins `GOTOOLCHAIN=local`, so a runner below the
           # directive fails the lane rather than quietly downloading what the
           # module asked for — which is how a go-redis bump that raised the
-          # directive to 1.24 arrived here red. Raise the two together.
-          go-version: '1.24'
+          # directive arrived here red. Raise the two together.
+          go-version: '1.26'
           cache-dependency-path: e2e/go/go.sum
       - name: build the server
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
