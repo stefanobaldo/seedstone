@@ -1283,3 +1283,48 @@ fn sync_recovered_fails_when_a_sync_fails() {
     assert!(sync_recovered(&disk, dir).is_err(), "the directory's sync");
     sync_recovered(&disk, dir).unwrap();
 }
+
+/// A generation that cut a shard and wrote its `Rebase` durably, and a
+/// later start that cannot read the segment holding that `Rebase` this
+/// once: the older generation's segments, read whole, are replayed past
+/// the cut, and the newer generation's write is lost with them. Every loss
+/// is reported — a header nobody could read charges every shard.
+///
+/// What this start replays from the older generation includes records the
+/// `Rebase` it could not see had made dead (2 and 3 below, `b` and `c`):
+/// that is #124, not asserted here either way.
+#[test]
+fn a_rebase_hidden_by_damage_still_leaves_every_loss_reported() {
+    let disk = MemDisk::default();
+    let mut first = wal(&disk, 1);
+    write(&mut first, 0, 0, &put(b"a", b"1"));
+    write(&mut first, 0, 1, &put(b"b", b"old"));
+    let mut second = rotate(&disk, 1, 1);
+    write(&mut second, 0, 2, &put(b"c", b"old"));
+    write(&mut second, 0, 3, &put(b"d", b"old"));
+
+    // Generation 2 resumed at 1, as a start that cut there does, and wrote
+    // its rebase and one record past it, both synced.
+    let mut gen2 = wal(&disk, 2);
+    let mut rebase = Vec::new();
+    Effect::Rebase.encode(&mut rebase);
+    write(&mut gen2, 0, 1, &rebase);
+    write(&mut gen2, 0, 2, &put(b"c", b"new"));
+
+    // This start cannot read generation 2's header.
+    let path = Path::new("/data/wal").join(segment_name(2, 0));
+    let mut bytes = disk.contents(&path);
+    bytes[..SEGMENT_HEADER_LEN].fill(b'j');
+    disk.overwrite(&path, bytes);
+
+    let recovery = recover(spec(&disk, 1)).unwrap();
+    assert_eq!(recovery.report.abandoned_segments, 1);
+    let shard = &recovery.shards[0];
+    assert!(
+        shard.lossy,
+        "the write `c = new` is lost, and the report says so"
+    );
+    // As it stands, generation 1 is replayed to its end (`b`, `c`, `d` all
+    // `old`, the shard resumed at 4), records the hidden rebase had made
+    // dead among them. Left unasserted: #124 is that class.
+}
