@@ -63,12 +63,18 @@ fn main() -> ExitCode {
     };
     let config_args = args.clone();
     let hashes = args.hashes;
+    // Totals over every seed, not only the failing ones: a sweep that holds
+    // still says how often it reached a start that failed.
+    let mut start_failures = 0u64;
+    let mut rebase_failures_at_start = 0u64;
     let report = seedstone_sim::sweep(
         first_seed,
         seeds,
         workers,
         move |sim_seed| config_args.config(sim_seed),
         |sim_seed, outcome| {
+            start_failures += outcome.start_failures;
+            rebase_failures_at_start += outcome.rebase_failures_at_start;
             if hashes {
                 // One flat line per seed, printed whatever the outcome: a
                 // sample of these is fed back to `replay` from a fresh
@@ -110,13 +116,16 @@ fn main() -> ExitCode {
     );
 
     println!(
-        "swept {} seeds start={} shape={} workload_seed={} planted={} violations={}",
+        "swept {} seeds start={} shape={} workload_seed={} planted={} violations={} \
+         start_failures={} rebase_failures_at_start={}",
         seeds,
         first_seed,
         shape(&args),
         args.workload_seed,
         args.plant.map_or("none", Plant::name),
-        report.violations
+        report.violations,
+        start_failures,
+        rebase_failures_at_start
     );
 
     // What this sweep did *not* reach, named. The simulated client's contract
