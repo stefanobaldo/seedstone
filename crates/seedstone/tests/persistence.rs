@@ -1382,3 +1382,46 @@ async fn a_cut_start_that_cannot_open_its_log_reports_the_cut_then_fails() {
     std::fs::remove_file(&stderr).unwrap();
     std::fs::remove_file(&failed_err).unwrap();
 }
+
+/// A start with nothing cut writes nothing but its segment's header and
+/// reports as it always has: a `recovery` line with nothing truncated or
+/// lossy, no `recovery_truncated`, no `recovery_failed`, every key served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_with_no_cut_writes_no_rebase_and_reports_as_before() {
+    let dir = scratch();
+    let stderr = dir.with_extension("stderr");
+    let segment_sizes = || -> Vec<(String, u64)> {
+        segment_names(&dir)
+            .into_iter()
+            .map(|name| {
+                let len = std::fs::metadata(dir.join("wal").join(&name))
+                    .unwrap()
+                    .len();
+                (name, len)
+            })
+            .collect()
+    };
+    let (first, port) = start_with(&dir, &stderr, &["--fsync", "always"]).await;
+    let header = segment_sizes()[0].1;
+    set_many(port, 50).await;
+    terminate_and_wait(first);
+    let (second, port) = start_with(&dir, &stderr, &["--fsync", "always"]).await;
+    let sizes = segment_sizes();
+    assert_eq!(sizes.len(), 2, "{sizes:?}");
+    assert_eq!(sizes[1].1, header, "the new segment holds its header alone");
+    assert_eq!(dbsize(port).await, Frame::Integer(50));
+    let text = std::fs::read_to_string(&stderr).unwrap();
+    let recovery = text
+        .lines()
+        .find(|line| line.contains("\"evt\":\"recovery\""))
+        .unwrap_or_else(|| panic!("no recovery line: {text}"));
+    for name in ["discarded", "truncated_shards", "lossy_shards", "holes"] {
+        assert_eq!(field(recovery, name), 0, "{name}: {recovery}");
+    }
+    assert_eq!(field(recovery, "applied"), 50, "{recovery}");
+    assert!(!text.contains("\"evt\":\"recovery_truncated\""), "{text}");
+    assert!(!text.contains("\"evt\":\"recovery_failed\""), "{text}");
+    terminate_and_wait(second);
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_file(&stderr).unwrap();
+}

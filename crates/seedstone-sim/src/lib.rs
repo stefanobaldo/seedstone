@@ -133,8 +133,8 @@ use seedstone_core::log::writer::{
 };
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
 use seedstone_core::shard::{
-    Deadlines, ExecutorPlants, LogFault, Now, PersistenceStats, PoolSpec, ShardPolicy, ShardPool,
-    SyncPolicy, TraceSink, parse_i64,
+    Deadlines, ExecutorPlants, Now, PersistenceStats, PoolSpec, ShardPolicy, ShardPool, SyncPolicy,
+    TraceSink, parse_i64,
 };
 use seedstone_resp::Frame;
 use seedstone_service::{NodeInfo, serve_connection};
@@ -441,6 +441,7 @@ fn outcome(cfg: &SimConfig, shared: &Shared, trace_hash: u64) -> SimOutcome {
         write_faults: tally.write_faults,
         sync_faults: tally.sync_faults,
         start_failures: tally.start_failures,
+        rebase_failures_at_start: tally.rebase_failures_at_start,
         crashes_in_flight: tally.crashes_in_flight,
         refused: tally.refused,
         refusals_ended: tally.refusals_ended,
@@ -604,7 +605,7 @@ async fn server(
     // rather than a finding.
     // One set per start, shared by the writer and the pool, as the binary's.
     let stats = PersistenceStats::new(executors);
-    let (recovery, generation, opened, log_failed) = loop {
+    let (recovery, generation, opened) = loop {
         if let Ok(started) = start_log(shards, executors, seed, planted, &sink, &shared, &stats) {
             break started;
         }
@@ -647,7 +648,6 @@ async fn server(
         sync: shared.policy,
         plants: executor_plants(planted),
         links,
-        log_failed,
         stats,
     };
     let pool = match planted {
@@ -757,8 +757,14 @@ const fn executor_plants(planted: Option<Plant>) -> ExecutorPlants {
 }
 
 /// Reads the log, opens the node's writer on this generation's first
-/// segment, and writes the cut shards' rebases through it; whether that
-/// write failed, which starts the node refusing.
+/// segment, and writes the cut shards' rebases through it. Any failure
+/// fails the start, as it fails the binary's.
+///
+/// A start that fails after recovery returned reports that recovery to
+/// the sink before it returns the error, as the binary writes its
+/// `recovery` lines before `recovery_failed`: the shards it cut were cut,
+/// and the next start's resume is judged against what this one said. A
+/// start that succeeds is reported by the pool, once.
 ///
 /// Inside the host, never around [`run_sim`]: turmoil's filesystem belongs
 /// to the host that is running, and there is none outside one.
@@ -770,7 +776,7 @@ fn start_log(
     sink: &HashSink,
     shared: &Shared,
     stats: &Arc<PersistenceStats>,
-) -> std::io::Result<(Recovery, u64, Opened<SimDisk, HashSink>, bool)> {
+) -> std::io::Result<(Recovery, u64, Opened<SimDisk, HashSink>)> {
     let disk = shared.disk.clone();
     let wal = Path::new(DATA_DIR).join("wal");
     disk.create_dir_all(&wal)?;
@@ -798,7 +804,20 @@ fn start_log(
         tally.snapshots_refused_at_start += recovery.report.snapshots_refused;
         tally.files_removed_at_start += recovery.report.files_removed;
     }
-    let generation = next_generation(&disk, &wal)?;
+    // As recovery returned them: `write_rebases` advances a cut shard's
+    // `seq` past its rebase, and a start that fails reports what it read.
+    let read: Vec<(u64, bool)> = recovery
+        .shards
+        .iter()
+        .map(|state| (state.seq, state.lossy))
+        .collect();
+    let failed = |error: std::io::Error| {
+        for (shard, (seq, lossy)) in (0u16..).zip(&read) {
+            sink.recovered(shard, *seq, *lossy);
+        }
+        error
+    };
+    let generation = next_generation(&disk, &wal).map_err(failed)?;
     let mut opened = Writer::open(WriterSpec {
         disk,
         wal,
@@ -810,17 +829,13 @@ fn start_log(
         trace: sink.clone(),
         plants: writer_plants(planted),
         stats: stats.clone(),
-    })?;
-    // Reported as the binary reports it, so the run counts the fault its
-    // refusals follow.
-    let log_failed = match write_rebases(&mut opened.writer, &mut recovery.shards) {
-        Ok(()) => false,
-        Err(error) => {
-            sink.log_fault(LogFault::Write, &error);
-            true
-        }
-    };
-    Ok((recovery, generation, opened, log_failed))
+    })
+    .map_err(failed)?;
+    if let Err(error) = write_rebases(&mut opened.writer, &mut recovery.shards) {
+        lock(&shared.tally).rebase_failures_at_start += 1;
+        return Err(failed(error));
+    }
+    Ok((recovery, generation, opened))
 }
 
 /// What every arm of the plant match spawns from: the spec minus its policy.
@@ -836,7 +851,6 @@ struct PoolParts<F, G> {
     sync: SyncPolicy,
     plants: ExecutorPlants,
     links: Vec<WriterLink>,
-    log_failed: bool,
     stats: Arc<PersistenceStats>,
 }
 
@@ -860,7 +874,6 @@ where
             sync: self.sync,
             plants: self.plants,
             writer_links: self.links,
-            log_failed: self.log_failed,
             stats: self.stats,
         })
     }

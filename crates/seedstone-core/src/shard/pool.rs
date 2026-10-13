@@ -427,9 +427,6 @@ pub struct PoolSpec<T, F, P, G> {
     /// One link per executor to the node's writer, in executor order; empty
     /// on a node with no log.
     pub writer_links: Vec<WriterLink>,
-    /// Whether the node's log failed before the pool served: a rebase the
-    /// writer could not write or sync. Every executor then starts refusing.
-    pub log_failed: bool,
     /// The node's persistence counters, one cell per executor; shared with
     /// the writer and `INFO`.
     pub stats: Arc<PersistenceStats>,
@@ -492,7 +489,6 @@ impl ShardPool {
             sync: SyncPolicy::INTERVAL,
             plants: ExecutorPlants::default(),
             writer_links: Vec::new(),
-            log_failed: false,
             stats: PersistenceStats::new(executors),
         })
     }
@@ -531,7 +527,6 @@ impl ShardPool {
             sync: SyncPolicy::INTERVAL,
             plants: ExecutorPlants::default(),
             writer_links: Vec::new(),
-            log_failed: false,
             stats: PersistenceStats::new(executors),
         })
     }
@@ -580,7 +575,6 @@ impl ShardPool {
             sync: SyncPolicy::INTERVAL,
             plants: ExecutorPlants::default(),
             writer_links: Vec::new(),
-            log_failed: false,
             stats: PersistenceStats::new(executors),
         })
     }
@@ -619,7 +613,6 @@ impl ShardPool {
             sync: SyncPolicy::INTERVAL,
             plants: ExecutorPlants::default(),
             writer_links: Vec::new(),
-            log_failed: false,
             stats: PersistenceStats::new(executors),
         })
     }
@@ -662,7 +655,6 @@ impl ShardPool {
             sync: SyncPolicy::INTERVAL,
             plants: ExecutorPlants::default(),
             writer_links: Vec::new(),
-            log_failed: false,
             stats: PersistenceStats::new(executors),
         })
     }
@@ -705,7 +697,6 @@ impl ShardPool {
             sync,
             plants,
             writer_links,
-            log_failed,
             stats,
         } = spec;
         check_shape(shards, executors, recovered.len(), writer_links.len());
@@ -733,7 +724,6 @@ impl ShardPool {
                 checkpoint: make_checkpoint(executor),
                 sync,
                 plants,
-                log_failed,
                 link,
                 stop: stopped.clone(),
                 stats: stats.clone(),

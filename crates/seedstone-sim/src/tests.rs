@@ -989,3 +989,54 @@ fn the_honest_node_holds_on_the_hostile_seeds_that_once_caught_the_model_out() {
         assert!(outcome.invariant_holds(), "seed {sim_seed}: {outcome:?}");
     }
 }
+
+/// A hostile seed that caught the node out: a start met a segment header
+/// it could not read this once, cut every shard there, removed the next
+/// segment — read whole, every record in it cut — and failed before it
+/// wrote anything; the next start read the header and replayed a log that
+/// ended early, synced records gone with nothing reported (5410, at
+/// `always`, crashed once). The honest node holds on it. The draws have
+/// moved since it was found and it no longer reaches that shape; the seeds
+/// of the next test do.
+#[test]
+fn the_honest_node_holds_on_the_hostile_seed_whose_start_removed_a_cut_segment() {
+    let outcome = run_sim(&SimConfig::hostile(1, 5410));
+    assert!(outcome.invariant_holds(), "{outcome:?}");
+}
+
+/// Hostile seeds where a start cut shards and then failed before it wrote
+/// anything — at the writer's open on 14240 (`interval`), at
+/// `next_generation` on 21840 (`always`), each after one crash. Recovery
+/// removed the segments whose records it had cut, so the next start, which
+/// read what the failed one could not, resumed shards below what was
+/// durable and nothing reported it. The segments are kept now, the failed
+/// start reports its recovery before it fails, and the honest node holds.
+#[test]
+fn the_honest_node_holds_on_the_hostile_seeds_whose_start_failed_after_its_cut() {
+    for sim_seed in [14240, 21840] {
+        let outcome = run_sim(&SimConfig::hostile(1, sim_seed));
+        assert!(outcome.invariant_holds(), "seed {sim_seed}: {outcome:?}");
+        assert!(
+            outcome.start_failures > 0 && outcome.recoveries > outcome.crashes,
+            "seed {sim_seed} no longer reaches a start that failed after it recovered: {outcome:?}"
+        );
+    }
+}
+
+/// A hostile seed where a start cut every shard and wrote their rebases,
+/// and the sync of them failed (10, at `always`, crashed once). The start
+/// reports its recovery and fails; the next one reads those rebases, which
+/// make the older records above them dead, and resumes below what was
+/// durable. That loss is the one the failed start reported, and the model
+/// counts it so: the honest node holds.
+#[test]
+fn the_honest_node_holds_on_the_hostile_seed_whose_start_could_not_sync_its_rebase() {
+    let mut cfg = SimConfig::hostile(1, 10);
+    cfg.fsync = FsyncDraw::Fixed(SyncPolicy::ALWAYS);
+    let outcome = run_sim(&cfg);
+    assert!(outcome.invariant_holds(), "{outcome:?}");
+    assert!(
+        outcome.rebase_failures_at_start > 0,
+        "the seed no longer reaches a failed rebase: {outcome:?}"
+    );
+}

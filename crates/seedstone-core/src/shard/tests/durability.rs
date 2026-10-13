@@ -47,7 +47,6 @@ fn pool_with_links_and_trace<T: TraceSink>(
         sync: policy,
         plants: ExecutorPlants::default(),
         writer_links: links,
-        log_failed: false,
         stats: crate::shard::PersistenceStats::new(1),
     })
 }
@@ -83,7 +82,6 @@ fn pool_with_links_and_checkpoint(policy: SyncPolicy, links: Vec<WriterLink>) ->
         sync: policy,
         plants: ExecutorPlants::default(),
         writer_links: links,
-        log_failed: false,
         stats: crate::shard::PersistenceStats::new(1),
     })
 }
@@ -557,19 +555,6 @@ async fn a_failed_sync_refuses_the_node_and_each_executor_resumes_on_its_own_sna
     assert_eq!(pool.dispatch(set(&on_one, b"w")).await, Reply::Ok);
 }
 
-/// A start whose recovery cut a shard writes a rebase before it serves; if
-/// that write fails, the node starts refusing, as on any failed write of
-/// the log, and serves writes again once a snapshot lands.
-#[tokio::test(start_paused = true)]
-async fn a_start_whose_rebase_fails_refuses_writes_until_a_snapshot_lands() {
-    let story = Story::default();
-    let (disk, pool) = disk_pool_cut(SyncPolicy::INTERVAL, story.clone());
-    assert_eq!(pool.dispatch(set(b"k", b"v")).await, refused());
-    disk.fail_writes(false);
-    tick(3).await;
-    assert_eq!(pool.dispatch(set(b"k", b"v")).await, Reply::Ok);
-}
-
 /// A read in the same batch as a held write is served when the sync fails:
 /// only the write's reply becomes the refusal.
 #[tokio::test(start_paused = true)]
@@ -661,10 +646,9 @@ async fn a_stop_whose_last_sync_fails_answers_its_held_writes_with_the_refusal()
 #[tokio::test(start_paused = true)]
 async fn a_lossy_shard_is_cleared_by_its_first_durable_image() {
     let story = Story::default();
-    let (disk, pool) = disk_pool_cut(SyncPolicy::INTERVAL, story.clone());
+    let (_disk, pool) = disk_pool_cut(SyncPolicy::INTERVAL, story.clone());
     assert_eq!(pool.stats().lossy_shards.load(Ordering::Relaxed), 1);
-    disk.fail_writes(false); // the cut start refused; let the forced cycles land
-    tick(3).await;
+    pool.dispatch_every(Command::Snapshot { wait: true }).await;
     let cleared: u64 = story.snapshots().iter().map(|report| report.cleared).sum();
     assert_eq!(cleared, 1, "shard 0 was the lossy one");
     assert_eq!(pool.stats().lossy_shards.load(Ordering::Relaxed), 0);
