@@ -7,6 +7,19 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed start no longer costs the next one its synced records.** Under
+  `--data-dir`, a start that failed after reading a damaged log segment
+  could leave the next start without records that had been synced, and
+  nothing reported it. A start now keeps every segment it may still need
+  and syncs the log it recovered from before it serves; one that cannot
+  record where a damaged shard resumes now fails with `recovery_failed` and
+  exits 1, instead of writing `log_fault` and serving with writes refused.
+  The `recovery` line now comes before anything that can fail the start,
+  and its `elapsed_ms` covers recovery alone, no longer the opening of the
+  log for writing.
+
 ## [0.3.3] - 2026-10-12
 
 ### Added

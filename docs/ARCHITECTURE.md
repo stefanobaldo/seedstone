@@ -124,7 +124,9 @@ Damage in that one file is charged to the shards it may have cost without a
 trace — those whose highest record precedes it, or that have none — and a
 gap behind damage is reported as a loss. A shard whose prefix was cut resumes
 there behind a *rebase* record, written and synced before the node serves, so
-the records the cut left on disk are never replayed by a later start. The same
+the records the cut left on disk are never replayed by a later start; a start
+that cannot write it fails rather than serving, and every start syncs the
+files it recovered from before it serves. The same
 abstraction becomes a consensus log after that. Without the flag the log is a
 no-op, as it was, and a write encodes no record at all.
 
