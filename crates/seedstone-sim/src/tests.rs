@@ -942,9 +942,12 @@ fn one_seed_per_durability_policy_is_pinned() {
     // tick came to be read after each envelope and awaited only when idle:
     // under the paused clock that is the schedule the tick had behind the
     // inbox (see `MINI_1_42`). `always` held still again.
-    const HOSTILE_1_3_ALWAYS: u64 = 0x676a_1ba9_4103_bb1c;
-    const HOSTILE_1_3_INTERVAL: u64 = 0x2f7e_329c_c918_aea2;
-    const HOSTILE_1_3_NEVER: u64 = 0x2495_bee7_97d3_492c;
+    //
+    // Re-pinned, all three, when every start began to sync the files it
+    // recovered from: each sync draws a fault from the disk's stream.
+    const HOSTILE_1_3_ALWAYS: u64 = 0x4916_eabc_154a_0867;
+    const HOSTILE_1_3_INTERVAL: u64 = 0x3676_e16a_bd9e_8cc0;
+    const HOSTILE_1_3_NEVER: u64 = 0xa7e7_e27b_6b6a_90d3;
     for (policy, pinned) in [
         (SyncPolicy::ALWAYS, HOSTILE_1_3_ALWAYS),
         (SyncPolicy::INTERVAL, HOSTILE_1_3_INTERVAL),
@@ -1024,14 +1027,15 @@ fn the_honest_node_holds_on_the_hostile_seeds_whose_start_failed_after_its_cut()
 }
 
 /// A hostile seed where a start cut every shard and wrote their rebases,
-/// and the sync of them failed (10, at `always`, crashed once). The start
-/// reports its recovery and fails; the next one reads those rebases, which
-/// make the older records above them dead, and resumes below what was
-/// durable. That loss is the one the failed start reported, and the model
-/// counts it so: the honest node holds.
+/// and the sync of them failed (108, at `always`, crashed once; 10 until a
+/// start began to sync what it recovered, which moved the disk's draws).
+/// The start reports its recovery and fails; the next one reads those
+/// rebases, which make the older records above them dead, and resumes
+/// below what was durable. That loss is the one the failed start reported,
+/// and the model counts it so: the honest node holds.
 #[test]
 fn the_honest_node_holds_on_the_hostile_seed_whose_start_could_not_sync_its_rebase() {
-    let mut cfg = SimConfig::hostile(1, 10);
+    let mut cfg = SimConfig::hostile(1, 108);
     cfg.fsync = FsyncDraw::Fixed(SyncPolicy::ALWAYS);
     let outcome = run_sim(&cfg);
     assert!(outcome.invariant_holds(), "{outcome:?}");
@@ -1039,4 +1043,171 @@ fn the_honest_node_holds_on_the_hostile_seed_whose_start_could_not_sync_its_reba
         outcome.rebase_failures_at_start > 0,
         "the seed no longer reaches a failed rebase: {outcome:?}"
     );
+}
+
+/// A start whose rebase sync failed leaves the rebase readable and not
+/// durable, and the start after it — a retry, with no crash between —
+/// reads it, resumes behind it, cuts nothing and writes no rebase of its
+/// own. It must make what it read durable before it serves: a crash after
+/// its first synced write would otherwise take the rebase back, and the
+/// records it made dead would replay over that write, with nothing
+/// reported. No hostile seed of 1..=20 000 reaches this shape under any
+/// policy, so it is scripted: the failed start's aftermath planted, the
+/// real start run over it, one write synced, the host crashed, and the log
+/// read again.
+#[test]
+fn the_honest_node_holds_when_a_start_inherits_a_rebase_its_predecessor_could_not_sync() {
+    let cfg = SimConfig::narrow(1, 1);
+    let image: Arc<Mutex<Option<Pairs>>> = Arc::default();
+    let starts = Arc::new(Mutex::new(0u32));
+    let mut sim = turmoil::Builder::new()
+        .simulation_duration(Duration::from_secs(10))
+        .rng_seed(1)
+        .build();
+    sim.host(SERVER, {
+        let image = Arc::clone(&image);
+        move || {
+            let image = Arc::clone(&image);
+            let starts = Arc::clone(&starts);
+            let cfg = cfg.clone();
+            async move {
+                let first = {
+                    let mut starts = lock(&starts);
+                    *starts += 1;
+                    *starts == 1
+                };
+                if first {
+                    inherit_an_unsynced_rebase_and_write(&cfg)?;
+                    // Parked until the driver crashes the host.
+                    tokio::time::sleep(Duration::from_secs(100)).await;
+                } else {
+                    *lock(&image) = Some(read_shard_zero(&cfg)?);
+                }
+                Ok(())
+            }
+        }
+    });
+    for driver in ["driver", "driver-after-crash"] {
+        if driver != "driver" {
+            sim.crash(SERVER);
+            sim.bounce(SERVER);
+        }
+        sim.client(driver, async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(())
+        });
+        sim.run().unwrap();
+    }
+    let image = lock(&image).clone().expect("the second start read the log");
+    let expected: Pairs = [(&b"k0"[..], &b"old"[..]), (b"k1", b"old"), (b"k3", b"new")]
+        .iter()
+        .map(|(key, value)| (key.to_vec(), value.to_vec()))
+        .collect();
+    assert_eq!(
+        image, expected,
+        "the write the start acknowledged, and not the record its rebase made dead"
+    );
+}
+
+/// A shard's keys and values, sorted by key.
+type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// One record of `shard` carrying `effect`, encoded.
+fn encoded(shard: u16, seq: u64, effect: &seedstone_core::log::effect::Effect<'_>) -> Vec<u8> {
+    let mut payload = Vec::new();
+    effect.encode(&mut payload);
+    let mut bytes = Vec::new();
+    seedstone_core::log::encode_record(
+        &seedstone_core::log::Record {
+            shard,
+            seq,
+            payload: &payload,
+        },
+        &mut bytes,
+    );
+    bytes
+}
+
+/// The dict seed of the scripted starts: any one, the same for both.
+const SCRIPTED_SEED: DictSeed = DictSeed { k0: 1, k1: 2 };
+
+/// Plants what a start whose rebase sync failed leaves — generation 1's
+/// records 0–3 of shard 0 synced, generation 2's rebase at 2 written and
+/// not synced — runs the node's start over it, and syncs one write of the
+/// generation it opened.
+fn inherit_an_unsynced_rebase_and_write(cfg: &SimConfig) -> std::io::Result<()> {
+    use seedstone_core::log::disk::LogFile;
+    use seedstone_core::log::effect::Effect;
+    use seedstone_core::log::file::{GENERATION_FILE, create_segment, segment_name};
+    let put = |key, value| Effect::Put {
+        key,
+        value,
+        deadline: None,
+    };
+    let mut shared = Shared::new(cfg);
+    // A disk that fails nothing on its own: the failure is planted.
+    shared.disk = SimDisk::default();
+    let disk = shared.disk.clone();
+    let wal = Path::new(DATA_DIR).join("wal");
+    disk.create_dir_all(&wal)?;
+    disk.sync_dir(Path::new(DATA_DIR))?;
+    let mut older = create_segment(&disk, &wal, 1, 0)?;
+    for (seq, key) in [(0, &b"k0"[..]), (1, b"k1"), (2, b"k2"), (3, b"k3")] {
+        older.write_all(&encoded(0, seq, &put(key, b"old")))?;
+    }
+    older.sync_data()?;
+    let mut failed = create_segment(&disk, &wal, 2, 0)?;
+    failed.write_all(&encoded(0, 2, &Effect::Rebase))?;
+    disk.write_file(&wal.join(GENERATION_FILE), b"2")?;
+    disk.sync_dir(&wal)?;
+
+    let sink = HashSink::new(Arc::new(Mutex::new(TRACE_INIT)), shared.clone());
+    let stats = PersistenceStats::new(cfg.executors);
+    let (recovery, generation, _opened) = start_log(
+        cfg.shards,
+        cfg.executors,
+        SCRIPTED_SEED,
+        None,
+        &sink,
+        &shared,
+        &stats,
+    )?;
+    assert_eq!(recovery.shards[0].seq, 3, "resumed behind the rebase");
+    assert!(!recovery.shards[0].cut, "and cut nothing");
+    let mut current = disk.create_append(&wal.join(segment_name(generation, 0)))?;
+    current.write_all(&encoded(0, 3, &put(b"k3", b"new")))?;
+    current.sync_data()
+}
+
+/// Recovers the log and returns shard 0's image, asserting that recovery
+/// reported no loss of it: whatever it holds is what an operator is told
+/// the node kept.
+fn read_shard_zero(cfg: &SimConfig) -> std::io::Result<Pairs> {
+    let disk = SimDisk::default();
+    let recovery = recover(RecoverSpec {
+        disk: &disk,
+        wal: &Path::new(DATA_DIR).join("wal"),
+        shards: cfg.shards,
+        reader: ReaderMode::Resynchronising,
+        trust_unfinished: false,
+        seed: SCRIPTED_SEED,
+        now: seedstone_core::shard::Now {
+            instant: Instant::now(),
+            unix_millis: 0,
+        },
+    })?;
+    let shard = &recovery.shards[0];
+    assert!(!shard.lossy && !shard.cut, "{shard:?}");
+    let mut pairs = Vec::new();
+    let mut cursor = 0;
+    loop {
+        cursor = shard.dict.scan(cursor, |key, entry| {
+            pairs.push((key.to_vec(), entry.value.to_vec()));
+        });
+        if cursor == 0 {
+            break;
+        }
+    }
+    pairs.sort();
+    Ok(pairs)
 }

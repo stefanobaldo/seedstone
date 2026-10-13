@@ -5,7 +5,8 @@ use crate::log::disk::mem::{MemDisk, MemFile};
 use crate::log::effect::Effect;
 use crate::log::file::tests::restamped;
 use crate::log::file::{
-    FORMAT_VERSION, SEGMENT_HEADER_LEN, create_segment, encode_segment_header, segment_name,
+    FORMAT_VERSION, GENERATION_FILE, SEGMENT_HEADER_LEN, create_segment, encode_segment_header,
+    segment_name,
 };
 use crate::log::snapshot::{Footer, SnapshotHeader, encode_entry, snapshot_name};
 use crate::log::{Record, encode_record};
@@ -1202,4 +1203,83 @@ fn a_segment_shorter_than_its_header_held_nothing_and_is_not_damage() {
     );
     assert!(recovery.shards.iter().all(|s| !s.lossy && !s.cut));
     assert_eq!(contents(&recovery.shards[0].dict), pairs(&[(b"a", b"1")]));
+}
+
+/// A start syncs every segment and snapshot it recovered from, and the
+/// directory, before it serves: a file this start read may hold bytes an
+/// earlier start wrote and could not sync, and serving on them would
+/// let a power loss take back what the start resumed behind.
+#[test]
+fn sync_recovered_syncs_every_file_left_and_the_directory() {
+    let disk = MemDisk::default();
+    let dir = Path::new("/data/wal");
+    let mut first = wal(&disk, 1);
+    write(&mut first, 0, 0, &put(b"a", b"1"));
+    let mut second = rotate(&disk, 1, 1);
+    write(&mut second, 0, 1, &put(b"b", b"2"));
+    snapshot(&disk, 1, 0, 0, &[(0, 0)], &[], true);
+    disk.write_file(&dir.join(GENERATION_FILE), b"1").unwrap();
+    let logged = [
+        segment_name(1, 0),
+        segment_name(1, 1),
+        snapshot_name(1, 0, 0),
+    ];
+    let before: Vec<u32> = logged
+        .iter()
+        .map(|name| disk.sync_count(&dir.join(name)))
+        .collect();
+    let dir_syncs = disk.dir_sync_count(dir);
+    let generation_syncs = disk.sync_count(&dir.join(GENERATION_FILE));
+
+    sync_recovered(&disk, dir).unwrap();
+
+    for (name, before) in logged.iter().zip(before) {
+        assert_eq!(
+            disk.sync_count(&dir.join(name)),
+            before + 1,
+            "{name} is synced once"
+        );
+    }
+    assert_eq!(disk.dir_sync_count(dir), dir_syncs + 1, "and the directory");
+    assert_eq!(
+        disk.sync_count(&dir.join(GENERATION_FILE)),
+        generation_syncs,
+        "nothing recovery does not read"
+    );
+}
+
+/// A file listed and then gone before its sync — a removal retried, an
+/// operator — is skipped: what is not there holds nothing to make durable.
+#[test]
+fn sync_recovered_skips_a_file_gone_since_the_listing() {
+    let disk = MemDisk::default();
+    let dir = Path::new("/data/wal");
+    let mut first = wal(&disk, 1);
+    write(&mut first, 0, 0, &put(b"a", b"1"));
+    let mut second = rotate(&disk, 1, 1);
+    write(&mut second, 0, 1, &put(b"b", b"2"));
+    let kept = dir.join(segment_name(1, 1));
+    let before = disk.sync_count(&kept);
+    disk.vanish_on_sync(&dir.join(segment_name(1, 0)));
+    let dir_syncs = disk.dir_sync_count(dir);
+
+    sync_recovered(&disk, dir).unwrap();
+
+    assert_eq!(disk.sync_count(&kept), before + 1, "the other is synced");
+    assert_eq!(disk.dir_sync_count(dir), dir_syncs + 1, "and the directory");
+}
+
+/// Any other failure is the start's: a file whose sync failed may be the
+/// one that holds what the start resumed behind.
+#[test]
+fn sync_recovered_fails_when_a_sync_fails() {
+    let disk = MemDisk::default();
+    let dir = Path::new("/data/wal");
+    let mut first = wal(&disk, 1);
+    write(&mut first, 0, 0, &put(b"a", b"1"));
+    disk.fail_next_sync();
+    assert!(sync_recovered(&disk, dir).is_err(), "a file's sync");
+    disk.fail_one_dir_sync_after(0);
+    assert!(sync_recovered(&disk, dir).is_err(), "the directory's sync");
+    sync_recovered(&disk, dir).unwrap();
 }
