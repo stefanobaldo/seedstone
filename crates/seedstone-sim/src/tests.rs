@@ -1047,6 +1047,28 @@ fn the_honest_node_holds_on_the_hostile_seed_whose_start_could_not_sync_its_reba
     );
 }
 
+/// Hostile seeds where a start cut, failed writing its rebases, and the
+/// node crashed before the retry, so the next start met whatever of those
+/// rebases the crash left (24637 at `always`, 17619 at `interval`, found by
+/// a local sweep of 1..=30 000 under each). It either replays what the
+/// failed start cut or reports its own cut: no loss goes unreported. The
+/// reach: a rebase failed, and no start was a retry without a crash before
+/// it — every start after a crash is counted once, and a retry with none
+/// between would count one more.
+#[test]
+fn the_honest_node_holds_when_it_crashes_before_retrying_a_failed_rebase() {
+    for (sim_seed, policy) in [(24637, SyncPolicy::ALWAYS), (17619, SyncPolicy::INTERVAL)] {
+        let mut cfg = SimConfig::hostile(1, sim_seed);
+        cfg.fsync = FsyncDraw::Fixed(policy);
+        let outcome = run_sim(&cfg);
+        assert!(outcome.invariant_holds(), "seed {sim_seed}: {outcome:?}");
+        assert!(
+            outcome.rebase_failures_at_start > 0 && outcome.recoveries == outcome.crashes,
+            "seed {sim_seed} no longer crashes before retrying a failed rebase: {outcome:?}"
+        );
+    }
+}
+
 /// A start whose rebase sync failed leaves the rebase readable and not
 /// durable, and the start after it — a retry, with no crash between —
 /// reads it, resumes behind it, cuts nothing and writes no rebase of its
