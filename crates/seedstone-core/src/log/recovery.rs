@@ -29,9 +29,10 @@
 //!    none. A shard with a record after the hole shows what it lost there
 //!    as a gap, and a gap on a disk with damage is reported as a loss.
 //! 5. **Garbage.** Every `.snap` no shard used and every `.seg` no kept
-//!    record came from is removed — unless damage was met reading it: a
-//!    read can fail where the next succeeds, and the file may be the only
-//!    copy of what it held.
+//!    or cut record came from is removed — unless damage was met reading
+//!    it: a read can fail where the next succeeds, and the file may be the
+//!    only copy of what it held. A record a gap cut is kept for the same
+//!    reason: the damage that cut it may not recur.
 //!
 //! **The prefix rule.** A shard applies sequence `base, base+1, …` and
 //! stops at the first number that is missing; everything of that shard
@@ -825,8 +826,9 @@ fn replay_tails<D: Disk>(
 /// A shard's records from `start` upwards to the first missing sequence,
 /// and how many came after it — once every record a newer generation's
 /// `Rebase` made dead is gone. Marks in `kept` the files the returned
-/// records came from, and the file of every `Rebase`, which must outlive
-/// the records it kills.
+/// records came from; the files of the records the gap discarded, which
+/// the next start replays if whatever cut them does not recur; and the
+/// file of every `Rebase`, which must outlive the records it kills.
 fn prefix(
     bucket: Vec<(u64, u64, usize, Owned)>,
     start: u64,
@@ -858,6 +860,7 @@ fn prefix(
     for (seq, _, file, effect) in live {
         if discarded > 0 || seq > expected {
             discarded += 1;
+            kept[file] = true;
         } else if seq == expected {
             kept[file] = true;
             records.push((seq, effect));
@@ -871,15 +874,18 @@ fn prefix(
 }
 
 /// Pass 5: remove every snapshot nothing used and every segment no kept
-/// record came from — of the files read whole without damage. A removal
-/// that fails is left for the next start.
+/// or cut record came from — of the files read whole without damage. A
+/// removal that fails is left for the next start.
 ///
 /// A file damage was met in stays: a read can fail where the next one
 /// succeeds, and what could not be read may be the only copy of records
 /// no other file holds — a finished image whose log a compaction already
 /// removed, a segment whose header failed this once. Removing it would
 /// turn a loss this start reported into one the next start cannot see.
-/// Once every executor of this process has a durable snapshot, the
+/// A segment whose records a gap cut stays for the same reason: if the
+/// damage that made the gap does not recur, the next start replays them.
+/// A newer generation's `Rebase` makes them dead, and dead records keep
+/// no file. Once every executor of this process has a durable snapshot, the
 /// writer removes every older generation's files, these among them.
 fn remove_garbage<D: Disk>(
     spec: &RecoverSpec<'_, D>,
