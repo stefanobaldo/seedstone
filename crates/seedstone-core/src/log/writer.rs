@@ -41,7 +41,7 @@ use crate::log::checkpoint::CheckpointConfig;
 use crate::log::disk::{Disk, LogFile, SyncFuture};
 use crate::log::effect::Effect;
 use crate::log::file::{
-    SEGMENT_HEADER_LEN, Segment, create_segment, parse_segment_name, segment_name,
+    Segment, create_segment, parse_segment_name, segment_header_len, segment_name,
 };
 use crate::log::recovery::RecoveredShard;
 use crate::log::snapshot::parse_snapshot_name;
@@ -142,6 +142,9 @@ pub struct WriterSpec<D: Disk, T: TraceSink> {
     pub disk: D,
     pub wal: PathBuf,
     pub generation: u64,
+    /// Where this generation's start cut a shard: [`cut_points`] of what
+    /// recovery returned. Every rotation's header carries them.
+    pub cuts: Vec<(u16, u64)>,
     pub executors: u16,
     pub policy: SyncPolicy,
     /// Bytes at which the segment rotates: [`SEGMENT_BYTES`] in the binary.
@@ -221,6 +224,7 @@ pub struct Writer<D: Disk, T: TraceSink> {
     disk: D,
     wal: PathBuf,
     generation: u64,
+    cuts: Vec<(u16, u64)>,
     policy: SyncPolicy,
     segment_bytes: u64,
     checkpoint: CheckpointConfig,
@@ -256,7 +260,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
     ///
     /// Whatever the disk reports.
     pub fn open(spec: WriterSpec<D, T>) -> io::Result<Opened<D, T>> {
-        let file = create_segment(&spec.disk, &spec.wal, spec.generation, 0)?;
+        let file = create_segment(&spec.disk, &spec.wal, spec.generation, 0, &spec.cuts)?;
         spec.disk.sync_dir(&spec.wal)?;
         let names = spec.disk.list(&spec.wal)?;
         let older = |name: &&String| {
@@ -294,6 +298,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
             disk: spec.disk,
             wal: spec.wal,
             generation: spec.generation,
+            cuts: spec.cuts,
             policy: spec.policy,
             segment_bytes: spec.segment_bytes,
             checkpoint: spec.checkpoint,
@@ -602,7 +607,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         }
         self.segment.attempted += 1;
         let next = self.segment.attempted;
-        let created = create_segment(&self.disk, &self.wal, self.generation, next)
+        let created = create_segment(&self.disk, &self.wal, self.generation, next, &self.cuts)
             .and_then(|file| self.disk.sync_dir(&self.wal).map(|()| file));
         let file = match created {
             Ok(file) => file,
@@ -830,7 +835,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         self.stats.log_bytes.store(
             self.segment.bytes_written
                 + closed
-                + ours * SEGMENT_HEADER_LEN as u64
+                + ours * segment_header_len(self.cuts.len()) as u64
                 + self.older_seg_bytes,
             Ordering::Relaxed,
         );
@@ -926,6 +931,22 @@ async fn in_flight(slot: &mut Option<(Vec<Option<u64>>, SyncFuture)>) -> io::Res
     }
 }
 
+/// Every cut shard and its resume position, where [`write_rebases`] puts
+/// its `Rebase`: what [`WriterSpec::cuts`] takes.
+///
+/// # Panics
+///
+/// If `shards` has more entries than a shard id can count, which no node
+/// has.
+#[must_use]
+pub fn cut_points(shards: &[RecoveredShard]) -> Vec<(u16, u64)> {
+    (0u16..)
+        .zip(shards)
+        .filter(|(_, state)| state.cut)
+        .map(|(shard, state)| (shard, state.seq))
+        .collect()
+}
+
 /// Writes a `Rebase` for every cut shard at its resume position, and syncs.
 ///
 /// Each cut shard's `seq` advances past its record. Before the pool serves;
@@ -937,29 +958,30 @@ async fn in_flight(slot: &mut Option<(Vec<Option<u64>>, SyncFuture)>) -> io::Res
 ///
 /// # Panics
 ///
-/// If `shards` has more entries than a shard id can count, which no node
-/// has.
+/// If the writer was opened with other cut points than `shards` has: the
+/// headers would then say a `Rebase` is where none was written.
 pub fn write_rebases<D: Disk + Send + 'static, T: TraceSink>(
     writer: &mut Writer<D, T>,
     shards: &mut [RecoveredShard],
 ) -> io::Result<()> {
+    assert_eq!(
+        cut_points(shards),
+        writer.cuts,
+        "the headers name the rebases written"
+    );
     let mut bytes = Vec::new();
     let mut payload = Vec::new();
     Effect::Rebase.encode(&mut payload);
-    for (shard, state) in shards.iter_mut().enumerate() {
-        if !state.cut {
-            continue;
-        }
-        let shard = u16::try_from(shard).expect("a node's shard count fits a u16");
+    for (shard, seq) in &writer.cuts {
         encode_record(
             &Record {
-                shard,
-                seq: state.seq,
+                shard: *shard,
+                seq: *seq,
                 payload: &payload,
             },
             &mut bytes,
         );
-        state.seq += 1;
+        shards[usize::from(*shard)].seq += 1;
     }
     if bytes.is_empty() {
         return Ok(());

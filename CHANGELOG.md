@@ -7,7 +7,26 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ## [Unreleased]
 
+### Changed
+
+- **The log's segment format moves to version 4.** Under `--data-dir`, each
+  segment's header now lists where its process's start cut damaged shards.
+  This version reads a data directory written by 0.3.x as it is; a 0.3.x
+  server refuses one this version has written to, so going back means
+  starting from an empty directory.
+
 ### Fixed
+
+- **A start no longer serves records discarded at an earlier start when
+  damage hides where they were discarded.** Under `--data-dir`, a start
+  that cuts a damaged shard writes a record marking the older records past
+  the cut as discarded. If a later start could not read that record — a
+  damaged stretch of the segment holding it, or a segment it could not read
+  beside a snapshot it could — it replayed the discarded records,
+  sometimes over that process's snapshot, into a state the node never
+  held, and in the first case without reporting the shard lossy. The
+  segment headers and snapshots now say where each start cut, and a start
+  reads them as it reads the record.
 
 - **A failed start no longer costs the next one its synced records.** Under
   `--data-dir`, a start that failed after reading a damaged log segment

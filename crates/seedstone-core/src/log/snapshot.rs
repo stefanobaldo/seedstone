@@ -28,7 +28,8 @@
 
 use crate::log::effect::Effect;
 use crate::log::file::{
-    FORMAT_VERSION, HeaderError, check_header_crc, parse_name, version_mismatch,
+    FORMAT_VERSION, HeaderError, OLDEST_READ_VERSION, check_header_crc, parse_name,
+    version_mismatch,
 };
 use crate::log::{Record, crc32_iso_hdlc, encode_record};
 
@@ -117,7 +118,7 @@ impl SnapshotHeader {
         }
         match fixed[4] {
             v if v > FORMAT_VERSION => return Err(HeaderError::NewerVersion(v)),
-            v if v < FORMAT_VERSION => return Err(HeaderError::OlderVersion(v)),
+            v if v < OLDEST_READ_VERSION => return Err(HeaderError::OlderVersion(v)),
             _ => {}
         }
         let shards = usize::from(u16::from_le_bytes([fixed[27], fixed[28]]));
@@ -137,7 +138,12 @@ impl SnapshotHeader {
                 // the version byte was damaged or written by another build.
                 let shards = usize::from(u16::from_le_bytes([buf[27], buf[28]]));
                 let header = buf.get(..SNAPSHOT_HEADER_FIXED_LEN + shards * 10 + 4);
-                return Err(header.map_or(error, version_mismatch));
+                return Err(header.map_or(error, |header| {
+                    version_mismatch(
+                        header[4],
+                        (OLDEST_READ_VERSION..=FORMAT_VERSION).map(|version| (version, header)),
+                    )
+                }));
             }
             Err(error) => return Err(error),
         };

@@ -11,7 +11,8 @@ use crate::log::disk::mem::MemDisk;
 use crate::log::file::{FileLog, next_generation};
 use crate::log::recovery::{ReaderMode, RecoverSpec, RecoveredShard, recover};
 use crate::log::writer::{
-    Opened, Progress, ToWriter, Writer, WriterLink, WriterPlants, WriterSpec, write_rebases,
+    Opened, Progress, ToWriter, Writer, WriterLink, WriterPlants, WriterSpec, cut_points,
+    write_rebases,
 };
 use crate::memory::MemoryLimit;
 use crate::shard::apply::apply;
@@ -260,6 +261,7 @@ fn start<T: TraceSink>(
         disk: disk.clone(),
         wal: wal.to_path_buf(),
         generation,
+        cuts: cut_points(&recovered),
         executors: 2,
         policy,
         segment_bytes: 1 << 20,

@@ -145,7 +145,7 @@ pub fn connected_with_log(
     use seedstone_core::log::disk::{Disk, StdDisk};
     use seedstone_core::log::file::{FileLog, next_generation};
     use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, recover};
-    use seedstone_core::log::writer::{Writer, WriterPlants, WriterSpec};
+    use seedstone_core::log::writer::{Writer, WriterPlants, WriterSpec, cut_points};
     use seedstone_core::memory::MemoryLimit;
     use seedstone_core::shard::{
         Deadlines, ExecutorPlants, Now, PersistenceStats, PoolSpec, SyncPolicy, frozen_clock,
@@ -179,6 +179,7 @@ pub fn connected_with_log(
         disk: StdDisk,
         wal: wal.clone(),
         generation,
+        cuts: cut_points(&recovery.shards),
         executors,
         policy: SyncPolicy::INTERVAL,
         segment_bytes: 1 << 20,
