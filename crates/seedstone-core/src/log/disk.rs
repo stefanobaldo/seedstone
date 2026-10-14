@@ -269,6 +269,20 @@ pub(crate) mod mem {
         sync_fails_after: Option<u32>,
         /// Directory syncs to let through before one fails, once.
         dir_sync_fails_after: Option<u32>,
+        /// Removals to let through before one fails, once.
+        remove_fails_after: Option<u32>,
+        /// Whether a listing comes in reverse name order: a directory whose
+        /// entries are not yielded by name, as `read_dir`'s need not be.
+        list_reversed: bool,
+        /// Every removal and successful directory sync, in order.
+        journal: Vec<Entry>,
+    }
+
+    /// One step of what a test reads back from [`MemDisk::journal`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Entry {
+        Removed(String),
+        DirSynced,
     }
 
     /// `io::ErrorKind` with a default, so that `MemFs` can derive its own.
@@ -414,6 +428,22 @@ pub(crate) mod mem {
         pub fn fail_one_dir_sync_after(&self, skip: u32) {
             self.lock().dir_sync_fails_after = Some(skip);
         }
+
+        /// The removal after the next `skip` fails, once.
+        pub fn fail_one_remove_after(&self, skip: u32) {
+            self.lock().remove_fails_after = Some(skip);
+        }
+
+        /// Whether listings from now on come in reverse name order.
+        pub fn list_reversed(&self, reversed: bool) {
+            self.lock().list_reversed = reversed;
+        }
+
+        /// Every removal, by file name, and every successful directory sync
+        /// so far, in the order they happened.
+        pub fn journal(&self) -> Vec<Entry> {
+            self.lock().journal.clone()
+        }
     }
 
     impl LogFile for MemFile {
@@ -479,6 +509,7 @@ pub(crate) mod mem {
             }
             if fs.dirs.contains(dir) {
                 *fs.dir_syncs.entry(dir.to_path_buf()).or_default() += 1;
+                fs.journal.push(Entry::DirSynced);
                 drop(fs);
                 Ok(())
             } else {
@@ -507,13 +538,19 @@ pub(crate) mod mem {
             if !fs.dirs.contains(dir) {
                 return Err(io::Error::new(io::ErrorKind::NotFound, "no such directory"));
             }
-            Ok(fs
+            let mut names: Vec<String> = fs
                 .files
                 .keys()
                 .filter(|path| path.parent() == Some(dir))
                 .filter_map(|path| path.file_name())
                 .map(|name| name.to_string_lossy().into_owned())
-                .collect())
+                .collect();
+            let reversed = fs.list_reversed;
+            drop(fs);
+            if reversed {
+                names.reverse();
+            }
+            Ok(names)
         }
 
         fn create_append(&self, path: &Path) -> io::Result<Self::File> {
@@ -569,13 +606,18 @@ pub(crate) mod mem {
 
         fn remove_file(&self, path: &Path) -> io::Result<()> {
             let mut fs = self.lock();
-            if fs.fail_removes {
+            if fs.fail_removes || countdown(&mut fs.remove_fails_after) {
                 return Err(io::Error::other("injected removal failure"));
             }
             fs.files
                 .remove(path)
-                .map(|_| ())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))?;
+            let name = path
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+            fs.journal.push(Entry::Removed(name));
+            drop(fs);
+            Ok(())
         }
     }
 }

@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::log::checkpoint::CheckpointConfig;
-use crate::log::disk::mem::MemDisk;
+use crate::log::disk::mem::{Entry, MemDisk};
 use crate::log::file::{decode_segment_header, segment_name};
 use crate::log::snapshot::snapshot_name;
 use crate::log::{Decoded, decode_record};
@@ -46,6 +46,18 @@ fn open_with<T: TraceSink>(
     plants: WriterPlants,
     trace: T,
 ) -> Rig {
+    open_generation(disk, 1, executors, policy, segment_bytes, plants, trace)
+}
+
+fn open_generation<T: TraceSink>(
+    disk: &MemDisk,
+    generation: u64,
+    executors: u16,
+    policy: SyncPolicy,
+    segment_bytes: u64,
+    plants: WriterPlants,
+    trace: T,
+) -> Rig {
     disk.create_dir_all(Path::new(WAL)).unwrap();
     let stats = PersistenceStats::new(executors);
     let Opened {
@@ -55,7 +67,7 @@ fn open_with<T: TraceSink>(
     } = Writer::open(WriterSpec {
         disk: disk.clone(),
         wal: Path::new(WAL).to_path_buf(),
-        generation: 1,
+        generation,
         executors,
         policy,
         segment_bytes,
@@ -847,6 +859,126 @@ async fn an_executor_that_wrote_nothing_pins_nothing_and_still_closes_the_genera
     assert!(
         !names(&disk).contains(&segment_name(1, 0)),
         "and rotation 0 with them, covered by executor 0 and never written by 1"
+    );
+}
+
+/// Older generations go oldest first, each one's removals made durable
+/// before the next one's begin, whatever order the directory lists them
+/// in: a `Rebase` must outlive the older records it makes dead, so a crash
+/// part-way through has to leave a newer generation's files rather than
+/// an older one's.
+#[tokio::test(start_paused = true)]
+async fn older_generations_go_oldest_first_each_made_durable_before_the_next() {
+    let disk = MemDisk::default();
+    disk.create_dir_all(Path::new(WAL)).unwrap();
+    for name in [
+        segment_name(1, 0),
+        segment_name(1, 1),
+        snapshot_name(1, 0, 0),
+        segment_name(2, 0),
+        snapshot_name(2, 0, 0),
+    ] {
+        disk.write_file(&Path::new(WAL).join(name), &[0u8; 10])
+            .unwrap();
+    }
+    disk.list_reversed(true);
+    let rig = open_generation(
+        &disk,
+        3,
+        1,
+        SyncPolicy::NEVER,
+        1 << 20,
+        WriterPlants::default(),
+        NoTrace,
+    );
+    let start = disk.journal().len();
+    covered(&rig, 0, 0, None, 0);
+    tokio::task::yield_now().await;
+    let journal = disk.journal()[start..].to_vec();
+    let removed = |name: String| Entry::Removed(name);
+    assert_eq!(
+        journal,
+        [
+            removed(snapshot_name(1, 0, 0)),
+            removed(segment_name(1, 0)),
+            removed(segment_name(1, 1)),
+            Entry::DirSynced,
+            removed(snapshot_name(2, 0, 0)),
+            removed(segment_name(2, 0)),
+            Entry::DirSynced,
+        ]
+    );
+}
+
+/// A removal that fails stops the generations above it: their `Rebase`s
+/// may be all that keeps the left file's records dead.
+#[tokio::test(start_paused = true)]
+async fn a_failed_removal_keeps_every_newer_generation() {
+    let disk = MemDisk::default();
+    disk.create_dir_all(Path::new(WAL)).unwrap();
+    for name in [segment_name(1, 0), segment_name(1, 1), segment_name(2, 0)] {
+        disk.write_file(&Path::new(WAL).join(name), &[0u8; 10])
+            .unwrap();
+    }
+    let rig = open_generation(
+        &disk,
+        3,
+        1,
+        SyncPolicy::NEVER,
+        1 << 20,
+        WriterPlants::default(),
+        NoTrace,
+    );
+    disk.fail_one_remove_after(0);
+    covered(&rig, 0, 0, None, 0);
+    tokio::task::yield_now().await;
+    assert!(
+        names(&disk).contains(&segment_name(1, 0)),
+        "its removal failed"
+    );
+    assert!(
+        !names(&disk).contains(&segment_name(1, 1)),
+        "the rest of generation 1 goes"
+    );
+    assert!(
+        names(&disk).contains(&segment_name(2, 0)),
+        "generation 1 is not all gone, so generation 2 stays"
+    );
+    covered(&rig, 0, 1, None, 0);
+    tokio::task::yield_now().await;
+    assert!(!names(&disk).contains(&segment_name(1, 0)));
+    assert!(
+        !names(&disk).contains(&segment_name(2, 0)),
+        "the next compaction takes both, oldest first"
+    );
+}
+
+/// A directory sync that fails between two generations stops the newer
+/// one's removals: the older one's may not be durable.
+#[tokio::test(start_paused = true)]
+async fn a_failed_directory_sync_keeps_every_newer_generation() {
+    let disk = MemDisk::default();
+    disk.create_dir_all(Path::new(WAL)).unwrap();
+    for name in [segment_name(1, 0), segment_name(2, 0)] {
+        disk.write_file(&Path::new(WAL).join(name), &[0u8; 10])
+            .unwrap();
+    }
+    let rig = open_generation(
+        &disk,
+        3,
+        1,
+        SyncPolicy::NEVER,
+        1 << 20,
+        WriterPlants::default(),
+        NoTrace,
+    );
+    disk.fail_one_dir_sync_after(0);
+    covered(&rig, 0, 0, None, 0);
+    tokio::task::yield_now().await;
+    assert!(!names(&disk).contains(&segment_name(1, 0)));
+    assert!(
+        names(&disk).contains(&segment_name(2, 0)),
+        "generation 1's removal is not durable, so generation 2 stays"
     );
 }
 

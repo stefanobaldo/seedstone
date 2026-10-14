@@ -20,6 +20,15 @@ SemVer and are `0.x` while the keyspace holds only strings;
   and its `elapsed_ms` covers recovery alone, no longer the opening of the
   log for writing.
 
+- **A crash during compaction no longer brings back discarded records.**
+  Under `--data-dir`, once every executor has a durable snapshot the node
+  removes the files of earlier processes. It removed them in whatever order
+  the directory listed them, so a crash part-way through could leave
+  records an earlier start had discarded at a gap in a damaged log, with
+  the record that marked them discarded already gone, and the next start
+  could replay them. The files now go oldest process first, and each
+  process's removals are made durable before the next one's begin.
+
 ## [0.3.3] - 2026-10-12
 
 ### Added
