@@ -685,29 +685,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         let mut removed = CompactionReport { files: 0, bytes: 0 };
         let names = self.disk.list(&self.wal).unwrap_or_default();
         let round_closed = self.lanes.iter().all(|lane| lane.snapshot_bytes.is_some());
-        let mut older_left = false;
-        let older: Vec<&String> = names.iter().filter(|name| self.is_older(name)).collect();
-        for name in older {
-            if !round_closed {
-                older_left = true;
-                continue;
-            }
-            match self.remove(name) {
-                Ok(bytes) => {
-                    removed.files += 1;
-                    removed.bytes += bytes;
-                    if parse_segment_name(name).is_some() {
-                        self.older_segments = self.older_segments.saturating_sub(1);
-                        self.older_seg_bytes = self.older_seg_bytes.saturating_sub(bytes);
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    older_left = true;
-                    self.trace.log_fault(LogFault::Remove, &error);
-                }
-            }
-        }
+        let (older_left, mut unsynced) = self.remove_older(&names, round_closed, &mut removed);
         if !older_left {
             self.older_bytes = 0;
         }
@@ -752,6 +730,14 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
                 index += 1;
                 continue;
             }
+            // This generation's `Rebase`s are in rotation 0: the older
+            // generations' removals are made durable before it goes.
+            if unsynced {
+                if !self.sync_removals() {
+                    break;
+                }
+                unsynced = false;
+            }
             match self.remove(&segment_name(self.generation, closed.rotation)) {
                 Ok(bytes) => {
                     removed.files += 1;
@@ -773,6 +759,66 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
             self.trace.log_fault(LogFault::Remove, &error);
         }
         self.trace.compaction(&removed);
+    }
+
+    /// Removes every older generation's file once the round is closed:
+    /// oldest generation first, each one's removals made durable before
+    /// the next one's begin, whatever order the directory lists them in.
+    /// A generation's `Rebase` makes records of older generations dead, so
+    /// it must not be gone while any of them is still on disk, and a
+    /// generation not wholly removed keeps every newer one. Says whether
+    /// any older file is left, and whether removals are not yet durable.
+    fn remove_older(
+        &mut self,
+        names: &[String],
+        round_closed: bool,
+        removed: &mut CompactionReport,
+    ) -> (bool, bool) {
+        let mut older_left = false;
+        let mut older: Vec<(u64, &String)> = names
+            .iter()
+            .filter_map(|name| {
+                self.older_generation(name)
+                    .map(|generation| (generation, name))
+            })
+            .collect();
+        older.sort_unstable();
+        let mut current = None;
+        let mut unsynced = false;
+        let mut stopped_after = None;
+        for (generation, name) in older {
+            if !round_closed || stopped_after.is_some_and(|stopped| stopped < generation) {
+                older_left = true;
+                continue;
+            }
+            if current != Some(generation) {
+                if unsynced && !self.sync_removals() {
+                    stopped_after = current;
+                    older_left = true;
+                    continue;
+                }
+                unsynced = false;
+                current = Some(generation);
+            }
+            match self.remove(name) {
+                Ok(bytes) => {
+                    unsynced = true;
+                    removed.files += 1;
+                    removed.bytes += bytes;
+                    if parse_segment_name(name).is_some() {
+                        self.older_segments = self.older_segments.saturating_sub(1);
+                        self.older_seg_bytes = self.older_seg_bytes.saturating_sub(bytes);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    older_left = true;
+                    stopped_after = Some(generation);
+                    self.trace.log_fault(LogFault::Remove, &error);
+                }
+            }
+        }
+        (older_left, unsynced)
     }
 
     /// What `INFO` reports as the log's size: the open rotation, the closed
@@ -814,12 +860,25 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         Ok(bytes)
     }
 
-    /// Whether `name` is a segment or snapshot of an older generation.
-    fn is_older(&self, name: &str) -> bool {
+    /// The generation of `name`, if it is a segment or snapshot of an
+    /// older one.
+    fn older_generation(&self, name: &str) -> Option<u64> {
         parse_segment_name(name)
             .map(|(generation, _)| generation)
             .or_else(|| parse_snapshot_name(name).map(|(generation, _, _)| generation))
-            .is_some_and(|generation| generation < self.generation)
+            .filter(|generation| *generation < self.generation)
+    }
+
+    /// Syncs the directory, so the removals so far are durable before any
+    /// that follows; whether it succeeded.
+    fn sync_removals(&self) -> bool {
+        match self.disk.sync_dir(&self.wal) {
+            Ok(()) => true,
+            Err(error) => {
+                self.trace.log_fault(LogFault::Remove, &error);
+                false
+            }
+        }
     }
 
     /// The trigger's second leg. The retained log is every closed rotation
