@@ -68,6 +68,7 @@ fn open_generation<T: TraceSink>(
         disk: disk.clone(),
         wal: Path::new(WAL).to_path_buf(),
         generation,
+        cuts: Vec::new(),
         executors,
         policy,
         segment_bytes,
@@ -149,7 +150,10 @@ async fn open_creates_the_segment_with_a_synced_header_and_one_link_per_executor
         rig.links.iter().map(|l| l.executor).collect::<Vec<_>>(),
         [0, 1, 2]
     );
-    assert_eq!(decode_segment_header(&rig.segment(0)), Ok((1, 0)));
+    assert_eq!(
+        decode_segment_header(&rig.segment(0)).map(|header| (header.generation, header.rotation)),
+        Ok((1, 0))
+    );
     assert_eq!(
         disk.synced_len(&Path::new(WAL).join(segment_name(1, 0))),
         rig.segment(0).len()
@@ -319,6 +323,7 @@ async fn the_start_path_appends_and_syncs_now_and_a_rebase_advances_the_cut_shar
         disk: disk.clone(),
         wal: Path::new(WAL).to_path_buf(),
         generation: 1,
+        cuts: vec![(0, 4)],
         executors: 1,
         policy: SyncPolicy::INTERVAL,
         segment_bytes: 1 << 20,
@@ -350,8 +355,13 @@ async fn the_start_path_appends_and_syncs_now_and_a_rebase_advances_the_cut_shar
         (5, 9),
         "only the cut shard advanced"
     );
-    let body = &disk.contents(&Path::new(WAL).join(segment_name(1, 0)))
-        [crate::log::file::SEGMENT_HEADER_LEN..];
+    let segment = disk.contents(&Path::new(WAL).join(segment_name(1, 0)));
+    assert_eq!(
+        decode_segment_header(&segment).map(|header| header.cuts),
+        Ok(vec![(0, 4)]),
+        "the header names the rebase"
+    );
+    let body = &segment[crate::log::file::segment_header_len(1)..];
     let Decoded::Record {
         shard,
         seq,
@@ -399,7 +409,10 @@ async fn a_failed_sync_faults_every_executor_and_the_next_submission_rotates_to_
     rig.submit(0, 1, record(0, 1, b"c"));
     let (through, _, _) = rig.durable(0).await;
     assert_eq!(through, Some(1));
-    assert_eq!(decode_segment_header(&rig.segment(1)), Ok((1, 1)));
+    assert_eq!(
+        decode_segment_header(&rig.segment(1)).map(|header| (header.generation, header.rotation)),
+        Ok((1, 1))
+    );
     let body = &rig.segment(1)[crate::log::file::SEGMENT_HEADER_LEN..];
     let Decoded::Record { seq, .. } = decode_record(body) else {
         panic!()
@@ -1108,12 +1121,15 @@ async fn a_rotation_whose_directory_sync_fails_is_retried_under_the_next_name() 
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
     assert_eq!(
-        decode_segment_header(&rig.segment(1)),
+        decode_segment_header(&rig.segment(1)).map(|header| (header.generation, header.rotation)),
         Ok((1, 1)),
         "the failed attempt's file holds its header alone"
     );
     assert_eq!(rig.segment(1).len(), crate::log::file::SEGMENT_HEADER_LEN);
-    assert_eq!(decode_segment_header(&rig.segment(2)), Ok((1, 2)));
+    assert_eq!(
+        decode_segment_header(&rig.segment(2)).map(|header| (header.generation, header.rotation)),
+        Ok((1, 2))
+    );
     assert_eq!(
         rig.segment(2).len(),
         crate::log::file::SEGMENT_HEADER_LEN + 10,

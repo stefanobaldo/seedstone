@@ -16,7 +16,9 @@ use seedstone_core::log::checkpoint::{CheckpointConfig, CheckpointSpec, SegmentC
 use seedstone_core::log::disk::{Disk, StdDisk};
 use seedstone_core::log::file::{FileLog, next_generation};
 use seedstone_core::log::recovery::{ReaderMode, RecoverSpec, Recovery, recover, sync_recovered};
-use seedstone_core::log::writer::{SEGMENT_BYTES, Writer, WriterPlants, WriterSpec, write_rebases};
+use seedstone_core::log::writer::{
+    SEGMENT_BYTES, Writer, WriterPlants, WriterSpec, cut_points, write_rebases,
+};
 use seedstone_core::memory::{EvictionMode, MemoryLimit, parse_bytes};
 use seedstone_core::shard::{
     Command, CompactionReport, Deadlines, ExecutorPlants, LogFault, NoTrace, Now, PersistenceStats,
@@ -998,6 +1000,7 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
             disk: StdDisk,
             wal: wal.clone(),
             generation,
+            cuts: cut_points(&recovery.shards),
             executors,
             policy: cfg.fsync,
             segment_bytes: SEGMENT_BYTES,

@@ -76,12 +76,12 @@ fn del(key: &[u8]) -> Vec<u8> {
 fn wal(disk: &MemDisk, generation: u64) -> MemFile {
     let dir = Path::new("/data/wal");
     disk.create_dir_all(dir).unwrap();
-    create_segment(disk, dir, generation, 0).unwrap()
+    create_segment(disk, dir, generation, 0, &[]).unwrap()
 }
 
 /// The next rotation of `generation`'s segment, as the writer opens it.
 fn rotate(disk: &MemDisk, generation: u64, rotation: u32) -> MemFile {
-    create_segment(disk, Path::new("/data/wal"), generation, rotation).unwrap()
+    create_segment(disk, Path::new("/data/wal"), generation, rotation, &[]).unwrap()
 }
 
 /// One record of `shard`, written and synced.
@@ -434,7 +434,7 @@ fn a_newer_format_version_refuses_to_recover() {
     let disk = MemDisk::default();
     wal(&disk, 1);
     let mut header = Vec::new();
-    encode_segment_header(2, 0, &mut header);
+    encode_segment_header(2, 0, &[], &mut header);
     let header = restamped(&header, FORMAT_VERSION + 1);
     disk.write_file(&Path::new("/data/wal").join(segment_name(2, 0)), &header)
         .unwrap();
@@ -473,8 +473,8 @@ fn a_segment_whose_version_byte_is_damaged_is_abandoned_not_refused() {
     let mut seg = wal(&disk, 1);
     write(&mut seg, 1, 0, &put(b"b", b"1"));
     let mut header = Vec::new();
-    encode_segment_header(2, 0, &mut header);
-    header[4] ^= 0x03; // 2 -> 1: what an earlier build would have written
+    encode_segment_header(2, 0, &[], &mut header);
+    header[4] = 1; // what an earlier build would have written
     disk.write_file(&Path::new("/data/wal").join(segment_name(2, 0)), &header)
         .unwrap();
     let recovery = recover(spec(&disk, 2)).expect("damage, not another version");
@@ -1191,7 +1191,7 @@ fn a_segment_shorter_than_its_header_held_nothing_and_is_not_damage() {
     let mut seg = wal(&disk, 1);
     write(&mut seg, 0, 0, &put(b"a", b"1"));
     let mut partial = Vec::new();
-    crate::log::file::encode_segment_header(1, 1, &mut partial);
+    crate::log::file::encode_segment_header(1, 1, &[], &mut partial);
     partial.truncate(7);
     disk.write_file(&Path::new("/data/wal").join(segment_name(1, 1)), &partial)
         .unwrap();
@@ -1290,9 +1290,10 @@ fn sync_recovered_fails_when_a_sync_fails() {
 /// the cut, and the newer generation's write is lost with them. Every loss
 /// is reported — a header nobody could read charges every shard.
 ///
-/// What this start replays from the older generation includes records the
-/// `Rebase` it could not see had made dead (2 and 3 below, `b` and `c`):
-/// that is #124, not asserted here either way.
+/// Nothing of generation 2 can be read — neither its `Rebase` nor the
+/// header that names its cut — so nothing on disk says where it resumed,
+/// and generation 1 is replayed to its end. What makes that tolerable is
+/// that the loss is reported.
 #[test]
 fn a_rebase_hidden_by_damage_still_leaves_every_loss_reported() {
     let disk = MemDisk::default();
@@ -1324,7 +1325,135 @@ fn a_rebase_hidden_by_damage_still_leaves_every_loss_reported() {
         shard.lossy,
         "the write `c = new` is lost, and the report says so"
     );
-    // As it stands, generation 1 is replayed to its end (`b`, `c`, `d` all
-    // `old`, the shard resumed at 4), records the hidden rebase had made
-    // dead among them. Left unasserted: #124 is that class.
+}
+
+fn rebase() -> Vec<u8> {
+    let mut out = Vec::new();
+    Effect::Rebase.encode(&mut out);
+    out
+}
+
+/// Generation 1's shard 0 to `d` at 3, before generation 2 cut it at 1.
+fn four_old_records(disk: &MemDisk) {
+    let mut gen1 = wal(disk, 1);
+    write(&mut gen1, 0, 0, &put(b"a", b"1"));
+    write(&mut gen1, 0, 1, &put(b"b", b"old"));
+    write(&mut gen1, 0, 2, &put(b"c", b"old"));
+    write(&mut gen1, 0, 3, &put(b"d", b"old"));
+}
+
+/// Generation 2 cut shard 0 at 1, wrote `c = new` at 2 and took an image at
+/// 3; this start cannot read its segment. The image's base bounds where it
+/// resumed, so generation 1's records from 3 up are dead: replayed over
+/// the image, `d = old` would make a state neither generation held.
+#[test]
+fn an_image_kills_older_records_at_and_above_its_base_when_its_log_cannot_be_read() {
+    let disk = MemDisk::default();
+    four_old_records(&disk);
+    let mut gen2 = create_segment(&disk, Path::new("/data/wal"), 2, 0, &[(0, 1)]).unwrap();
+    write(&mut gen2, 0, 1, &rebase());
+    write(&mut gen2, 0, 2, &put(b"c", b"new"));
+    snapshot(
+        &disk,
+        2,
+        0,
+        0,
+        &[(0, 3)],
+        &[(0, b"a", b"1", None), (0, b"c", b"new", None)],
+        true,
+    );
+    let path = Path::new("/data/wal").join(segment_name(2, 0));
+    let mut bytes = disk.contents(&path);
+    bytes[..SEGMENT_HEADER_LEN].fill(b'j');
+    disk.overwrite(&path, bytes);
+
+    let recovery = recover(spec(&disk, 1)).unwrap();
+    let shard = &recovery.shards[0];
+    assert_eq!(
+        contents(&shard.dict),
+        pairs(&[(b"a", b"1"), (b"c", b"new")]),
+        "the image, and nothing generation 2 had cut"
+    );
+    assert_eq!(shard.seq, 3);
+    assert!(shard.lossy, "a segment that could not be read");
+}
+
+/// A hole takes generation 2's `Rebase` and spares the records after it.
+/// Its segment's header still says where it cut, so generation 1's `b`,
+/// which that cut killed, does not come back beside generation 2's
+/// writes; the missing `Rebase` is a gap, cut and reported.
+#[test]
+fn a_rebase_lost_in_a_hole_still_kills_through_its_segments_header() {
+    let disk = MemDisk::default();
+    four_old_records(&disk);
+    let path = Path::new("/data/wal").join(segment_name(2, 0));
+    let mut gen2 = create_segment(&disk, Path::new("/data/wal"), 2, 0, &[(0, 1)]).unwrap();
+    write(&mut gen2, 0, 1, &rebase());
+    let end = disk.contents(&path).len();
+    write(&mut gen2, 0, 2, &put(b"c", b"new"));
+    write(&mut gen2, 0, 3, &put(b"d", b"new"));
+    let mut bytes = disk.contents(&path);
+    bytes[end - 1] ^= 0xFF; // the rebase's checksum
+    disk.overwrite(&path, bytes);
+
+    let recovery = recover(spec(&disk, 1)).unwrap();
+    assert_eq!(recovery.report.holes, 1);
+    let shard = &recovery.shards[0];
+    assert_eq!(
+        contents(&shard.dict),
+        pairs(&[(b"a", b"1")]),
+        "not `b = old`, which generation 2 had cut"
+    );
+    assert_eq!(shard.seq, 1, "cut where the rebase was");
+    assert!(shard.lossy && shard.cut);
+}
+
+/// A start syncs its first segment's header before its `Rebase`s. One whose
+/// rebases never became durable never served, and its cut never took
+/// effect: the records it would have killed are read again.
+#[test]
+fn the_cut_points_of_a_start_that_never_served_kill_nothing() {
+    let disk = MemDisk::default();
+    four_old_records(&disk);
+    create_segment(&disk, Path::new("/data/wal"), 2, 0, &[(0, 1)]).unwrap();
+
+    let recovery = recover(spec(&disk, 1)).unwrap();
+    let shard = &recovery.shards[0];
+    assert_eq!(
+        contents(&shard.dict),
+        pairs(&[(b"a", b"1"), (b"b", b"old"), (b"c", b"old"), (b"d", b"old")])
+    );
+    assert_eq!(shard.seq, 4);
+    assert!(!shard.lossy && !shard.cut);
+}
+
+/// A directory written by the previous layout is read: its segment headers
+/// carry no cut points, and its records are replayed as ever.
+#[test]
+fn a_version_3_segment_is_recovered() {
+    let disk = MemDisk::default();
+    let dir = Path::new("/data/wal");
+    disk.create_dir_all(dir).unwrap();
+    let mut header = Vec::new();
+    header.extend_from_slice(b"SSEG");
+    header.push(3);
+    header.extend_from_slice(&1u64.to_le_bytes());
+    header.extend_from_slice(&0u32.to_le_bytes());
+    let crc = crate::log::crc32_iso_hdlc(&header);
+    header.extend_from_slice(&crc.to_le_bytes());
+    let mut file = header;
+    encode_record(
+        &Record {
+            shard: 0,
+            seq: 0,
+            payload: &put(b"a", b"1"),
+        },
+        &mut file,
+    );
+    disk.write_file(&dir.join(segment_name(1, 0)), &file)
+        .unwrap();
+
+    let recovery = recover(spec(&disk, 1)).unwrap();
+    assert_eq!(contents(&recovery.shards[0].dict), pairs(&[(b"a", b"1")]));
+    assert!(!recovery.shards[0].lossy);
 }

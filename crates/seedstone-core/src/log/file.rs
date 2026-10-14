@@ -11,7 +11,23 @@
 //! written back atomically. Segments of a newer generation sort after every
 //! segment of an older one, so a shard's records are in sequence order
 //! across files whichever executor owned it each time. A **segment** is a
-//! fixed header followed by records in the format `log.rs` defines.
+//! header followed by records in the format `log.rs` defines:
+//!
+//! ```text
+//! fixed    SSEG · version u8 · generation u64 · rotation u32 · cuts u16 · crc u32
+//! cuts     (shard u16, seq u64) × cuts · crc u32        only when cuts > 0
+//! ```
+//!
+//! The **cut points** are where this generation's start cut a shard and
+//! wrote its `Rebase`: every rotation of the generation carries them all.
+//! The `Rebase` record is what makes the older records at and above it
+//! dead, and a hole in the file can take that record while sparing the
+//! records after it; a header cannot be lost that way, since a segment
+//! whose header does not read is not read at all. So whatever recovery
+//! reads of a generation, it knows where that generation cut. The list
+//! has its own CRC so that the fixed part's vouches for the count before
+//! the list's length is trusted: a file that stops inside a list its
+//! fixed part declares is a creation that stopped, not a damaged count.
 //!
 //! There is one segment per node, written by the node's writer
 //! ([`writer`](crate::log::writer)): every executor hands it its batches,
@@ -32,11 +48,30 @@ use crate::log::{Record, ReplicationLog, crc32_iso_hdlc, encode_record};
 /// The four bytes every segment starts with.
 pub const SEGMENT_MAGIC: [u8; 4] = *b"SSEG";
 
-/// The layout version this build writes, and the only one it reads.
-pub const FORMAT_VERSION: u8 = 3;
+/// The layout version this build writes.
+pub const FORMAT_VERSION: u8 = 4;
 
-/// Magic, version, generation, rotation, and a CRC over the rest.
-pub const SEGMENT_HEADER_LEN: usize = 4 + 1 + 8 + 4 + 4;
+/// The oldest layout version this build reads. Version 3 is this layout
+/// without the cut points: its segment header stops after the rotation,
+/// and its snapshots are laid out as these are.
+pub const OLDEST_READ_VERSION: u8 = 3;
+
+/// A version 3 segment header: magic, version, generation, rotation, CRC.
+const V3_SEGMENT_HEADER_LEN: usize = 4 + 1 + 8 + 4 + 4;
+
+/// Magic, version, generation, rotation, cut count, and a CRC over them:
+/// the whole header of a generation that cut nothing.
+pub const SEGMENT_HEADER_LEN: usize = 4 + 1 + 8 + 4 + 2 + 4;
+
+/// The length of a segment header listing `cuts` cut points.
+#[must_use]
+pub const fn segment_header_len(cuts: usize) -> usize {
+    if cuts == 0 {
+        SEGMENT_HEADER_LEN
+    } else {
+        SEGMENT_HEADER_LEN + cuts * 10 + 4
+    }
+}
 
 /// The file the generation counter lives in.
 pub const GENERATION_FILE: &str = "GENERATION";
@@ -93,14 +128,49 @@ pub(crate) fn parse_name2(name: &str, suffix: &str) -> Option<(u64, u32)> {
     ))
 }
 
-/// Appends a segment header to `out`: the fields, then a CRC over them.
-pub fn encode_segment_header(generation: u64, rotation: u32, out: &mut Vec<u8>) {
+/// A segment's header: the generation and rotation the file is, and
+/// where that generation's start cut a shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentHeader {
+    pub generation: u64,
+    pub rotation: u32,
+    /// `(shard, seq)`: the shard's `Rebase` is at `seq` in this generation.
+    pub cuts: Vec<(u16, u64)>,
+    /// The bytes the header takes: where the records begin.
+    pub len: usize,
+}
+
+/// Appends a segment header to `out`: the fixed part and its CRC, then the
+/// cut points and theirs if there are any.
+///
+/// # Panics
+///
+/// If more than `u16::MAX` cut points are listed: one per shard at most,
+/// and no node runs that many shards.
+pub fn encode_segment_header(
+    generation: u64,
+    rotation: u32,
+    cuts: &[(u16, u64)],
+    out: &mut Vec<u8>,
+) {
     let at = out.len();
     out.extend_from_slice(&SEGMENT_MAGIC);
     out.push(FORMAT_VERSION);
     out.extend_from_slice(&generation.to_le_bytes());
     out.extend_from_slice(&rotation.to_le_bytes());
+    let count = u16::try_from(cuts.len()).expect("one cut point per shard at most");
+    out.extend_from_slice(&count.to_le_bytes());
     let crc = crc32_iso_hdlc(&out[at..]);
+    out.extend_from_slice(&crc.to_le_bytes());
+    if cuts.is_empty() {
+        return;
+    }
+    let list = out.len();
+    for (shard, seq) in cuts {
+        out.extend_from_slice(&shard.to_le_bytes());
+        out.extend_from_slice(&seq.to_le_bytes());
+    }
+    let crc = crc32_iso_hdlc(&out[list..]);
     out.extend_from_slice(&crc.to_le_bytes());
 }
 
@@ -114,54 +184,155 @@ pub enum HeaderError {
     /// A version above [`FORMAT_VERSION`]: a file this build must not guess
     /// at.
     NewerVersion(u8),
-    /// A version below [`FORMAT_VERSION`]: the file predates this build's
-    /// layout; nothing reads it, and a start that finds one refuses.
+    /// A version below [`OLDEST_READ_VERSION`]: the file predates the
+    /// layouts this build reads; nothing reads it, and a start that finds
+    /// one refuses.
     OlderVersion(u8),
     /// The fields do not match their CRC: damage.
     BadChecksum,
 }
 
-/// Reads a segment header: the generation and rotation it names.
+/// Reads a segment header from the start of `buf`.
+///
+/// # Errors
+///
+/// [`HeaderError`], as each variant says; `Short` for bytes that stop
+/// inside the header they begin.
+pub fn decode_segment_header(buf: &[u8]) -> Result<SegmentHeader, HeaderError> {
+    let len = buf.len() as u64;
+    read_segment_header(&mut &buf[..], len)?.ok_or(HeaderError::Short)
+}
+
+/// Reads the header of a segment `len` bytes long from `src`, and leaves
+/// `src` at its first record.
+///
+/// `Ok(None)` when the file stops inside its header: a creation that
+/// failed before the header was whole, since nothing is appended to a
+/// segment before its header is synced.
 ///
 /// The version is checked before the checksum: another version may lay its
 /// header out differently, and refusing it as damage would scan a downgrade
 /// as a hole, or an earlier build's directory as every shard's loss. A
-/// version byte that is this layout's own once restored, with the checksum
-/// then matching, was damaged rather than written by another build.
+/// version byte that is a readable layout's own once restored, with the
+/// checksum then matching, was damaged rather than written by another
+/// build.
 ///
 /// # Errors
 ///
-/// [`HeaderError`], as each variant says.
-pub fn decode_segment_header(buf: &[u8]) -> Result<(u64, u32), HeaderError> {
-    let Some(header) = buf.get(..SEGMENT_HEADER_LEN) else {
-        return Err(HeaderError::Short);
+/// [`HeaderError`], as each variant says; `Short` when a read stops before
+/// the file does.
+pub fn read_segment_header<R: io::Read>(
+    src: &mut R,
+    len: u64,
+) -> Result<Option<SegmentHeader>, HeaderError> {
+    let mut header = Vec::with_capacity(SEGMENT_HEADER_LEN);
+    // The version byte picks the fixed part's length.
+    if !take(src, len, &mut header, 5)? {
+        return Ok(None);
+    }
+    let fixed = if header[4] == 3 {
+        V3_SEGMENT_HEADER_LEN
+    } else {
+        SEGMENT_HEADER_LEN
     };
+    if !take(src, len, &mut header, fixed)? {
+        return Ok(None);
+    }
     if header[..4] != SEGMENT_MAGIC {
         return Err(HeaderError::BadMagic);
     }
-    if header[4] != FORMAT_VERSION {
-        return Err(version_mismatch(header));
+    if !(OLDEST_READ_VERSION..=FORMAT_VERSION).contains(&header[4]) {
+        return Err(version_mismatch(
+            header[4],
+            [
+                (3, header.get(..V3_SEGMENT_HEADER_LEN)),
+                (FORMAT_VERSION, header.get(..SEGMENT_HEADER_LEN)),
+            ]
+            .into_iter()
+            .filter_map(|(version, layout)| Some((version, layout?))),
+        ));
     }
-    check_header_crc(header)?;
+    check_header_crc(&header)?;
     let mut generation = [0; 8];
     generation.copy_from_slice(&header[5..13]);
     let mut rotation = [0; 4];
     rotation.copy_from_slice(&header[13..17]);
-    Ok((u64::from_le_bytes(generation), u32::from_le_bytes(rotation)))
+    let mut read = SegmentHeader {
+        generation: u64::from_le_bytes(generation),
+        rotation: u32::from_le_bytes(rotation),
+        cuts: Vec::new(),
+        len: header.len(),
+    };
+    if header[4] == 3 {
+        return Ok(Some(read));
+    }
+    // The fixed part's CRC has vouched for the count.
+    let count = usize::from(u16::from_le_bytes([header[17], header[18]]));
+    if count == 0 {
+        return Ok(Some(read));
+    }
+    if !take(src, len, &mut header, segment_header_len(count))? {
+        return Ok(None);
+    }
+    check_header_crc(&header[SEGMENT_HEADER_LEN..])?;
+    read.cuts = header[SEGMENT_HEADER_LEN..header.len() - 4]
+        .chunks_exact(10)
+        .map(|point| {
+            let mut seq = [0; 8];
+            seq.copy_from_slice(&point[2..]);
+            (
+                u16::from_le_bytes([point[0], point[1]]),
+                u64::from_le_bytes(seq),
+            )
+        })
+        .collect();
+    read.len = header.len();
+    Ok(Some(read))
 }
 
-/// Why a header of this layout's length carries another version: written
-/// by another build, or this layout's own header with its version byte
-/// damaged — which the checksum tells apart, since it covers the byte.
-pub(crate) fn version_mismatch(header: &[u8]) -> HeaderError {
-    let mut restored = header.to_vec();
-    restored[4] = FORMAT_VERSION;
-    if check_header_crc(&restored).is_ok() {
-        return HeaderError::BadChecksum;
+/// Reads `header` up to `want` bytes. `Ok(false)` when the file, `len`
+/// bytes long, stops before that; `Short` when a read does.
+fn take<R: io::Read>(
+    src: &mut R,
+    len: u64,
+    header: &mut Vec<u8>,
+    want: usize,
+) -> Result<bool, HeaderError> {
+    if len < want as u64 {
+        return Ok(false);
     }
-    match header[4] {
-        v if v > FORMAT_VERSION => HeaderError::NewerVersion(v),
-        v => HeaderError::OlderVersion(v),
+    let at = header.len();
+    header.resize(want, 0);
+    let mut got = at;
+    while got < want {
+        match src.read(&mut header[got..]) {
+            Ok(0) | Err(_) => return Err(HeaderError::Short),
+            Ok(n) => got += n,
+        }
+    }
+    Ok(true)
+}
+
+/// Why a header carries `found`, a version this build does not read:
+/// written by another build, or a readable layout's own header with its
+/// version byte damaged — which the checksum tells apart, since it covers
+/// the byte. `layouts` holds each readable version's header as it would lie
+/// in these bytes.
+pub(crate) fn version_mismatch<'a>(
+    found: u8,
+    layouts: impl IntoIterator<Item = (u8, &'a [u8])>,
+) -> HeaderError {
+    for (version, header) in layouts {
+        let mut restored = header.to_vec();
+        restored[4] = version;
+        if check_header_crc(&restored).is_ok() {
+            return HeaderError::BadChecksum;
+        }
+    }
+    if found > FORMAT_VERSION {
+        HeaderError::NewerVersion(found)
+    } else {
+        HeaderError::OlderVersion(found)
     }
 }
 
@@ -307,8 +478,9 @@ fn read_generation<D: Disk>(disk: &D, wal: &Path) -> Option<u64> {
     std::str::from_utf8(&text).ok()?.trim().parse().ok()
 }
 
-/// Creates one segment file: header written and synced. The directory is
-/// the caller's to sync — once per batch of files, not once per file.
+/// Creates one segment file: header written and synced, `cuts` the
+/// generation's cut points. The directory is the caller's to sync — once
+/// per batch of files, not once per file.
 ///
 /// # Errors
 ///
@@ -318,10 +490,11 @@ pub fn create_segment<D: Disk>(
     wal: &Path,
     generation: u64,
     rotation: u32,
+    cuts: &[(u16, u64)],
 ) -> io::Result<D::File> {
     let mut file = disk.create_append(&wal.join(segment_name(generation, rotation)))?;
-    let mut header = Vec::with_capacity(SEGMENT_HEADER_LEN);
-    encode_segment_header(generation, rotation, &mut header);
+    let mut header = Vec::with_capacity(segment_header_len(cuts.len()));
+    encode_segment_header(generation, rotation, cuts, &mut header);
     file.write_all(&header)?;
     file.sync_data()?;
     Ok(file)
@@ -355,12 +528,21 @@ pub(crate) mod tests {
         );
     }
 
+    fn decoded(generation: u64, rotation: u32, cuts: &[(u16, u64)]) -> SegmentHeader {
+        SegmentHeader {
+            generation,
+            rotation,
+            cuts: cuts.to_vec(),
+            len: segment_header_len(cuts.len()),
+        }
+    }
+
     #[test]
     fn a_segment_header_round_trips_and_refuses_other_versions_and_a_bad_checksum() {
         let mut out = Vec::new();
-        encode_segment_header(9, 5, &mut out);
+        encode_segment_header(9, 5, &[], &mut out);
         assert_eq!(out.len(), SEGMENT_HEADER_LEN);
-        assert_eq!(decode_segment_header(&out), Ok((9, 5)));
+        assert_eq!(decode_segment_header(&out), Ok(decoded(9, 5, &[])));
         assert_eq!(decode_segment_header(&out[..3]), Err(HeaderError::Short));
         let mut bad = out.clone();
         bad[0] = b'X';
@@ -383,6 +565,73 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn a_segment_header_carries_its_generations_cut_points() {
+        let cuts = [(3, 17), (0, 4)];
+        let mut out = Vec::new();
+        encode_segment_header(9, 5, &cuts, &mut out);
+        assert_eq!(out.len(), segment_header_len(2));
+        assert_eq!(decode_segment_header(&out), Ok(decoded(9, 5, &cuts)));
+        let mut damaged = out.clone();
+        damaged[SEGMENT_HEADER_LEN + 3] ^= 0x01; // inside a cut point
+        assert_eq!(
+            decode_segment_header(&damaged),
+            Err(HeaderError::BadChecksum)
+        );
+        let mut count = out.clone();
+        count[17] ^= 0x40; // the count, which the fixed part's CRC covers
+        assert_eq!(decode_segment_header(&count), Err(HeaderError::BadChecksum));
+    }
+
+    #[test]
+    fn a_file_that_stops_inside_its_header_held_nothing() {
+        let mut out = Vec::new();
+        encode_segment_header(9, 5, &[(3, 17)], &mut out);
+        for len in [0, 4, SEGMENT_HEADER_LEN - 1, out.len() - 1] {
+            assert_eq!(
+                read_segment_header(&mut &out[..len], len as u64),
+                Ok(None),
+                "{len} bytes"
+            );
+        }
+        assert_eq!(
+            read_segment_header(&mut &out[..4], out.len() as u64),
+            Err(HeaderError::Short),
+            "a read that stops before the file does is damage"
+        );
+    }
+
+    #[test]
+    fn a_version_3_segment_header_is_read_and_cuts_nothing() {
+        let mut v3 = Vec::new();
+        v3.extend_from_slice(&SEGMENT_MAGIC);
+        v3.push(3);
+        v3.extend_from_slice(&9u64.to_le_bytes());
+        v3.extend_from_slice(&5u32.to_le_bytes());
+        let crc = crc32_iso_hdlc(&v3);
+        v3.extend_from_slice(&crc.to_le_bytes());
+        let mut file = v3.clone();
+        file.extend_from_slice(b"records");
+        let mut src = &file[..];
+        assert_eq!(
+            read_segment_header(&mut src, file.len() as u64),
+            Ok(Some(SegmentHeader {
+                len: v3.len(),
+                ..decoded(9, 5, &[])
+            }))
+        );
+        assert_eq!(src, b"records", "left at the first record");
+        for version in [0, 1, FORMAT_VERSION + 1, u8::MAX] {
+            let mut damaged = file.clone();
+            damaged[4] = version;
+            assert_eq!(
+                decode_segment_header(&damaged),
+                Err(HeaderError::BadChecksum),
+                "version byte {version}"
+            );
+        }
+    }
+
     /// `header` with its version byte set to `version` and its CRC made to
     /// match: what a build writing that version would have laid out, had it
     /// kept this layout.
@@ -398,8 +647,8 @@ pub(crate) mod tests {
     #[test]
     fn a_damaged_version_byte_is_a_bad_checksum_not_another_version() {
         let mut out = Vec::new();
-        encode_segment_header(9, 5, &mut out);
-        for version in [0, 1, FORMAT_VERSION + 1, u8::MAX] {
+        encode_segment_header(9, 5, &[], &mut out);
+        for version in [0, 1, 3, FORMAT_VERSION + 1, u8::MAX] {
             let mut damaged = out.clone();
             damaged[4] = version;
             assert_eq!(
@@ -414,9 +663,9 @@ pub(crate) mod tests {
     fn create_segment_writes_a_synced_header_under_the_name() {
         let disk = MemDisk::default();
         disk.create_dir_all(Path::new("/w")).unwrap();
-        let _file = create_segment(&disk, Path::new("/w"), 4, 1).unwrap();
+        let _file = create_segment(&disk, Path::new("/w"), 4, 1, &[(2, 8)]).unwrap();
         let bytes = disk.contents(&Path::new("/w").join(segment_name(4, 1)));
-        assert_eq!(decode_segment_header(&bytes), Ok((4, 1)));
+        assert_eq!(decode_segment_header(&bytes), Ok(decoded(4, 1, &[(2, 8)])));
         assert_eq!(
             disk.synced_len(&Path::new("/w").join(segment_name(4, 1))),
             bytes.len()
@@ -496,7 +745,7 @@ pub(crate) mod tests {
         let disk = MemDisk::default();
         let wal = Path::new("/data/wal");
         disk.create_dir_all(wal).unwrap();
-        create_segment(&disk, wal, 7, 0).unwrap();
+        create_segment(&disk, wal, 7, 0, &[]).unwrap();
         disk.write_file(&wal.join(GENERATION_FILE), b"7\xff\x00")
             .unwrap();
         assert_eq!(
@@ -504,7 +753,7 @@ pub(crate) mod tests {
             8,
             "one above the highest generation any segment carries"
         );
-        create_segment(&disk, wal, 8, 0).unwrap();
+        create_segment(&disk, wal, 8, 0, &[]).unwrap();
         disk.write_file(&wal.join(GENERATION_FILE), b"3").unwrap();
         assert_eq!(
             next_generation(&disk, wal).unwrap(),

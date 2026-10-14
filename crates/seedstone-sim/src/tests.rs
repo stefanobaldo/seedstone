@@ -945,9 +945,12 @@ fn one_seed_per_durability_policy_is_pinned() {
     //
     // Re-pinned, all three, when every start began to sync the files it
     // recovered from: each sync draws a fault from the disk's stream.
-    const HOSTILE_1_3_ALWAYS: u64 = 0x4916_eabc_154a_0867;
-    const HOSTILE_1_3_INTERVAL: u64 = 0x3676_e16a_bd9e_8cc0;
-    const HOSTILE_1_3_NEVER: u64 = 0xa7e7_e27b_6b6a_90d3;
+    //
+    // Re-pinned, all three, when a segment's header began to carry its
+    // generation's cut points: two bytes more in every file.
+    const HOSTILE_1_3_ALWAYS: u64 = 0x0fef_2205_5718_d984;
+    const HOSTILE_1_3_INTERVAL: u64 = 0x5345_6cc1_7a2c_95af;
+    const HOSTILE_1_3_NEVER: u64 = 0xbec3_f534_69c7_7058;
     for (policy, pinned) in [
         (SyncPolicy::ALWAYS, HOSTILE_1_3_ALWAYS),
         (SyncPolicy::INTERVAL, HOSTILE_1_3_INTERVAL),
@@ -1008,17 +1011,19 @@ fn the_honest_node_holds_on_the_hostile_seed_whose_start_removed_a_cut_segment()
 }
 
 /// Hostile seeds where a start cut shards and then failed before it wrote
-/// anything — at the writer's open on 14240 (`interval`), at
-/// `next_generation` on 21840 (`always`), each after one crash. Recovery
-/// removed the segments whose records it had cut, so the next start, which
-/// read what the failed one could not, resumed shards below what was
-/// durable and nothing reported it. The segments are kept now, the failed
-/// start reports its recovery before it fails, and the honest node holds.
-/// That report excuses nothing the next start loses — it wrote no rebase,
-/// so its cut could not stand — and without the keep both seeds violate.
+/// anything — at the writer's open on 14240 (`interval`), after one crash.
+/// Recovery removed the segments whose records it had cut, so the next
+/// start, which read what the failed one could not, resumed shards below
+/// what was durable and nothing reported it. The segments are kept now, the
+/// failed start reports its recovery before it fails, and the honest node
+/// holds. That report excuses nothing the next start loses — it wrote no
+/// rebase, so its cut could not stand — and without the keep 14240
+/// violates. Seed 1 (`never`) reaches a start that failed after it
+/// recovered too; it replaced 21840 when a segment's header began to carry
+/// its cut points, which moved the disk's draws.
 #[test]
 fn the_honest_node_holds_on_the_hostile_seeds_whose_start_failed_after_its_cut() {
-    for sim_seed in [14240, 21840] {
+    for sim_seed in [14240, 1] {
         let outcome = run_sim(&SimConfig::hostile(1, sim_seed));
         assert!(outcome.invariant_holds(), "seed {sim_seed}: {outcome:?}");
         assert!(
@@ -1049,15 +1054,16 @@ fn the_honest_node_holds_on_the_hostile_seed_whose_start_could_not_sync_its_reba
 
 /// Hostile seeds where a start cut, failed writing its rebases, and the
 /// node crashed before the retry, so the next start met whatever of those
-/// rebases the crash left (24637 at `always`, 17619 at `interval`, found by
-/// a local sweep of 1..=30 000 under each). It either replays what the
+/// rebases the crash left (2023 at `always`, 10215 at `interval`, found by
+/// a sweep of 1..=30 000 under each when a segment's header began to carry
+/// its cut points and moved the disk's draws off 24637 and 17619). It either replays what the
 /// failed start cut or reports its own cut: no loss goes unreported. The
 /// reach: a rebase failed, and no start was a retry without a crash before
 /// it — every start after a crash is counted once, and a retry with none
 /// between would count one more.
 #[test]
 fn the_honest_node_holds_when_it_crashes_before_retrying_a_failed_rebase() {
-    for (sim_seed, policy) in [(24637, SyncPolicy::ALWAYS), (17619, SyncPolicy::INTERVAL)] {
+    for (sim_seed, policy) in [(2023, SyncPolicy::ALWAYS), (10215, SyncPolicy::INTERVAL)] {
         let mut cfg = SimConfig::hostile(1, sim_seed);
         cfg.fsync = FsyncDraw::Fixed(policy);
         let outcome = run_sim(&cfg);
@@ -1175,12 +1181,12 @@ fn inherit_an_unsynced_rebase_and_write(cfg: &SimConfig) -> std::io::Result<()> 
     let wal = Path::new(DATA_DIR).join("wal");
     disk.create_dir_all(&wal)?;
     disk.sync_dir(Path::new(DATA_DIR))?;
-    let mut older = create_segment(&disk, &wal, 1, 0)?;
+    let mut older = create_segment(&disk, &wal, 1, 0, &[])?;
     for (seq, key) in [(0, &b"k0"[..]), (1, b"k1"), (2, b"k2"), (3, b"k3")] {
         older.write_all(&encoded(0, seq, &put(key, b"old")))?;
     }
     older.sync_data()?;
-    let mut failed = create_segment(&disk, &wal, 2, 0)?;
+    let mut failed = create_segment(&disk, &wal, 2, 0, &[(0, 2)])?;
     failed.write_all(&encoded(0, 2, &Effect::Rebase))?;
     disk.write_file(&wal.join(GENERATION_FILE), b"2")?;
     disk.sync_dir(&wal)?;

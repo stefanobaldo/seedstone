@@ -57,6 +57,26 @@
 //! and cut the log. So a snapshot of generation `g` with base `b` is dead
 //! for a shard when a `Rebase` of a generation above `g` sits below `b`.
 //!
+//! **Where a generation resumed is known without its `Rebase`.** Damage
+//! can hide the record and leave the rest — a hole that takes it alone, a
+//! segment that cannot be read beside an image that can — and older
+//! records it made dead would then be replayed into a state no generation
+//! held. Two other things on disk bound the resume point, and each is
+//! taken as a `Rebase` would be:
+//!
+//! - the cut points in every segment header of the generation: a record
+//!   of it read is a header of it read, so wherever recovery sees the
+//!   generation it sees where it cut. The first header is synced before
+//!   the `Rebase`s are, so a start that failed in between leaves cut points
+//!   no `Rebase` was made durable for — and a cut that never took effect
+//!   must not kill what it would have. A generation serves only once its
+//!   `Rebase`s are durable, so its cut points count once it shows it
+//!   served: a record of it that is not a `Rebase`, or an image of it;
+//! - the base of every image of the generation whose header reads: a
+//!   generation resumes before it takes an image, so an older record at or
+//!   above that base was cut by it, and an older image above it holds
+//!   records it cut.
+//!
 //! **A refused image is a possible loss only where the log cannot make up
 //! for it.** Its shards are marked lossy if the log they fall back to stops
 //! short of the image's base, and not otherwise, whatever made it refused:
@@ -89,9 +109,7 @@ use bytes::Bytes;
 use crate::dict::{Dict, DictSeed, Entry, shard_seed};
 use crate::log::disk::Disk;
 use crate::log::effect::{Effect, Owned};
-use crate::log::file::{
-    HeaderError, SEGMENT_HEADER_LEN, decode_segment_header, parse_name, parse_segment_name,
-};
+use crate::log::file::{HeaderError, parse_name, parse_segment_name, read_segment_header};
 use crate::log::reader::{Item, Reader};
 use crate::log::snapshot::{FOOTER_SHARD, Footer, SnapshotHeader, parse_snapshot_name};
 use crate::shard::{Now, Replayed, replay_into};
@@ -217,7 +235,7 @@ pub fn recover<D: Disk>(spec: RecoverSpec<'_, D>) -> io::Result<Recovery> {
         scan.segment(spec.disk, spec.wal, spec.reader, file, index)?;
     }
     scan.charge_holes();
-    let rebases = scan.rebases();
+    let rebases = scan.rebases(&snaps);
     let mut building = Building {
         dicts: (0..spec.shards)
             .map(|shard| Dict::with_seed(shard_seed(spec.seed, shard)))
@@ -226,7 +244,15 @@ pub fn recover<D: Disk>(spec: RecoverSpec<'_, D>) -> io::Result<Recovery> {
     };
     let chosen = read_images(&spec, &mut snaps, &rebases, &mut building, &mut report);
     let unread = std::mem::take(&mut scan.unread);
-    let (shards, kept) = replay_tails(&spec, scan, &chosen, building, segments.len(), &mut report);
+    let (shards, kept) = replay_tails(
+        &spec,
+        scan,
+        &rebases,
+        &chosen,
+        building,
+        segments.len(),
+        &mut report,
+    );
     for snap in &mut snaps {
         snap.damaged |= snap
             .unfinished_for
@@ -411,6 +437,12 @@ struct Scan {
     report: Report,
     /// Per shard: `(seq, generation, file index, effect)`.
     buckets: Vec<Vec<(u64, u64, usize, Owned)>>,
+    /// Per shard: every `(generation, seq)` a segment header names as a
+    /// cut point.
+    cuts: Vec<Vec<(u64, u64)>>,
+    /// The generations a record of that is not a `Rebase` was read from:
+    /// they served, so their `Rebase`s were durable.
+    served: Vec<u64>,
     /// Per shard: damage may have taken records of it that nothing else on
     /// disk shows missing.
     damaged: Vec<bool>,
@@ -434,6 +466,8 @@ impl Scan {
         Self {
             report: Report::default(),
             buckets: (0..shards).map(|_| Vec::new()).collect(),
+            cuts: (0..shards).map(|_| Vec::new()).collect(),
+            served: Vec::new(),
             damaged: vec![false; usize::from(shards)],
             position: 0,
             last: vec![None; usize::from(shards)],
@@ -458,16 +492,13 @@ impl Scan {
             self.abandon(index);
             return Ok(());
         };
-        // Shorter than a header: a creation that failed before its header
-        // was whole. Nothing is appended to a segment before its header is
-        // synced, so it never held a record — not damage, and nothing lost.
-        if len < SEGMENT_HEADER_LEN as u64 {
-            return Ok(());
-        }
-        let mut header = [0u8; SEGMENT_HEADER_LEN];
-        let read = read_fully(&mut src, &mut header);
-        match decode_segment_header(&header[..read]) {
-            Ok(_) => {}
+        let header = match read_segment_header(&mut src, len) {
+            Ok(Some(header)) => header,
+            // Shorter than its header: a creation that failed before the
+            // header was whole. Nothing is appended to a segment before its
+            // header is synced, so it never held a record — not damage, and
+            // nothing lost.
+            Ok(None) => return Ok(()),
             Err(HeaderError::NewerVersion(version)) => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -491,8 +522,26 @@ impl Scan {
                 self.abandon(index);
                 return Ok(());
             }
+        };
+        // A cut point outside the node, or a shard named twice, is damage
+        // the checksum happened to pass, as in a snapshot's header: nobody
+        // can say where the generation cut.
+        let mut seen = vec![false; self.cuts.len()];
+        let sound = header.cuts.iter().all(|(shard, _)| {
+            seen.get_mut(usize::from(*shard))
+                .is_some_and(|seen| !std::mem::replace(seen, true))
+        });
+        if !sound {
+            self.abandon(index);
+            return Ok(());
         }
-        let body_len = len.saturating_sub(SEGMENT_HEADER_LEN as u64);
+        for (shard, seq) in &header.cuts {
+            let cuts = &mut self.cuts[usize::from(*shard)];
+            if !cuts.contains(&(file.generation, *seq)) {
+                cuts.push((file.generation, *seq));
+            }
+        }
+        let body_len = len.saturating_sub(header.len as u64);
         let mut reader = Reader::new(src, body_len, mode);
         let mut holes = 0;
         loop {
@@ -567,6 +616,9 @@ impl Scan {
             *last = Some((item.seq, at));
         }
         if let Some(effect) = Effect::decode(&item.payload) {
+            if !matches!(effect, Effect::Rebase) && !self.served.contains(&generation) {
+                self.served.push(generation);
+            }
             bucket.push((item.seq, generation, file, effect.to_owned()));
         } else {
             // A well-checksummed record this build cannot read ends the
@@ -585,18 +637,42 @@ impl Scan {
         self.unread[index] = true;
     }
 
-    /// Per shard, every `(generation, seq)` a `Rebase` was read at.
-    fn rebases(&self) -> Vec<Vec<(u64, u64)>> {
-        self.buckets
+    /// Per shard, every `(generation, seq)` a `Rebase` is known at: read
+    /// as a record, named as a cut point by a segment header of a
+    /// generation that served, or bounded by the base of an image in
+    /// `snaps` — see the module doc.
+    fn rebases(&self, snaps: &[SnapFile]) -> Vec<Vec<(u64, u64)>> {
+        let headers: Vec<&SnapshotHeader> = snaps
             .iter()
-            .map(|bucket| {
+            .filter_map(|snap| snap.header.as_ref())
+            .collect();
+        let served = |generation: u64| {
+            self.served.contains(&generation)
+                || headers.iter().any(|header| header.generation == generation)
+        };
+        let mut rebases: Vec<Vec<(u64, u64)>> = self
+            .buckets
+            .iter()
+            .zip(&self.cuts)
+            .map(|(bucket, cuts)| {
                 bucket
                     .iter()
                     .filter(|(_, _, _, effect)| matches!(effect, Owned::Rebase))
                     .map(|(seq, generation, _, _)| (*generation, *seq))
+                    .chain(
+                        cuts.iter()
+                            .copied()
+                            .filter(|(generation, _)| served(*generation)),
+                    )
                     .collect()
             })
-            .collect()
+            .collect();
+        for header in headers {
+            for (shard, base) in &header.bases {
+                rebases[usize::from(*shard)].push((header.generation, *base));
+            }
+        }
+        rebases
     }
 }
 
@@ -799,6 +875,7 @@ fn take_entry(
 fn replay_tails<D: Disk>(
     spec: &RecoverSpec<'_, D>,
     scan: Scan,
+    rebases: &[Vec<(u64, u64)>],
     chosen: &Chosen,
     building: Building,
     files: usize,
@@ -821,7 +898,7 @@ fn replay_tails<D: Disk>(
     for (shard, (((mut dict, due), bucket), damaged)) in (0u16..).zip(zipped) {
         let index = usize::from(shard);
         let base = chosen.images[index].unwrap_or(0);
-        let (records, discarded) = prefix(bucket, base, &mut kept);
+        let (records, discarded) = prefix(bucket, &rebases[index], base, &mut kept);
         let applied = records.len() as u64;
         report.applied += applied;
         report.discarded += discarded;
@@ -856,30 +933,30 @@ fn replay_tails<D: Disk>(
 
 /// A shard's records from `start` upwards to the first missing sequence,
 /// and how many came after it — once every record a newer generation's
-/// `Rebase` made dead is gone. Marks in `kept` the files the returned
-/// records came from; the files of the records the gap discarded, which
-/// the next start replays if whatever cut them does not recur; and the
-/// file of every `Rebase`, which must outlive the records it kills.
+/// `Rebase`, at a `(generation, seq)` of `rebases`, made dead is gone.
+/// Marks in `kept` the files the returned records came from; the files of
+/// the records the gap discarded, which the next start replays if whatever
+/// cut them does not recur; and the file of every `Rebase` record, which
+/// must outlive the records it kills.
 fn prefix(
     bucket: Vec<(u64, u64, usize, Owned)>,
+    rebases: &[(u64, u64)],
     start: u64,
     kept: &mut [bool],
 ) -> (Vec<(u64, Owned)>, u64) {
-    let rebases: Vec<(u64, u64)> = bucket
+    for (_, _, file, _) in bucket
         .iter()
         .filter(|(_, _, _, effect)| matches!(effect, Owned::Rebase))
-        .map(|(seq, generation, file, _)| {
-            kept[*file] = true;
-            (*seq, *generation)
-        })
-        .collect();
+    {
+        kept[*file] = true;
+    }
     let mut live: Vec<(u64, u64, usize, Owned)> = bucket
         .into_iter()
         .filter(|(seq, generation, _, _)| {
             *seq >= start
                 && !rebases
                     .iter()
-                    .any(|(from, newer)| newer > generation && seq >= from)
+                    .any(|(newer, from)| newer > generation && seq >= from)
         })
         .collect();
     // By sequence, the newest generation first within one: the duplicate

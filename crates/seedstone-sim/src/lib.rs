@@ -131,7 +131,7 @@ use seedstone_core::log::recovery::{
     ReaderMode, RecoverSpec, RecoveredShard, Recovery, recover, sync_recovered,
 };
 use seedstone_core::log::writer::{
-    Opened, Writer, WriterLink, WriterPlants, WriterSpec, write_rebases,
+    Opened, Writer, WriterLink, WriterPlants, WriterSpec, cut_points, write_rebases,
 };
 use seedstone_core::memory::{EvictionMode, MemoryLimit};
 use seedstone_core::shard::{
@@ -827,6 +827,7 @@ fn start_log(
         disk,
         wal,
         generation,
+        cuts: cut_points(&recovery.shards),
         executors,
         policy: shared.policy,
         segment_bytes: SIM_SEGMENT_BYTES,
