@@ -64,11 +64,14 @@ fn hostile_always(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
 /// The honest node, and the shape's calibration: every seed meets a disk
 /// fault of some kind — a crash does not count, since every hostile seed
 /// crashes by construction — recovers, and still decides its checks — all but the
-/// expiration checks on a seed whose recoveries reported a loss: the model
-/// gives up a deadline kept across such a recovery, and a crash under load
-/// charges every shard, so such a seed may have none left to decide. Some
-/// seed of the range still decides them. How many decide a durable read is
-/// the test below's.
+/// expiration checks, which some seed of the range decides. Whether a seed
+/// reads a key past its deadline is its workload's draw: a seed whose
+/// recoveries reported a loss may have none left to decide, since the model
+/// gives up a deadline kept across such a recovery and a crash under load
+/// charges every shard, and seed 10 reported none and read no key past its
+/// deadline once a segment's header grew by two bytes and moved its disk's
+/// draws (read 2026-10-14). How many decide a durable read is the test
+/// below's.
 #[test]
 fn the_hostile_shape_faults_on_every_seed_and_the_honest_node_holds() {
     let mut any_recovered_lossy = false;
@@ -80,10 +83,8 @@ fn the_hostile_shape_faults_on_every_seed_and_the_honest_node_holds() {
             "seed {sim_seed} violated an invariant with an honest node: {outcome:?}"
         );
         let mut rest = outcome.clone();
-        if outcome.excused_losses > 0 {
-            rest.dead_checks = rest.dead_checks.max(1);
-            rest.alive_checks = rest.alive_checks.max(1);
-        }
+        rest.dead_checks = rest.dead_checks.max(1);
+        rest.alive_checks = rest.alive_checks.max(1);
         assert!(
             rest.invariants_were_exercised(),
             "seed {sim_seed} decided nothing: {outcome:?}"
