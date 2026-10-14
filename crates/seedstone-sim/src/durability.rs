@@ -309,6 +309,30 @@ impl SlotHistory {
         candidates
     }
 
+    /// Narrows the slot to `known`, which a read found in memory at `at`,
+    /// and says whether that settled it.
+    ///
+    /// A read shows what the node holds, not what a sync stands behind. If
+    /// a write after the last acknowledged one, whose reply never came or
+    /// was a refusal, could have put `known` there, nothing is settled: the
+    /// history stays as it is, and a crash still leaves every state it held
+    /// open. Otherwise `known` is acknowledged state, and is all that is
+    /// kept.
+    pub fn observed(&mut self, known: Known, at: Duration) -> bool {
+        let after = self
+            .writes
+            .iter()
+            .rposition(|(_, _, acknowledged)| *acknowledged)
+            .map_or(0, |index| index + 1);
+        let unsettled = self.writes[after..]
+            .iter()
+            .any(|(written, _, _)| *written == known);
+        if !unsettled {
+            self.keep_only(known, at);
+        }
+        !unsettled
+    }
+
     /// Forgets everything but `known`, which a read just confirmed at `at`.
     pub fn keep_only(&mut self, known: Known, at: Duration) {
         self.writes.clear();
@@ -397,6 +421,27 @@ mod tests {
                 Known::Absent,
                 Known::Value(b"4".to_vec())
             ]
+        );
+    }
+
+    #[test]
+    fn a_read_of_a_write_never_acknowledged_keeps_the_state_before_it() {
+        let mut slot = SlotHistory::default();
+        slot.record(Known::Value(b"1".to_vec()), ms(10), None);
+        // Refused: applied, answered with the refusal, never synced.
+        slot.record_unacknowledged(Known::Value(b"2".to_vec()), ms(20));
+        // A read finds it in memory, which says nothing about the disk.
+        assert!(!slot.observed(Known::Value(b"2".to_vec()), ms(30)));
+        // A crash with everything acknowledged durable leaves the key either.
+        assert_eq!(
+            slot.candidates(Some(ms(40))),
+            vec![Known::Value(b"1".to_vec()), Known::Value(b"2".to_vec())]
+        );
+        // A read of the state before it settles the key as before.
+        assert!(slot.observed(Known::Value(b"1".to_vec()), ms(50)));
+        assert_eq!(
+            slot.candidates(Some(ms(60))),
+            vec![Known::Value(b"1".to_vec())]
         );
     }
 

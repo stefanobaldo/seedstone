@@ -192,9 +192,13 @@ impl Model {
             }
         }
         if matched {
-            self.plain_history[slot as usize].keep_only(observed.clone(), world_now());
+            // A read of a write that was never acknowledged settles nothing
+            // about the disk, so `plain_since` stays, as under a write with
+            // no reply: see `SlotHistory::observed`.
+            if self.plain_history[slot as usize].observed(observed.clone(), world_now()) {
+                self.plain_since[slot as usize] = None;
+            }
             self.plain_state[slot as usize] = observed;
-            self.plain_since[slot as usize] = None;
         } else {
             // Counted once: the model holds nothing it could judge the
             // next read by until its owner writes the key again.
