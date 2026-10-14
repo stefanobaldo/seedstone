@@ -7,6 +7,14 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ## [Unreleased]
 
+### Added
+
+- **The `recovery` line says where a start's time went.** Under
+  `--data-dir`, it now carries `read_ms`, `images_ms` and `replay_ms`
+  beside `elapsed_ms`: the time spent reading the log directory, loading
+  the snapshots, and replaying the log over them. A slow start shows which
+  of the three to look at.
+
 ### Changed
 
 - **The log's segment format moves to version 4.** Under `--data-dir`, each

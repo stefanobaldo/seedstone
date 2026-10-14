@@ -1055,6 +1055,7 @@ fn spawn_pool(cfg: &Config, seed: DictSeed) -> std::io::Result<(ShardPool, Optio
 /// per shard the recovery cut. `elapsed` is the start's time on the
 /// directory, from the first `create_dir_all` to the end of recovery.
 fn emit_recovery(recovery: &Recovery, elapsed: std::time::Duration) {
+    let millis = |took: std::time::Duration| u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
     let report = &recovery.report;
     emit(
         &RECOVERY,
@@ -1072,7 +1073,10 @@ fn emit_recovery(recovery: &Recovery, elapsed: std::time::Duration) {
             Field::Num(report.snapshots_used),
             Field::Num(report.snapshots_refused),
             Field::Num(report.files_removed),
-            Field::Num(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
+            Field::Num(millis(elapsed)),
+            Field::Num(millis(report.read)),
+            Field::Num(millis(report.images)),
+            Field::Num(millis(report.replay)),
         ],
     );
     for cut in &report.truncated {

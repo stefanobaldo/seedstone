@@ -1020,6 +1020,12 @@ async fn save_lands_an_image_on_every_executor_and_lastsave_dates_it() {
             field(line, "elapsed_ms") < 10_000,
             "{policy}: elapsed_ms is a number under ten seconds: {line}"
         );
+        // And splits it: three numbers, every one of them inside it.
+        let split = field(line, "read_ms") + field(line, "images_ms") + field(line, "replay_ms");
+        assert!(
+            split <= field(line, "elapsed_ms"),
+            "{policy}: read_ms, images_ms and replay_ms fit inside elapsed_ms: {line}"
+        );
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         assert_eq!(
             round_trip(&mut stream, &["LASTSAVE"]).await,
