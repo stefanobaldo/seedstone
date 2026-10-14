@@ -77,25 +77,71 @@ fn spawn(cwd: &Path, args: &[&std::ffi::OsStr], stderr: &Path) -> Node {
     )
 }
 
+/// How long a start gets to listen when its directory holds no log: it
+/// creates the directory and reads nothing.
+const FRESH_START: Duration = Duration::from_secs(10);
+
+/// How long a start gets to listen when its directory holds a log, and how
+/// long a node past the floor gets to snapshot and compact.
+///
+/// Both read or write the whole log — a snapshot floor's worth in the tests
+/// that cross it — so they take what the machine's disk takes, not the
+/// fixed cost of a start over nothing.
+const LOG_BOUND: Duration = Duration::from_mins(1);
+
+/// Polls `stderr` every 20 ms until `found` picks a result out of its text,
+/// for at most `within`. On a timeout the panic carries the text, so it
+/// says which start it was and how far the node got.
+async fn poll_stderr<T>(
+    stderr: &Path,
+    within: Duration,
+    waited_for: &str,
+    mut found: impl FnMut(&str) -> Option<T>,
+) -> T {
+    let polls = within.as_millis() / 20;
+    let mut text = String::new();
+    for _ in 0..polls {
+        text = std::fs::read_to_string(stderr).unwrap_or_default();
+        if let Some(result) = found(&text) {
+            return result;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "{waited_for} within {} seconds; the node's stderr:\n{text}",
+        within.as_secs()
+    )
+}
+
 /// Waits for the `listening` line in `stderr` and returns every line up to
-/// it; fails if `recovery_failed` arrives instead, or nothing does.
-async fn until_listening(stderr: &Path) -> Vec<String> {
-    for _ in 0..500 {
-        let text = std::fs::read_to_string(stderr).unwrap_or_default();
-        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+/// it; fails if `recovery_failed` arrives instead, or nothing does within
+/// `within`.
+async fn until_listening(stderr: &Path, within: Duration) -> Vec<String> {
+    poll_stderr(stderr, within, "no listening line", |text| {
         assert!(
             !text.contains("\"evt\":\"recovery_failed\""),
             "the node refused to start: {text}"
         );
-        if let Some(at) = lines
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        let at = lines
             .iter()
-            .position(|line| line.contains("\"evt\":\"listening\""))
-        {
-            return lines[..=at].to_vec();
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("no listening line within ten seconds")
+            .position(|line| line.contains("\"evt\":\"listening\""))?;
+        Some(lines[..=at].to_vec())
+    })
+    .await
+}
+
+/// The deadline of a start over `dir`: [`LOG_BOUND`] once its `wal/` holds
+/// a segment or a snapshot, [`FRESH_START`] before.
+fn start_deadline(dir: &Path) -> Duration {
+    let holds_a_log = std::fs::read_dir(dir.join("wal")).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            Path::new(&entry.file_name())
+                .extension()
+                .is_some_and(|ext| ext == "seg" || ext == "snap")
+        })
+    });
+    if holds_a_log { LOG_BOUND } else { FRESH_START }
 }
 
 /// The port a `listening` line reports.
@@ -108,8 +154,9 @@ fn port_of(listening: &str) -> u16 {
 /// Starts the binary over `dir` as its data directory and returns the child
 /// and its port.
 async fn start(dir: &Path, stderr: &Path) -> (Node, u16) {
+    let within = start_deadline(dir);
     let child = spawn(dir, &["--data-dir".as_ref(), dir.as_os_str()], stderr);
-    let lines = until_listening(stderr).await;
+    let lines = until_listening(stderr, within).await;
     let port = port_of(lines.last().unwrap());
     (child, port)
 }
@@ -215,7 +262,7 @@ async fn a_node_without_the_flag_writes_no_log() {
     let dir = scratch();
     let stderr = dir.with_extension("stderr");
     let mut child = spawn(&dir, &[], &stderr);
-    let lines = until_listening(&stderr).await;
+    let lines = until_listening(&stderr, FRESH_START).await;
     {
         let port = port_of(lines.last().unwrap());
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -281,17 +328,14 @@ async fn a_second_process_on_the_same_directory_is_refused() {
 }
 
 /// Waits until a line with `evt` appears in `stderr`, returning every line
-/// so far; fails after ten seconds.
-async fn until_event(stderr: &Path, evt: &str) -> Vec<String> {
+/// so far; fails after `within`.
+async fn until_event(stderr: &Path, evt: &str, within: Duration) -> Vec<String> {
     let needle = format!("\"evt\":\"{evt}\"");
-    for _ in 0..500 {
-        let text = std::fs::read_to_string(stderr).unwrap_or_default();
-        if text.contains(&needle) {
-            return text.lines().map(str::to_owned).collect();
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("no {evt} line within ten seconds")
+    poll_stderr(stderr, within, &format!("no {evt} line"), |text| {
+        text.contains(&needle)
+            .then(|| text.lines().map(str::to_owned).collect())
+    })
+    .await
 }
 
 /// The number `name` holds in the line `line`.
@@ -368,7 +412,7 @@ async fn a_node_past_the_floor_snapshots_compacts_and_restarts_from_the_image() 
             Frame::Simple("OK".into())
         );
     }
-    let lines = until_event(&stderr, "compaction").await;
+    let lines = until_event(&stderr, "compaction", LOG_BOUND).await;
     let snapshot = lines
         .iter()
         .find(|line| line.contains("\"evt\":\"snapshot\""))
@@ -435,7 +479,7 @@ async fn a_node_killed_at_its_snapshot_line_starts_again_clean() {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         write_past(&mut stream, floor + floor / 10, &keys, 16 * 1024).await;
     }
-    until_event(&stderr, "snapshot").await;
+    until_event(&stderr, "snapshot", LOG_BOUND).await;
     first.kill().expect("SIGKILL");
     first.wait().expect("reaped");
 
@@ -469,8 +513,9 @@ async fn a_node_killed_at_its_snapshot_line_starts_again_clean() {
 async fn start_with(dir: &Path, stderr: &Path, extra: &[&str]) -> (Node, u16) {
     let mut args: Vec<&std::ffi::OsStr> = vec!["--data-dir".as_ref(), dir.as_os_str()];
     args.extend(extra.iter().map(|arg| std::ffi::OsStr::new(*arg)));
+    let within = start_deadline(dir);
     let child = spawn(dir, &args, stderr);
-    let lines = until_listening(stderr).await;
+    let lines = until_listening(stderr, within).await;
     let port = port_of(lines.last().unwrap());
     (child, port)
 }
@@ -607,7 +652,7 @@ async fn fsync_without_a_data_dir_warns_once() {
     let dir = scratch();
     let stderr = dir.with_extension("stderr");
     let mut node = spawn(&dir, &["--fsync".as_ref(), "always".as_ref()], &stderr);
-    let lines = until_listening(&stderr).await;
+    let lines = until_listening(&stderr, FRESH_START).await;
     assert_eq!(
         lines
             .iter()
@@ -730,22 +775,16 @@ fn segment_names(dir: &Path) -> Vec<String> {
 /// fails after thirty seconds.
 async fn until_event_count(stderr: &Path, evt: &str, count: usize) -> Vec<String> {
     let needle = format!("\"evt\":\"{evt}\"");
-    for _ in 0..1500 {
-        let text = std::fs::read_to_string(stderr).unwrap_or_default();
+    let waited_for = format!("fewer than {count} {evt} lines");
+    poll_stderr(stderr, Duration::from_secs(30), &waited_for, |text| {
         let found: Vec<String> = text
             .lines()
             .filter(|line| line.contains(&needle))
             .map(str::to_owned)
             .collect();
-        if found.len() >= count {
-            return found;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!(
-        "fewer than {count} {evt} lines within thirty seconds: {}",
-        std::fs::read_to_string(stderr).unwrap_or_default()
-    )
+        (found.len() >= count).then_some(found)
+    })
+    .await
 }
 
 /// Writes 16 KiB values over keys spread across every shard, and so across
@@ -965,7 +1004,7 @@ async fn save_lands_an_image_on_every_executor_and_lastsave_dates_it() {
         node.kill().unwrap();
         node.wait().unwrap();
         let (mut again, port) = start_with(&dir, &stderr, &["--fsync", policy]).await;
-        let recovery = until_event(&stderr, "recovery").await;
+        let recovery = until_event(&stderr, "recovery", FRESH_START).await;
         let line = recovery
             .iter()
             .find(|line| line.contains("\"evt\":\"recovery\""))
@@ -1047,7 +1086,7 @@ async fn without_a_data_dir_the_three_persistence_commands_name_the_flag() {
     let dir = scratch();
     let stderr = dir.with_extension("stderr");
     let mut node = spawn(&dir, &[], &stderr);
-    let lines = until_listening(&stderr).await;
+    let lines = until_listening(&stderr, FRESH_START).await;
     let port = port_of(lines.last().unwrap());
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     for cmd in [&["SAVE"][..], &["BGSAVE"], &["LASTSAVE"]] {
