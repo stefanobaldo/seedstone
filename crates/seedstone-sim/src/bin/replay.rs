@@ -8,6 +8,7 @@
 //!
 //! ```text
 //! replay --sim-seed S [--workload-seed W] [--mini | --eviction | --hostile] [--plant NAME]
+//!        [--fsync POLICY]
 //! ```
 //!
 //! Exits 1 if the run violated any invariant, so it also works as a plain
@@ -19,7 +20,8 @@ use std::process::ExitCode;
 #[path = "shared/args.rs"]
 mod args;
 
-const USAGE: &str = "usage: replay --sim-seed S [--workload-seed W] [--mini | --eviction | --hostile] [--plant NAME]";
+const USAGE: &str = "usage: replay --sim-seed S [--workload-seed W] \
+                     [--mini | --eviction | --hostile] [--plant NAME] [--fsync POLICY]";
 
 fn main() -> ExitCode {
     let args = match args::Args::from_env() {
@@ -101,4 +103,24 @@ fn fail(message: &str) -> ExitCode {
     eprintln!("replay: {message}");
     eprintln!("{USAGE}");
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    /// The usage line is the only documentation a caller gets at the moment
+    /// they need it, and a flag that exists but is not named there is a flag
+    /// nobody finds.
+    #[test]
+    fn the_usage_line_names_every_flag_replay_accepts() {
+        let flags = super::args::flags();
+        assert!(
+            flags.contains(&"--sim-seed"),
+            "the parser's flags were not found"
+        );
+        // Sweep's own flags, which replay refuses.
+        let sweep_only = ["--seeds", "--seed-start", "--hashes", "--workers"];
+        for flag in flags.into_iter().filter(|flag| !sweep_only.contains(flag)) {
+            assert!(super::USAGE.contains(flag), "usage does not name {flag}");
+        }
+    }
 }

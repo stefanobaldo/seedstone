@@ -207,6 +207,21 @@ fn workers(flag: &str, value: Option<String>) -> Result<usize, String> {
         .map_err(|_| format!("{flag} needs a count this machine can hold, got `{count}`"))
 }
 
+/// Every flag the parser matches, read off its own source.
+///
+/// For the tests that hold each binary's usage line to the flags it takes: a
+/// list kept by hand beside the parser is a second place a new flag has to be
+/// added, and the one it was once left out of.
+#[cfg(test)]
+pub fn flags() -> Vec<&'static str> {
+    include_str!("args.rs")
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix('"')?.split_once("\" =>"))
+        .map(|(flag, _)| flag)
+        .filter(|flag| flag.starts_with("--"))
+        .collect()
+}
+
 /// Reads the value that follows a flag.
 fn number(flag: &str, value: Option<String>) -> Result<u64, String> {
     let value = value.ok_or_else(|| format!("{flag} needs a value"))?;

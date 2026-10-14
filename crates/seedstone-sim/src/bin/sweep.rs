@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! sweep --seeds N [--seed-start S] [--workload-seed W] [--mini | --eviction | --hostile] [--plant NAME]
-//!       [--hashes] [--workers K]
+//!       [--fsync POLICY] [--hashes] [--workers K]
 //! ```
 //!
 //! The range starts at seed 1 unless `--seed-start` says otherwise, which is
@@ -34,7 +34,8 @@ use std::process::ExitCode;
 mod args;
 
 const USAGE: &str = "usage: sweep --seeds N [--seed-start S] [--workload-seed W] \
-                     [--mini | --eviction | --hostile] [--plant NAME] [--hashes] [--workers K]";
+                     [--mini | --eviction | --hostile] [--plant NAME] [--fsync POLICY] \
+                     [--hashes] [--workers K]";
 
 fn main() -> ExitCode {
     let args = match args::Args::from_env() {
@@ -251,17 +252,13 @@ mod tests {
     /// nobody finds.
     #[test]
     fn the_usage_line_names_every_flag_sweep_accepts() {
-        for flag in [
-            "--seeds",
-            "--seed-start",
-            "--workload-seed",
-            "--mini",
-            "--eviction",
-            "--hostile",
-            "--plant",
-            "--hashes",
-            "--workers",
-        ] {
+        let flags = super::args::flags();
+        assert!(
+            flags.contains(&"--seeds"),
+            "the parser's flags were not found"
+        );
+        // `--sim-seed` is replay's, and sweep refuses it.
+        for flag in flags.into_iter().filter(|flag| *flag != "--sim-seed") {
             assert!(super::USAGE.contains(flag), "usage does not name {flag}");
         }
     }
