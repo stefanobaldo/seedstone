@@ -103,8 +103,10 @@
 
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use bytes::Bytes;
+use tokio::time::Instant;
 
 use crate::dict::{Dict, DictSeed, Entry, shard_seed};
 use crate::log::disk::Disk;
@@ -208,6 +210,13 @@ pub struct Report {
     pub snapshots_refused: u64,
     /// Files removed because nothing used them.
     pub files_removed: u64,
+    /// Time spent reading every snapshot's header and every segment:
+    /// passes 1 and 2.
+    pub read: Duration,
+    /// Time spent loading images: pass 3.
+    pub images: Duration,
+    /// Time spent replaying each shard's tail over its image: pass 4.
+    pub replay: Duration,
 }
 
 /// Every shard, and the report.
@@ -225,6 +234,7 @@ pub struct Recovery {
 /// this build's — the two cases where the node must not start. Everything
 /// else is damage, counted and survived.
 pub fn recover<D: Disk>(spec: RecoverSpec<'_, D>) -> io::Result<Recovery> {
+    let began = Instant::now();
     let names = spec.disk.list(spec.wal)?;
     let mut report = Report::default();
     let (mut snaps, header_damage) = read_headers(&spec, &names, &mut report)?;
@@ -236,14 +246,18 @@ pub fn recover<D: Disk>(spec: RecoverSpec<'_, D>) -> io::Result<Recovery> {
     }
     scan.charge_holes();
     let rebases = scan.rebases(&snaps);
+    let read = began.elapsed();
     let mut building = Building {
         dicts: (0..spec.shards)
             .map(|shard| Dict::with_seed(shard_seed(spec.seed, shard)))
             .collect(),
         due: vec![Vec::new(); usize::from(spec.shards)],
     };
+    let images_began = Instant::now();
     let chosen = read_images(&spec, &mut snaps, &rebases, &mut building, &mut report);
+    let images = images_began.elapsed();
     let unread = std::mem::take(&mut scan.unread);
+    let replay_began = Instant::now();
     let (shards, kept) = replay_tails(
         &spec,
         scan,
@@ -253,6 +267,9 @@ pub fn recover<D: Disk>(spec: RecoverSpec<'_, D>) -> io::Result<Recovery> {
         segments.len(),
         &mut report,
     );
+    report.read = read;
+    report.images = images;
+    report.replay = replay_began.elapsed();
     for snap in &mut snaps {
         snap.damaged |= snap
             .unfinished_for

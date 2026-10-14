@@ -149,8 +149,13 @@ pub static PASSWORD_RELOAD_SKIPPED: Event = Event {
 /// shards any of it may have touched. The last three say what the
 /// snapshots did: how many files gave a shard its image, how many were
 /// refused, and how many files nothing used were removed. `elapsed_ms` is
-/// how long the start spent on the directory before it listened — the
-/// read, the images, the replay, the writer's open — in milliseconds.
+/// how long the start spent recovering the directory, in milliseconds:
+/// from its creation and lock to the end of recovery, the removal of the
+/// files nothing used included and the opening of the log for writing
+/// not. `read_ms`, `images_ms` and `replay_ms` split it: the snapshots'
+/// headers and every segment read, the images loaded, the tails replayed.
+/// What they leave of `elapsed_ms` is the directory's setup and the
+/// removals.
 pub static RECOVERY: Event = Event {
     name: "recovery",
     level: Level::Info,
@@ -169,6 +174,9 @@ pub static RECOVERY: Event = Event {
         "snapshots_refused",
         "files_removed",
         "elapsed_ms",
+        "read_ms",
+        "images_ms",
+        "replay_ms",
     ],
 };
 
