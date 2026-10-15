@@ -956,9 +956,13 @@ fn one_seed_per_durability_policy_is_pinned() {
     // every sync it issues: one write more per round, and one more draw
     // from the hostile disk. `never` moved too — its rotations and its stop
     // sync, and mark. `MINI_1_42` held still.
-    const HOSTILE_1_3_ALWAYS: u64 = 0x4f45_206b_8b58_28d7;
-    const HOSTILE_1_3_INTERVAL: u64 = 0x8e8b_9c96_57c2_2b6c;
-    const HOSTILE_1_3_NEVER: u64 = 0x15e9_5840_7c1c_c8c4;
+    //
+    // Re-pinned, all three, when recovery stopped charging a crash's torn
+    // tail to every shard as lossy: the hash folds each recovered shard's
+    // lossy flag, and fewer are set. `MINI_1_42` held still.
+    const HOSTILE_1_3_ALWAYS: u64 = 0xfa39_9f02_193f_7614;
+    const HOSTILE_1_3_INTERVAL: u64 = 0x46bc_739c_e8c0_e73a;
+    const HOSTILE_1_3_NEVER: u64 = 0x0f1b_6ebf_35a4_b805;
     for (policy, pinned) in [
         (SyncPolicy::ALWAYS, HOSTILE_1_3_ALWAYS),
         (SyncPolicy::INTERVAL, HOSTILE_1_3_INTERVAL),

@@ -498,7 +498,7 @@ pub fn next_generation<D: Disk>(disk: &D, wal: &Path) -> io::Result<u64> {
 }
 
 /// The counter as written, or `None` for anything that is not a number.
-fn read_generation<D: Disk>(disk: &D, wal: &Path) -> Option<u64> {
+pub(crate) fn read_generation<D: Disk>(disk: &D, wal: &Path) -> Option<u64> {
     let mut text = Vec::new();
     std::io::Read::read_to_end(
         &mut disk.open_read(&wal.join(GENERATION_FILE)).ok()?,

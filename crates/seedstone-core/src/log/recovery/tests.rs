@@ -12,6 +12,7 @@ use crate::shard::Now;
 use tokio::time::Instant;
 
 mod format;
+mod tear;
 
 fn now() -> Now {
     Now {
