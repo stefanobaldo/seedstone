@@ -4,6 +4,13 @@ use seedstone_core::shard::SyncPolicy;
 use seedstone_sim::{FsyncDraw, Plant, SimConfig, SimOutcome, run_sim};
 
 const SEEDS: u64 = 12;
+/// The early release's own window. It surfaces on about one standard seed
+/// in twelve, so whether 1..=12 holds one is the draw's luck: over 1..=100
+/// it was caught on nine seeds, the first 9, and once the writer began to
+/// mark the log before every sync, on eight, the first 32 — the rate held
+/// and the draws moved (read 2026-10-15). Widened from `SEEDS` once, for
+/// that; the search stops at the first catch.
+const DURABLE_ON_ISSUE_SEEDS: u64 = 48;
 const HONEST_SEEDS: u64 = 6;
 const HOSTILE_SEEDS: u64 = 24;
 const POLICIES: [SyncPolicy; 3] = [SyncPolicy::ALWAYS, SyncPolicy::INTERVAL, SyncPolicy::NEVER];
@@ -70,12 +77,15 @@ fn the_honest_node_holds_under_every_policy_and_is_crashed_mid_flight_on_some_se
 /// takes.
 #[test]
 fn durable_on_issue_is_caught() {
-    let caught = (1..=SEEDS).find(|seed| {
+    let caught = (1..=DURABLE_ON_ISSUE_SEEDS).find(|seed| {
         let outcome = standard(*seed, SyncPolicy::ALWAYS, Some(Plant::DurableOnIssue));
         outcome.lost_durable_writes > 0
     });
     let Some(seed) = caught else {
-        panic!("no seed in 1..={SEEDS} surfaced the early release — investigate, do not widen")
+        panic!(
+            "no seed in 1..={DURABLE_ON_ISSUE_SEEDS} surfaced the early release — investigate, \
+             do not widen"
+        )
     };
     eprintln!("durable-on-issue: first caught on seed {seed}");
     assert!(
