@@ -21,7 +21,7 @@ REPO = "https://github.com/stefanobaldo/seedstone/blob/main/"
 ORIGIN = "https://seedstone.io/"
 BUDGET = 200 * 1024
 # Paths the page links before the file lands beside it; each entry leaves
-# with the task that adds its file.
+# with the change that adds its file.
 PENDING = {"install.sh"}
 
 status = 0
@@ -124,6 +124,34 @@ def check_mark():
     else:
         fail("mark", "the page does not carry the mark's four shapes verbatim")
 
+FAST = ("Against Redis 8.10.0 at one I/O thread on a 16-core machine, v0.3.2 reads ahead on "
+        "throughput in 12 of 13 measured pairs, by 1.03\u00d7 to 5.16\u00d7, and more expensive per "
+        "operation in all 13.")
+
+def check_charts():
+    """The charts on the page are the README's, byte for byte."""
+    bad = []
+    for name in ("benchmarks.svg", "benchmarks-dark.svg"):
+        site_copy, source = os.path.join(SITE, "assets", name), os.path.join("docs", "assets", name)
+        try:
+            same = open(site_copy, "rb").read() == open(source, "rb").read()
+        except FileNotFoundError:
+            same = False
+        if not same:
+            bad.append(f"{site_copy} is not {source}: cp {source} {site_copy}")
+    if bad:
+        fail("charts", "; ".join(bad))
+    else:
+        ok("charts", "both copies identical to docs/assets")
+
+def check_fast_sentence():
+    """The benchmark verdict is the benchmark page's sentence, not a paraphrase."""
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", html))
+    if FAST in text:
+        ok("fast sentence", "verbatim")
+    else:
+        fail("fast sentence", "the page does not carry the pair verdict verbatim")
+
 def check_budget(referenced):
     files = {INDEX, *referenced}
     for path in list(files):
@@ -142,6 +170,8 @@ referenced = check_links()
 check_metadata()
 check_no_http()
 check_mark()
+check_charts()
+check_fast_sentence()
 check_budget(referenced)
 sys.exit(status)
 PY

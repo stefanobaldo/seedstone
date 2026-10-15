@@ -52,16 +52,86 @@
 </section>
 
 <main>
-  <section id="install"><h2>Install</h2></section>
-  <section id="correct"><h2>Correct</h2></section>
-  <section id="fast"><h2>Fast</h2></section>
-  <section id="operated"><h2>Operated</h2></section>
-  <section id="production"><h2>In production</h2></section>
-  <section id="speaks"><h2>What it speaks, and what it does not</h2></section>
+  <section id="install">
+    <h2>Install</h2>
+    <p>Every way in; the binary is the same on each. The packages start a service on loopback. After Homebrew or Cargo, start the server with <code>seedstone</code>.</p>
+    <dl class="ways">
+      <dt>One line</dt>
+      <dd><pre><code>curl -fsSL https://seedstone.io/install.sh | sh</code></pre><span class="note">macOS and Linux. Verifies the release's SHA-256, installs the binary, nothing else.</span></dd>
+      <dt>Container</dt>
+      <dd><pre><code>docker run -p 6379:6379 seedstone/seedstone --bind 0.0.0.0:6379 --no-auth</code></pre><span class="note">Also on <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#container-image">GHCR</a>.</span></dd>
+      <dt>Homebrew</dt>
+      <dd><pre><code>brew install seedstonelabs/tap/seedstone</code></pre><span class="note">macOS and Linux; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#homebrew-macos-and-linux">as a service</a> with <code>brew services</code>.</span></dd>
+      <dt>Cargo</dt>
+      <dd><pre><code>cargo binstall seedstone</code></pre><span class="note">The release archive in seconds; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#cargo"><code>cargo install</code></a> builds from source.</span></dd>
+      <dt>Debian, Ubuntu / Fedora, RHEL</dt>
+      <dd><span class="note">A <code>.deb</code> or <code>.rpm</code> with a systemd unit, <a href="https://github.com/stefanobaldo/seedstone/releases/latest">from the release page</a>; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#debian-ubuntu-deb-and-fedora-rhel-rpm">what the service does</a>.</span></dd>
+      <dt>Kubernetes</dt>
+      <dd><pre><code>helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --set auth.noAuth=true</code></pre><span class="note"><a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#kubernetes-helm">The chart</a>, and what <code>auth.noAuth</code> says.</span></dd>
+    </dl>
+    <p>Then, with any client:</p>
+<pre class="console"><code>$ redis-cli
+127.0.0.1:6379&gt; set greeting hello ex 60
+OK
+127.0.0.1:6379&gt; ttl greeting
+(integer) 60
+127.0.0.1:6379&gt; get greeting
+"hello"</code></pre>
+    <p>Every channel, with checksums, the packaged defaults and the service units: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md">docs/install.md</a>.</p>
+  </section>
+
+  <section id="correct">
+    <h2>Correct</h2>
+    <p>The whole server runs inside a deterministic simulation: a virtual clock, a simulated network, scheduled clients. Every completed command is folded into a trace hash that is a function of two seeds and nothing else, so a concurrency bug is reproduced from its seed, in a fresh process, byte for byte.</p>
+    <p>CI sweeps seeds on every code change, and proves the machinery on fourteen defects planted in the server itself: each has to be caught by the counter that owns it.</p>
+    <p>How it is built and how it is tested: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/testing.md">docs/testing.md</a>.</p>
+  </section>
+
+  <section id="fast">
+    <h2>Fast</h2>
+    <figure class="chart">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="/assets/benchmarks-dark.svg">
+        <img src="/assets/benchmarks.svg" width="960" height="534" alt="Throughput of seedstone against Redis, Valkey, Dragonfly and Garnet on four cells">
+      </picture>
+      <figcaption>Four of the cells, throughput only, rendered from the raw logs by the harness itself: <code>v0.3.2</code> on a GCP <code>c4a-standard-16</code>, against Redis 8.10.0, Valkey 9.1.1, Dragonfly <code>df-v1.40.2</code> and Garnet 2.1.5.</figcaption>
+    </figure>
+    <p>Against Redis 8.10.0 at one I/O thread on a 16-core machine, <code>v0.3.2</code> reads ahead on throughput in 12 of 13 measured pairs, by 1.03× to 5.16×, and more expensive per operation in all 13.</p>
+    <p>Every cell at every pipeline depth, the CPU per operation, the method fixed before the run, and what the numbers do not say: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/benchmarks.md">docs/benchmarks.md</a>.</p>
+  </section>
+
+  <section id="operated">
+    <h2>Operated</h2>
+    <p><code>INFO</code> in sections that carry only what the node can state truthfully; one JSON line per event; a password that rotates without a restart; a disk that fails or fills met with refusal, not with acknowledgements the node cannot keep. A stock Prometheus exporter scrapes it in CI.</p>
+    <p>Flags, output, signals, the password, persistence and <code>INFO</code>: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/operations.md">docs/operations.md</a>.</p>
+  </section>
+
+  <section id="production">
+    <h2>In production</h2>
+    <p><code>0.x</code>: the keyspace holds strings, and this server has been a Django application's production cache since August 2026, without issues: 88 million commands in its first week, 147 clients at peak.</p>
+  </section>
+
+  <section id="speaks">
+    <h2>What it speaks, and what it does not</h2>
+    <p>RESP2 over TCP, so <code>redis-cli</code> and the ordinary client libraries connect unmodified. The surface is a named list, chosen for the workloads this server targets: <strong>strings</strong>; <strong>keys and expiry</strong>; <strong>server</strong>; <strong>persistence</strong>. Anything outside the list is refused with an error naming the command, never answered approximately.</p>
+    <p>Not here yet: other data types, RESP3, replication, clustering, transactions, scripting. Next: hashes, lists, sets and sorted sets, Pub/Sub, RESP3.</p>
+    <p>Every command, every option, every refusal and every deliberate difference from Redis: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/compatibility.md">docs/compatibility.md</a>.</p>
+  </section>
 </main>
 
 <footer>
+  <nav aria-label="Documentation">
+    <a href="https://github.com/stefanobaldo/seedstone">GitHub</a>
+    <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md">Install</a>
+    <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/operations.md">Operations</a>
+    <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/compatibility.md">Compatibility</a>
+    <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/benchmarks.md">Benchmarks</a>
+    <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/testing.md">Testing</a>
+    <a href="https://github.com/stefanobaldo/seedstone/blob/main/CHANGELOG.md">Changelog</a>
+  </nav>
+  <p>Dual-licensed under <a href="https://github.com/stefanobaldo/seedstone/blob/main/LICENSE-APACHE">Apache-2.0</a> or <a href="https://github.com/stefanobaldo/seedstone/blob/main/LICENSE-MIT">MIT</a>, at your option. "SeedStone" is a trademark — see <a href="https://github.com/stefanobaldo/seedstone/blob/main/TRADEMARK.md">TRADEMARK.md</a>.</p>
 </footer>
 
+<script src="/assets/hero.js"></script>
 </body>
 </html>
