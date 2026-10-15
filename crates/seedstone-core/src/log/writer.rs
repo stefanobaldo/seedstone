@@ -385,7 +385,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
 
                 result = in_flight(&mut self.in_flight), if self.in_flight.is_some() => {
                     self.sync_done(result);
-                    self.maybe_issue(Instant::now());
+                    self.maybe_issue();
                 }
                 message = inbox.recv() => {
                     // Every link dropped is the pool gone: nothing more will
@@ -396,7 +396,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
                         self.take(message);
                     }
                     self.write_staged().await;
-                    self.maybe_issue(Instant::now());
+                    self.maybe_issue();
                     if self.lanes.iter().all(|lane| lane.stopped) {
                         self.last_round().await;
                         break;
@@ -404,7 +404,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
                 }
                 _ = tick.tick() => {
                     self.watch_slow(Instant::now());
-                    self.maybe_issue(Instant::now());
+                    self.maybe_issue();
                 }
             }
         }
@@ -466,15 +466,19 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         }
     }
 
-    fn maybe_issue(&mut self, now: Instant) {
+    /// Issues a sync of the segment if one is due. The clock is read only
+    /// once the segment holds unsynced bytes and nothing is in flight: this
+    /// runs after every drain, every completion and every tick, and most of
+    /// those find nothing to sync.
+    fn maybe_issue(&mut self) {
         let Some(interval) = self.policy.min_interval else {
             return;
         };
-        if !self.segment.dirty
-            || self.segment.sync_failed
-            || self.in_flight.is_some()
-            || now.saturating_duration_since(self.issued_at) < interval
-        {
+        if !self.segment.dirty || self.segment.sync_failed || self.in_flight.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        if now.saturating_duration_since(self.issued_at) < interval {
             return;
         }
         self.segment.dirty = false;
