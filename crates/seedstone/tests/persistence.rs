@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use seedstone::server::{SHARDS, executors};
+use seedstone_core::slot::{executor_of, shard_of};
 use seedstone_resp::{Frame, encode, parse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -599,19 +601,30 @@ async fn a_node_killed_right_after_acknowledging_under_always_keeps_every_write(
     std::fs::remove_file(&stderr).unwrap();
 }
 
-/// A pipelined `SET` then `GET` of one key under `always`: the `GET` runs
-/// at once against memory, yet its reply lands after the `SET`'s, which
-/// waits for its sync, and carries the value.
+/// A pipelined `SET` then `GET`s under `always`: each `GET` runs at once
+/// against memory, yet its reply lands after the `SET`'s, which waits for
+/// its sync. The first `GET` reads a missing key another executor owns, so
+/// its reply is ready in a batch of its own long before the `SET`'s; the
+/// second reads the key just set, and carries the value.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pipelined_read_behind_a_held_write_lands_after_it() {
     let dir = scratch();
     let stderr = dir.with_extension("stderr");
     let (mut node, port) = start_with(&dir, &stderr, &["--fsync", "always"]).await;
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let replies = pipelined(&mut stream, &[&["SET", "k", "v"], &["GET", "k"]]).await;
+    let elsewhere = key_on_another_executor("k");
+    let replies = pipelined(
+        &mut stream,
+        &[&["SET", "k", "v"], &["GET", &elsewhere], &["GET", "k"]],
+    )
+    .await;
     assert_eq!(
         replies,
-        vec![Frame::Simple("OK".into()), Frame::Bulk("v".into())]
+        vec![
+            Frame::Simple("OK".into()),
+            Frame::Null,
+            Frame::Bulk("v".into())
+        ]
     );
     node.kill().expect("SIGKILL");
     node.wait().expect("reaped");
@@ -746,6 +759,18 @@ async fn info_persistence_reports_the_log_and_the_images() {
 /// The executors the binary runs on this host.
 fn available_parallelism() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+/// A key the binary on this host places on another executor than `key`'s;
+/// panics on a host with one executor, where there is no other.
+fn key_on_another_executor(key: &str) -> String {
+    let executors = executors();
+    assert!(executors > 1, "one executor on this host: no other to use");
+    let executor = |key: &str| executor_of(shard_of(key.as_bytes(), SHARDS), SHARDS, executors);
+    (0..u32::from(SHARDS))
+        .map(|i| format!("other-{i}"))
+        .find(|other| executor(other) != executor(key))
+        .expect("some key lands on another executor")
 }
 
 /// Names of the segments and snapshots under `dir/wal`.

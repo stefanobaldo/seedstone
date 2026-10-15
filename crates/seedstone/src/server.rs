@@ -52,7 +52,7 @@ const DEFAULT_MAX_CLIENTS: usize = 10_000;
 /// so this number is part of the placement, and a node that could be restarted
 /// with a different one would be a node whose keyspace moved. It is a
 /// deployment-format decision, not a flag.
-const SHARDS: u16 = 1024;
+pub const SHARDS: u16 = 1024;
 
 /// How many executor tasks host those shards.
 ///
@@ -65,7 +65,7 @@ const SHARDS: u16 = 1024;
 /// A host that will not say how much parallelism it has gets one executor:
 /// the shape still works, and a node that refuses to start over this would be
 /// worse than a node that runs conservatively.
-fn executors() -> u16 {
+pub fn executors() -> u16 {
     let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     u16::try_from(available)
         .unwrap_or(u16::MAX)
