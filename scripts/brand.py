@@ -8,11 +8,20 @@ Usage (from the repository root):
     python3 -I scripts/brand.py emit         write every derivative
     python3 -I scripts/brand.py --check      exit 1 naming each one that differs
     python3 -I scripts/brand.py --selftest   the mark's own invariants
+    python3 -I scripts/brand.py --png <target> <out.png>
+        target: avatar (512, on the rim colour), touch (180, on the rim
+        colour), favicon-16, favicon-32 (transparent). Needs ImageMagick 7
+        (`magick`); the rasters are made by hand, once per change of the
+        mark, and are not byte-checked.
 
 To regenerate after a change to the mark: python3 -I scripts/brand.py emit
 """
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 
 RIM = "#1f2831"
 FACE = "#3a4756"
@@ -85,6 +94,37 @@ def check():
     return status
 
 
+# target -> (shapes, size in px, background)
+RASTERS = {
+    "avatar": (SHAPES, 512, RIM),
+    "touch": (SHAPES, 180, RIM),
+    "favicon-16": (SHAPES_FAVICON, 16, "none"),
+    "favicon-32": (SHAPES_FAVICON, 32, "none"),
+}
+
+
+def png(target, out):
+    if target not in RASTERS:
+        print(f"unknown target {target}; one of: {', '.join(RASTERS)}", file=sys.stderr)
+        return 2
+    if shutil.which("magick") is None:
+        print("--png needs ImageMagick 7 (`magick`) on the PATH", file=sys.stderr)
+        return 1
+    shapes, size, background = RASTERS[target]
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "mark.svg")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(svg(shapes, "SeedStone"))
+        # Rendered at twice the target and scaled down, never up. The grid's
+        # own 4-unit margin keeps the rim whole under a circle crop.
+        density = str(72 * size * 2 // 64)
+        subprocess.run(["magick", "-background", background, "-density", density, src,
+                        "-resize", f"{size}x{size}", "-gravity", "center",
+                        "-extent", f"{size}x{size}", "-depth", "8", "-strip", out], check=True)
+    subprocess.run(["magick", "identify", out], check=True)
+    return 0
+
+
 def selftest():
     rim = re.fullmatch(r'<circle cx="(\d+)" cy="(\d+)" r="(\d+)" fill="[^"]+"/>', SHAPES[0])
     assert rim, SHAPES[0]
@@ -113,6 +153,8 @@ def main(argv):
     if argv == ["--selftest"]:
         selftest()
         return 0
+    if len(argv) == 3 and argv[0] == "--png":
+        return png(argv[1], argv[2])
     print(__doc__, file=sys.stderr)
     return 2
 
