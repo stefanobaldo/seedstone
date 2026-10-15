@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/stefanobaldo/seedstone/main/docs/assets/wordmark-dark.svg">
-    <img alt="SeedStone" src="https://raw.githubusercontent.com/stefanobaldo/seedstone/main/docs/assets/wordmark-light.svg" width="400">
+    <img alt="seedstone" src="https://raw.githubusercontent.com/stefanobaldo/seedstone/main/docs/assets/wordmark-light.svg" width="410">
   </picture>
 </p>
 
