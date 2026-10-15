@@ -49,6 +49,36 @@
     <button type="button" class="copy-button" data-copy="curl -fsSL https://seedstone.io/install.sh | sh">Copy</button>
   </div>
   <p class="fine">macOS and Linux, x86_64 and arm64. Verifies the release's SHA-256 before installing. Read it first: <a href="/install.sh">install.sh</a>.</p>
+  <figure class="anim-figure">
+    <svg class="anim" role="img" aria-labelledby="anim-title" viewBox="0 0 336 226">
+      <title id="anim-title">A seed reproducing a failure</title>
+      <text class="seed" x="0" y="18">seed 0x4f2a9c1e</text>
+      <text class="clock dim" x="326" y="18" text-anchor="end">t = 1.800 s</text>
+      <text class="dim" x="0" y="46">c1</text>
+      <g class="chip on" data-tick="1"><rect x="52" y="35" width="50" height="14" rx="3"/><text x="56" y="45.5">SET k v</text></g>
+      <g class="chip on" data-tick="7"><rect x="124" y="35" width="38" height="14" rx="3"/><text x="128" y="45.5">GET k</text></g>
+      <g class="chip on" data-tick="14"><rect x="208" y="35" width="44" height="14" rx="3"/><text x="212" y="45.5">INCR n</text></g>
+      <text class="dim" x="0" y="66">c2</text>
+      <g class="chip on" data-tick="4"><rect x="88" y="55" width="38" height="14" rx="3"/><text x="92" y="65.5">GET k</text></g>
+      <g class="chip on" data-tick="11"><rect x="172" y="55" width="38" height="14" rx="3"/><text x="176" y="65.5">DEL k</text></g>
+      <g class="chip on" data-tick="17"><rect x="244" y="55" width="50" height="14" rx="3"/><text x="248" y="65.5">SET k v</text></g>
+      <text class="dim" x="0" y="86">c3</text>
+      <g class="chip on" data-tick="9"><rect x="148" y="75" width="74" height="14" rx="3"/><text x="152" y="85.5">EXPIRE k 60</text></g>
+      <g class="chip on" data-tick="16"><rect x="232" y="75" width="38" height="14" rx="3"/><text x="236" y="85.5">GET k</text></g>
+      <g class="run">
+        <text class="dim" x="0" y="118">run 1</text>
+        <rect class="cell on" x="40" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="52" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="64" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="76" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="88" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="100" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="112" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="124" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="136" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="148" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="160" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="172" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="184" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="196" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="208" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="220" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="232" y="108" width="10" height="10" rx="2"/><rect class="cell on" x="244" y="108" width="10" height="10" rx="2"/><rect class="cell hit on" x="256" y="108" width="10" height="10" rx="2"/><rect class="cell" x="268" y="108" width="10" height="10" rx="2"/><rect class="cell" x="280" y="108" width="10" height="10" rx="2"/><rect class="cell" x="292" y="108" width="10" height="10" rx="2"/><rect class="cell" x="304" y="108" width="10" height="10" rx="2"/><rect class="cell" x="316" y="108" width="10" height="10" rx="2"/>
+        <text class="trace on" x="40" y="136"><tspan class="fail">✗</tspan> tick 18, assertion failed, trace 0x8b…31</text>
+      </g>
+      <g class="run">
+        <text class="dim" x="0" y="166">run 2</text>
+        <rect class="cell on" x="40" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="52" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="64" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="76" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="88" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="100" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="112" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="124" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="136" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="148" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="160" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="172" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="184" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="196" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="208" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="220" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="232" y="156" width="10" height="10" rx="2"/><rect class="cell on" x="244" y="156" width="10" height="10" rx="2"/><rect class="cell hit on" x="256" y="156" width="10" height="10" rx="2"/><rect class="cell" x="268" y="156" width="10" height="10" rx="2"/><rect class="cell" x="280" y="156" width="10" height="10" rx="2"/><rect class="cell" x="292" y="156" width="10" height="10" rx="2"/><rect class="cell" x="304" y="156" width="10" height="10" rx="2"/><rect class="cell" x="316" y="156" width="10" height="10" rx="2"/>
+        <text class="trace on" x="40" y="184"><tspan class="fail">✗</tspan> tick 18, assertion failed, trace 0x8b…31</text>
+      </g>
+      <text class="verdict on" x="0" y="214"><tspan class="pass">✓</tspan> reproduced: same tick, same trace</text>
+    </svg>
+    <figcaption>Illustrative; the real thing is on the <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/testing.md">testing page</a>.</figcaption>
+  </figure>
 </section>
 
 <main>

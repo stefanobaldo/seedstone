@@ -169,6 +169,32 @@ def check_no_version_literal():
     else:
         ok("no version literal", "in the install section")
 
+ANIM_BUDGET = 30 * 1024
+ANIM_SVG = re.compile(r'<svg[^>]*\baria-labelledby="anim-title"[^>]*>.*?</svg>', re.S)
+ANIM_CSS = re.compile(r"/\* anim \*/.*?/\* /anim \*/", re.S)
+
+def check_animation():
+    """The hero animation — the inline SVG, its driver and its CSS block —
+    carries an accessible name and stays under its own budget."""
+    svg = ANIM_SVG.search(html)
+    if not svg:
+        fail("animation", 'no inline <svg> with aria-labelledby="anim-title" on the page')
+        return
+    if 'role="img"' not in svg.group(0).split(">", 1)[0]:
+        fail("animation", 'the SVG lacks role="img"')
+        return
+    css_path, js_path = os.path.join(SITE, "assets", "site.css"), os.path.join(SITE, "assets", "hero.js")
+    block = ANIM_CSS.search(open(css_path, encoding="utf-8").read())
+    if not block:
+        fail("animation", f"no /* anim */ ... /* /anim */ block in {css_path}")
+        return
+    total = (len(svg.group(0).encode()) + len(block.group(0).encode())
+             + (os.path.getsize(js_path) if os.path.exists(js_path) else 0))
+    if total < ANIM_BUDGET:
+        ok("animation", f"{total} bytes (svg, css block, hero.js), budget {ANIM_BUDGET}")
+    else:
+        fail("animation", f"{total} bytes (svg, css block, hero.js), budget {ANIM_BUDGET}")
+
 def check_budget(referenced):
     files = {INDEX, *referenced}
     for path in list(files):
@@ -190,6 +216,7 @@ check_mark()
 check_charts()
 check_fast_sentence()
 check_no_version_literal()
+check_animation()
 check_budget(referenced)
 sys.exit(status)
 PY

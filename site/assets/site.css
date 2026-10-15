@@ -151,3 +151,37 @@ footer nav { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; margin-bottom:
   .ways { grid-template-columns: 1fr; gap: 0.25rem; }
   .ways dd { margin-bottom: 1rem; }
 }
+
+/* anim */
+/* The hero animation: a seed, three clients, two runs. The markup is the
+   final frame — every cell, chip, trace and the verdict carry `on` — so the
+   picture is complete with no script and under reduced motion; hero.js
+   strips the classes and puts them back, tick by tick. */
+.anim-figure { margin: 2rem 0 0; max-width: 34rem; }
+.anim {
+  display: block;
+  width: 100%;
+  height: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  fill: currentColor;
+  --cell-on: var(--face);
+  --fail: #e5484d;
+  --pass: #3fb950;
+}
+@media (prefers-color-scheme: light) {
+  .anim { --cell-on: #c9d1d9; --fail: #cf222e; --pass: #1a7f37; }
+}
+.anim .seed { fill: var(--amber); }
+.anim .dim { fill: var(--muted); }
+.anim .cell { fill: none; stroke: var(--rule); stroke-width: 1; transition: fill 0.12s, stroke 0.12s; }
+.anim .cell.on { fill: var(--cell-on); stroke: var(--cell-on); }
+.anim .cell.hit.on { fill: var(--fail); stroke: var(--fail); }
+.anim .chip, .anim .trace, .anim .verdict { opacity: 0; transition: opacity 0.2s; }
+.anim .chip.on, .anim .trace.on, .anim .verdict.on { opacity: 1; }
+.anim .chip rect { fill: var(--bg-raised); stroke: var(--rule); }
+.anim .chip text, .anim .trace { font-size: 10px; }
+.anim .fail { fill: var(--fail); }
+.anim .pass { fill: var(--pass); }
+.anim-figure figcaption { color: var(--muted); font-size: 0.85rem; margin-top: 0.5rem; }
+/* /anim */
