@@ -1,0 +1,130 @@
+/* The page's style. Dark by default, in the slate of the mark; the light
+   scheme follows the reader's setting. Amber is kept for the seed and the
+   one thing on the screen the eye should go to. */
+
+@font-face {
+  font-family: Inter;
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(inter-400.woff2) format("woff2");
+}
+@font-face {
+  font-family: Inter;
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url(inter-700.woff2) format("woff2");
+}
+
+:root {
+  color-scheme: dark light;
+  --rim: #1f2831;
+  --face: #3a4756;
+  --amber: #f0a030;
+  --highlight: #ffc45c;
+
+  --bg: #12181e;
+  --bg-raised: var(--rim);
+  --text: #e6edf3;
+  --muted: #9aa7b4;
+  --rule: #2c3845;
+  --link: var(--text);
+
+  --sans: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #ffffff;
+    --bg-raised: #f6f8fa;
+    --text: #1f2328;
+    --muted: #59636e;
+    --rule: #d0d7de;
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  background: var(--bg);
+  color: var(--text);
+  font: 400 1rem/1.55 var(--sans);
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  padding: 0 16px;
+}
+
+body > * {
+  max-width: 68rem;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+h1, h2 { font-weight: 700; line-height: 1.15; letter-spacing: -0.01em; }
+h1 { font-size: clamp(1.8rem, 5vw, 2.75rem); margin: 0 0 1rem; }
+h2 { font-size: clamp(1.35rem, 3vw, 1.75rem); margin: 0 0 0.75rem; }
+p { margin: 0 0 1rem; }
+
+a { color: var(--link); text-decoration: underline; text-underline-offset: 0.15em; }
+a:hover { color: var(--highlight); }
+
+code, pre, kbd { font-family: var(--mono); font-size: 0.925em; }
+pre { margin: 0; overflow-x: auto; }
+img, svg, picture { max-width: 100%; height: auto; }
+
+/* The header: the mark and the name. */
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem 0;
+}
+.brand { display: inline-flex; align-items: center; gap: 0.6rem; text-decoration: none; font-weight: 700; font-size: 1.2rem; }
+.brand .mark { flex: none; width: 2rem; height: 2rem; }
+.top nav { display: flex; gap: 1rem; flex-wrap: wrap; }
+
+/* The hero. */
+.hero { padding: 2rem 0 3rem; }
+.lede { font-size: 1.15rem; max-width: 46rem; color: var(--text); }
+
+.copy {
+  display: flex;
+  align-items: stretch;
+  gap: 0.5rem;
+  max-width: 40rem;
+  margin: 1.5rem 0 0.5rem;
+  padding: 0.75rem 1rem;
+  background: var(--bg-raised);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+}
+.copy pre { flex: 1 1 auto; min-width: 0; align-self: center; }
+.copy-button {
+  flex: none;
+  font: 700 0.9rem var(--sans);
+  color: var(--rim);
+  background: var(--amber);
+  border: 0;
+  border-radius: 6px;
+  padding: 0.4rem 0.8rem;
+  cursor: pointer;
+}
+.copy-button:hover, .copy-button:focus-visible { background: var(--highlight); }
+
+.fine { color: var(--muted); font-size: 0.9rem; }
+
+main section { padding: 2.5rem 0; border-top: 1px solid var(--rule); }
+footer { padding: 2rem 0 3rem; border-top: 1px solid var(--rule); color: var(--muted); font-size: 0.9rem; }
+
+@media (max-width: 480px) {
+  .copy { flex-direction: column; }
+  .copy pre { align-self: stretch; }
+}

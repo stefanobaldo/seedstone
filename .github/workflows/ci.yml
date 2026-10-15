@@ -60,6 +60,9 @@ jobs:
       # The logo and the favicon are emitted from the mark's four shapes and
       # never edited; this regenerates them and refuses a byte of difference.
       - run: python3 -I scripts/brand.py --selftest && python3 -I scripts/brand.py --check
+      # The site's page: every link resolves, the metadata is there, the
+      # page and what it references stay under their byte budget.
+      - run: bash scripts/check-site.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # `--workspace` unifies Cargo features across every crate in the build, so
       # the features the simulator turns on leak into the production crates and

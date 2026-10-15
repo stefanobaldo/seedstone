@@ -1,0 +1,13 @@
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Frame-Options: DENY
+
+# The installer is read in a browser as often as it is piped to a shell,
+# and a fix to it must reach users in minutes.
+/install.sh
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: max-age=300
+
+/assets/*
+  Cache-Control: max-age=31536000, immutable
