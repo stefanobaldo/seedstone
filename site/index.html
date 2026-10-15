@@ -13,7 +13,7 @@
 <meta property="og:image" content="https://seedstone.io/assets/social.png">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="color-scheme" content="dark light">
-<meta name="theme-color" content="#12181e" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#10161c" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
@@ -25,15 +25,16 @@
 <noscript><style>.copy-button{display:none}</style></noscript>
 </head>
 <body>
+<div class="backdrop" aria-hidden="true"><i class="glow g1"></i><i class="glow g2"></i><i class="glow g3"></i></div>
 
 <header class="top">
-  <a class="brand" href="/">
-    <svg class="mark" width="64" height="64" viewBox="0 0 64 64" aria-hidden="true">
+  <a class="brand" href="/" aria-label="seedstone, home">
+    <span class="mark"><svg viewBox="0 0 64 64" aria-hidden="true">
 <circle cx="32" cy="32" r="28" fill="#1f2831"/>
 <circle cx="32" cy="30" r="26" fill="#3a4756"/>
 <path d="M32 15 C26 25 21 30 21 37 A11 11 0 0 0 43 37 C43 30 38 25 32 15 Z" fill="#f0a030"/>
 <path d="M32 15 C26 25 21 30 21 37 A11 11 0 0 0 29 47 C24 42 24 36 32 26 Z" fill="#ffc45c"/>
-    </svg>
+</svg></span>
     <span class="name">seedstone</span>
   </a>
   <nav aria-label="Site">
@@ -46,13 +47,16 @@
 <main>
 <section class="hero">
   <div class="hero-text">
-  <h1><span>Proves it is correct.</span> <span>Measures that it is fast.</span></h1>
-  <p class="lede">An in-memory key-value store that speaks the Redis protocol, written from scratch in Rust. Every run is a deterministic simulation, so a concurrency bug reproduces from its seed, byte for byte; on the same machine it reads ahead of Redis on throughput in 12 of 13 measured pairs, with the method beside the number.</p>
-  <div class="copy">
-    <pre><code>curl -fsSL https://seedstone.io/install.sh | sh</code></pre>
-    <button type="button" class="copy-button" data-copy="curl -fsSL https://seedstone.io/install.sh | sh">Copy</button>
-  </div>
-  <p class="fine">macOS and Linux, x86_64 and arm64. Verifies the release's SHA-256 before installing. Read it first: <a href="/install.sh">install.sh</a>.</p>
+    <h1><span>Proves it is correct.</span> <span>Measures that it is fast.</span></h1>
+    <p class="lede">An in-memory key-value store that speaks the Redis protocol. Deterministic by construction, benchmarked with the method beside every number.</p>
+    <ul class="pills" aria-label="In short">
+      <li>Rust</li><li>RESP2</li><li>Apache-2.0 / MIT</li><li>single binary</li>
+    </ul>
+    <div class="copy">
+      <pre><code>curl -fsSL https://seedstone.io/install.sh | sh</code></pre>
+      <button type="button" class="copy-button" data-copy="curl -fsSL https://seedstone.io/install.sh | sh">Copy</button>
+    </div>
+    <p class="fine">macOS and Linux, x86_64 and arm64. Verifies the release's SHA-256 before installing. Read it first: <a href="/install.sh">install.sh</a>.</p>
   </div>
   <figure class="anim-figure">
     <svg class="anim" role="img" aria-labelledby="anim-title" viewBox="0 0 336 226">
@@ -84,8 +88,9 @@
     </svg>
     <figcaption>Illustrative; the real thing is on the <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/testing.md">testing page</a>.</figcaption>
   </figure>
-  <aside class="card proof" aria-labelledby="keys-label">
+  <aside class="proof" aria-labelledby="keys-label">
     <p class="label" id="keys-label">Fast · KEYS over 7 000 keys, ops/s</p>
+    <div class="proof-body">
     <p class="factor-line"><span class="factor" data-cell="keys-7000" data-pair="redis-iot1">5.16×</span> <span class="factor-what">the throughput of Redis on a page cache's walk</span></p>
     <div class="bars">
       <div class="bar me" data-cell="keys-7000" data-arm="seedstone" style="--w: 100%"><span class="arm">seedstone</span><span class="figure">3 537</span></div>
@@ -94,13 +99,15 @@
       <div class="bar" data-cell="keys-7000" data-arm="valkey-iot1" style="--w: 19.8%"><span class="arm">Valkey</span><span class="figure">701</span></div>
       <div class="bar" data-cell="keys-7000" data-arm="redis-iot1" style="--w: 19.4%"><span class="arm">Redis</span><span class="figure">686</span></div>
     </div>
+    </div>
     <p class="src">Same machine, same client, median of three · every cell and the method: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/benchmarks.md">benchmarks →</a></p>
   </aside>
 </section>
 
   <section id="install">
-    <h2>Install</h2>
-    <p>Every way in; the binary is the same on each. The packages start a service on loopback. After Homebrew or Cargo, start the server with <code>seedstone</code>.</p>
+    <p class="eyebrow">Install</p>
+    <h2 class="claim">One line. Or any of five others.</h2>
+    <p class="line">Every way in; the binary is the same on each. The packages start a service on loopback. After Homebrew or Cargo, start the server with <code>seedstone</code>.</p>
     <dl class="ways">
       <dt>One line</dt>
       <dd><pre><code>curl -fsSL https://seedstone.io/install.sh | sh</code></pre><span class="note">macOS and Linux. Verifies the release's SHA-256, installs the binary, nothing else.</span></dd>
@@ -115,7 +122,7 @@
       <dt>Kubernetes</dt>
       <dd><pre><code>helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --set auth.noAuth=true</code></pre><span class="note"><a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#kubernetes-helm">The chart</a>, and what <code>auth.noAuth</code> says.</span></dd>
     </dl>
-    <p>Then, with any client:</p>
+    <p class="line">Then, with any client:</p>
 <pre class="console"><code>$ redis-cli
 127.0.0.1:6379&gt; set greeting hello ex 60
 OK
@@ -123,53 +130,81 @@ OK
 (integer) 60
 127.0.0.1:6379&gt; get greeting
 "hello"</code></pre>
-    <p>Every channel, with checksums, the packaged defaults and the service units: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md">docs/install.md</a>.</p>
+    <p class="src">Every channel, with checksums, the packaged defaults and the service units: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md">docs/install.md</a></p>
   </section>
 
   <section id="correct">
-    <h2>Correct</h2>
-    <p>The whole server runs inside a deterministic simulation: a virtual clock, a simulated network, scheduled clients. Every completed command is folded into a trace hash that is a function of two seeds and nothing else, so a concurrency bug is reproduced from its seed, in a fresh process, byte for byte.</p>
-    <p>CI sweeps seeds on every code change, and proves the machinery on fourteen defects planted in the server itself: each has to be caught by the counter that owns it.</p>
-    <p>How it is built and how it is tested: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/testing.md">docs/testing.md</a>.</p>
+    <p class="eyebrow">Correct</p>
+    <h2 class="claim">The same seed, the same bug. Every time.</h2>
+    <p class="line">The whole server runs inside a deterministic simulation: a virtual clock, a simulated network, scheduled clients. Every completed command is folded into a trace hash that is a function of two seeds and nothing else, so a concurrency bug is reproduced from its seed, in a fresh process, byte for byte.</p>
+    <p class="line">CI sweeps seeds on every code change, and proves the machinery on fourteen defects planted in the server itself: each has to be caught by the counter that owns it.</p>
+    <p class="src">How it is built and how it is tested: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/testing.md">docs/testing.md</a></p>
   </section>
 
   <section id="fast">
-    <h2>Fast</h2>
-    <p>Every cell at every pipeline depth, the CPU per operation, the method fixed before the run, and what the numbers do not say: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/benchmarks.md">docs/benchmarks.md</a>.</p>
+    <p class="eyebrow">Fast</p>
+    <h2 class="claim">Ahead of Redis where a cache lives.</h2>
+    <p class="line">Same machine, same client, median of three runs, throughput in operations per second.</p>
+    <p class="src">Every cell at every pipeline depth, the CPU per operation, the method fixed before the run, and what the numbers do not say: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/benchmarks.md">docs/benchmarks.md</a></p>
   </section>
 
   <section id="operated">
-    <h2>Operated</h2>
-    <p><code>INFO</code> in sections that carry only what the node can state truthfully; one JSON line per event; a password that rotates without a restart; a disk that fails or fills met with refusal, not with acknowledgements the node cannot keep. A stock Prometheus exporter scrapes it in CI.</p>
-    <p>Flags, output, signals, the password, persistence and <code>INFO</code>: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/operations.md">docs/operations.md</a>.</p>
+    <p class="eyebrow">Operated</p>
+    <h2 class="claim">Says only what it can state truthfully.</h2>
+    <p class="line"><code>INFO</code> in sections that carry only what the node can state truthfully; one JSON line per event; a password that rotates without a restart; a disk that fails or fills met with refusal, not with acknowledgements the node cannot keep. A stock Prometheus exporter scrapes it in CI.</p>
+    <p class="src">Flags, output, signals, the password, persistence and <code>INFO</code>: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/operations.md">docs/operations.md</a></p>
   </section>
 
-  <section id="production">
-    <h2>In production</h2>
-    <p><code>0.x</code>: the keyspace holds strings, and this server has been a Django application's production cache since August 2026, without issues: 88 million commands in its first week, 147 clients at peak.</p>
+  <section id="compatibility">
+    <p class="eyebrow">Compatibility</p>
+    <h2 class="claim">A named list. Nothing answered approximately.</h2>
+    <p class="line">RESP2 over TCP, so <code>redis-cli</code> and the ordinary client libraries connect unmodified. The surface is a named list, chosen for the workloads this server targets: <strong>strings</strong>; <strong>keys and expiry</strong>; <strong>server</strong>; <strong>persistence</strong>. Anything outside the list is refused with an error naming the command, never answered approximately.</p>
+    <p class="line">Not here yet: other data types, RESP3, replication, clustering, transactions, scripting. Next: hashes, lists, sets and sorted sets, Pub/Sub, RESP3.</p>
+    <p class="src">Every command, every option, every refusal and every deliberate difference from Redis: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/compatibility.md">docs/compatibility.md</a></p>
   </section>
 
-  <section id="speaks">
-    <h2>What it speaks, and what it does not</h2>
-    <p>RESP2 over TCP, so <code>redis-cli</code> and the ordinary client libraries connect unmodified. The surface is a named list, chosen for the workloads this server targets: <strong>strings</strong>; <strong>keys and expiry</strong>; <strong>server</strong>; <strong>persistence</strong>. Anything outside the list is refused with an error naming the command, never answered approximately.</p>
-    <p>Not here yet: other data types, RESP3, replication, clustering, transactions, scripting. Next: hashes, lists, sets and sorted sets, Pub/Sub, RESP3.</p>
-    <p>Every command, every option, every refusal and every deliberate difference from Redis: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/compatibility.md">docs/compatibility.md</a>.</p>
+  <section id="start">
+    <p class="eyebrow">Get started</p>
+    <div class="two">
+      <div>
+        <h2 class="claim">Try it in the time it takes to read the script.</h2>
+        <p class="line">The installer is the only thing between you and a running server, and it is meant to be read.</p>
+      </div>
+      <div class="card">
+        <div class="copy">
+          <pre><code>curl -fsSL https://seedstone.io/install.sh | sh</code></pre>
+          <button type="button" class="copy-button" data-copy="curl -fsSL https://seedstone.io/install.sh | sh">Copy</button>
+        </div>
+        <p class="fine">Verifies the SHA-256 first · <a href="/install.sh">read install.sh</a> · or <a href="https://github.com/stefanobaldo/seedstone">star it on GitHub</a></p>
+      </div>
+    </div>
   </section>
 </main>
 
 <footer>
-  <nav aria-label="Documentation">
-    <a href="https://github.com/stefanobaldo/seedstone">GitHub</a>
-    <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md">Install</a>
-    <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/operations.md">Operations</a>
-    <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/compatibility.md">Compatibility</a>
-    <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/benchmarks.md">Benchmarks</a>
-    <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/testing.md">Testing</a>
-    <a href="https://github.com/stefanobaldo/seedstone/blob/main/CHANGELOG.md">Changelog</a>
-  </nav>
-  <p>Dual-licensed under <a href="https://github.com/stefanobaldo/seedstone/blob/main/LICENSE-APACHE">Apache-2.0</a> or <a href="https://github.com/stefanobaldo/seedstone/blob/main/LICENSE-MIT">MIT</a>, at your option. "SeedStone" is a trademark — see <a href="https://github.com/stefanobaldo/seedstone/blob/main/TRADEMARK.md">TRADEMARK.md</a>.</p>
+  <a class="brand small" href="/" aria-label="seedstone, home">
+    <span class="mark"><svg viewBox="0 0 64 64" aria-hidden="true">
+<circle cx="32" cy="32" r="28" fill="#1f2831"/>
+<circle cx="32" cy="30" r="26" fill="#3a4756"/>
+<path d="M32 15 C26 25 21 30 21 37 A11 11 0 0 0 43 37 C43 30 38 25 32 15 Z" fill="#f0a030"/>
+<path d="M32 15 C26 25 21 30 21 37 A11 11 0 0 0 29 47 C24 42 24 36 32 26 Z" fill="#ffc45c"/>
+</svg></span>
+    <span class="name">seedstone</span>
+  </a>
+  <div>
+    <nav aria-label="Documentation">
+      <a href="https://github.com/stefanobaldo/seedstone">GitHub</a>
+      <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md">Install</a>
+      <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/operations.md">Operations</a>
+      <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/compatibility.md">Compatibility</a>
+      <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/benchmarks.md">Benchmarks</a>
+      <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/testing.md">Testing</a>
+      <a href="https://github.com/stefanobaldo/seedstone/blob/main/CHANGELOG.md">Changelog</a>
+    </nav>
+    <p>Dual-licensed under <a href="https://github.com/stefanobaldo/seedstone/blob/main/LICENSE-APACHE">Apache-2.0</a> or <a href="https://github.com/stefanobaldo/seedstone/blob/main/LICENSE-MIT">MIT</a>, at your option. "SeedStone" is a trademark — see <a href="https://github.com/stefanobaldo/seedstone/blob/main/TRADEMARK.md">TRADEMARK.md</a>.</p>
+  </div>
 </footer>
 
-<script src="/assets/hero.js"></script>
+<script src="/assets/site.js"></script>
 </body>
 </html>
