@@ -1241,3 +1241,29 @@ fn read_shard_zero(cfg: &SimConfig) -> std::io::Result<Pairs> {
     pairs.sort();
     Ok(pairs)
 }
+
+/// A cut shard is reported one past the position recovery resumed it at,
+/// because its `Rebase` was written there first. The check judges the
+/// resume, not the `Rebase`: a cut shard resumed at its durable point lost
+/// that record, and a clean report says nobody was told.
+#[test]
+fn a_cut_shard_resumed_at_its_durable_point_lost_that_record() {
+    let judged = |next_seq: u64, cut: bool| {
+        let shared = Shared::new(&SimConfig::mini(1, 42));
+        lock(&shared.crashes).push(CrashRecord {
+            at: Duration::ZERO,
+            durable: vec![Some((5, Duration::ZERO)); usize::from(shared.shards)],
+        });
+        let sink = HashSink::new(Arc::new(Mutex::new(TRACE_INIT)), shared.clone());
+        seedstone_core::shard::TraceSink::recovered(&sink, 0, next_seq, false, cut);
+        let tally = *lock(&shared.tally);
+        (tally.lost_durable_prefixes, tally.unreported_losses)
+    };
+    // Resumed at 5, its `Rebase` written there: record 5 is gone.
+    assert_eq!(judged(6, true), (1, 1));
+    // Resumed at 6, past the durable point: nothing durable lost.
+    assert_eq!(judged(7, true), (0, 0));
+    // Not cut: serving from 6 is resuming at 6.
+    assert_eq!(judged(6, false), (0, 0));
+    assert_eq!(judged(5, false), (1, 1));
+}
