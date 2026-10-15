@@ -157,7 +157,9 @@ pub static PASSWORD_RELOAD_SKIPPED: Event = Event {
 /// It says every way recovery can have cost records, not only a gap: a hole
 /// can swallow a shard's last records and leave no gap behind, and a
 /// segment given up whole loses whatever it held. `lossy_shards` counts the
-/// shards any of it may have touched. The last three say what the
+/// shards any of it may have touched. `torn_bytes` is the part of
+/// `damage_bytes` past the last sync the log's last segment recorded: a
+/// crash's tear, charged to no shard. The last three say what the
 /// snapshots did: how many files gave a shard its image, how many were
 /// refused, and how many files nothing used were removed. `elapsed_ms` is
 /// how long the start spent recovering the directory, in milliseconds:
@@ -177,6 +179,7 @@ pub static RECOVERY: Event = Event {
         "discarded",
         "damage_bytes",
         "holes",
+        "torn_bytes",
         "abandoned_segments",
         "malformed",
         "truncated_shards",
