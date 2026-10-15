@@ -22,7 +22,7 @@ ORIGIN = "https://seedstone.io/"
 BUDGET = 200 * 1024
 # Paths the page links before the file lands beside it; each entry leaves
 # with the change that adds its file.
-PENDING = {"install.sh"}
+PENDING = {"install.sh", "assets/social.png"}
 
 status = 0
 def ok(check, detail=""):
@@ -58,7 +58,9 @@ def anchors_of(path):
     return anchors[path]
 
 ATTR = re.compile(r"""\b(?:href|src|srcset)=["']([^"']+)["']""")
-URLS = sorted({u.strip() for m in ATTR.finditer(html) for u in m.group(1).split(",")})
+OG_IMAGE = re.compile(r"""<meta property="og:image" content="([^"]+)">""")
+URLS = sorted({u.strip() for m in ATTR.finditer(html) for u in m.group(1).split(",")}
+              | set(OG_IMAGE.findall(html)))
 
 def site_file(url):
     """A URL on this site -> its path under site/, or None if it is not one."""
@@ -79,7 +81,7 @@ def check_links():
             if path in tracked:
                 referenced.append(path)
             elif path[len(SITE) + 1:] in PENDING:
-                continue
+                continue  # not yet; checked below that it stays not-yet
             else:
                 bad.append(f"{url} -> {path} is not tracked")
         elif url.startswith(REPO):
@@ -90,10 +92,13 @@ def check_links():
                 bad.append(f"{url}: no heading for #{frag} in {target}")
         elif url.startswith("#") and f'id="{url[1:]}"' not in html:
             bad.append(f"{url}: no element with that id")
+    landed = sorted(p for p in PENDING if os.path.join(SITE, p) in tracked)
+    if landed:
+        bad.append("tracked now, so no longer pending: " + ", ".join(landed))
     if bad:
         fail("links", "; ".join(bad))
     else:
-        ok("links", f"{len(URLS)} resolve")
+        ok("links", f"{len(URLS)} resolve, {len(PENDING)} pending")
     return referenced
 
 def check_metadata():
@@ -152,6 +157,18 @@ def check_fast_sentence():
     else:
         fail("fast sentence", "the page does not carry the pair verdict verbatim")
 
+def check_no_version_literal():
+    """The install rows name no version: the page is not pinned to a commit
+    the way the README is, and a literal here goes stale at the next tag.
+    The benchmark section names the release it measured, which is a fact."""
+    start = html.index('<section id="install">')
+    install = html[start:html.index("<section", start + 1)]
+    hits = sorted(set(re.findall(r"(?<![\d.])\d+\.\d+\.\d+(?![\d.])", install)))
+    if hits:
+        fail("no version literal", "in the install section: " + ", ".join(hits))
+    else:
+        ok("no version literal", "in the install section")
+
 def check_budget(referenced):
     files = {INDEX, *referenced}
     for path in list(files):
@@ -172,6 +189,7 @@ check_no_http()
 check_mark()
 check_charts()
 check_fast_sentence()
+check_no_version_literal()
 check_budget(referenced)
 sys.exit(status)
 PY
