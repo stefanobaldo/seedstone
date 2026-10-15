@@ -15,6 +15,12 @@ SemVer and are `0.x` while the keyspace holds only strings;
   the snapshots, and replaying the log over them. A slow start shows which
   of the three to look at.
 
+- **A stop whose log could not be synced says so.** Under `--data-dir`, a
+  stop whose last sync of the log failed, or that came while writes were
+  still refused after an earlier failure, now writes `shutdown_unsynced`
+  after `stopping`. It used to end as if the log had been synced; what was
+  written since the last successful sync may not be on disk.
+
 ### Changed
 
 - **The log's segment format moves to version 4.** Under `--data-dir`, each
@@ -24,6 +30,15 @@ SemVer and are `0.x` while the keyspace holds only strings;
   starting from an empty directory.
 
 ### Fixed
+
+- **`CONFIG GET slowlog-max-len` answers.** It answered an empty array, so
+  a monitoring client that reads the slow log's capacity before it calls
+  `SLOWLOG GET` failed its run. It now answers `128`, Redis's default.
+
+- **Under `--fsync always`, a read whose key has expired is answered at
+  once.** Removing the key writes its deletion to the log, and that made
+  the read wait for the next sync, and answer with the write refusal if the
+  sync failed. Only writes wait for the sync now.
 
 - **A large damaged stretch of a log segment no longer costs the records
   after it.** Under `--data-dir`, a start steps over damage in a segment
