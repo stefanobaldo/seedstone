@@ -3,7 +3,8 @@
 # to a file this repository tracks, or to a heading on one of the
 # documentation pages — the page carries the metadata a crawler and a link
 # preview read, it names no `http://` URL, the mark it shows is the mark
-# `brand.py` holds, and the page with everything it references stays
+# `brand.py` holds, every benchmark figure it shows is the benchmark page's
+# for that cell and arm, and the page with everything it references stays
 # under its byte budget. Each check prints one `ok:` or `FAIL:` line.
 #
 # Usage: check-site.sh            (from the repository root)
@@ -20,7 +21,8 @@ sys.path.insert(0, "scripts")
 import brand
 
 SITE = "site"
-INDEX = os.path.join(SITE, "index.html")
+# A fixture may stand in for the page (the checker's own tests do that).
+INDEX = os.environ.get("CHECK_SITE_INDEX", os.path.join(SITE, "index.html"))
 REPO = "https://github.com/stefanobaldo/seedstone/blob/main/"
 ORIGIN = "https://seedstone.io/"
 BUDGET = 200 * 1024
@@ -149,33 +151,129 @@ def check_mark():
     else:
         fail("mark", "the page does not carry the mark's four shapes verbatim")
 
-FAST = ("Against Redis 8.10.0 at one I/O thread on a 16-core machine, v0.3.2 reads ahead on "
-        "throughput in 12 of 13 measured pairs, by 1.03\u00d7 to 5.16\u00d7, and more expensive per "
-        "operation in all 13.")
+BENCH = os.path.join("docs", "benchmarks.md")
+# Each cell the page may name -> the heading(s) its tables sit under on the
+# benchmark page: a `###` heading, then optionally a `####` one, each
+# matched by prefix with the backticks dropped. Under the innermost heading
+# every Markdown table until the next heading of the same or a higher level
+# counts (the main table and the *Other engines* table both), and so do the
+# `- seedstone vs <arm>:` pair lines.
+CELLS = {
+    "keys-7000": ("KEYS over 7 000 keys",),
+    "set-64-ex60-d64": ("SET 64 B, without and with", "With EX 60"),
+    "set-64-d64": ("SET 64 B, without and with", "Without EX"),
+    "mget-16-d64": ("MGET of 1, 4 and 16 keys", "16 keys"),
+    "get-64-d64": ("GET 64 B", "Depth 64"),
+}
 
-def check_charts():
-    """The charts on the page are the README's, byte for byte."""
-    bad = []
-    for name in ("benchmarks.svg", "benchmarks-dark.svg"):
-        site_copy, source = os.path.join(SITE, "assets", name), os.path.join("docs", "assets", name)
-        try:
-            same = open(site_copy, "rb").read() == open(source, "rb").read()
-        except FileNotFoundError:
-            same = False
-        if not same:
-            bad.append(f"{site_copy} is not {source}: cp {source} {site_copy}")
+def abbreviate(n):
+    """The README chart's abbreviation: three significant digits with `M`
+    and `k`; below ten thousand the table's own string."""
+    if n >= 1_000_000:
+        return f"{n / 1e6:.2f} M"
+    if n >= 10_000:
+        return f"{round(n / 1e3):.0f} k"
+    return f"{n:,}".replace(",", " ")
+
+def bench_section(headings):
+    """The text of docs/benchmarks.md under the named heading(s)."""
+    text = open(BENCH, encoding="utf-8").read()
+    for level, want in zip((3, 4), headings):
+        lines, out, inside = text.split("\n"), [], False
+        for line in lines:
+            m = re.match(r"^(#{1,6})\s+(.*)$", line)
+            if m and len(m.group(1)) <= level:
+                if inside:
+                    break
+                inside = m.group(2).replace("`", "").startswith(want) and len(m.group(1)) == level
+                continue
+            if inside:
+                out.append(line)
+        if not inside and not out:
+            return None
+        text = "\n".join(out)
+    return text
+
+def bench_cell(cell):
+    """(ops/s by arm, factor text by arm) for a cell, read from the page."""
+    text = bench_section(CELLS[cell])
+    if text is None:
+        return None, None
+    ops, factors = {}, {}
+    for line in text.split("\n"):
+        cols = [c.strip() for c in line.strip().strip("|").split("|")] if line.startswith("|") else None
+        if cols and len(cols) >= 2 and re.fullmatch(r"[\d\s]+", cols[1]):
+            ops[cols[0]] = int(re.sub(r"\D", "", cols[1]))
+        m = re.match(r"- seedstone vs ([\w-]+): (?:ahead|behind) ([\d.]+)x on throughput", line)
+        if m:
+            factors[m.group(1)] = m.group(2) + "\u00d7"
+    return ops, factors
+
+ELEMENT = re.compile(r"<(\w+)\b([^>]*\bdata-cell=\"[^\"]*\"[^>]*)>(.*?)</\1>", re.S)
+def attrs_of(s):
+    return dict(re.findall(r"""\b([\w-]+)=["']([^"']*)["']""", s))
+def text_of(s):
+    """Tags dropped, whitespace folded: the table's thousands separator is a
+    narrow no-break space (U+202F), and the page's may be any space that
+    keeps a figure from wrapping; both read as one plain space here."""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", s)).strip()
+
+def check_figures():
+    """Every benchmark figure the page shows is bound to its cell and its
+    arm (`data-cell`, `data-arm`), every factor to its cell and the arm it
+    is against (`data-pair`), and each matches the benchmark page's table
+    for exactly that cell and arm, abbreviated as the README's chart does.
+    A bar's width (`--w`) is its figure's share of the cell's largest shown
+    figure, so a bar cannot say one thing and its text another."""
+    bad, figures, factors = [], 0, 0
+    if re.search(r"benchmarks(-dark)?\.svg", html):
+        bad.append("the page references the README's chart")
+    per_cell = {}
+    for el in ELEMENT.finditer(html):
+        attrs, inner = attrs_of(el.group(2)), el.group(3)
+        cell = attrs["data-cell"]
+        if cell not in CELLS:
+            bad.append(f"data-cell={cell!r} is not a cell this check knows ({', '.join(CELLS)})")
+            continue
+        if cell not in per_cell:
+            per_cell[cell] = bench_cell(cell)
+        ops, pairs = per_cell[cell]
+        if ops is None:
+            bad.append(f"{cell}: no heading {CELLS[cell]} in {BENCH}")
+            continue
+        fig = re.search(r"<(\w+)\b[^>]*\bclass=\"[^\"]*\bfigure\b[^\"]*\"[^>]*>(.*?)</\1>", inner, re.S)
+        shown = text_of(fig.group(2) if fig else inner)
+        if "data-arm" in attrs:
+            arm = attrs["data-arm"]
+            if arm not in ops:
+                bad.append(f"{cell}: no row for arm {arm!r}")
+                continue
+            want = abbreviate(ops[arm])
+            if shown != want:
+                bad.append(f"{cell} {arm}: the page says {shown!r}, the table {want!r}")
+            m = re.search(r"--w:\s*([\d.]+)%", attrs.get("style", ""))
+            if m:
+                shown_arms = [a for _, s2, _ in ELEMENT.findall(html) for a in [attrs_of(s2)]
+                              if a.get("data-cell") == cell and "data-arm" in a and "--w" in a.get("style", "")]
+                top = max(ops[a["data-arm"]] for a in shown_arms if a["data-arm"] in ops)
+                want_w = 100 * ops[arm] / top
+                if abs(float(m.group(1)) - want_w) > 0.5:
+                    bad.append(f"{cell} {arm}: bar width {m.group(1)}%, the figure's share is {want_w:.1f}%")
+            figures += 1
+        elif "data-pair" in attrs:
+            arm = attrs["data-pair"]
+            if arm not in pairs:
+                bad.append(f"{cell}: no pair line with a factor against {arm!r}")
+                continue
+            if shown != pairs[arm]:
+                bad.append(f"{cell} vs {arm}: the page says {shown!r}, the pair line {pairs[arm]!r}")
+            factors += 1
+        else:
+            bad.append(f"{cell}: an element with data-cell but neither data-arm nor data-pair")
     if bad:
-        fail("charts", "; ".join(bad))
+        fail("figures", "; ".join(bad))
     else:
-        ok("charts", "both copies identical to docs/assets")
-
-def check_fast_sentence():
-    """The benchmark verdict is the benchmark page's sentence, not a paraphrase."""
-    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", html))
-    if FAST in text:
-        ok("fast sentence", "verbatim")
-    else:
-        fail("fast sentence", "the page does not carry the pair verdict verbatim")
+        ok("figures", f"{figures} figures, {factors} factors")
 
 def check_no_version_literal():
     """The install rows name no version: the page is not pinned to a commit
@@ -234,8 +332,7 @@ check_metadata()
 check_landmarks()
 check_no_http()
 check_mark()
-check_charts()
-check_fast_sentence()
+check_figures()
 check_no_version_literal()
 check_animation()
 check_budget(referenced)
