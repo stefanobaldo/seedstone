@@ -14,6 +14,7 @@ use std::future::Future;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// A sync that completes later: the executor's, issued and awaited beside
 /// the batches that follow it.
@@ -142,24 +143,29 @@ pub trait Disk {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StdDisk;
 
-impl LogFile for std::fs::File {
+/// The real file, shared: the writer appends through one handle while a
+/// sync in flight holds another to the same open file, so issuing a sync
+/// costs a reference count rather than a duplicated descriptor.
+impl LogFile for Arc<std::fs::File> {
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        Write::write_all(self, bytes)
+        // `Write` is implemented for `&File`: appending needs no exclusive
+        // handle, which is what lets a sync share this one.
+        let mut file: &std::fs::File = self;
+        Write::write_all(&mut file, bytes)
     }
 
     fn sync_data(&mut self) -> io::Result<()> {
-        Self::sync_data(self)
+        std::fs::File::sync_data(self)
     }
 
-    /// `fdatasync` on tokio's blocking pool, over a duplicate descriptor:
-    /// the executor keeps appending to the page cache through its own
+    /// `fdatasync` on tokio's blocking pool, over the shared file: the
+    /// writer keeps appending to the page cache through its own handle
     /// while the kernel flushes, and a flush covers everything written
     /// before it was asked for, which is all the caller accounts for.
     fn sync_later(&self) -> SyncFuture {
-        let handle = self.try_clone();
+        let file = Self::clone(self);
         Box::pin(async move {
-            let handle = handle?;
-            tokio::task::spawn_blocking(move || handle.sync_data())
+            tokio::task::spawn_blocking(move || std::fs::File::sync_data(&file))
                 .await
                 .map_err(|join| {
                     io::Error::other(format!("the sync thread did not finish: {join}"))
@@ -169,7 +175,7 @@ impl LogFile for std::fs::File {
 }
 
 impl Disk for StdDisk {
-    type File = std::fs::File;
+    type File = Arc<std::fs::File>;
     type ReadFile = std::fs::File;
 
     fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
@@ -200,6 +206,7 @@ impl Disk for StdDisk {
             .append(true)
             .create(true)
             .open(path)
+            .map(Arc::new)
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Self::ReadFile> {
