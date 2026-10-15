@@ -6,7 +6,7 @@ use crate::log::effect::Effect;
 use crate::log::file::tests::restamped;
 use crate::log::file::{
     FORMAT_VERSION, GENERATION_FILE, SEGMENT_HEADER_LEN, create_segment, encode_segment_header,
-    segment_name,
+    encode_sync_mark, segment_name,
 };
 use crate::log::snapshot::{Footer, SnapshotHeader, encode_entry, snapshot_name};
 use crate::log::{Record, encode_record};
@@ -1456,4 +1456,101 @@ fn a_version_3_segment_is_recovered() {
     let recovery = recover(spec(&disk, 1)).unwrap();
     assert_eq!(contents(&recovery.shards[0].dict), pairs(&[(b"a", b"1")]));
     assert!(!recovery.shards[0].lossy);
+}
+
+/// A sync mark, written and synced as the writer writes one.
+fn write_mark(file: &mut MemFile) {
+    let mut bytes = Vec::new();
+    encode_sync_mark(&mut bytes);
+    file.write_all(&bytes).unwrap();
+    file.sync_data().unwrap();
+}
+
+/// Restamps generation 1's first segment to `version`, its header's CRC
+/// made to match: the same records, as a build of that version wrote them.
+fn restamp_segment(disk: &MemDisk, version: u8) {
+    let path = Path::new("/data/wal").join(segment_name(1, 0));
+    let mut bytes = disk.contents(&path);
+    let header = restamped(&bytes[..SEGMENT_HEADER_LEN], version);
+    bytes[..SEGMENT_HEADER_LEN].copy_from_slice(&header);
+    disk.write_file(&path, &bytes).unwrap();
+}
+
+/// `a`, a mark, `b`: what the writer leaves when a sync is issued between
+/// two records of shard 0 and 1.
+fn two_records_around_a_mark(disk: &MemDisk) {
+    let mut seg = wal(disk, 1);
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    write_mark(&mut seg);
+    write(&mut seg, 1, 0, &put(b"b", b"1"));
+}
+
+#[test]
+fn a_sync_mark_in_a_version_5_segment_is_stepped_over_and_counted_nowhere() {
+    let disk = MemDisk::default();
+    two_records_around_a_mark(&disk);
+    let recovery = recover(spec(&disk, 2)).unwrap();
+    assert_eq!(
+        (
+            recovery.report.records,
+            recovery.report.malformed,
+            recovery.report.applied
+        ),
+        (2, 0, 2)
+    );
+    assert!(
+        recovery
+            .shards
+            .iter()
+            .all(|shard| !shard.lossy && !shard.cut)
+    );
+}
+
+#[test]
+fn a_sync_mark_in_a_version_4_segment_is_malformed_as_before() {
+    // Version 4 reserved nothing: the record is one of a shard outside the
+    // node, read and counted malformed as any such record is, and charged
+    // to no shard.
+    let disk = MemDisk::default();
+    two_records_around_a_mark(&disk);
+    restamp_segment(&disk, 4);
+    let recovery = recover(spec(&disk, 2)).unwrap();
+    assert_eq!(
+        (
+            recovery.report.records,
+            recovery.report.malformed,
+            recovery.report.applied
+        ),
+        (3, 1, 2)
+    );
+    assert!(
+        recovery
+            .shards
+            .iter()
+            .all(|shard| !shard.lossy && !shard.cut)
+    );
+}
+
+#[test]
+fn a_version_4_segment_is_recovered() {
+    // The layout this one shares, written by the build before the marks:
+    // the cut points are read and the records replay as before.
+    let disk = MemDisk::default();
+    let dir = Path::new("/data/wal");
+    disk.create_dir_all(dir).unwrap();
+    let mut seg = create_segment(&disk, dir, 1, 0, &[(1, 0)]).unwrap();
+    write(&mut seg, 0, 0, &put(b"a", b"1"));
+    let mut rebase = Vec::new();
+    Effect::Rebase.encode(&mut rebase);
+    write(&mut seg, 1, 0, &rebase);
+    let path = dir.join(segment_name(1, 0));
+    let mut bytes = disk.contents(&path);
+    let fixed = restamped(&bytes[..SEGMENT_HEADER_LEN], 4);
+    bytes[..SEGMENT_HEADER_LEN].copy_from_slice(&fixed);
+    disk.write_file(&path, &bytes).unwrap();
+
+    let recovery = recover(spec(&disk, 2)).unwrap();
+    assert_eq!(recovery.report.malformed, 0);
+    assert_eq!(contents(&recovery.shards[0].dict), pairs(&[(b"a", b"1")]));
+    assert!(recovery.shards.iter().all(|shard| !shard.lossy));
 }

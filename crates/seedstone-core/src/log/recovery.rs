@@ -93,13 +93,17 @@
 //! A segment whose header names a format version above this build's is
 //! refused, and the node does not start: that is not damage, it is a
 //! downgrade, and guessing at it would be worse than stopping. One whose
-//! version is below this build's is refused too: the directory was written
-//! by an earlier build, and reading its files as damage would charge a loss
-//! to every shard instead of saying what they are. A header
-//! that is short, carries the wrong magic or fails its checksum is damage:
-//! the segment is abandoned and counted, and every shard is marked lossy,
-//! because a loss nobody can attribute to a shard is a possible loss for
-//! all of them.
+//! version is below the oldest this build reads is refused too: the
+//! directory was written by an earlier build, and reading its files as
+//! damage would charge a loss to every shard instead of saying what they
+//! are. Versions 3 and 4 are read: 3 lists no cut points, and neither
+//! carries a sync mark. From version 5 the writer appends a mark before
+//! every sync it issues — a record of no shard, stepped over and counted
+//! nowhere; in an older file such a record is malformed, as it always was.
+//! A header that is short, carries the wrong magic or fails its checksum
+//! is damage: the segment is abandoned and counted, and every shard is
+//! marked lossy, because a loss nobody can attribute to a shard is a
+//! possible loss for all of them.
 
 use std::io;
 use std::path::Path;
@@ -111,7 +115,10 @@ use tokio::time::Instant;
 use crate::dict::{Dict, DictSeed, Entry, shard_seed};
 use crate::log::disk::Disk;
 use crate::log::effect::{Effect, Owned};
-use crate::log::file::{HeaderError, parse_name, parse_segment_name, read_segment_header};
+use crate::log::file::{
+    HeaderError, SYNC_MARK_SHARD, SYNC_MARK_VERSION, parse_name, parse_segment_name,
+    read_segment_header,
+};
 use crate::log::reader::{Item, Reader};
 use crate::log::snapshot::{FOOTER_SHARD, Footer, SnapshotHeader, parse_snapshot_name};
 use crate::shard::{Now, Replayed, replay_into};
@@ -476,6 +483,8 @@ struct Scan {
     /// Per segment file: damage was met reading it. Such a file is never
     /// garbage: see [`remove_garbage`].
     unread: Vec<bool>,
+    /// The layout version of the segment being read.
+    version: u8,
 }
 
 impl Scan {
@@ -491,6 +500,7 @@ impl Scan {
             last_hole: None,
             unattributed_loss: false,
             unread: vec![false; files],
+            version: 0,
         }
     }
 
@@ -558,6 +568,7 @@ impl Scan {
                 cuts.push((file.generation, *seq));
             }
         }
+        self.version = header.version;
         let body_len = len.saturating_sub(header.len as u64);
         let mut reader = Reader::new(src, body_len, mode);
         let mut holes = 0;
@@ -619,8 +630,15 @@ impl Scan {
         }
     }
 
-    /// One intact record, bucketed by shard.
+    /// One intact record, bucketed by shard. A sync mark is no shard's
+    /// record: it is stepped over and counted nowhere.
     fn item(&mut self, item: &Item, generation: u64, file: usize) {
+        if item.shard == SYNC_MARK_SHARD
+            && self.version >= SYNC_MARK_VERSION
+            && item.payload.is_empty()
+        {
+            return;
+        }
         self.report.records += 1;
         let at = self.position;
         self.position += 1;
