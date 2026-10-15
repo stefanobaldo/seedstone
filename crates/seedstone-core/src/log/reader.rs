@@ -18,7 +18,9 @@
 //! checksummed, and the bytes checksummed while resynchronising after one
 //! hole are capped at [`RESYNC_CAP`] — past it the rest of the *segment*
 //! is given up, and counted, rather than the process grinding for hours on
-//! adversarial payload bytes.
+//! adversarial payload bytes. The cap ends at a candidate's boundary: the
+//! one that crosses it is still checksummed whole, because it may be the
+//! record the hole ends at.
 //!
 //! The reader reads in chunks of [`READ_CHUNK`] rather than the whole file,
 //! and that is not an optimisation: the simulator corrupts reads per call,
@@ -40,11 +42,13 @@ pub const READ_CHUNK: usize = 64 * 1024;
 /// How many bytes may be checksummed while resynchronising after one hole
 /// before the rest of the segment is given up.
 ///
-/// Four megabytes of candidates is seconds of work; unbounded it is the
-/// O(N²) grind `Decoded::Corrupt` warns of. A record longer than this
-/// after a hole is lost; one that long is a value near the codec's bulk
-/// ceiling, sitting right behind damage, and losing it is what the shard's
-/// gap rule already prices.
+/// The cap is spent by whole candidates. One that begins with the hole at
+/// or under the cap is checksummed whatever it declares — it may be the
+/// intact record the hole ends at, and refusing it would give up every
+/// record after it untried — and the first one after the hole has gone
+/// past the cap is refused. So a hole checksums at most this plus one
+/// body of [`MAX_BODY_LEN`]: seconds of work, where unbounded it is the
+/// O(N²) grind `Decoded::Corrupt` warns of.
 pub const RESYNC_CAP: u64 = 4 * 1024 * 1024;
 
 /// How a reader treats damage.
@@ -101,8 +105,8 @@ pub struct Reader<R: Read> {
     /// marker, so it ends the segment honestly only if nothing intact
     /// follows it; then the damage is put back as it was.
     hole_at_end: Option<Damage>,
-    /// Bytes this hole may still checksum; see [`RESYNC_CAP`].
-    budget: u64,
+    /// Bytes this hole has checksummed; see [`RESYNC_CAP`].
+    spent: u64,
     damage: Damage,
 }
 
@@ -128,7 +132,7 @@ impl<R: Read> Reader<R> {
             resynchronising: false,
             hole_at_tail: None,
             hole_at_end: None,
-            budget: RESYNC_CAP,
+            spent: 0,
             damage: Damage::default(),
         }
     }
@@ -173,7 +177,7 @@ impl<R: Read> Reader<R> {
                     self.resynchronising = false;
                     self.hole_at_tail = None;
                     self.hole_at_end = None;
-                    self.budget = RESYNC_CAP;
+                    self.spent = 0;
                     return Ok(Some(item));
                 }
                 Decoded::EndOfLog => {
@@ -233,14 +237,21 @@ impl<R: Read> Reader<R> {
         }
     }
 
-    /// Spends `declared` checksummed bytes of this hole's budget, or gives
-    /// up on the rest of the segment when the budget cannot cover them.
+    /// Counts `declared` checksummed bytes against this hole, or gives up
+    /// on the rest of the segment when the hole had already gone past
+    /// [`RESYNC_CAP`] before this candidate.
     const fn charge(&mut self, declared: u64) {
-        if declared > self.budget {
+        if self.overdrawn() {
             self.damage.abandoned = true;
         } else {
-            self.budget -= declared;
+            self.spent = self.spent.saturating_add(declared);
         }
+    }
+
+    /// Whether this hole has checksummed past [`RESYNC_CAP`]: the next
+    /// candidate is refused. A hole exactly at the cap is not.
+    const fn overdrawn(&self) -> bool {
+        self.spent > RESYNC_CAP
     }
 
     /// The segment ran out. A hole that began at an end marker, with
@@ -262,8 +273,8 @@ impl<R: Read> Reader<R> {
     }
 
     /// A short read while resynchronising: decide whether the candidate at
-    /// the cursor can be completed within the segment and the budget, and
-    /// either pull it in or step past it. The budget is charged when the
+    /// the cursor can be completed within the segment and the cap, and
+    /// either pull it in or step past it. The cap is charged when the
     /// candidate is checksummed, not here.
     fn resync_short_read(&mut self) -> io::Result<()> {
         let window = &self.buf[self.at..];
@@ -283,7 +294,7 @@ impl<R: Read> Reader<R> {
             self.step(1);
             return Ok(());
         }
-        if declared > self.budget {
+        if self.overdrawn() {
             self.damage.abandoned = true;
             return Ok(());
         }
@@ -326,7 +337,7 @@ impl<R: Read> Reader<R> {
 
 /// The body length `decode_record` will checksum for the candidate at the
 /// start of `window`, if it gets that far: a magic byte, a plausible length,
-/// and the whole body present. What the resynchronisation budget is spent on.
+/// and the whole body present. What the resynchronisation cap is spent on.
 fn checksummed_len(window: &[u8]) -> Option<u64> {
     if window.first() != Some(&MAGIC) || window.len() < HEADER_LEN {
         return None;
@@ -521,25 +532,69 @@ mod tests {
         assert_eq!(damage.holes, 1);
     }
 
-    #[test]
-    fn resynchronisation_gives_up_on_a_segment_past_its_budget() {
-        // A run of fake headers each claiming a body that is present, so
-        // every candidate is checksummed: the budget is spent and the
-        // segment is abandoned, counted, without the intact record after
-        // the run being reached.
-        let mut buf = Vec::new();
+    /// `holes` candidates of a hole, each a plausible header whose 1 KiB
+    /// body is present and fails its checksum, then a record too long for
+    /// one chunk and a short one: the long one is read with a short read,
+    /// which is where the budget is consulted before it is checksummed.
+    fn after_a_hole(candidates: usize, chunk: usize) -> (Vec<(u16, u64, Vec<u8>)>, Damage) {
         let claimed = 1024u32;
-        let candidates = usize::try_from(RESYNC_CAP / u64::from(claimed)).unwrap() + 2;
+        let mut buf = Vec::new();
         for _ in 0..candidates {
             buf.push(crate::log::MAGIC);
             buf.extend_from_slice(&claimed.to_le_bytes());
             buf.extend_from_slice(&[0u8; 4]);
         }
         buf.extend(vec![0x5A; 2048]);
-        buf.extend(record(1, 0, b"unreachable"));
+        buf.extend(record(1, 0, &[0xAB; 10_000]));
+        buf.extend(record(1, 1, b"after"));
         buf.push(END_OF_LOG);
-        let (items, damage) = scan(&buf, ReaderMode::Resynchronising, 4096);
-        assert!(items.is_empty());
-        assert!(damage.abandoned);
+        scan(&buf, ReaderMode::Resynchronising, chunk)
+    }
+
+    /// Candidates of 1 KiB that spend exactly the cap.
+    fn at_the_cap() -> usize {
+        usize::try_from(RESYNC_CAP / 1024).unwrap()
+    }
+
+    #[test]
+    fn a_record_that_straddles_the_cap_is_checksummed() {
+        // The hole leaves a kilobyte of budget and the record after it
+        // declares ten: it begins inside the budget, so it is tried — it is
+        // where the hole ends — and every record after it is kept.
+        for chunk in [64, 4096] {
+            let (items, damage) = after_a_hole(at_the_cap() - 1, chunk);
+            assert_eq!(items.len(), 2, "chunk {chunk}");
+            assert_eq!(items[1], (1, 1, b"after".to_vec()), "chunk {chunk}");
+            assert_eq!(
+                (damage.holes, damage.abandoned),
+                (1, false),
+                "chunk {chunk}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hole_that_spends_exactly_the_cap_keeps_the_record_after_it() {
+        for chunk in [64, 4096] {
+            let (items, damage) = after_a_hole(at_the_cap(), chunk);
+            assert_eq!(items.len(), 2, "chunk {chunk}");
+            assert_eq!(
+                (damage.holes, damage.abandoned),
+                (1, false),
+                "chunk {chunk}"
+            );
+        }
+    }
+
+    #[test]
+    fn resynchronisation_gives_up_on_a_segment_past_its_budget() {
+        // One candidate past the cap: it begins at the cap, so it is
+        // checksummed and overdraws the hole, and the next one — the intact
+        // record — is refused with the rest of the segment, counted.
+        for chunk in [64, 4096] {
+            let (items, damage) = after_a_hole(at_the_cap() + 1, chunk);
+            assert!(items.is_empty(), "chunk {chunk}");
+            assert!(damage.abandoned, "chunk {chunk}");
+        }
     }
 }
