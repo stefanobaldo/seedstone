@@ -16,6 +16,10 @@
 //! arrives while it is in flight is written and waits for the next round.
 //! On completion each executor is told `Durable` through its frozen batch:
 //! a sync covers what was written when it was issued, nothing after.
+//! Before every sync it issues — the round's, a rotation's, the stop's and
+//! the start path's — the writer appends a sync mark, so the sync covers
+//! the mark: a start can then tell a crash's torn tail, past the last mark,
+//! from damage to bytes a sync was issued over.
 //!
 //! **The budget.** An executor counts the bytes it has handed over and not
 //! yet seen written, and stops reading its inbox above [`WRITER_BUDGET`].
@@ -41,7 +45,7 @@ use crate::log::checkpoint::CheckpointConfig;
 use crate::log::disk::{Disk, LogFile, SyncFuture};
 use crate::log::effect::Effect;
 use crate::log::file::{
-    Segment, create_segment, parse_segment_name, segment_header_len, segment_name,
+    Segment, create_segment, encode_sync_mark, parse_segment_name, segment_header_len, segment_name,
 };
 use crate::log::recovery::RecoveredShard;
 use crate::log::snapshot::parse_snapshot_name;
@@ -360,6 +364,10 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         if !self.segment.dirty {
             return Ok(());
         }
+        if let Err(error) = self.mark() {
+            self.segment.sync_failed = true;
+            return Err(error);
+        }
         if let Err(error) = self.segment.file.sync_data() {
             self.segment.sync_failed = true;
             return Err(error);
@@ -481,6 +489,10 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
         if now.saturating_duration_since(self.issued_at) < interval {
             return;
         }
+        if let Err(error) = self.mark() {
+            self.fail(LogFault::Write, &error);
+            return;
+        }
         self.segment.dirty = false;
         self.round += 1;
         let frozen: Vec<Option<u64>> = self.lanes.iter().map(|lane| lane.written).collect();
@@ -492,6 +504,16 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
             // The plant: answered at the issue, before anything is on disk.
             self.report_durable(&frozen);
         }
+    }
+
+    /// Appends a sync mark to the open segment: the sync about to be issued
+    /// covers it. Counted toward the rotation's size and no executor's lane.
+    fn mark(&mut self) -> io::Result<()> {
+        let mut mark = Vec::new();
+        encode_sync_mark(&mut mark);
+        self.segment.file.write_all(&mark)?;
+        self.segment.bytes_written += mark.len() as u64;
+        Ok(())
     }
 
     fn sync_done(&mut self, result: io::Result<()>) {
@@ -603,6 +625,10 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
     /// directory are synced before the swap.
     async fn rotate(&mut self) -> bool {
         if self.segment.dirty && !self.segment.sync_failed {
+            if let Err(error) = self.mark() {
+                self.fail(LogFault::Write, &error);
+                return false;
+            }
             if let Err(error) = self.segment.file.sync_later().await {
                 self.fail(LogFault::Sync, &error);
                 return false;
@@ -649,17 +675,21 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
             self.settle(frozen, result);
         }
         if self.segment.dirty && !self.segment.sync_failed {
-            self.round += 1;
-            self.trace.sync_issued(self.round);
-            let frozen: Vec<Option<u64>> = self.lanes.iter().map(|lane| lane.written).collect();
-            let result = self.segment.file.sync_later().await;
-            self.trace.sync_settled(self.round);
-            match result {
-                Ok(()) => {
-                    self.segment.dirty = false;
-                    self.report_durable(&frozen);
+            if let Err(error) = self.mark() {
+                self.fail(LogFault::Write, &error);
+            } else {
+                self.round += 1;
+                self.trace.sync_issued(self.round);
+                let frozen: Vec<Option<u64>> = self.lanes.iter().map(|lane| lane.written).collect();
+                let result = self.segment.file.sync_later().await;
+                self.trace.sync_settled(self.round);
+                match result {
+                    Ok(()) => {
+                        self.segment.dirty = false;
+                        self.report_durable(&frozen);
+                    }
+                    Err(error) => self.fail(LogFault::Sync, &error),
                 }
-                Err(error) => self.fail(LogFault::Sync, &error),
             }
         }
         for lane in &self.lanes {
