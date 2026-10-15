@@ -47,8 +47,10 @@ if (anim && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
     lane.querySelector(".trace").classList.add("on");
   };
 
+  // Three times through, then the picture rests on its final frame, which
+  // is what the markup already is after the third verdict.
   (async () => {
-    for (;;) {
+    for (let round = 0; round < 3; round++) {
       clear(anim);
       clock.textContent = "t = 0.000 s";
       await sleep(600);

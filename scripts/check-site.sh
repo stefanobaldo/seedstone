@@ -126,6 +126,16 @@ def check_metadata():
     else:
         ok("metadata")
 
+def check_landmarks():
+    """The headline and the install line are inside <main>: a reader who
+    jumps to the main landmark lands on them, not past them."""
+    main = html.find("<main>")
+    h1 = html.find("<h1")
+    if 0 <= main < h1 and html.find("</main>") > h1:
+        ok("landmarks", "the h1 is inside main")
+    else:
+        fail("landmarks", "the h1 is not inside <main>")
+
 def check_no_http():
     hits = sorted(set(re.findall(r"http://[^\s\"'<)]+", html)))
     if hits:
@@ -221,6 +231,7 @@ def check_budget(referenced):
 
 referenced = check_links()
 check_metadata()
+check_landmarks()
 check_no_http()
 check_mark()
 check_charts()
