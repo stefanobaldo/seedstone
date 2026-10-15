@@ -541,6 +541,11 @@ async fn an_executor_whose_writer_is_gone_refuses_writes_for_good() {
     tick(16).await;
     assert_eq!(pool.dispatch(set(b"k", b"v")).await, refused());
     assert_eq!(pool.dispatch(get(b"k")).await, Reply::Bulk(None));
+    assert_eq!(
+        pool.shutdown().await,
+        Shutdown::Unsynced,
+        "a stop with no writer synced nothing"
+    );
 }
 
 /// A stop hands what is queued to the writer and waits for its last sync
@@ -559,6 +564,22 @@ async fn shutdown_syncs_what_was_written_under_every_policy() {
             policy.name()
         );
     }
+}
+
+/// A writer that goes during the stop, before its last sync answers,
+/// proved nothing: the stop says the log did not end synced.
+#[tokio::test(start_paused = true)]
+async fn a_writer_gone_during_the_stop_leaves_the_log_unsynced() {
+    let (links, mut to_writer, progress) = fake_links(1);
+    let pool = pool_with_links(SyncPolicy::INTERVAL, links);
+    assert_eq!(pool.dispatch(set(b"k", b"v")).await, Reply::Ok);
+    let stopping = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.shutdown().await }
+    });
+    while !matches!(to_writer.recv().await, Some(ToWriter::Stop { .. })) {}
+    drop(progress);
+    assert_eq!(stopping.await.unwrap(), Shutdown::Unsynced);
 }
 
 /// A writer that never answers the stop does not hold the process
@@ -666,7 +687,8 @@ async fn a_full_disk_refuses_writes_and_a_snapshot_resumes_them() {
 }
 
 /// A stop whose last sync fails answers what it held with the refusal,
-/// not as a success no sync stands behind.
+/// not as a success no sync stands behind, and says so itself: the stop
+/// did not sync the log.
 #[tokio::test(start_paused = true)]
 async fn a_stop_whose_last_sync_fails_answers_its_held_writes_with_the_refusal() {
     let (disk, pool) = disk_pool(SyncPolicy::ALWAYS, NoTrace);
@@ -692,7 +714,7 @@ async fn a_stop_whose_last_sync_fails_answers_its_held_writes_with_the_refusal()
     });
     assert_eq!(first.await.unwrap(), Reply::Ok);
     assert_eq!(second.await.unwrap(), refused());
-    assert_eq!(stopping.await.unwrap(), Shutdown::Clean);
+    assert_eq!(stopping.await.unwrap(), Shutdown::Unsynced);
 }
 
 /// A shard reported lossy at the start stops being so once an image of it

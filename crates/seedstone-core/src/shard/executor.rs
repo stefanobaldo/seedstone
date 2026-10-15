@@ -369,11 +369,13 @@ pub struct ExecutorSpec<T, L, P, C> {
 ///
 /// Returns when the pool is shut down or the inbox closes, which happens
 /// once the last [`ShardPool`] handle is dropped — after serving what was
-/// queued and waiting for the writer's last sync, either way.
+/// queued and waiting for the writer's last sync, either way — and returns
+/// whether the executor ended with its log intact: `false` when that sync
+/// failed, or when it was still refusing writes for an earlier failure.
 pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint>(
     spec: ExecutorSpec<T, L, P, C>,
     mut inbox: mpsc::UnboundedReceiver<Envelope>,
-) {
+) -> bool {
     let (mut this, mut stop) = Executor::new(spec);
     let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
     // A shard that fell behind resumes at its normal spacing instead of firing
@@ -495,7 +497,7 @@ pub async fn run_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Ch
             _ = stop.changed() => break,
         }
     }
-    this.stop(&mut inbox).await;
+    this.stop(&mut inbox).await
 }
 
 /// The writer's next word, or a future that never completes when there is
@@ -580,7 +582,10 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
     /// everything appended is handed to the writer, and the writer's last
     /// sync is waited for; nothing is held. Under every policy — under
     /// `never`, that sync is the one the log ever gets.
-    async fn stop(&mut self, inbox: &mut mpsc::UnboundedReceiver<Envelope>) {
+    ///
+    /// Whether the log ended intact: a failure the stop's sync met, or one
+    /// a snapshot had not yet recovered from, leaves the executor refusing.
+    async fn stop(&mut self, inbox: &mut mpsc::UnboundedReceiver<Envelope>) -> bool {
         // Nothing new is accepted; what was already sent is answered.
         inbox.close();
         while let Ok(envelope) = inbox.try_recv() {
@@ -591,7 +596,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         let Some(executor) = self.sync.link.as_ref().map(|link| link.executor) else {
             let released = self.sync.release_through(self.sync.batch);
             self.trace.held_answered(self.first_shard, released, false);
-            return;
+            return !self.sync.is_refusing();
         };
         if let Some(link) = &self.sync.link {
             let _ = link.to_writer.send(ToWriter::Stop { executor });
@@ -599,7 +604,14 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         while let Some(link) = self.sync.link.as_mut() {
             let next = link.progress.recv().await;
             match next {
-                Some(Progress::Stopped) | None => break,
+                Some(Progress::Stopped) => break,
+                // The writer went before its last sync answered: nothing
+                // was proven, as when it goes while serving.
+                None => {
+                    self.sync.link = None;
+                    self.sync.writer_lost = true;
+                    self.refuse();
+                }
                 Some(message) => self.progress(message),
             }
         }
@@ -612,6 +624,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         if failed > 0 {
             self.trace.held_answered(self.first_shard, failed, true);
         }
+        !self.sync.is_refusing()
     }
 
     /// Hands every owned shard's buffer to the staging buffer; per shard

@@ -28,8 +28,8 @@ use seedstone_resp::{Frame, encode};
 use seedstone_service::log::{
     COMPACTION, Event, FSYNC_IGNORED, Field, LOG_FAULT, PASSWORD_RELOAD_FAILED,
     PASSWORD_RELOAD_SKIPPED, PASSWORD_RELOADED, RECOVERY, RECOVERY_FAILED, RECOVERY_TRUNCATED,
-    REFUSAL_ENDED, SHUTDOWN_TIMEOUT, SNAPSHOT, SNAPSHOT_FAULT, STOPPING, SYNC_SLOW,
-    SYNC_SLOW_ENDED, line,
+    REFUSAL_ENDED, SHUTDOWN_TIMEOUT, SHUTDOWN_UNSYNCED, SNAPSHOT, SNAPSHOT_FAULT, STOPPING,
+    SYNC_SLOW, SYNC_SLOW_ENDED, line,
 };
 use seedstone_service::{NodeInfo, PasswordStore, Passwords, Secret, serve_connection};
 use tokio::io::AsyncWriteExt;
@@ -603,8 +603,10 @@ impl Server {
         // The executors answer what they had queued and sync the log before
         // the runtime is dropped under them: a rollout must not lose what
         // only a crash would.
-        if self.pool.shutdown().await == Shutdown::TimedOut {
-            emit(&SHUTDOWN_TIMEOUT, &[]);
+        match self.pool.shutdown().await {
+            Shutdown::Clean => {}
+            Shutdown::Unsynced => emit(&SHUTDOWN_UNSYNCED, &[]),
+            Shutdown::TimedOut => emit(&SHUTDOWN_TIMEOUT, &[]),
         }
     }
 }

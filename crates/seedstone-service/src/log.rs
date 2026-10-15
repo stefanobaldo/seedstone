@@ -115,6 +115,17 @@ pub static SHUTDOWN_TIMEOUT: Event = Event {
     fields: &[],
 };
 
+/// The stop finished in time, and the log did not end synced.
+///
+/// The stop's last sync failed, or the node was still refusing writes after
+/// an earlier failure (`log_fault` came first). `warn`, as `shutdown_timeout`
+/// is: what was written since the last successful sync may not be on disk.
+pub static SHUTDOWN_UNSYNCED: Event = Event {
+    name: "shutdown_unsynced",
+    level: Level::Warn,
+    fields: &[],
+};
+
 /// `SIGHUP` re-read the password file and the new set is in force.
 pub static PASSWORD_RELOADED: Event = Event {
     name: "password_reloaded",
@@ -289,6 +300,7 @@ pub static EVENTS: &[&Event] = &[
     &ERROR_REPLY,
     &STOPPING,
     &SHUTDOWN_TIMEOUT,
+    &SHUTDOWN_UNSYNCED,
     &PASSWORD_RELOADED,
     &PASSWORD_RELOAD_FAILED,
     &PASSWORD_RELOAD_SKIPPED,
