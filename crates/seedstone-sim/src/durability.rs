@@ -114,11 +114,22 @@ impl ReplicationLog for Observed {
 
     /// The durable point, dated at the instant the writer issued `round`:
     /// what was handed over by then is what it covered.
+    ///
+    /// Only a point that rose is dated. The inner log never lowers its
+    /// point, so a round that covered nothing above it — one after a
+    /// snapshot raised the point, or after a failure — reports the same
+    /// sequence again, and re-dating it to this round would move the
+    /// instant it became durable later than it did.
     fn sync_completed(&mut self, through: Option<u64>, round: u64) -> Option<u64> {
         let durable = self.inner.sync_completed(through, round);
         if let Some(seq) = durable {
             let issued_at = self.run.round_issued_at(round);
-            lock(&self.run.durable)[usize::from(self.shard)] = Some((seq, issued_at));
+            let mut points = lock(&self.run.durable);
+            let slot = &mut points[usize::from(self.shard)];
+            if slot.is_none_or(|(point, _)| point < seq) {
+                *slot = Some((seq, issued_at));
+            }
+            drop(points);
             self.forget_through(seq);
         }
         durable
