@@ -84,6 +84,18 @@
     </svg>
     <figcaption>Illustrative; the real thing is on the <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/testing.md">testing page</a>.</figcaption>
   </figure>
+  <aside class="card proof" aria-labelledby="keys-label">
+    <p class="label" id="keys-label">Fast · KEYS over 7 000 keys, ops/s</p>
+    <p class="factor-line"><span class="factor" data-cell="keys-7000" data-pair="redis-iot1">5.16×</span> <span class="factor-what">the throughput of Redis on a page cache's walk</span></p>
+    <div class="bars">
+      <div class="bar me" data-cell="keys-7000" data-arm="seedstone" style="--w: 100%"><span class="arm">seedstone</span><span class="figure">3 537</span></div>
+      <div class="bar" data-cell="keys-7000" data-arm="dragonfly" style="--w: 60.4%"><span class="arm">Dragonfly</span><span class="figure">2 137</span></div>
+      <div class="bar" data-cell="keys-7000" data-arm="garnet" style="--w: 42.9%"><span class="arm">Garnet</span><span class="figure">1 517</span></div>
+      <div class="bar" data-cell="keys-7000" data-arm="valkey-iot1" style="--w: 19.8%"><span class="arm">Valkey</span><span class="figure">701</span></div>
+      <div class="bar" data-cell="keys-7000" data-arm="redis-iot1" style="--w: 19.4%"><span class="arm">Redis</span><span class="figure">686</span></div>
+    </div>
+    <p class="src">Same machine, same client, median of three · every cell and the method: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/benchmarks.md">benchmarks →</a></p>
+  </aside>
 </section>
 
   <section id="install">
@@ -123,14 +135,6 @@ OK
 
   <section id="fast">
     <h2>Fast</h2>
-    <figure class="chart">
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="/assets/benchmarks-dark.svg">
-        <img src="/assets/benchmarks.svg" width="960" height="534" alt="Throughput of seedstone against Redis, Valkey, Dragonfly and Garnet on four cells">
-      </picture>
-      <figcaption>Four of the cells, throughput only, rendered from the raw logs by the harness itself: <code>v0.3.2</code> on a GCP <code>c4a-standard-16</code>, against Redis 8.10.0, Valkey 9.1.1, Dragonfly <code>df-v1.40.2</code> and Garnet 2.1.5.</figcaption>
-    </figure>
-    <p>Against Redis 8.10.0 at one I/O thread on a 16-core machine, <code>v0.3.2</code> reads ahead on throughput in 12 of 13 measured pairs, by 1.03× to 5.16×, and more expensive per operation in all 13.</p>
     <p>Every cell at every pipeline depth, the CPU per operation, the method fixed before the run, and what the numbers do not say: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/benchmarks.md">docs/benchmarks.md</a>.</p>
   </section>
 
