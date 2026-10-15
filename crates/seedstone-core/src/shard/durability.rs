@@ -107,8 +107,9 @@ pub struct Held {
     pub batch: u64,
     pub to: ReplyTo,
     pub replies: Vec<Reply>,
-    /// Per reply, whether its command appended to the log: what the
-    /// refusal replaces if the sync behind the batch fails.
+    /// Per reply, whether its command wrote the log — a write that
+    /// appended, not a read that appended the deletion of an expired key:
+    /// what the refusal replaces if the sync behind the batch fails.
     pub wrote: Vec<bool>,
 }
 

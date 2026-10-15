@@ -948,7 +948,10 @@ fn one_seed_per_durability_policy_is_pinned() {
     //
     // Re-pinned, all three, when a segment's header began to carry its
     // generation's cut points: two bytes more in every file.
-    const HOSTILE_1_3_ALWAYS: u64 = 0x0fef_2205_5718_d984;
+    //
+    // Re-pinned, `always` alone, when a read that expires its key stopped
+    // being held for the sync: its reply leaves at once.
+    const HOSTILE_1_3_ALWAYS: u64 = 0xfa19_9cea_9957_eb17;
     const HOSTILE_1_3_INTERVAL: u64 = 0x5345_6cc1_7a2c_95af;
     const HOSTILE_1_3_NEVER: u64 = 0xbec3_f534_69c7_7058;
     for (policy, pinned) in [
