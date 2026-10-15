@@ -7,6 +7,10 @@
 # under its byte budget. Each check prints one `ok:` or `FAIL:` line.
 #
 # Usage: check-site.sh            (from the repository root)
+#
+# The budget counts the first load: the page and what the browser fetches
+# to show it. A link the reader may follow and the image a link preview
+# fetches are not in it.
 set -euo pipefail
 
 python3 -I - <<'PY'
@@ -22,7 +26,7 @@ ORIGIN = "https://seedstone.io/"
 BUDGET = 200 * 1024
 # Paths the page links before the file lands beside it; each entry leaves
 # with the change that adds its file.
-PENDING = {"install.sh", "assets/social.png"}
+PENDING = {"install.sh"}
 
 status = 0
 def ok(check, detail=""):
@@ -61,6 +65,11 @@ ATTR = re.compile(r"""\b(?:href|src|srcset)=["']([^"']+)["']""")
 OG_IMAGE = re.compile(r"""<meta property="og:image" content="([^"]+)">""")
 URLS = sorted({u.strip() for m in ATTR.finditer(html) for u in m.group(1).split(",")}
               | set(OG_IMAGE.findall(html)))
+# What a browser fetches to show the page: `src`, `srcset` and `<link href>`
+# (stylesheet, icons, preloads). An `<a href>` is a navigation and the
+# `og:image` a crawler's fetch; neither is in the first load the budget bounds.
+LOADED = re.compile(r"""<(?:link|img|source|script)\b[^>]*?\b(?:href|src|srcset)=["']([^"']+)["']""")
+LOADED_URLS = {u.strip() for m in LOADED.finditer(html) for u in m.group(1).split(",")}
 
 def site_file(url):
     """A URL on this site -> its path under site/, or None if it is not one."""
@@ -79,7 +88,8 @@ def check_links():
         path = site_file(url)
         if path is not None:
             if path in tracked:
-                referenced.append(path)
+                if url in LOADED_URLS:
+                    referenced.append(path)
             elif path[len(SITE) + 1:] in PENDING:
                 continue  # not yet; checked below that it stays not-yet
             else:
