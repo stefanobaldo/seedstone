@@ -25,6 +25,14 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ### Fixed
 
+- **A large damaged stretch of a log segment no longer costs the records
+  after it.** Under `--data-dir`, a start steps over damage in a segment
+  and checks what it finds there, up to a bounded amount of work per
+  damaged stretch. A record that began within that bound but ran past it
+  was given up untried, and with it the rest of the segment. Such a record
+  is now checked whole; only the next one past the bound gives up the
+  segment, as before.
+
 - **A start no longer serves records discarded at an earlier start when
   damage hides where they were discarded.** Under `--data-dir`, a start
   that cuts a damaged shard writes a record marking the older records past
