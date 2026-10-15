@@ -29,7 +29,7 @@
 
 <header class="top">
   <a class="brand" href="/" aria-label="seedstone, home">
-    <span class="mark"><svg viewBox="0 0 64 64" aria-hidden="true">
+    <span class="mark"><svg width="48" height="48" viewBox="0 0 64 64" aria-hidden="true">
 <circle cx="32" cy="32" r="28" fill="#1f2831"/>
 <circle cx="32" cy="30" r="26" fill="#3a4756"/>
 <path d="M32 15 C26 25 21 30 21 37 A11 11 0 0 0 43 37 C43 30 38 25 32 15 Z" fill="#f0a030"/>
@@ -49,7 +49,7 @@
   <div class="hero-text">
     <h1><span>Proves it is correct.</span> <span>Measures that it is fast.</span></h1>
     <p class="lede">An in-memory key-value store that speaks the Redis protocol. Deterministic by construction, benchmarked with the method beside every number.</p>
-    <ul class="pills" aria-label="In short">
+    <ul class="pills" role="list" aria-label="In short">
       <li>Rust</li><li>RESP2</li><li>Apache-2.0 / MIT</li><li>single binary</li>
     </ul>
     <div class="copy">
@@ -88,20 +88,20 @@
     </svg>
     <figcaption>Illustrative; the real thing is on the <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/testing.md">testing page</a>.</figcaption>
   </figure>
-  <aside class="proof" aria-labelledby="keys-label">
+  <section class="card proof" aria-labelledby="keys-label">
     <p class="label" id="keys-label">Fast · KEYS over 7 000 keys, ops/s</p>
     <div class="proof-body">
     <p class="factor-line"><span class="factor" data-cell="keys-7000" data-pair="redis-iot1">5.16×</span> <span class="factor-what">the throughput of Redis on a page cache's walk</span></p>
-    <div class="bars">
-      <div class="bar me" data-cell="keys-7000" data-arm="seedstone" style="--w: 100%"><span class="arm">seedstone</span><span class="figure">3 537</span></div>
-      <div class="bar" data-cell="keys-7000" data-arm="dragonfly" style="--w: 60.4%"><span class="arm">Dragonfly</span><span class="figure">2 137</span></div>
-      <div class="bar" data-cell="keys-7000" data-arm="garnet" style="--w: 42.9%"><span class="arm">Garnet</span><span class="figure">1 517</span></div>
-      <div class="bar" data-cell="keys-7000" data-arm="valkey-iot1" style="--w: 19.8%"><span class="arm">Valkey</span><span class="figure">701</span></div>
-      <div class="bar" data-cell="keys-7000" data-arm="redis-iot1" style="--w: 19.4%"><span class="arm">Redis</span><span class="figure">686</span></div>
-    </div>
+    <ul class="bars" role="list" aria-label="Operations per second by engine">
+      <li class="bar me" data-cell="keys-7000" data-arm="seedstone" style="--w: 100%"><span class="arm">seedstone</span><span class="figure">3 537</span></li>
+      <li class="bar" data-cell="keys-7000" data-arm="dragonfly" style="--w: 60.4%"><span class="arm">Dragonfly</span><span class="figure">2 137</span></li>
+      <li class="bar" data-cell="keys-7000" data-arm="garnet" style="--w: 42.9%"><span class="arm">Garnet</span><span class="figure">1 517</span></li>
+      <li class="bar" data-cell="keys-7000" data-arm="valkey-iot1" style="--w: 19.8%"><span class="arm">Valkey</span><span class="figure">701</span></li>
+      <li class="bar" data-cell="keys-7000" data-arm="redis-iot1" style="--w: 19.4%"><span class="arm">Redis</span><span class="figure">686</span></li>
+    </ul>
     </div>
     <p class="src">Same machine, same client, median of three · every cell and the method: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/benchmarks.md">benchmarks →</a></p>
-  </aside>
+  </section>
 </section>
 
   <section id="install">
@@ -183,7 +183,7 @@ OK
 
 <footer>
   <a class="brand small" href="/" aria-label="seedstone, home">
-    <span class="mark"><svg viewBox="0 0 64 64" aria-hidden="true">
+    <span class="mark"><svg width="32" height="32" viewBox="0 0 64 64" aria-hidden="true">
 <circle cx="32" cy="32" r="28" fill="#1f2831"/>
 <circle cx="32" cy="30" r="26" fill="#3a4756"/>
 <path d="M32 15 C26 25 21 30 21 37 A11 11 0 0 0 43 37 C43 30 38 25 32 15 Z" fill="#f0a030"/>
