@@ -951,9 +951,14 @@ fn one_seed_per_durability_policy_is_pinned() {
     //
     // Re-pinned, `always` alone, when a read that expires its key stopped
     // being held for the sync: its reply leaves at once.
-    const HOSTILE_1_3_ALWAYS: u64 = 0xfa19_9cea_9957_eb17;
-    const HOSTILE_1_3_INTERVAL: u64 = 0x5345_6cc1_7a2c_95af;
-    const HOSTILE_1_3_NEVER: u64 = 0xbec3_f534_69c7_7058;
+    //
+    // Re-pinned, all three, when the writer began to write a mark before
+    // every sync it issues: one write more per round, and one more draw
+    // from the hostile disk. `never` moved too — its rotations and its stop
+    // sync, and mark. `MINI_1_42` held still.
+    const HOSTILE_1_3_ALWAYS: u64 = 0x4f45_206b_8b58_28d7;
+    const HOSTILE_1_3_INTERVAL: u64 = 0x8e8b_9c96_57c2_2b6c;
+    const HOSTILE_1_3_NEVER: u64 = 0x15e9_5840_7c1c_c8c4;
     for (policy, pinned) in [
         (SyncPolicy::ALWAYS, HOSTILE_1_3_ALWAYS),
         (SyncPolicy::INTERVAL, HOSTILE_1_3_INTERVAL),

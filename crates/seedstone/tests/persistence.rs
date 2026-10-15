@@ -1399,7 +1399,7 @@ async fn a_cut_start_that_cannot_open_its_log_reports_the_cut_then_fails() {
     let older = wal.join(&segments[0]);
     let good = std::fs::read(&older).unwrap();
     let mut bad = good.clone();
-    let middle = bad.len() / 2;
+    let middle = data_record_at(&good, good.len() / 2);
     bad[middle] ^= 0xFF;
     std::fs::write(&older, &bad).unwrap();
 
@@ -1451,6 +1451,27 @@ async fn a_cut_start_that_cannot_open_its_log_reports_the_cut_then_fails() {
     std::fs::remove_dir_all(&dir).unwrap();
     std::fs::remove_file(&stderr).unwrap();
     std::fs::remove_file(&failed_err).unwrap();
+}
+
+/// The middle of the first key's record in `segment` that ends past
+/// `from`: a byte whose damage costs a shard a record, not one inside a
+/// sync mark, which belongs to no shard.
+fn data_record_at(segment: &[u8], from: usize) -> usize {
+    use seedstone_core::log::file::{SYNC_MARK_SHARD, decode_segment_header};
+    use seedstone_core::log::{Decoded, decode_record};
+    let mut at = decode_segment_header(segment).unwrap().len;
+    loop {
+        let Decoded::Record {
+            shard, consumed, ..
+        } = decode_record(&segment[at..])
+        else {
+            panic!("no key's record past byte {from}")
+        };
+        if shard != SYNC_MARK_SHARD && at + consumed > from {
+            return at + consumed / 2;
+        }
+        at += consumed;
+    }
 }
 
 /// A start with nothing cut writes nothing but its segment's header and
