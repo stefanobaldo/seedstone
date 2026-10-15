@@ -85,12 +85,14 @@ pub trait TraceSink: Clone + Send + 'static {
     /// and `lossy` says whether damage on disk could have cost this shard
     /// records — a hole or a cut tail in a segment its executor wrote, or a
     /// segment that could not be read at all. A gap in an otherwise intact
-    /// log is reported as a truncation but does not set it.
+    /// log is reported as a truncation but does not set it. `cut` says the
+    /// shard's prefix was cut: its `Rebase` was written at the position
+    /// recovery resumed it at, so `next_seq` is one past that.
     ///
     /// A default that does nothing, so a sink that folds commands need not
     /// know a restart exists. The simulator's does: two runs that recovered
     /// different prefixes are different runs.
-    fn recovered(&self, _shard: u16, _next_seq: u64, _lossy: bool) {}
+    fn recovered(&self, _shard: u16, _next_seq: u64, _lossy: bool, _cut: bool) {}
 
     /// Called when a shard's log could not be written or synced on a tick.
     ///

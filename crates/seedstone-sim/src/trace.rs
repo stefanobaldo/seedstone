@@ -64,8 +64,9 @@ impl HashSink {
     /// start replays it. Its report then excuses nothing the next start
     /// loses and leaves the durable points as they were — honoured, it
     /// would hide exactly the loss of a start that destroyed what it cut.
+    /// `next_seq` is what recovery returned: no `Rebase` is counted in it.
     pub fn failed_start(&self, shard: u16, next_seq: u64, lossy: bool, rebase_written: bool) {
-        self.judge_recovery(shard, next_seq, lossy, rebase_written);
+        self.judge_recovery(shard, next_seq, next_seq, lossy, rebase_written);
     }
 
     /// Folded: two runs that recovered different prefixes are different
@@ -74,7 +75,13 @@ impl HashSink {
     /// invariant the log makes, measured on the server's own numbers.
     /// `stands` is false for a start that failed before its cut could
     /// persist: judged, but neither an excuse nor a new durable point.
-    fn judge_recovery(&self, shard: u16, next_seq: u64, lossy: bool, stands: bool) {
+    ///
+    /// `resumed` is where recovery resumed the shard and `next_seq` where it
+    /// serves from; they differ by the `Rebase` of a cut shard. The loss is
+    /// judged on the first — a shard resumed one short of its durable point
+    /// lost that record, whatever its `Rebase` was written over — and the
+    /// new durable point is the second, because the `Rebase` is synced.
+    fn judge_recovery(&self, shard: u16, resumed: u64, next_seq: u64, lossy: bool, stands: bool) {
         // A new process: whatever its predecessor was refusing, it is not.
         self.shared.set_refusing(shard, false);
         {
@@ -116,11 +123,11 @@ impl HashSink {
         let reported = {
             let mut reports = lock(&self.shared.reported_lossy);
             let report = &mut reports[usize::from(shard)];
-            let earlier = report.is_some_and(|(at, from)| at == crash && next_seq >= from);
+            let earlier = report.is_some_and(|(at, from)| at == crash && resumed >= from);
             if stands && lossy {
                 *report = match *report {
-                    Some((at, from)) if at == crash => Some((crash, from.min(next_seq))),
-                    _ => Some((crash, next_seq)),
+                    Some((at, from)) if at == crash => Some((crash, from.min(resumed))),
+                    _ => Some((crash, resumed)),
                 };
             }
             drop(reports);
@@ -131,7 +138,7 @@ impl HashSink {
             tally.recoveries += 1;
         }
         if let Some((durable_seq, _)) = durable
-            && next_seq <= durable_seq
+            && resumed <= durable_seq
         {
             tally.lost_durable_prefixes += 1;
             if !reported {
@@ -204,9 +211,12 @@ impl TraceSink for HashSink {
         }
     }
 
-    /// A start that serves: see [`HashSink::judge_recovery`].
-    fn recovered(&self, shard: u16, next_seq: u64, lossy: bool) {
-        self.judge_recovery(shard, next_seq, lossy, true);
+    /// A start that serves: see [`HashSink::judge_recovery`]. A cut
+    /// shard's `next_seq` is one past its `Rebase`, written where recovery
+    /// resumed it.
+    fn recovered(&self, shard: u16, next_seq: u64, lossy: bool, cut: bool) {
+        let resumed = next_seq.saturating_sub(u64::from(cut));
+        self.judge_recovery(shard, resumed, next_seq, lossy, true);
     }
 
     /// Folded: which executor completed which cycle with how many entries.

@@ -639,7 +639,7 @@ async fn a_pool_spawned_from_a_recovery_serves_the_recovered_keys() {
     struct Resumed(Arc<Mutex<Vec<(u16, u64, bool)>>>);
     impl TraceSink for Resumed {
         fn record(&self, _shard: u16, _seq: u64, _cmd: &Command, _reply: &Reply) {}
-        fn recovered(&self, shard: u16, next_seq: u64, lossy: bool) {
+        fn recovered(&self, shard: u16, next_seq: u64, lossy: bool, _cut: bool) {
             self.0
                 .lock()
                 .expect("resumed")

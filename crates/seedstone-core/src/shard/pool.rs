@@ -747,12 +747,10 @@ impl ShardPool {
             };
             // A cut shard's `Rebase` was written and synced through the
             // node's writer before the pool was built: see `write_rebases`.
-            let state = recovered_state(
-                recovered.next().unwrap_or_else(fresh),
-                make_log(shard),
-                &stats,
-            );
-            trace.recovered(shard, state.seq, state.lossy);
+            let read = recovered.next().unwrap_or_else(fresh);
+            let cut = read.cut;
+            let state = recovered_state(read, make_log(shard), &stats);
+            trace.recovered(shard, state.seq, state.lossy, cut);
             // A fresh dict already costs its table, and the gauge is the sum
             // of what the dicts account — so it starts at the sum of what
             // they hold after replay rather than at zero.
