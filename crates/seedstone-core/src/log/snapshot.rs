@@ -36,9 +36,11 @@ use crate::log::{Record, crc32_iso_hdlc, encode_record};
 /// The four bytes every snapshot starts with.
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SSNP";
 
-/// The shard id the footer record carries: no shard, since a node runs at
-/// most `u16::MAX - 1` of them and the deployed count is 1024. A segment
-/// reader that meets it counts the record malformed.
+/// The shard id the footer record carries: no shard.
+///
+/// A node runs at most `u16::MAX - 1` shards, and the deployed count is
+/// 1024. A segment's [sync mark](crate::log::file::SYNC_MARK_SHARD) carries
+/// the same id; the file each sits in tells them apart.
 pub const FOOTER_SHARD: u16 = u16::MAX;
 
 /// Magic, version, generation, executor, cycle, time, shard count: what
