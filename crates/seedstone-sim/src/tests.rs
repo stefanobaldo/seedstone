@@ -1046,15 +1046,16 @@ fn the_honest_node_holds_on_the_hostile_seeds_whose_start_failed_after_its_cut()
 }
 
 /// A hostile seed where a start cut every shard and wrote their rebases,
-/// and the sync of them failed (108, at `always`, crashed once; 10 until a
-/// start began to sync what it recovered, which moved the disk's draws).
+/// and the sync of them failed (6, at `always`, crashed once; 10 until a
+/// start began to sync what it recovered, 108 until the writer began to
+/// mark the log before every sync, each of which moved the disk's draws).
 /// The start reports its recovery and fails; the next one reads those
 /// rebases, which make the older records above them dead, and resumes
 /// below what was durable. That loss is the one the failed start reported,
 /// and the model counts it so: the honest node holds.
 #[test]
 fn the_honest_node_holds_on_the_hostile_seed_whose_start_could_not_sync_its_rebase() {
-    let mut cfg = SimConfig::hostile(1, 108);
+    let mut cfg = SimConfig::hostile(1, 6);
     cfg.fsync = FsyncDraw::Fixed(SyncPolicy::ALWAYS);
     let outcome = run_sim(&cfg);
     assert!(outcome.invariant_holds(), "{outcome:?}");
@@ -1064,27 +1065,28 @@ fn the_honest_node_holds_on_the_hostile_seed_whose_start_could_not_sync_its_reba
     );
 }
 
-/// Hostile seeds where a start cut, failed writing its rebases, and the
+/// A hostile seed where a start cut, failed writing its rebases, and the
 /// node crashed before the retry, so the next start met whatever of those
-/// rebases the crash left (2023 at `always`, 10215 at `interval`, found by
-/// a sweep of 1..=30 000 under each when a segment's header began to carry
-/// its cut points and moved the disk's draws off 24637 and 17619). It either replays what the
-/// failed start cut or reports its own cut: no loss goes unreported. The
+/// rebases the crash left (10215 at `interval`, found by a sweep of
+/// 1..=30 000 when a segment's header began to carry its cut points and
+/// moved the disk's draws off 17619). It either replays what the failed
+/// start cut or reports its own cut: no loss goes unreported. `always` had
+/// a seed too, 2023, until the writer began to mark the log before every
+/// sync: of 1..=30 000 at `always`, 1 546 seeds now fail a rebase, all
+/// retried before a crash, none crashed first (read 2026-10-15). The
 /// reach: a rebase failed, and no start was a retry without a crash before
 /// it — every start after a crash is counted once, and a retry with none
 /// between would count one more.
 #[test]
 fn the_honest_node_holds_when_it_crashes_before_retrying_a_failed_rebase() {
-    for (sim_seed, policy) in [(2023, SyncPolicy::ALWAYS), (10215, SyncPolicy::INTERVAL)] {
-        let mut cfg = SimConfig::hostile(1, sim_seed);
-        cfg.fsync = FsyncDraw::Fixed(policy);
-        let outcome = run_sim(&cfg);
-        assert!(outcome.invariant_holds(), "seed {sim_seed}: {outcome:?}");
-        assert!(
-            outcome.rebase_failures_at_start > 0 && outcome.recoveries == outcome.crashes,
-            "seed {sim_seed} no longer crashes before retrying a failed rebase: {outcome:?}"
-        );
-    }
+    let mut cfg = SimConfig::hostile(1, 10215);
+    cfg.fsync = FsyncDraw::Fixed(SyncPolicy::INTERVAL);
+    let outcome = run_sim(&cfg);
+    assert!(outcome.invariant_holds(), "{outcome:?}");
+    assert!(
+        outcome.rebase_failures_at_start > 0 && outcome.recoveries == outcome.crashes,
+        "the seed no longer crashes before retrying a failed rebase: {outcome:?}"
+    );
 }
 
 /// A start whose rebase sync failed leaves the rebase readable and not
