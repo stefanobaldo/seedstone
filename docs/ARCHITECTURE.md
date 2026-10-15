@@ -338,7 +338,9 @@ GET` is empty,
 `LATENCY LATEST` is empty, and `CONFIG GET` reports
 `slowlog-log-slower-than -1` and `latency-monitor-threshold 0` — which is what
 Redis itself reports with both monitors off, so the readings and the
-configuration agree. Answering rather than refusing is deliberate: a refusal
+configuration agree. It reports `slowlog-max-len 128` too, Redis's default: a
+capacity the empty log promises nothing about, there for the client that reads
+it before it sizes a `SLOWLOG GET`. Answering rather than refusing is deliberate: a refusal
 carries a different fact — that the command does not exist — and an exporter
 reads the first as the node's answer and the second as a failed scrape. Only
 a named list of subcommands is answered, though, and anything outside it —

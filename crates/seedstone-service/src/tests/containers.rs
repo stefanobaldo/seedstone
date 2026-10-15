@@ -188,7 +188,7 @@ async fn config_get_answers_the_parameters_a_glob_selects() {
     tokio::spawn(serve_connection(server, pool, node));
     let (mut r, mut w) = tokio::io::split(client);
     let mut out = Vec::new();
-    let requests: [&[&str]; 8] = [
+    let requests: [&[&str]; 9] = [
         &["CONFIG", "GET", "maxmemory"],
         &["CONFIG", "GET", "maxmemory*"],
         &["CONFIG", "GET", "*"],
@@ -199,6 +199,9 @@ async fn config_get_answers_the_parameters_a_glob_selects() {
         &["CONFIG", "SET", "maxmemory", "1"],
         &["CONFIG", "GET"],
         &["CONFIG"],
+        // The slow log's threshold and its capacity, which a monitoring
+        // client reads before it sizes a `SLOWLOG GET`.
+        &["CONFIG", "GET", "slowlog-*"],
     ];
     for parts in requests {
         encode(&req(parts), &mut out);
@@ -241,6 +244,13 @@ async fn config_get_answers_the_parameters_a_glob_selects() {
     assert_eq!(
         frames[7],
         Frame::Error("ERR wrong number of arguments for 'config' command".into())
+    );
+    assert_eq!(
+        frames[8],
+        pairs(&[
+            ("slowlog-log-slower-than", "-1"),
+            ("slowlog-max-len", "128")
+        ])
     );
 }
 

@@ -70,18 +70,20 @@ pub fn client(sub: &[u8], rest: &[Frame]) -> Result<Action, String> {
 /// connection ceiling, and the handful of fields a client library checks on
 /// connect and would otherwise treat as a node it cannot talk to.
 ///
-/// Four of them describe a feature this server does not have, and each is
-/// answered with the value Redis reports when the feature is switched off:
-/// `databases` is `1` because there is one keyspace, `requirepass` is empty
-/// because Redis never reports a password, and the two latency fields are the
-/// disabled readings. See [`config_value`].
-pub const CONFIG_PARAMETERS: [&str; 9] = [
+/// Five of them describe a feature this server does not have, and each is
+/// answered with the value Redis reports when the feature is switched off or
+/// left at its default: `databases` is `1` because there is one keyspace,
+/// `requirepass` is empty because Redis never reports a password, the two
+/// latency fields are the disabled readings, and the slow log's capacity is
+/// Redis's default. See [`config_value`].
+pub const CONFIG_PARAMETERS: [&str; 10] = [
     "maxmemory",
     "maxmemory-policy",
     "maxclients",
     "databases",
     "requirepass",
     "slowlog-log-slower-than",
+    "slowlog-max-len",
     "latency-monitor-threshold",
     "bind",
     "port",
@@ -172,6 +174,12 @@ pub fn config_value(name: &str, node: &NodeInfo) -> String {
         // disabled at zero. Neither is sampled here.
         "slowlog-log-slower-than" => "-1".to_owned(),
         "latency-monitor-threshold" => "0".to_owned(),
+        // The capacity a client reads before it asks `SLOWLOG GET <n>`.
+        // The log records nothing at any capacity, so this is not a promise
+        // about it: it is the default Redis 6.2.24 and 8.10.1 both report
+        // (read 2026-10-06), so a client that sizes its request by it asks
+        // for what it would ask a Redis for.
+        "slowlog-max-len" => "128".to_owned(),
         "bind" => node.bind.clone(),
         "port" => node.tcp_port.to_string(),
         other => unreachable!("{other} is in CONFIG_PARAMETERS with no value beside it"),
