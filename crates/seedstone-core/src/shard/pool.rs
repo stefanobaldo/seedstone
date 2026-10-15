@@ -32,6 +32,11 @@ pub const SHUTDOWN_GRACE: Duration = HOUSEKEEPING_TICK.saturating_mul(10);
 pub enum Shutdown {
     /// Every executor served what was queued, synced its log and ended.
     Clean,
+    /// Every executor ended, and at least one with its log failed: the
+    /// stop's last sync failed, or an earlier failure had not yet been
+    /// recovered from by a snapshot. What was acknowledged since the last
+    /// successful sync may be lost.
+    Unsynced,
     /// [`SHUTDOWN_GRACE`] passed first; what was still unsynced may be lost.
     TimedOut,
 }
@@ -384,7 +389,7 @@ pub struct ShardPool {
     /// watches it.
     stop: Arc<watch::Sender<bool>>,
     /// The executor tasks, taken by the first `shutdown` to await them.
-    executors_done: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    executors_done: Arc<Mutex<Vec<JoinHandle<bool>>>>,
     /// The persistence counters the executors keep: see
     /// [`stats`](ShardPool::stats).
     stats: Arc<PersistenceStats>,
@@ -793,7 +798,7 @@ impl ShardPool {
 
     /// Asks every executor to stop, and waits for them: each drains what is
     /// queued, hands it to the writer, waits for the writer's last sync,
-    /// and ends. Bounded by [`SHUTDOWN_GRACE`]: a disk that hangs must not
+    /// and ends — [`Shutdown::Unsynced`] if any ended with its log failed. Bounded by [`SHUTDOWN_GRACE`]: a disk that hangs must not
     /// hold a supervisor's termination grace period hostage.
     ///
     /// A second call, or one after a timeout, finds nothing left to wait
@@ -807,12 +812,20 @@ impl ShardPool {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         );
+        let mut synced = true;
         for handle in handles {
-            if tokio::time::timeout_at(deadline, handle).await.is_err() {
-                return Shutdown::TimedOut;
+            match tokio::time::timeout_at(deadline, handle).await {
+                Err(_) => return Shutdown::TimedOut,
+                Ok(Ok(ended_synced)) => synced &= ended_synced,
+                // A task that panicked synced nothing on its way out.
+                Ok(Err(_)) => synced = false,
             }
         }
-        Shutdown::Clean
+        if synced {
+            Shutdown::Clean
+        } else {
+            Shutdown::Unsynced
+        }
     }
 
     /// How many virtual shards this pool spans.
@@ -910,7 +923,7 @@ async fn one_reply(pending: Option<oneshot::Receiver<Vec<Reply>>>) -> Reply {
 /// Spawns one executor task and returns the inbox that reaches it.
 fn spawn_executor<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint>(
     spec: ExecutorSpec<T, L, P, C>,
-) -> (mpsc::UnboundedSender<Envelope>, JoinHandle<()>) {
+) -> (mpsc::UnboundedSender<Envelope>, JoinHandle<bool>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(run_executor(spec, rx));
     (tx, handle)
