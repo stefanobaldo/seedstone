@@ -647,6 +647,11 @@ async fn a_read_held_beside_a_write_is_served_when_the_sync_fails() {
     );
 }
 
+/// A write that fails — a full disk — refuses the same way under
+/// `interval`, where nothing was held: the write it failed for was already
+/// acknowledged, the next is refused, and reads are served. A snapshot
+/// taken while the disk is still full fails too, and the refusal goes on;
+/// once it has room, each executor's snapshot ends its own refusal.
 #[tokio::test(start_paused = true)]
 async fn a_full_disk_refuses_writes_and_a_snapshot_resumes_them() {
     let story = Story::default();
