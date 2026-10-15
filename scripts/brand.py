@@ -35,6 +35,9 @@ FAVICON_SEED = "M32 11 C25 23 18 29 18 38 A14 14 0 0 0 46 38 C46 29 39 23 32 11 
 SHAPES_FAVICON = SHAPES[:2] + [f'<path d="{FAVICON_SEED}" fill="{AMBER}"/>']
 
 
+WORDMARKS = ("docs/assets/wordmark-light.svg", "docs/assets/wordmark-dark.svg")
+
+
 def svg(shapes, title):
     return "\n".join([
         '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img">',
@@ -70,6 +73,14 @@ def check():
             current = None
         if current != text.encode("utf-8"):
             print(f"{path}: regenerate with: python3 -I scripts/brand.py emit", file=sys.stderr)
+            status = 1
+    # The wordmarks' letter outlines come from a font and are not emitted
+    # here; only the mark inside them is held, shape by shape.
+    for path in WORDMARKS:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        if not all(shape in text for shape in SHAPES):
+            print(f"{path}: does not carry the mark's shapes verbatim", file=sys.stderr)
             status = 1
     return status
 
