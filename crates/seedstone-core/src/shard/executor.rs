@@ -761,14 +761,20 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         // No `await` inside this loop, so a batch is applied as a unit:
         // nothing from another connection lands between its commands.
         let mut replies = Vec::with_capacity(cmds.len());
-        // Which commands appended, kept only where a batch can be held: a
-        // policy that answers at once never needs it, and an empty `Vec`
+        // Which commands wrote the log, kept only where a batch can be held:
+        // a policy that answers at once never needs it, and an empty `Vec`
         // allocates nothing. Nor does a refusing executor hold anything: it
-        // applies no client write, and what it may still append — a read
-        // expiring its key — promises nothing that a sync would have to
-        // prove, so a `Durable` must not be what answers it.
+        // applies no client write.
+        //
+        // A command writes the log when it is one of `writes_the_log` and
+        // it appended. A read that appends — the deletion of a key whose
+        // deadline has passed — promises nothing a sync would have to prove:
+        // the record replays to what the reader was already told. So it is
+        // neither held for the sync nor refused if the sync fails; the next
+        // sync carries the record, as it carries the sweep's.
         let holds = self.sync.holds() && !self.sync.is_refusing();
-        let mut appended_each = Vec::new();
+        let mut wrote_each = Vec::new();
+        let mut any_write = false;
         // One clock reading for the whole envelope, taken here rather
         // than inside a handler. A handler that read the clock itself
         // would still be synchronous — this is not the no-await rule —
@@ -796,7 +802,9 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             appended_count += u64::from(appended);
             replies.push(answer);
             if holds {
-                appended_each.push(appended);
+                let wrote_the_log = appended && cmd.writes_the_log();
+                any_write |= wrote_the_log;
+                wrote_each.push(wrote_the_log);
             }
         }
         let mut touched = Vec::new();
@@ -820,12 +828,12 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         }
         let batch = self.sync.batch;
         let submitted = self.submit(touched);
-        if submitted && holds {
+        if submitted && any_write {
             self.sync.held.push_back(Held {
                 batch,
                 to: reply,
                 replies,
-                wrote: appended_each,
+                wrote: wrote_each,
             });
         } else {
             send(reply, replies);

@@ -3,7 +3,9 @@
 //! Either the test plays the writer over [`fake_links`], or the real one
 //! runs over the in-memory disk through [`disk_pool`].
 
-use super::support::{SEED, WAL, disk_pool, disk_pool_cut, fake_links, gathered, get, set, set_ex};
+use super::support::{
+    NoSweep, SEED, WAL, disk_pool, disk_pool_cut, fake_links, gathered, get, set, set_ex,
+};
 use crate::log::checkpoint::{CheckpointConfig, CheckpointSpec, NoCheckpoint, SegmentCheckpoint};
 use crate::log::disk::Disk;
 use crate::log::disk::mem::MemDisk;
@@ -329,6 +331,59 @@ async fn a_durable_after_a_fault_raises_nothing() {
         refused(),
         "and the executor refuses until a snapshot lands"
     );
+}
+
+/// A read that finds its key expired appends the deletion, and is still a
+/// read: under `always` it is answered at once, not held for the sync that
+/// carries the record — so a failure of that sync cannot refuse it either.
+/// The sweep is off, so the read is what removes the key.
+#[tokio::test(start_paused = true)]
+async fn a_read_that_expires_its_key_is_not_held_for_the_sync() {
+    let (links, mut to_writer, progress) = fake_links(1);
+    let pool = ShardPool::spawn_spec(PoolSpec {
+        shards: 2,
+        executors: 1,
+        seed: SEED,
+        trace: NoTrace,
+        make_log: FileLog::new,
+        policy: NoSweep,
+        limit: MemoryLimit::default(),
+        clock: frozen_clock,
+        recovered: Vec::new(),
+        make_checkpoint: |_| NoCheckpoint,
+        sync: SyncPolicy::ALWAYS,
+        plants: ExecutorPlants::default(),
+        writer_links: links,
+        stats: crate::shard::PersistenceStats::new(1),
+    });
+    let write = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.dispatch(set_ex(b"k", b"v", 1)).await }
+    });
+    let Some(ToWriter::Submit { bytes, .. }) = to_writer.recv().await else {
+        panic!("a write is submitted")
+    };
+    progress[0]
+        .send(Progress::Durable {
+            through_batch: Some(0),
+            bytes: bytes.len() as u64,
+            round: 1,
+        })
+        .unwrap();
+    assert_eq!(write.await.unwrap(), Reply::Ok);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let read = tokio::spawn({
+        let pool = pool.clone();
+        async move { pool.dispatch(get(b"k")).await }
+    });
+    settle().await;
+    assert!(read.is_finished(), "the read is not held for the sync");
+    assert_eq!(read.await.unwrap(), Reply::Bulk(None));
+    let Ok(ToWriter::Submit { bytes, .. }) = to_writer.try_recv() else {
+        panic!("the deletion is handed to the writer")
+    };
+    assert_eq!(count_records(&bytes), 1);
+    assert_eq!(gathered(&pool).await.expired, 1, "the read removed it");
 }
 
 /// A refusing executor applies no client write, so nothing it answers
