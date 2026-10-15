@@ -153,15 +153,15 @@ def check_mark():
 
 BENCH = os.path.join("docs", "benchmarks.md")
 # Each cell the page may name -> the heading(s) its tables sit under on the
-# benchmark page: a `###` heading, then optionally a `####` one, each
-# matched by prefix with the backticks dropped. Under the innermost heading
-# every Markdown table until the next heading of the same or a higher level
-# counts (the main table and the *Other engines* table both), and so do the
-# `- seedstone vs <arm>:` pair lines.
+# benchmark page: a `###` heading, then optionally a `####` one, each the
+# heading's text before its " — " with the backticks dropped. Under the
+# innermost heading every Markdown table until the next heading of the same
+# or a higher level counts (the main table and the *Other engines* table
+# both), and so do the `- seedstone vs <arm>:` pair lines.
 CELLS = {
     "keys-7000": ("KEYS over 7 000 keys",),
-    "set-64-ex60-d64": ("SET 64 B, without and with", "With EX 60"),
-    "set-64-d64": ("SET 64 B, without and with", "Without EX"),
+    "set-64-ex60-d64": ("SET 64 B, without and with EX 60", "With EX 60"),
+    "set-64-d64": ("SET 64 B, without and with EX 60", "Without EX"),
     "mget-16-d64": ("MGET of 1, 4 and 16 keys", "16 keys"),
     "get-64-d64": ("GET 64 B", "Depth 64"),
 }
@@ -175,6 +175,9 @@ def abbreviate(n):
         return f"{round(n / 1e3):.0f} k"
     return f"{n:,}".replace(",", " ")
 
+def heading_name(text):
+    return re.sub(r"\s+", " ", text.replace("`", "")).split(" — ")[0].strip()
+
 def bench_section(headings):
     """The text of docs/benchmarks.md under the named heading(s)."""
     text = open(BENCH, encoding="utf-8").read()
@@ -185,7 +188,7 @@ def bench_section(headings):
             if m and len(m.group(1)) <= level:
                 if inside:
                     break
-                inside = m.group(2).replace("`", "").startswith(want) and len(m.group(1)) == level
+                inside = len(m.group(1)) == level and heading_name(m.group(2)) == want
                 continue
             if inside:
                 out.append(line)
@@ -209,14 +212,36 @@ def bench_cell(cell):
             factors[m.group(1)] = m.group(2) + "\u00d7"
     return ops, factors
 
-ELEMENT = re.compile(r"<(\w+)\b([^>]*\bdata-cell=\"[^\"]*\"[^>]*)>(.*?)</\1>", re.S)
-def attrs_of(s):
-    return dict(re.findall(r"""\b([\w-]+)=["']([^"']*)["']""", s))
-def text_of(s):
-    """Tags dropped, whitespace folded: the table's thousands separator is a
-    narrow no-break space (U+202F), and the page's may be any space that
-    keeps a figure from wrapping; both read as one plain space here."""
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", s)).strip()
+from html.parser import HTMLParser
+VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+
+class Elements(HTMLParser):
+    """Every element on the page with its attributes, its ancestors and its
+    text (entities decoded), so a bound element is read as the browser
+    reads it: a nested element is seen, a quote style is irrelevant."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack, self.all = [], []
+    def handle_starttag(self, tag, attrs):
+        el = {"tag": tag, "attrs": dict(attrs), "ancestors": list(self.stack), "text": [], "classes": set()}
+        el["classes"] = set((el["attrs"].get("class") or "").split())
+        self.all.append(el)
+        if tag not in VOID:
+            self.stack.append(el)
+    def handle_endtag(self, tag):
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i]["tag"] == tag:
+                del self.stack[i:]
+                break
+    def handle_data(self, data):
+        for el in self.stack:
+            el["text"].append(data)
+
+def text_of(el):
+    """The element's text, whitespace folded: the table's thousands
+    separator is a narrow no-break space (U+202F), and the page's may be
+    any space that keeps a figure from wrapping; both read as one space."""
+    return re.sub(r"\s+", " ", "".join(el["text"])).strip()
 
 def check_figures():
     """Every benchmark figure the page shows is bound to its cell and its
@@ -224,14 +249,28 @@ def check_figures():
     is against (`data-pair`), and each matches the benchmark page's table
     for exactly that cell and arm, abbreviated as the README's chart does.
     A bar's width (`--w`) is its figure's share of the cell's largest shown
-    figure, so a bar cannot say one thing and its text another."""
+    figure, so a bar cannot say one thing and its text another. An element
+    that looks like one of these (`.bar`, `.figure`, `.factor`) and is not
+    bound fails: a figure may not opt out of the check by forgetting its
+    attributes."""
     bad, figures, factors = [], 0, 0
     if re.search(r"benchmarks(-dark)?\.svg", html):
         bad.append("the page references the README's chart")
+    parser = Elements()
+    parser.feed(html)
+    def bound(el):
+        return "data-cell" in el["attrs"]
+    for el in parser.all:
+        if el["classes"] & {"bar", "figure", "factor"} and not bound(el) and not any(bound(a) for a in el["ancestors"]):
+            bad.append(f"<{el['tag']} class=\"{' '.join(sorted(el['classes']))}\"> showing {text_of(el)!r} is not bound to a cell")
     per_cell = {}
-    for el in ELEMENT.finditer(html):
-        attrs, inner = attrs_of(el.group(2)), el.group(3)
-        cell = attrs["data-cell"]
+    for el in parser.all:
+        if not bound(el):
+            continue
+        attrs, cell = el["attrs"], el["attrs"]["data-cell"]
+        if any(bound(a) for a in el["ancestors"]):
+            bad.append(f"{cell}: a bound element inside another bound element ({text_of(el)!r})")
+            continue
         if cell not in CELLS:
             bad.append(f"data-cell={cell!r} is not a cell this check knows ({', '.join(CELLS)})")
             continue
@@ -241,8 +280,8 @@ def check_figures():
         if ops is None:
             bad.append(f"{cell}: no heading {CELLS[cell]} in {BENCH}")
             continue
-        fig = re.search(r"<(\w+)\b[^>]*\bclass=\"[^\"]*\bfigure\b[^\"]*\"[^>]*>(.*?)</\1>", inner, re.S)
-        shown = text_of(fig.group(2) if fig else inner)
+        figure_child = next((c for c in parser.all if el in c["ancestors"] and "figure" in c["classes"]), None)
+        shown = text_of(figure_child or el)
         if "data-arm" in attrs:
             arm = attrs["data-arm"]
             if arm not in ops:
@@ -251,14 +290,18 @@ def check_figures():
             want = abbreviate(ops[arm])
             if shown != want:
                 bad.append(f"{cell} {arm}: the page says {shown!r}, the table {want!r}")
-            m = re.search(r"--w:\s*([\d.]+)%", attrs.get("style", ""))
-            if m:
-                shown_arms = [a for _, s2, _ in ELEMENT.findall(html) for a in [attrs_of(s2)]
-                              if a.get("data-cell") == cell and "data-arm" in a and "--w" in a.get("style", "")]
-                top = max(ops[a["data-arm"]] for a in shown_arms if a["data-arm"] in ops)
-                want_w = 100 * ops[arm] / top
-                if abs(float(m.group(1)) - want_w) > 0.5:
-                    bad.append(f"{cell} {arm}: bar width {m.group(1)}%, the figure's share is {want_w:.1f}%")
+            style = attrs.get("style", "")
+            if "--w" in style:
+                m = re.search(r"--w:\s*([\d.]+)%", style)
+                if not m:
+                    bad.append(f"{cell} {arm}: --w is not a percentage: {style!r}")
+                else:
+                    shown_arms = [e["attrs"]["data-arm"] for e in parser.all if bound(e) and e["attrs"]["data-cell"] == cell
+                                  and "data-arm" in e["attrs"] and "--w" in e["attrs"].get("style", "")]
+                    top = max(ops[a] for a in shown_arms if a in ops)
+                    want_w = 100 * ops[arm] / top
+                    if abs(float(m.group(1)) - want_w) > 0.5:
+                        bad.append(f"{cell} {arm}: bar width {m.group(1)}%, the figure's share is {want_w:.1f}%")
             figures += 1
         elif "data-pair" in attrs:
             arm = attrs["data-pair"]
@@ -273,13 +316,16 @@ def check_figures():
     if bad:
         fail("figures", "; ".join(bad))
     else:
-        ok("figures", f"{figures} figures, {factors} factors")
+        ok("figures", f"{figures} figures, {factors} factor" + ("s" if factors != 1 else ""))
 
 def check_no_version_literal():
     """The install rows name no version: the page is not pinned to a commit
     the way the README is, and a literal here goes stale at the next tag.
     The benchmark section names the release it measured, which is a fact."""
-    start = html.index('<section id="install">')
+    start = html.find('<section id="install">')
+    if start < 0:
+        fail("no version literal", 'no <section id="install"> on the page')
+        return
     install = html[start:html.index("<section", start + 1)]
     hits = sorted(set(re.findall(r"(?<![\d.])\d+\.\d+\.\d+(?![\d.])", install)))
     if hits:

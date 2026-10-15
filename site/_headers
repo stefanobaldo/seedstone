@@ -11,7 +11,7 @@
 
 # Only the fonts are immutable: a change to the typeface would come with a
 # new file name. Everything else under /assets/ keeps a fixed name and
-# changes in place — the stylesheet, the script, the charts — so it keeps
+# changes in place — the stylesheet, the script — so it keeps
 # the default headers, which make the browser revalidate.
 /assets/inter-400.woff2
   Cache-Control: max-age=31536000, immutable

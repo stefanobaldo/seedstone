@@ -172,7 +172,7 @@ ul { margin: 0; padding: 0; list-style: none; }
   padding: 2.5rem 0 4.5rem;
 }
 .hero-text { grid-area: text; min-width: 0; }
-.hero .anim-figure { grid-area: anim; }
+.hero .anim-figure { grid-area: anim; margin: 0; min-width: 0; }
 .hero .proof { grid-area: proof; }
 .lede { font-size: 1.25rem; line-height: 1.5; color: var(--text-2); margin: 1.5rem 0 0; max-width: 28em; text-wrap: pretty; }
 
@@ -216,7 +216,7 @@ ul { margin: 0; padding: 0; list-style: none; }
 .fine { color: var(--muted); font-size: 0.8125rem; line-height: 1.5; max-width: 34rem; }
 @media (max-width: 480px) {
   /* The line is longer than the box here and scrolls inside it; the fade says so. */
-  .copy pre { mask-image: linear-gradient(90deg, #000 82%, transparent); -webkit-mask-image: linear-gradient(90deg, #000 82%, transparent); padding-right: 1.5rem; }
+  .copy pre { padding-right: 1.5rem; mask-image: linear-gradient(90deg, #000 calc(100% - 1.5rem), transparent); -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 1.5rem), transparent); }
 }
 
 /* The animation's caption, and the proof card under it. */
@@ -229,13 +229,7 @@ ul { margin: 0; padding: 0; list-style: none; }
   padding: 1.1rem 1.25rem;
   min-width: 0;
 }
-.proof {
-  background: var(--card);
-  border: 1px solid var(--rule);
-  border-radius: var(--radius-card);
-  padding: 1.1rem 1.25rem 1rem;
-  min-width: 0;
-}
+.proof { padding-bottom: 1rem; }
 .label { font-size: 0.75rem; color: var(--muted); margin: 0 0 0.75rem; }
 .proof-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.9rem 1.25rem; align-items: center; }
 .factor-line { margin: 0; }
@@ -248,7 +242,7 @@ ul { margin: 0; padding: 0; list-style: none; }
 /* Bars: the name, the bar on its track, the figure; seedstone's row in
    amber. `--w` is the figure's share of the largest, which the checker
    holds to the table. */
-.bars { display: grid; gap: 0.45rem; }
+.bars { display: grid; gap: 0.45rem; margin: 0; padding: 0; list-style: none; }
 .bar {
   display: grid;
   grid-template-columns: 5.2em minmax(0, 1fr) 3.4em;
@@ -275,8 +269,7 @@ ul { margin: 0; padding: 0; list-style: none; }
 .src a { text-decoration-color: var(--rule); }
 
 /* The proof as a line under the fine print instead of a card on the right. */
-.hero.proof-line { grid-template-areas: "text" "anim" "proof"; }
-.hero.proof-line .proof { background: none; border: 0; border-top: 1px solid var(--rule); border-radius: 0; padding: 1.25rem 0 0; }
+.hero.proof-line .proof.card { background: none; border: 0; border-top: 1px solid var(--rule); border-radius: 0; padding: 1.25rem 0 0; }
 .hero.proof-line .bar::before { height: 6px; }
 
 @media (min-width: 64rem) {
@@ -348,7 +341,7 @@ footer p { max-width: 60em; }
    final frame — every cell, chip, trace and the verdict carry `on` — so the
    picture is complete with no script and under reduced motion; site.js
    strips the classes and puts them back, tick by tick. */
-.anim-figure { margin: 0; min-width: 0; }
+.anim-figure { margin: 2.5rem 0 0; max-width: 32rem; }
 .anim {
   display: block;
   width: 100%;
