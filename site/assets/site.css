@@ -1,6 +1,7 @@
-/* The page's style. Dark by default, in the slate of the mark; the light
-   scheme follows the reader's setting. Amber is kept for the seed and the
-   one thing on the screen the eye should go to: the copy button. */
+/* The page's style. Dark by default, in the slate of the mark, on a fine
+   grid; the light scheme follows the reader's setting. Amber is the one
+   accent: the eyebrow that opens a section, seedstone's bar in a chart,
+   the seed, and the copy button. */
 
 @font-face {
   font-family: Inter;
@@ -24,69 +25,129 @@
   --amber: #f0a030;
   --highlight: #ffc45c;
 
-  --bg: #12181e;
-  --bg-raised: var(--rim);
+  --bg: #10161c;
+  --bg-raised: #1b232c;
+  --card: rgba(16, 22, 28, 0.82);
   --text: #e6edf3;
-  --muted: #9aa7b4;
-  --rule: #2c3845;
+  --text-2: #b4bec9;
+  --muted: #8f9cab;
+  --rule: #2b3540;
+  --grid: rgba(255, 255, 255, 0.04);
+  --glow: rgba(240, 160, 48, 0.13);
+  --accent: var(--highlight);   /* amber as text and as a bar, on this background */
+  --bar: var(--face);
   --focus: var(--amber);
 
   --sans: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --measure: 40em;
-  --radius: 6px;
+  --radius: 8px;
+  --radius-card: 12px;
+  --column: 70rem;
 }
 
 @media (prefers-color-scheme: light) {
   :root {
     --bg: #ffffff;
     --bg-raised: #f6f8fa;
+    --card: rgba(255, 255, 255, 0.82);
     --text: #1f2328;
+    --text-2: #3d4753;
     --muted: #59636e;
     --rule: #d0d7de;
+    --grid: rgba(0, 0, 0, 0.05);
+    --glow: rgba(240, 160, 48, 0.08);
+    --accent: #9a5a05;           /* the amber, deepened until 12 px text holds on white */
+    --bar: #8f9cab;
     --focus: var(--text);
   }
 }
 
 *, *::before, *::after { box-sizing: border-box; }
 
+/* The canvas: the colour and the grid, 28 px, one-pixel lines. It is on
+   html so the glows, which sit at z-index -1, paint above it. */
 html {
-  background: var(--bg);
+  background-color: var(--bg);
+  background-image: linear-gradient(var(--grid) 1px, transparent 1px),
+                    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 28px 28px;
   color: var(--text);
-  font: 400 1.0625rem/1.55 var(--sans);
+  font: 400 1rem/1.55 var(--sans);
   -webkit-text-size-adjust: 100%;
 }
 
 body {
+  position: relative;
   margin: 0;
-  background: var(--bg);
   padding: 0 16px;
+  background: none;
 }
 
 body > * {
-  max-width: 68rem;
+  max-width: var(--column);
   margin-left: auto;
   margin-right: auto;
 }
 
-h1, h2 { font-weight: 700; margin: 0; }
-h1 { font-size: clamp(2rem, 1.2rem + 3.5vw, 3.25rem); line-height: 1.05; letter-spacing: -0.02em; text-wrap: pretty; }
-h1 span { display: block; }
-h2 { font-size: 1.5rem; line-height: 1.2; letter-spacing: -0.01em; }
-p { margin: 0 0 1rem; max-width: var(--measure); }
+/* The glows: three soft amber discs behind the hero's right column and two
+   of the sections, clipped at the page's edges so none of them widens it. */
+.backdrop {
+  position: absolute;
+  inset: 0;
+  max-width: none;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: -1;
+}
+.glow {
+  position: absolute;
+  width: 640px;
+  height: 640px;
+  border-radius: 50%;
+  background: radial-gradient(closest-side, var(--glow), transparent);
+}
+.g1 { top: -200px; right: calc(50% - 40rem); }
+.g2 { top: 36%; left: calc(50% - 50rem); }
+.g3 { top: 64%; right: calc(50% - 48rem); }
+
+h1, h2 { font-weight: 700; margin: 0; letter-spacing: -0.02em; text-wrap: balance; }
+h1 { font-size: clamp(2.5rem, 1.5rem + 4.2vw, 4.25rem); line-height: 1.02; letter-spacing: -0.03em; }
+h1 span { display: block; text-wrap: balance; }
+.claim { font-size: clamp(1.75rem, 1.3rem + 1.8vw, 2.375rem); line-height: 1.12; max-width: 24em; }
+p { margin: 0 0 1rem; }
 p:last-child { margin-bottom: 0; }
 strong { font-weight: 700; }
 
 a { color: inherit; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 0.18em; text-decoration-color: var(--muted); }
-a:hover { text-decoration-color: currentColor; text-decoration-thickness: 2px; }
+a:hover { text-decoration-color: currentColor; }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; border-radius: 2px; }
 
 code, pre, kbd { font-family: var(--mono); font-size: 0.9em; }
 pre { margin: 0; overflow-x: auto; line-height: 1.5; }
 pre code { font-size: 0.875rem; }
 img, svg, picture { max-width: 100%; height: auto; }
+ul { margin: 0; padding: 0; list-style: none; }
 
-/* The header: the mark and the name, the three places a reader goes. */
+/* The lockup: the mark's box at 48 px, the name at 48 / 1.6 / 0.727 — the
+   cap height of Inter — lifted 0.09 em so the mark's centre meets the middle
+   of the x-height; the footer repeats it at 32 px. */
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.22em;
+  font-size: 2.58rem;        /* 41.3 px beside a 48 px mark */
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 1;
+  text-decoration: none;
+}
+.brand .mark { flex: none; width: 1.1622em; height: 1.1622em; }   /* 48 / 41.3 */
+.brand .mark svg { display: block; width: 100%; height: 100%; }
+.brand .name { position: relative; top: -0.09em; }
+.brand.small { font-size: 1.72rem; }                                /* 27.5 px beside a 32 px mark */
+
+/* The header: the lockup and the three places a reader goes. */
 .top {
   display: flex;
   flex-wrap: wrap;
@@ -95,105 +156,199 @@ img, svg, picture { max-width: 100%; height: auto; }
   gap: 0.75rem 1.5rem;
   padding: 1.25rem 0;
 }
-.brand { display: inline-flex; align-items: center; gap: 0.6rem; text-decoration: none; font-weight: 700; font-size: 1.2rem; letter-spacing: -0.01em; }
-.brand .mark { flex: none; width: 2rem; height: 2rem; }
-.top nav { display: flex; gap: 1.25rem; flex-wrap: wrap; font-size: 0.95rem; }
+.top nav { display: flex; gap: 1.5rem; flex-wrap: wrap; font-size: 0.9375rem; color: var(--text-2); }
 .top nav a { text-decoration-color: transparent; }
-.top nav a:hover { text-decoration-color: currentColor; text-decoration-thickness: 1px; }
+.top nav a:hover { color: var(--text); text-decoration-color: currentColor; }
 
-/* The hero: the claim, the line, the animation beside it when there is room. */
+/* The hero: the claim and the line on the left; the animation, frameless
+   and top-aligned, with its proof under it on the right. `.proof-line`
+   moves the proof under the fine print instead, thin and unboxed. */
 .hero {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 2.5rem 4rem;
+  grid-template-areas: "text" "anim" "proof";
+  gap: 2.5rem;
   align-items: start;
-  padding: 3rem 0 4rem;
+  padding: 2.5rem 0 4.5rem;
 }
-.hero-text { min-width: 0; }
-.lede { font-size: 1.2rem; line-height: 1.5; margin: 1.5rem 0 0; max-width: 32em; }
+.hero-text { grid-area: text; min-width: 0; }
+.hero .anim-figure { grid-area: anim; }
+.hero .proof { grid-area: proof; }
+.lede { font-size: 1.25rem; line-height: 1.5; color: var(--text-2); margin: 1.5rem 0 0; max-width: 28em; text-wrap: pretty; }
 
+.pills { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 1.5rem 0 0; }
+.pills li, .pill {
+  font-size: 0.8125rem;
+  line-height: 1;
+  padding: 0.4rem 0.7rem;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  color: var(--text-2);
+  background: var(--card);
+}
+
+/* The copy box: the line never wraps or elides; where the box is narrower
+   than the line, the line scrolls inside it and the button stays put. */
 .copy {
   display: flex;
   align-items: center;
   gap: 0.75rem;
-  max-width: 36rem;
-  margin: 2rem 0 0.75rem;
-  padding: 0.75rem 0.75rem 0.75rem 1rem;
+  max-width: 34rem;
+  margin: 1.75rem 0 0.75rem;
+  padding: 0.6rem 0.6rem 0.6rem 1rem;
   background: var(--bg-raised);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
 }
-.copy pre { flex: 1 1 auto; min-width: 0; }
+.copy pre { flex: 1 1 auto; min-width: 0; white-space: pre; }
+.copy pre code { font-size: 0.875rem; }
 .copy-button {
   flex: none;
-  font: 700 0.9rem/1 var(--sans);
+  font: 700 0.875rem/1 var(--sans);
   color: var(--rim);
   background: var(--amber);
   border: 0;
-  border-radius: 4px;
-  padding: 0.6rem 0.9rem;
+  border-radius: 6px;
+  padding: 0.6rem 0.85rem;
   cursor: pointer;
 }
 .copy-button:hover { background: var(--highlight); }
-
-.fine { color: var(--muted); font-size: 0.875rem; max-width: 36rem; }
-
+.fine { color: var(--muted); font-size: 0.8125rem; line-height: 1.5; max-width: 34rem; }
 @media (max-width: 480px) {
-  .copy { flex-direction: column; align-items: stretch; }
-}
-@media (min-width: 64rem) {
-  .hero { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); }
-  .hero .anim-figure { margin-top: 0.5rem; }
+  /* The line is longer than the box here and scrolls inside it; the fade says so. */
+  .copy pre { mask-image: linear-gradient(90deg, #000 82%, transparent); -webkit-mask-image: linear-gradient(90deg, #000 82%, transparent); padding-right: 1.5rem; }
 }
 
-/* The sections: one claim each, its heading on the left where there is
-   room, so the headings read as a list on their own. */
-main > section:not(.hero) {
+/* The animation's caption, and the proof card under it. */
+.anim-figure figcaption { text-align: right; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-card);
+  padding: 1.1rem 1.25rem;
+  min-width: 0;
+}
+.proof {
+  background: var(--card);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-card);
+  padding: 1.1rem 1.25rem 1rem;
+  min-width: 0;
+}
+.label { font-size: 0.75rem; color: var(--muted); margin: 0 0 0.75rem; }
+.proof-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.9rem 1.25rem; align-items: center; }
+.factor-line { margin: 0; }
+.factor { display: block; font-size: 2.375rem; font-weight: 700; line-height: 1; letter-spacing: -0.02em; }
+.factor-what { display: block; font-size: 0.8125rem; color: var(--text-2); line-height: 1.35; margin-top: 0.4rem; }
+@media (min-width: 30rem) {
+  .proof-body { grid-template-columns: 9.5rem minmax(0, 1fr); }
+}
+
+/* Bars: the name, the bar on its track, the figure; seedstone's row in
+   amber. `--w` is the figure's share of the largest, which the checker
+   holds to the table. */
+.bars { display: grid; gap: 0.45rem; }
+.bar {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 1rem 3rem;
-  padding: clamp(2rem, 5vw, 3rem) 0;
-  border-top: 1px solid var(--rule);
+  grid-template-columns: 5.2em minmax(0, 1fr) 3.4em;
+  gap: 0.6rem;
+  align-items: center;
+  font-size: 0.75rem;
+  line-height: 1;
+  color: var(--text-2);
+  --w: 0%;
 }
+.bar::before {
+  content: "";
+  display: block;
+  height: 8px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--bar), var(--bar)) no-repeat 0 0 / var(--w) 100%, var(--bg-raised);
+  order: 1;
+}
+.bar .arm { order: 0; white-space: nowrap; }
+.bar .figure { order: 2; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bar.me { color: var(--accent); font-weight: 700; }
+.bar.me::before { background: linear-gradient(90deg, var(--amber), var(--highlight)) no-repeat 0 0 / var(--w) 100%, var(--bg-raised); }
+.src { font-size: 0.75rem; color: var(--muted); margin: 1rem 0 0; }
+.src a { text-decoration-color: var(--rule); }
+
+/* The proof as a line under the fine print instead of a card on the right. */
+.hero.proof-line { grid-template-areas: "text" "anim" "proof"; }
+.hero.proof-line .proof { background: none; border: 0; border-top: 1px solid var(--rule); border-radius: 0; padding: 1.25rem 0 0; }
+.hero.proof-line .bar::before { height: 6px; }
+
+@media (min-width: 64rem) {
+  .hero {
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+    grid-template-areas: "text anim" "text proof";
+    gap: 1.5rem 3rem;
+    padding: 2.5rem 0 5rem;
+  }
+  .hero.proof-line { grid-template-areas: "text anim" "proof anim"; }
+  .hero.proof-line .proof { margin-top: 0.5rem; }
+}
+
+/* The sections: the same skeleton each — an eyebrow, a claim, one line, a
+   visual, a source line — set apart by space, not by rules. */
+main > section:not(.hero) { padding: clamp(3rem, 7vw, 4.5rem) 0; }
 main > section:not(.hero) > * { min-width: 0; }
-@media (min-width: 56rem) {
-  main > section:not(.hero) { grid-template-columns: 12rem minmax(0, 1fr); }
-  main > section:not(.hero) > h2 { grid-column: 1; }
-  main > section:not(.hero) > :not(h2) { grid-column: 2; }
+.eyebrow {
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 0.75rem;
 }
+.claim { margin: 0 0 0.9rem; }
+.line { font-size: 1.0625rem; color: var(--text-2); max-width: var(--measure); text-wrap: pretty; }
+.two { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.5rem 2.5rem; align-items: start; }
+@media (min-width: 64rem) {
+  .two { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); }
+}
+#start .two { align-items: center; }
+#start .card .copy { margin: 0 0 0.75rem; max-width: none; }
 
 /* The install rows: the channel on the left, what to type on the right. */
 .ways { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 0.9rem 1.25rem; margin: 0.5rem 0 1.5rem; }
-.ways dt { padding-top: 0.45rem; color: var(--muted); font-size: 0.95rem; }
+.ways dt { padding-top: 0.45rem; color: var(--muted); font-size: 0.9375rem; }
 .ways dd { margin: 0; min-width: 0; }
 .ways pre, .console { padding: 0.6rem 0.9rem; background: var(--bg-raised); border: 1px solid var(--rule); border-radius: var(--radius); }
 .ways .note { display: block; color: var(--muted); font-size: 0.875rem; margin-top: 0.35rem; max-width: var(--measure); }
 .console { margin: 0 0 1rem; max-width: 36rem; }
-
 @media (max-width: 640px) {
   .ways { grid-template-columns: minmax(0, 1fr); gap: 0.2rem; }
   .ways dt { padding-top: 0; }
   .ways dd { margin-bottom: 1rem; }
 }
 
-/* The chart spans the column; the prose beside it keeps its measure. On a
-   narrow screen the chart keeps a width its labels survive at and scrolls
-   inside its figure, so the page itself never does. */
-.chart { margin: 0 0 1.5rem; }
-.chart picture { display: block; overflow-x: auto; }
-.chart img { display: block; width: 100%; min-width: 36rem; max-width: 960px; height: auto; border-radius: var(--radius); }
-.chart figcaption { color: var(--muted); font-size: 0.875rem; margin-top: 0.6rem; max-width: 48em; }
-
-footer { padding: 2rem 0 3rem; border-top: 1px solid var(--rule); color: var(--muted); font-size: 0.875rem; }
-footer nav { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; margin-bottom: 1rem; }
-footer p { max-width: none; }
+/* The footer: the lockup, the seven pages, the licence. */
+footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1.5rem 3rem;
+  padding: 2.5rem 0 3.5rem;
+  margin-top: 1rem;
+  border-top: 1px solid var(--rule);
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+footer > div { flex: 1 1 28rem; min-width: 0; }
+footer nav { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; margin-bottom: 0.9rem; color: var(--text-2); }
+footer nav a { text-decoration-color: transparent; }
+footer nav a:hover { text-decoration-color: currentColor; }
+footer p { max-width: 60em; }
 
 /* anim */
 /* The hero animation: a seed, three clients, two runs. The markup is the
    final frame — every cell, chip, trace and the verdict carry `on` — so the
-   picture is complete with no script and under reduced motion; hero.js
+   picture is complete with no script and under reduced motion; site.js
    strips the classes and puts them back, tick by tick. */
-.anim-figure { margin: 2.5rem 0 0; max-width: 32rem; }
+.anim-figure { margin: 0; min-width: 0; }
 .anim {
   display: block;
   width: 100%;
