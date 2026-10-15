@@ -1068,6 +1068,7 @@ fn emit_recovery(recovery: &Recovery, elapsed: std::time::Duration) {
             Field::Num(report.discarded),
             Field::Num(report.damage_bytes),
             Field::Num(report.holes),
+            Field::Num(report.torn_bytes),
             Field::Num(report.abandoned_segments),
             Field::Num(report.malformed),
             Field::Num(report.truncated.len() as u64),
