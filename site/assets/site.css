@@ -148,18 +148,18 @@ img, svg, picture { max-width: 100%; height: auto; }
 
 /* The sections: one claim each, its heading on the left where there is
    room, so the headings read as a list on their own. */
-main section {
+main > section:not(.hero) {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 1rem 3rem;
   padding: clamp(2rem, 5vw, 3rem) 0;
   border-top: 1px solid var(--rule);
 }
-main section > * { min-width: 0; }
+main > section:not(.hero) > * { min-width: 0; }
 @media (min-width: 56rem) {
-  main section { grid-template-columns: 12rem minmax(0, 1fr); }
-  main section > h2 { grid-column: 1; }
-  main section > :not(h2) { grid-column: 2; }
+  main > section:not(.hero) { grid-template-columns: 12rem minmax(0, 1fr); }
+  main > section:not(.hero) > h2 { grid-column: 1; }
+  main > section:not(.hero) > :not(h2) { grid-column: 2; }
 }
 
 /* The install rows: the channel on the left, what to type on the right. */
