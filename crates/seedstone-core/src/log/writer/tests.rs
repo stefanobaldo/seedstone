@@ -557,7 +557,8 @@ async fn the_segment_rotates_at_its_size_and_the_old_one_is_synced_first() {
     tokio::task::yield_now().await;
     assert_eq!(
         rig.segment(0).len(),
-        crate::log::file::SEGMENT_HEADER_LEN + 70
+        crate::log::file::SEGMENT_HEADER_LEN + 70 + mark().len(),
+        "the rotation marks the old file before it syncs it"
     );
     assert_eq!(
         disk.synced_len(&Path::new(WAL).join(segment_name(1, 0))),
@@ -1158,4 +1159,168 @@ async fn a_covered_that_removes_nothing_reports_nothing_and_syncs_no_directory()
         recorder.faults.lock().unwrap().is_empty(),
         "no directory was synced"
     );
+}
+
+/// A sync mark's bytes.
+fn mark() -> Vec<u8> {
+    let mut out = Vec::new();
+    crate::log::file::encode_sync_mark(&mut out);
+    out
+}
+
+/// The body of generation 1's segment at `rotation` on `disk`.
+fn body(disk: &MemDisk, rotation: u32) -> Vec<u8> {
+    let bytes = disk.contents(&Path::new(WAL).join(segment_name(1, rotation)));
+    let header = decode_segment_header(&bytes).unwrap();
+    bytes[header.len..].to_vec()
+}
+
+/// Whether generation 1's segment at `rotation` is synced to its end.
+fn synced_whole(disk: &MemDisk, rotation: u32) -> bool {
+    let path = Path::new(WAL).join(segment_name(1, rotation));
+    disk.synced_len(&path) == disk.contents(&path).len()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_mark_is_written_before_every_sync_and_the_sync_covers_it() {
+    let disk = MemDisk::default();
+    let mut rig = open(
+        &disk,
+        1,
+        SyncPolicy::ALWAYS,
+        1 << 20,
+        WriterPlants::default(),
+    );
+    rig.submit(0, 0, record(0, 0, b"a"));
+    rig.durable(0).await;
+    assert_eq!(body(&disk, 0), [record(0, 0, b"a"), mark()].concat());
+    assert!(synced_whole(&disk, 0), "the sync covers its mark");
+    rig.submit(0, 1, record(0, 1, b"b"));
+    rig.durable(0).await;
+    assert_eq!(
+        body(&disk, 0),
+        [record(0, 0, b"a"), mark(), record(0, 1, b"b"), mark()].concat(),
+        "one mark per sync issued"
+    );
+    assert!(synced_whole(&disk, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn under_never_no_mark_is_written_until_a_rotation_or_the_stop() {
+    let disk = MemDisk::default();
+    let mut rig = open(&disk, 1, SyncPolicy::NEVER, 64, WriterPlants::default());
+    rig.submit(0, 0, vec![1u8; 70]);
+    tokio::task::yield_now().await;
+    assert_eq!(body(&disk, 0), vec![1u8; 70], "no sync issued, no mark");
+    rig.submit(0, 1, vec![2u8; 10]);
+    yield_now_n(3).await;
+    assert_eq!(body(&disk, 0), [vec![1u8; 70], mark()].concat());
+    assert!(
+        synced_whole(&disk, 0),
+        "the rotation's sync covers its mark"
+    );
+    assert_eq!(body(&disk, 1), vec![2u8; 10], "the open file has none");
+    rig.links[0]
+        .to_writer
+        .send(ToWriter::Stop { executor: 0 })
+        .unwrap();
+    loop {
+        if matches!(rig.next(0).await, Progress::Stopped) {
+            break;
+        }
+    }
+    assert_eq!(body(&disk, 1), [vec![2u8; 10], mark()].concat());
+    assert!(synced_whole(&disk, 1), "the stop's sync covers its mark");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_start_path_marks_before_it_syncs_and_not_when_it_has_nothing_to_sync() {
+    let start = |cuts: Vec<(u16, u64)>| {
+        let disk = MemDisk::default();
+        disk.create_dir_all(Path::new(WAL)).unwrap();
+        let Opened { mut writer, .. } = Writer::open(WriterSpec {
+            disk: disk.clone(),
+            wal: Path::new(WAL).to_path_buf(),
+            generation: 1,
+            cuts: cuts.clone(),
+            executors: 1,
+            policy: SyncPolicy::INTERVAL,
+            segment_bytes: 1 << 20,
+            checkpoint: SMALL,
+            trace: NoTrace,
+            plants: WriterPlants::default(),
+            stats: crate::shard::PersistenceStats::new(1),
+        })
+        .unwrap();
+        let mut shards = vec![crate::log::recovery::RecoveredShard {
+            dict: crate::dict::Dict::with_seed(crate::dict::DictSeed { k0: 1, k1: 2 }),
+            seq: 4,
+            lossy: false,
+            cut: !cuts.is_empty(),
+            image_unix_millis: None,
+        }];
+        write_rebases(&mut writer, &mut shards).unwrap();
+        disk
+    };
+    let disk = start(vec![(0, 4)]);
+    let mut rebase = Vec::new();
+    Effect::Rebase.encode(&mut rebase);
+    assert_eq!(body(&disk, 0), [record(0, 4, &rebase), mark()].concat());
+    assert!(synced_whole(&disk, 0));
+    let disk = start(Vec::new());
+    assert!(body(&disk, 0).is_empty(), "nothing to sync, no mark");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_mark_write_that_fails_is_a_write_fault_and_no_sync_is_issued() {
+    let disk = MemDisk::default();
+    let trace = Recorder::default();
+    let mut rig = open_with(
+        &disk,
+        2,
+        SyncPolicy::ALWAYS,
+        1 << 20,
+        WriterPlants::default(),
+        trace.clone(),
+    );
+    // The batch's write goes through; the mark's, the next, fails.
+    disk.fail_one_write_after(1);
+    rig.submit(0, 0, record(0, 0, b"a"));
+    assert!(matches!(rig.next(0).await, Progress::Fault));
+    assert!(
+        matches!(rig.next(1).await, Progress::Fault),
+        "every executor hears it"
+    );
+    assert_eq!(*trace.faults.lock().unwrap(), [LogFault::Write]);
+    assert!(
+        trace.rounds.lock().unwrap().is_empty(),
+        "no sync is issued over a mark that is not there"
+    );
+    assert_eq!(
+        disk.sync_count(&Path::new(WAL).join(segment_name(1, 0))),
+        1,
+        "the header's sync and nothing after it"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rotation_marks_the_closing_file_before_its_sync() {
+    // Under interval, the first write is synced at once (its mark); the
+    // second lands inside the interval, unsynced; the third rotates, and
+    // the closing file's sync covers a mark of its own.
+    let disk = MemDisk::default();
+    let mut rig = open(&disk, 1, SyncPolicy::INTERVAL, 100, WriterPlants::default());
+    rig.submit(0, 0, vec![1u8; 70]);
+    rig.durable(0).await;
+    rig.submit(0, 1, vec![2u8; 20]);
+    tokio::task::yield_now().await;
+    assert!(!synced_whole(&disk, 0));
+    rig.submit(0, 2, vec![3u8; 10]);
+    yield_now_n(3).await;
+    assert_eq!(
+        body(&disk, 0),
+        [vec![1u8; 70], mark(), vec![2u8; 20], mark()].concat()
+    );
+    assert!(synced_whole(&disk, 0));
+    assert_eq!(body(&disk, 1), vec![3u8; 10]);
 }

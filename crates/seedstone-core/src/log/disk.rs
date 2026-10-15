@@ -274,6 +274,8 @@ pub(crate) mod mem {
         fail_creates: bool,
         /// File syncs to let through before one fails, once.
         sync_fails_after: Option<u32>,
+        /// File writes to let through before one fails, once.
+        write_fails_after: Option<u32>,
         /// Directory syncs to let through before one fails, once.
         dir_sync_fails_after: Option<u32>,
         /// Removals to let through before one fails, once.
@@ -431,6 +433,11 @@ pub(crate) mod mem {
             self.lock().sync_fails_after = Some(skip);
         }
 
+        /// The file write after the next `skip` fails, once.
+        pub fn fail_one_write_after(&self, skip: u32) {
+            self.lock().write_fails_after = Some(skip);
+        }
+
         /// The directory sync after the next `skip` fails, once.
         pub fn fail_one_dir_sync_after(&self, skip: u32) {
             self.lock().dir_sync_fails_after = Some(skip);
@@ -456,7 +463,7 @@ pub(crate) mod mem {
     impl LogFile for MemFile {
         fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
             let mut fs = self.disk.lock();
-            if fs.fail_writes {
+            if fs.fail_writes || countdown(&mut fs.write_fails_after) {
                 return Err(fs.write_failure());
             }
             fs.files
