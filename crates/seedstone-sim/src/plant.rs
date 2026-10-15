@@ -281,13 +281,12 @@ impl Plant {
                 "SimConfig::crossing, walked by crates/seedstone-sim/tests/planted_crossing.rs",
             ),
             // A hole inside the durable region needs read corruption, which
-            // the swept shapes do not draw. `hostile` held at `--fsync
-            // always` catches it on one seed in a hundred, and as swept, on
-            // none: a crash under load tears the node's one segment
-            // and charges every shard, so the loss it hides is reported
-            // regardless, and a crash at rest rarely leaves a hole where
-            // the plant could hide one — the claim there is kept, ignored,
-            // with the seeds measured.
+            // the swept shapes do not draw. `hostile` catches it on one
+            // seed in a hundred as swept and on none held at `--fsync
+            // always`: the span of a sync in flight at a crash is still
+            // charged, so the loss it hides there is reported regardless,
+            // and a hole elsewhere in the synced region is rare — the claim
+            // is kept, ignored, with the seeds measured.
             Self::PrefixScanRecovery => Some(
                 "no shape today; the claim is kept, ignored, in \
                  crates/seedstone-sim/tests/planted_recovery.rs",
