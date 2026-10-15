@@ -136,7 +136,7 @@ fn a_version_3_segment_is_recovered() {
 }
 
 /// A sync mark, written and synced as the writer writes one.
-fn write_mark(file: &mut MemFile) {
+pub(super) fn write_mark(file: &mut MemFile) {
     let mut bytes = Vec::new();
     encode_sync_mark(&mut bytes);
     file.write_all(&bytes).unwrap();
@@ -145,7 +145,7 @@ fn write_mark(file: &mut MemFile) {
 
 /// Restamps generation 1's first segment to `version`, its header's CRC
 /// made to match: the same records, as a build of that version wrote them.
-fn restamp_segment(disk: &MemDisk, version: u8) {
+pub(super) fn restamp_segment(disk: &MemDisk, version: u8) {
     let path = Path::new("/data/wal").join(segment_name(1, 0));
     let mut bytes = disk.contents(&path);
     let header = restamped(&bytes[..SEGMENT_HEADER_LEN], version);
