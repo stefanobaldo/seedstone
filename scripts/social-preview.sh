@@ -7,5 +7,5 @@
 set -euo pipefail
 out=${1:?out.png}
 magick -background white -density 384 docs/assets/wordmark-light.svg \
-  -resize 900x -gravity center -extent 1280x640 "$out"
+  -resize 900x -gravity center -extent 1280x640 -depth 8 -strip "$out"
 magick identify "$out"

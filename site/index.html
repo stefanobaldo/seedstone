@@ -13,7 +13,8 @@
 <meta property="og:image" content="https://seedstone.io/assets/social.png">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="color-scheme" content="dark light">
-<meta name="theme-color" content="#1f2831">
+<meta name="theme-color" content="#12181e" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
 <link rel="icon" href="/favicon-16.png" sizes="16x16" type="image/png">
@@ -21,6 +22,7 @@
 <link rel="preload" href="/assets/inter-400.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/assets/inter-700.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/assets/site.css">
+<noscript><style>.copy-button{display:none}</style></noscript>
 </head>
 <body>
 
@@ -42,17 +44,19 @@
 </header>
 
 <section class="hero">
-  <h1>Proves it is correct. Measures that it is fast.</h1>
+  <div class="hero-text">
+  <h1><span>Proves it is correct.</span> <span>Measures that it is fast.</span></h1>
   <p class="lede">An in-memory key-value store that speaks the Redis protocol, written from scratch in Rust. Every run is a deterministic simulation, so a concurrency bug reproduces from its seed, byte for byte; on the same machine it reads ahead of Redis on throughput in 12 of 13 measured pairs, with the method beside the number.</p>
   <div class="copy">
     <pre><code>curl -fsSL https://seedstone.io/install.sh | sh</code></pre>
     <button type="button" class="copy-button" data-copy="curl -fsSL https://seedstone.io/install.sh | sh">Copy</button>
   </div>
   <p class="fine">macOS and Linux, x86_64 and arm64. Verifies the release's SHA-256 before installing. Read it first: <a href="/install.sh">install.sh</a>.</p>
+  </div>
   <figure class="anim-figure">
     <svg class="anim" role="img" aria-labelledby="anim-title" viewBox="0 0 336 226">
       <title id="anim-title">A seed reproducing a failure</title>
-      <text class="seed" x="0" y="18">seed 0x4f2a9c1e</text>
+      <rect class="seed-bg" x="0" y="6" width="104" height="17" rx="3"/><text class="seed" x="5" y="18">seed 0x4f2a9c1e</text>
       <text class="clock dim" x="326" y="18" text-anchor="end">t = 1.800 s</text>
       <text class="dim" x="0" y="46">c1</text>
       <g class="chip on" data-tick="1"><rect x="52" y="35" width="50" height="14" rx="3"/><text x="56" y="45.5">SET k v</text></g>

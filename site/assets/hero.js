@@ -1,7 +1,6 @@
-// The copy button: it exists only where a script runs, so the page
-// without one shows the line alone.
-document.documentElement.classList.add("js");
-
+// The copy button. The page hides it where no script runs (a <noscript>
+// style in the head), so the line stands alone there and nothing moves
+// here when this file arrives.
 for (const button of document.querySelectorAll("[data-copy]")) {
   const label = button.textContent;
   button.addEventListener("click", async () => {
