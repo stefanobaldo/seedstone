@@ -447,11 +447,10 @@ main > section:not(.hero) > * { min-width: 0; }
 }
 .compare .bar { grid-template-columns: 5.6em minmax(0, 1fr) 3.4em; }   /* room for "Valkey ×4" */
 
-/* The four operations cards: a title, one line, and the excerpt pinned to
-   the card's bottom edge so the four line up. */
-.ops { align-items: stretch; }
-.op { display: flex; flex-direction: column; }
-.op > p { flex: 1 1 auto; margin-bottom: 1rem; }
+/* The four operations cards: a title, one line, the excerpt; each card
+   the height of what it holds, since a blank band inside a card reads
+   worse than two cards of unequal height. */
+.op > p { margin-bottom: 1rem; }
 .op pre { padding: 0.7rem 0.85rem; background: var(--bg-raised); border: 1px solid var(--rule); border-radius: var(--radius); line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 .op pre code { font-size: 0.75rem; }
 .op .key { color: var(--accent); }
@@ -459,7 +458,7 @@ main > section:not(.hero) > * { min-width: 0; }
 .op .cm { color: var(--muted); }
 .op .p { color: var(--muted); }
 .steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.4rem; margin: 0 0 0.6rem; padding: 0; list-style: none; font-size: 0.75rem; line-height: 1.35; color: var(--text-2); }
-.steps li { padding: 0.5rem 0.6rem; border: 1px solid var(--rule); border-radius: var(--radius); background: var(--bg-raised); }
+.steps li { padding: 0.5rem 0.6rem; border: 1px solid var(--rule); border-radius: var(--radius); background: var(--bg-raised); text-wrap: balance; }
 .steps .step-n { display: block; font-size: 0.6875rem; font-weight: 700; color: var(--accent); margin-bottom: 0.15rem; }
 
 /* The compatibility chips: the four groups of the named list, then the
