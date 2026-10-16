@@ -91,8 +91,8 @@
   <section class="card proof" aria-labelledby="keys-label">
     <p class="label" id="keys-label">Fast · KEYS over 7 000 keys, ops/s</p>
     <div class="proof-body">
-    <p class="factor-line"><span class="factor" data-cell="keys-7000" data-pair="redis-iot1">5.16×</span> <span class="factor-what">the throughput of Redis on a page cache's walk</span></p>
-    <ul class="bars" role="list" aria-label="Operations per second by engine">
+    <p class="factor-line" data-cell="keys-7000" data-pair="redis-iot1"><span class="factor">5.16×</span> <span class="factor-what">the throughput of <span class="arm">Redis</span> on a page cache's walk</span></p>
+    <ul class="bars" role="list" aria-labelledby="keys-label">
       <li class="bar me" data-cell="keys-7000" data-arm="seedstone" style="--w: 100%"><span class="arm">seedstone</span><span class="figure">3 537</span></li>
       <li class="bar" data-cell="keys-7000" data-arm="dragonfly" style="--w: 60.4%"><span class="arm">Dragonfly</span><span class="figure">2 137</span></li>
       <li class="bar" data-cell="keys-7000" data-arm="garnet" style="--w: 42.9%"><span class="arm">Garnet</span><span class="figure">1 517</span></li>
@@ -118,7 +118,7 @@
         <button type="button" role="tab" id="tab-pkg" aria-controls="panel-pkg" aria-selected="false" tabindex="-1">deb / rpm</button>
         <button type="button" role="tab" id="tab-helm" aria-controls="panel-helm" aria-selected="false" tabindex="-1">Helm</button>
       </div>
-      <section class="panel" id="panel-curl" role="tabpanel" aria-labelledby="h-curl">
+      <section class="panel" id="panel-curl" aria-labelledby="h-curl">
         <h3 id="h-curl">curl</h3>
         <div class="copy">
           <pre><code>curl -fsSL https://seedstone.io/install.sh | sh</code></pre>
@@ -126,7 +126,7 @@
         </div>
         <p class="note">macOS and Linux, x86_64 and arm64. Verifies the release's SHA-256, installs the binary, nothing else.</p>
       </section>
-      <section class="panel" id="panel-docker" role="tabpanel" aria-labelledby="h-docker">
+      <section class="panel" id="panel-docker" aria-labelledby="h-docker">
         <h3 id="h-docker">Docker</h3>
         <div class="copy">
           <pre><code>docker run -p 6379:6379 seedstone/seedstone --bind 0.0.0.0:6379 --no-auth</code></pre>
@@ -134,7 +134,7 @@
         </div>
         <p class="note">Also on <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#container-image">GHCR</a>.</p>
       </section>
-      <section class="panel" id="panel-brew" role="tabpanel" aria-labelledby="h-brew">
+      <section class="panel" id="panel-brew" aria-labelledby="h-brew">
         <h3 id="h-brew">Homebrew</h3>
         <div class="copy">
           <pre><code>brew install seedstonelabs/tap/seedstone</code></pre>
@@ -142,7 +142,7 @@
         </div>
         <p class="note">macOS and Linux; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#homebrew-macos-and-linux">as a service</a> with <code>brew services</code>.</p>
       </section>
-      <section class="panel" id="panel-cargo" role="tabpanel" aria-labelledby="h-cargo">
+      <section class="panel" id="panel-cargo" aria-labelledby="h-cargo">
         <h3 id="h-cargo">Cargo</h3>
         <div class="copy">
           <pre><code>cargo binstall seedstone</code></pre>
@@ -150,11 +150,11 @@
         </div>
         <p class="note">The release archive in seconds; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#cargo"><code>cargo install</code></a> builds from source.</p>
       </section>
-      <section class="panel" id="panel-pkg" role="tabpanel" aria-labelledby="h-pkg">
+      <section class="panel" id="panel-pkg" aria-labelledby="h-pkg">
         <h3 id="h-pkg">deb / rpm</h3>
         <p class="note">A <code>.deb</code> or <code>.rpm</code> with a systemd unit, <a href="https://github.com/stefanobaldo/seedstone/releases/latest">from the release page</a>; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#debian-ubuntu-deb-and-fedora-rhel-rpm">what the service does</a>.</p>
       </section>
-      <section class="panel" id="panel-helm" role="tabpanel" aria-labelledby="h-helm">
+      <section class="panel" id="panel-helm" aria-labelledby="h-helm">
         <h3 id="h-helm">Helm</h3>
         <div class="copy">
           <pre><code>helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --set auth.noAuth=true</code></pre>
@@ -182,20 +182,20 @@
       <div class="card runs">
         <h3 id="runs-usual">A concurrency bug, the usual way <span class="tag">no seed</span></h3>
         <ol class="runlist">
-        <li class="run"><span class="run-n">run 1</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on hit"></i><i data-tick="7"></i><i data-tick="8"></i><i data-tick="9"></i><i data-tick="10"></i><i data-tick="11"></i><i data-tick="12"></i><i data-tick="13"></i><i data-tick="14"></i><i data-tick="15"></i><i data-tick="16"></i><i data-tick="17"></i><i data-tick="18"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 6</span></li>
-        <li class="run"><span class="run-n">run 2</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on"></i><i data-tick="10" class="on"></i><i data-tick="11" class="on"></i><i data-tick="12" class="on"></i><i data-tick="13" class="on"></i><i data-tick="14" class="on"></i><i data-tick="15" class="on"></i><i data-tick="16" class="on"></i><i data-tick="17" class="on"></i><i data-tick="18" class="on"></i><i data-tick="19" class="on"></i><i data-tick="20" class="on"></i></span><span class="tr dim">passed</span></li>
-        <li class="run"><span class="run-n">run 3</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on"></i><i data-tick="10" class="on"></i><i data-tick="11" class="on"></i><i data-tick="12" class="on"></i><i data-tick="13" class="on"></i><i data-tick="14" class="on"></i><i data-tick="15" class="on"></i><i data-tick="16" class="on"></i><i data-tick="17" class="on"></i><i data-tick="18" class="on"></i><i data-tick="19" class="on"></i><i data-tick="20" class="on"></i></span><span class="tr dim">passed</span></li>
-        <li class="run"><span class="run-n">run 4</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on hit"></i><i data-tick="10"></i><i data-tick="11"></i><i data-tick="12"></i><i data-tick="13"></i><i data-tick="14"></i><i data-tick="15"></i><i data-tick="16"></i><i data-tick="17"></i><i data-tick="18"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 9, elsewhere</span></li>
+        <li class="run"><span class="run-n">run 1</span><span class="cells" aria-hidden="true"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on hit"></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span><span class="tr fail">✗ tick 6</span></li>
+        <li class="run"><span class="run-n">run 2</span><span class="cells" aria-hidden="true"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i></span><span class="tr dim">passed</span></li>
+        <li class="run"><span class="run-n">run 3</span><span class="cells" aria-hidden="true"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i></span><span class="tr dim">passed</span></li>
+        <li class="run"><span class="run-n">run 4</span><span class="cells" aria-hidden="true"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on hit"></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span><span class="tr fail">✗ tick 9, elsewhere</span></li>
         </ol>
         <p class="verdict">Seen once, gone under the debugger, back in production.</p>
       </div>
       <div class="card runs seeded">
         <h3 id="runs-seeded">In seedstone <span class="tag seed">seed 0x4f2a9c1e</span></h3>
         <ol class="runlist">
-        <li class="run"><span class="run-n">run 1</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on"></i><i data-tick="10" class="on"></i><i data-tick="11" class="on"></i><i data-tick="12" class="on"></i><i data-tick="13" class="on"></i><i data-tick="14" class="on"></i><i data-tick="15" class="on"></i><i data-tick="16" class="on"></i><i data-tick="17" class="on"></i><i data-tick="18" class="on hit"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 18 · 0x8b…31</span></li>
-        <li class="run"><span class="run-n">run 2</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on"></i><i data-tick="10" class="on"></i><i data-tick="11" class="on"></i><i data-tick="12" class="on"></i><i data-tick="13" class="on"></i><i data-tick="14" class="on"></i><i data-tick="15" class="on"></i><i data-tick="16" class="on"></i><i data-tick="17" class="on"></i><i data-tick="18" class="on hit"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 18 · 0x8b…31</span></li>
-        <li class="run"><span class="run-n">run 3</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on"></i><i data-tick="10" class="on"></i><i data-tick="11" class="on"></i><i data-tick="12" class="on"></i><i data-tick="13" class="on"></i><i data-tick="14" class="on"></i><i data-tick="15" class="on"></i><i data-tick="16" class="on"></i><i data-tick="17" class="on"></i><i data-tick="18" class="on hit"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 18 · 0x8b…31</span></li>
-        <li class="run"><span class="run-n">run 4</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on"></i><i data-tick="10" class="on"></i><i data-tick="11" class="on"></i><i data-tick="12" class="on"></i><i data-tick="13" class="on"></i><i data-tick="14" class="on"></i><i data-tick="15" class="on"></i><i data-tick="16" class="on"></i><i data-tick="17" class="on"></i><i data-tick="18" class="on hit"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 18 · 0x8b…31</span></li>
+        <li class="run"><span class="run-n">run 1</span><span class="cells" aria-hidden="true"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on hit"></i><i></i><i></i></span><span class="tr fail">✗ tick 18 · 0x8b…31</span></li>
+        <li class="run"><span class="run-n">run 2</span><span class="cells" aria-hidden="true"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on hit"></i><i></i><i></i></span><span class="tr fail">✗ tick 18 · 0x8b…31</span></li>
+        <li class="run"><span class="run-n">run 3</span><span class="cells" aria-hidden="true"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on hit"></i><i></i><i></i></span><span class="tr fail">✗ tick 18 · 0x8b…31</span></li>
+        <li class="run"><span class="run-n">run 4</span><span class="cells" aria-hidden="true"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on hit"></i><i></i><i></i></span><span class="tr fail">✗ tick 18 · 0x8b…31</span></li>
         </ol>
         <p class="run-note">run 4 on another machine, in a fresh process</p>
         <p class="verdict pass">✓ Reproduced from the seed, byte for byte. Fixed once.</p>
@@ -215,11 +215,11 @@
     <p class="line">Same machine, same client, median of three runs, throughput in operations per second. Every bar is an engine this server is ahead of; the grey line names the ones level with it.</p>
     <div class="grid-2">
       <div class="card compare">
-        <h3 class="label"><span class="cell-name">SET 64 B with EX 60 · depth 64</span> <span class="what">a cache write with a deadline</span></h3>
-        <p class="tie">Dragonfly reads <span data-cell="set-64-ex60-d64" data-arm="dragonfly">4.63 M</span>, level with seedstone: the client's ceiling</p>
+        <h3 class="label" id="c-set-ex"><span class="cell-name">SET 64 B with EX 60 · depth 64</span> <span class="what">a cache write with a deadline</span></h3>
+        <p class="tie"><span data-cell="set-64-ex60-d64" data-arm="dragonfly"><span class="arm">Dragonfly</span> reads <span class="figure">4.63 M</span></span>, level with seedstone: the client's ceiling</p>
         <div class="proof-body">
-          <p class="factor-line"><span class="factor" data-cell="set-64-ex60-d64" data-pair="redis-iot1">2.96×</span> <span class="factor-what">Redis at one I/O thread</span></p>
-          <ul class="bars" role="list" aria-label="Operations per second by engine">
+          <p class="factor-line" data-cell="set-64-ex60-d64" data-pair="redis-iot1"><span class="factor">2.96×</span> <span class="factor-what"><span class="arm">Redis</span> at one I/O thread</span></p>
+          <ul class="bars" role="list" aria-labelledby="c-set-ex">
             <li class="bar me" data-cell="set-64-ex60-d64" data-arm="seedstone" style="--w: 100.0%"><span class="arm">seedstone</span><span class="figure">4.61 M</span></li>
             <li class="bar" data-cell="set-64-ex60-d64" data-arm="garnet" style="--w: 93.5%"><span class="arm">Garnet</span><span class="figure">4.31 M</span></li>
             <li class="bar" data-cell="set-64-ex60-d64" data-arm="redis-iot4" style="--w: 39.5%"><span class="arm">Redis ×4</span><span class="figure">1.82 M</span></li>
@@ -230,11 +230,11 @@
         </div>
       </div>
       <div class="card compare">
-        <h3 class="label"><span class="cell-name">SET 64 B · depth 64</span> <span class="what">the plain cache write</span></h3>
-        <p class="tie">Dragonfly <span data-cell="set-64-d64" data-arm="dragonfly">4.65 M</span> and Garnet <span data-cell="set-64-d64" data-arm="garnet">4.63 M</span>, level with seedstone: the client's ceiling</p>
+        <h3 class="label" id="c-set"><span class="cell-name">SET 64 B · depth 64</span> <span class="what">the plain cache write</span></h3>
+        <p class="tie"><span data-cell="set-64-d64" data-arm="dragonfly"><span class="arm">Dragonfly</span> <span class="figure">4.65 M</span></span> and <span data-cell="set-64-d64" data-arm="garnet"><span class="arm">Garnet</span> <span class="figure">4.63 M</span></span>, level with seedstone: the client's ceiling</p>
         <div class="proof-body">
-          <p class="factor-line"><span class="factor" data-cell="set-64-d64" data-pair="redis-iot1">2.21×</span> <span class="factor-what">Redis at one I/O thread</span></p>
-          <ul class="bars" role="list" aria-label="Operations per second by engine">
+          <p class="factor-line" data-cell="set-64-d64" data-pair="redis-iot1"><span class="factor">2.21×</span> <span class="factor-what"><span class="arm">Redis</span> at one I/O thread</span></p>
+          <ul class="bars" role="list" aria-labelledby="c-set">
             <li class="bar me" data-cell="set-64-d64" data-arm="seedstone" style="--w: 100.0%"><span class="arm">seedstone</span><span class="figure">4.63 M</span></li>
             <li class="bar" data-cell="set-64-d64" data-arm="valkey-iot4" style="--w: 56.5%"><span class="arm">Valkey ×4</span><span class="figure">2.62 M</span></li>
             <li class="bar" data-cell="set-64-d64" data-arm="redis-iot4" style="--w: 53.7%"><span class="arm">Redis ×4</span><span class="figure">2.49 M</span></li>
@@ -244,11 +244,11 @@
         </div>
       </div>
       <div class="card compare">
-        <h3 class="label"><span class="cell-name">MGET 16 keys · depth 64</span> <span class="what">the multi-key read</span></h3>
-        <p class="tie">Garnet reads <span data-cell="mget-16-d64" data-arm="garnet">629 k</span>, level with seedstone</p>
+        <h3 class="label" id="c-mget"><span class="cell-name">MGET 16 keys · depth 64</span> <span class="what">the multi-key read</span></h3>
+        <p class="tie"><span data-cell="mget-16-d64" data-arm="garnet"><span class="arm">Garnet</span> reads <span class="figure">629 k</span></span>, level with seedstone</p>
         <div class="proof-body">
-          <p class="factor-line"><span class="factor" data-cell="mget-16-d64" data-pair="redis-iot1">1.86×</span> <span class="factor-what">Redis at one I/O thread</span></p>
-          <ul class="bars" role="list" aria-label="Operations per second by engine">
+          <p class="factor-line" data-cell="mget-16-d64" data-pair="redis-iot1"><span class="factor">1.86×</span> <span class="factor-what"><span class="arm">Redis</span> at one I/O thread</span></p>
+          <ul class="bars" role="list" aria-labelledby="c-mget">
             <li class="bar me" data-cell="mget-16-d64" data-arm="seedstone" style="--w: 100.0%"><span class="arm">seedstone</span><span class="figure">625 k</span></li>
             <li class="bar" data-cell="mget-16-d64" data-arm="dragonfly" style="--w: 74.1%"><span class="arm">Dragonfly</span><span class="figure">463 k</span></li>
             <li class="bar" data-cell="mget-16-d64" data-arm="valkey-iot4" style="--w: 70.6%"><span class="arm">Valkey ×4</span><span class="figure">442 k</span></li>
@@ -259,11 +259,11 @@
         </div>
       </div>
       <div class="card compare">
-        <h3 class="label"><span class="cell-name">GET 64 B · depth 64</span> <span class="what">the pipelined read</span></h3>
-        <p class="tie">Dragonfly reads <span data-cell="get-64-d64" data-arm="dragonfly">4.65 M</span>, level with seedstone: the client's ceiling</p>
+        <h3 class="label" id="c-get"><span class="cell-name">GET 64 B · depth 64</span> <span class="what">the pipelined read</span></h3>
+        <p class="tie"><span data-cell="get-64-d64" data-arm="dragonfly"><span class="arm">Dragonfly</span> reads <span class="figure">4.65 M</span></span>, level with seedstone: the client's ceiling</p>
         <div class="proof-body">
-          <p class="factor-line"><span class="factor" data-cell="get-64-d64" data-pair="redis-iot1">1.75×</span> <span class="factor-what">Redis at one I/O thread</span></p>
-          <ul class="bars" role="list" aria-label="Operations per second by engine">
+          <p class="factor-line" data-cell="get-64-d64" data-pair="redis-iot1"><span class="factor">1.75×</span> <span class="factor-what"><span class="arm">Redis</span> at one I/O thread</span></p>
+          <ul class="bars" role="list" aria-labelledby="c-get">
             <li class="bar me" data-cell="get-64-d64" data-arm="seedstone" style="--w: 100.0%"><span class="arm">seedstone</span><span class="figure">4.63 M</span></li>
             <li class="bar" data-cell="get-64-d64" data-arm="garnet" style="--w: 94.3%"><span class="arm">Garnet</span><span class="figure">4.37 M</span></li>
             <li class="bar" data-cell="get-64-d64" data-arm="valkey-iot4" style="--w: 79.1%"><span class="arm">Valkey ×4</span><span class="figure">3.66 M</span></li>
