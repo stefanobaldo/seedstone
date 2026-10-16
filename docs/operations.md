@@ -217,7 +217,9 @@ acknowledged writes only the snapshot it was taking could have covered.
 `--fsync` without `--data-dir` is accepted, logged as `fsync_ignored`, and
 does nothing. On start the log is read back: a shard whose records have a
 gap is replayed up to the gap and reported with `recovery_truncated`, and
-the node serves what it has.
+the node serves what it has. After a crash, the `recovery` line separates the
+crash's tear (`torn_bytes`, charged to no shard) from damage to what a sync
+had reached (`lossy_shards`).
 
 **When the disk fails.** A write, a sync or a rotation of the log that
 fails (`log_fault`) puts the node into refusal: every write is answered
@@ -317,7 +319,7 @@ Redis (read on 6.2.24 and 8.10.1).
 | `syncs_total` | count | syncs of the log completed since the start |
 | `last_sync_ms` | milliseconds | how long the last completed sync took; absent until the first one |
 | `refusing_executors` | count | executors refusing writes right now |
-| `lossy_shards` | count | shards the start reported lossy (the `recovery` line's `lossy_shards`) that no durable snapshot has covered since; it only falls within a process, and each snapshot that covers one says so with its `cleared` field |
+| `lossy_shards` | count | shards the start reported lossy (the `recovery` line's `lossy_shards`: shards that may have lost records a sync had been issued over) that no durable snapshot has covered since; it only falls within a process, and each snapshot that covers one says so with its `cleared` field |
 
 The rest of Redis's section is absent. There is no fork and no rewrite, so
 there are no copy-on-write, fork or rewrite fields. A snapshot's duration is
