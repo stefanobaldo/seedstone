@@ -40,22 +40,55 @@ GLIBC_MIN=2.34
 # Colour and symbols only on a terminal, with NO_COLOR unset and TERM not
 # dumb; the sprite only when the terminal advertises 24-bit colour. Piped or
 # plain, the same lines without an escape byte, so a CI log reads as a screen.
+#
+# The sprite is printed whole before the report. On a terminal at least 100
+# columns wide the cursor then goes back up and the report is written beside
+# it, from the column after it (so the picture never appears line by line
+# while a download runs); on a narrower one the report starts below it.
 COLOR=0
 SPRITE=0
+BESIDE=0
 LINE=0
 setup_output() {
   if [ -t 1 ] && [ -z "${NO_COLOR+set}" ] && [ "${TERM:-dumb}" != dumb ]; then
     COLOR=1
     case "${COLORTERM:-}" in truecolor | 24bit) SPRITE=1 ;; esac
   fi
+  [ "$SPRITE" -eq 1 ] || return 0
+  # The width is read from the controlling terminal: under `curl | sh`
+  # stdin is the pipe, and `tput cols` inside a substitution reports the
+  # terminfo default, not the window.
+  columns="$(stty size < /dev/tty 2>/dev/null | cut -d' ' -f2)"
+  [ -n "$columns" ] || columns="${COLUMNS:-80}"
+  n=1
+  while [ "$n" -le "$SPRITE_LINES" ]; do
+    sprite_line "$n"
+    printf '\n'
+    n=$((n + 1))
+  done
+  if [ "$columns" -ge 100 ]; then
+    BESIDE=1
+    printf '\033[%dA' "$SPRITE_LINES"
+  else
+    printf '\n'
+  fi
 }
 
-# Every line of the report goes through here, so the sprite's twelve lines
-# come out beside the first twelve of them and the rest keep the margin.
+# Every line of the report goes through here: beside the sprite it starts
+# at the column after it, otherwise at the margin.
 out() {
   LINE=$((LINE + 1))
-  if [ "$SPRITE" -eq 1 ]; then sprite_line "$LINE"; else printf '  '; fi
+  if [ "$BESIDE" -eq 1 ]; then printf '\033[%dG' "$((SPRITE_WIDTH + 1))"; else printf '  '; fi
   printf '%s\n' "$1"
+}
+
+# Beside the sprite, a report that ends before the sprite's last line would
+# leave the shell's prompt in the picture: the cursor goes down past it.
+below_sprite() {
+  if [ "$BESIDE" -eq 1 ] && [ "$LINE" -lt "$SPRITE_LINES" ]; then
+    printf '\033[%dB' "$((SPRITE_LINES - LINE))"
+    LINE="$SPRITE_LINES"
+  fi
 }
 
 # A step line: a symbol in its colour, a label, a value.
@@ -70,11 +103,14 @@ step() { # <symbol> <ansi colour> <label> <value>
 
 # One sentence on stderr, then the exit code the header documents.
 die() { # <exit code> <sentence>
+  if [ "$BESIDE" -eq 1 ]; then printf '\033[%dG' "$((SPRITE_WIDTH + 1))" >&2; else printf '  ' >&2; fi
   if [ "$COLOR" -eq 1 ]; then
-    printf '  \033[31m✗\033[0m  %s\n' "$2" >&2
+    printf '\033[31m✗\033[0m  %s\n' "$2" >&2
   else
-    printf '  ✗  %s\n' "$2" >&2
+    printf '✗  %s\n' "$2" >&2
   fi
+  LINE=$((LINE + 1))
+  below_sprite
   exit "$1"
 }
 
@@ -211,6 +247,7 @@ install_binary() { # <source> <destination>
     die 1 "$INSTALL_DIR is not writable and there is no sudo; choose a directory you own with SEEDSTONE_INSTALL_DIR, e.g. SEEDSTONE_INSTALL_DIR=\$HOME/.local/bin"
   fi
   out "   $INSTALL_DIR is not writable; copying with sudo"
+  below_sprite
   sudo sh -c 'mkdir -p "$3" && cp "$1" "$2.new" && chmod 755 "$2.new" && mv -f "$2.new" "$2" || { rm -f "$2.new"; exit 1; }' sh "$1" "$2" "$INSTALL_DIR" ||
     die 1 "sudo could not copy the binary into $INSTALL_DIR; choose a directory you own with SEEDSTONE_INSTALL_DIR"
 }
@@ -314,31 +351,28 @@ main() {
     *":$INSTALL_DIR:"*) ;;
     *)
       out ""
-      out "  $INSTALL_DIR is not on your PATH; for this shell:  export PATH=\"$INSTALL_DIR:\$PATH\""
+      out "  $INSTALL_DIR is not on your PATH; for this shell:"
+      out "    export PATH=\"$INSTALL_DIR:\$PATH\""
       ;;
   esac
   closing_block "$VERSION"
 }
 
 # --- sprite ---
-# The mark, 24 by 24 pixels in half-block characters and 24-bit colour,
-# one line of the twelve per call. Emitted by scripts/brand.py from the
-# grid it holds; edit the grid there, never these lines.
+# The mark, 16 by 14 pixels in half-block characters and 24-bit colour,
+# one line per call. Emitted by scripts/brand.py from the grid it holds;
+# edit the grid there, never these lines.
+SPRITE_LINES=7
+SPRITE_WIDTH=21
 sprite_line() {
   case "$1" in
-  1) printf '           \033[38;2;58;71;86m▄▄▄▄▄▄\033[0m             ' ;;
-  2) printf '       \033[38;2;58;71;86m▄████████████▄\033[0m         ' ;;
-  3) printf '     \033[38;2;31;40;49m▄\033[38;2;58;71;86m███████\033[38;2;58;71;86;48;2;240;160;48m▀▀\033[38;2;58;71;86m███████\033[38;2;31;40;49m▄\033[0m       ' ;;
-  4) printf '    \033[38;2;31;40;49m█\033[38;2;58;71;86m███████\033[38;2;58;71;86;48;2;255;196;92m▀\033[38;2;255;196;92m█\033[38;2;240;160;48m█\033[38;2;58;71;86;48;2;240;160;48m▀\033[38;2;58;71;86m███████\033[38;2;31;40;49m█\033[0m      ' ;;
-  5) printf '   \033[38;2;31;40;49m▄\033[38;2;31;40;49;48;2;58;71;86m▀\033[38;2;58;71;86m██████\033[38;2;58;71;86;48;2;255;196;92m▀\033[38;2;255;196;92m█\033[38;2;255;196;92;48;2;240;160;48m▀\033[38;2;240;160;48m██\033[38;2;58;71;86;48;2;240;160;48m▀\033[38;2;58;71;86m██████\033[38;2;31;40;49;48;2;58;71;86m▀\033[38;2;31;40;49m▄\033[0m     ' ;;
-  6) printf '   \033[38;2;31;40;49m█\033[38;2;58;71;86m██████\033[38;2;58;71;86;48;2;255;196;92m▀\033[38;2;255;196;92m█\033[38;2;255;196;92;48;2;240;160;48m▀\033[38;2;240;160;48m████\033[38;2;58;71;86;48;2;240;160;48m▀\033[38;2;58;71;86m██████\033[38;2;31;40;49m█\033[0m     ' ;;
-  7) printf '   \033[38;2;31;40;49m█\033[38;2;58;71;86m██████\033[38;2;255;196;92m██\033[38;2;240;160;48m██████\033[38;2;58;71;86m██████\033[38;2;31;40;49m█\033[0m     ' ;;
-  8) printf '   \033[38;2;31;40;49m▀█\033[38;2;58;71;86m█████\033[38;2;255;196;92m██\033[38;2;240;160;48m██████\033[38;2;58;71;86m█████\033[38;2;31;40;49m█▀\033[0m     ' ;;
-  9) printf '    \033[38;2;31;40;49m██\033[38;2;58;71;86m█████\033[38;2;255;196;92;48;2;58;71;86m▀\033[38;2;240;160;48m████\033[38;2;240;160;48;48;2;58;71;86m▀\033[38;2;58;71;86m█████\033[38;2;31;40;49m██\033[0m      ' ;;
-  10) printf '     \033[38;2;31;40;49m▀█\033[38;2;58;71;86;48;2;31;40;49m▀▀\033[38;2;58;71;86m██████████\033[38;2;58;71;86;48;2;31;40;49m▀▀\033[38;2;31;40;49m█▀\033[0m       ' ;;
-  11) printf '       \033[38;2;31;40;49m▀███\033[38;2;58;71;86;48;2;31;40;49m▀▀▀▀▀▀\033[38;2;31;40;49m███▀\033[0m         ' ;;
-  12) printf '           \033[38;2;31;40;49m▀▀▀▀▀▀\033[0m             ' ;;
-  *) printf '%30s' '' ;;
+  1) printf '     \033[38;2;31;40;49m▄\033[38;2;58;71;86m▄\033[38;2;31;40;49;48;2;58;71;86m▀\033[38;2;58;71;86m████\033[38;2;31;40;49;48;2;58;71;86m▀\033[38;2;58;71;86m▄\033[38;2;31;40;49m▄\033[0m      ' ;;
+  2) printf '   \033[38;2;31;40;49m▄\033[38;2;31;40;49;48;2;58;71;86m▀\033[38;2;58;71;86m████\033[38;2;58;71;86;48;2;240;160;48m▀▀\033[38;2;58;71;86m████\033[38;2;31;40;49;48;2;58;71;86m▀\033[38;2;31;40;49m▄\033[0m    ' ;;
+  3) printf '  \033[38;2;31;40;49m▄\033[38;2;58;71;86m█████\033[38;2;58;71;86;48;2;255;196;92m▀\033[38;2;255;196;92;48;2;240;160;48m▀\033[38;2;240;160;48m█\033[38;2;58;71;86;48;2;240;160;48m▀\033[38;2;58;71;86m█████\033[38;2;31;40;49m▄\033[0m   ' ;;
+  4) printf '  \033[38;2;31;40;49m█\033[38;2;58;71;86m████\033[38;2;58;71;86;48;2;255;196;92m▀\033[38;2;255;196;92m█\033[38;2;240;160;48m███\033[38;2;58;71;86;48;2;240;160;48m▀\033[38;2;58;71;86m████\033[38;2;31;40;49m█\033[0m   ' ;;
+  5) printf '  \033[38;2;31;40;49m▀\033[38;2;58;71;86;48;2;31;40;49m▀\033[38;2;58;71;86m███\033[38;2;255;196;92m█\033[38;2;255;196;92;48;2;240;160;48m▀\033[38;2;240;160;48m████\033[38;2;58;71;86m███\033[38;2;58;71;86;48;2;31;40;49m▀\033[38;2;31;40;49m▀\033[0m   ' ;;
+  6) printf '   \033[38;2;31;40;49m▀█\033[38;2;58;71;86;48;2;31;40;49m▀\033[38;2;58;71;86m██\033[38;2;255;196;92;48;2;58;71;86m▀\033[38;2;240;160;48m██\033[38;2;240;160;48;48;2;58;71;86m▀\033[38;2;58;71;86m██\033[38;2;58;71;86;48;2;31;40;49m▀\033[38;2;31;40;49m█▀\033[0m    ' ;;
+  7) printf '     \033[38;2;31;40;49m▀▀█\033[38;2;58;71;86;48;2;31;40;49m▀▀▀▀\033[38;2;31;40;49m█▀▀\033[0m      ' ;;
   esac
 }
 # --- /sprite ---
