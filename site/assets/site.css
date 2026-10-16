@@ -447,10 +447,13 @@ main > section:not(.hero) > * { min-width: 0; }
 }
 .compare .bar { grid-template-columns: 5.6em minmax(0, 1fr) 3.4em; }   /* room for "Valkey ×4" */
 
-/* The four operations cards: a title, one line, the excerpt; each card
-   the height of what it holds, since a blank band inside a card reads
-   worse than two cards of unequal height. */
+/* The four operations cards: a title, one line, the excerpt. The two
+   cards of a row share a height, and the excerpt's block is what grows to
+   fill it, so nothing opens up between the text and the code. */
+.ops { align-items: stretch; }
+.op { display: flex; flex-direction: column; }
 .op > p { margin-bottom: 1rem; }
+.op > pre:last-child { flex: 1 1 auto; }
 .op pre { padding: 0.7rem 0.85rem; background: var(--bg-raised); border: 1px solid var(--rule); border-radius: var(--radius); line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 .op pre code { font-size: 0.75rem; }
 .op .key { color: var(--accent); }
