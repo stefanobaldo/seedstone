@@ -37,6 +37,9 @@
   --accent: var(--highlight);   /* amber as text and as a bar, on this background */
   --bar: var(--face);
   --focus: var(--amber);
+  --pass: #3fb950;              /* the check mark and an OK; semantic, not brand */
+  --fail: #e5484d;
+  --string: #9ad0ff;            /* a JSON string in an excerpt */
 
   --sans: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
@@ -60,6 +63,9 @@
     --accent: #9a5a05;           /* the amber, deepened until 12 px text holds on white */
     --bar: #8f9cab;
     --focus: var(--text);
+    --pass: #1a7f37;
+    --fail: #cf222e;
+    --string: #0a5fa8;
   }
 }
 
@@ -90,8 +96,10 @@ body > * {
   margin-right: auto;
 }
 
-/* The glows: three soft amber discs behind the hero's right column and two
-   of the sections, clipped at the page's edges so none of them widens it. */
+/* The glows: three soft amber discs. The hero's sits in a backdrop clipped
+   at the page's edges, so it may bleed past the column; the two behind the
+   sections are each section's own `::before`, no wider than the section,
+   so they follow it wherever the page's height moves it. */
 .backdrop {
   position: absolute;
   inset: 0;
@@ -100,16 +108,29 @@ body > * {
   pointer-events: none;
   z-index: -1;
 }
-.glow {
+.glow, .glow-left::before, .glow-right::before {
   position: absolute;
   width: 640px;
   height: 640px;
   border-radius: 50%;
   background: radial-gradient(closest-side, var(--glow), transparent);
+  pointer-events: none;
 }
 .g1 { top: -200px; right: calc(50% - 40rem); }
-.g2 { top: 36%; left: calc(50% - 50rem); }
-.g3 { top: 64%; right: calc(50% - 48rem); }
+.glow-left, .glow-right { position: relative; }
+.glow-left::before, .glow-right::before {
+  content: "";
+  z-index: -1;
+  width: min(640px, 100%);
+  height: auto;
+  aspect-ratio: 1;
+}
+.glow-left::before { top: 4rem; left: -4rem; }
+.glow-right::before { top: 6rem; right: -2rem; }
+@media (max-width: 64rem) {
+  .glow-left::before { left: 0; }
+  .glow-right::before { right: 0; }
+}
 
 h1, h2 { font-weight: 700; margin: 0; letter-spacing: -0.02em; text-wrap: balance; }
 h1 { font-size: clamp(2.5rem, 1.5rem + 4.2vw, 4.25rem); line-height: 1.02; letter-spacing: -0.03em; }
@@ -214,10 +235,9 @@ ul { margin: 0; padding: 0; list-style: none; }
 }
 .copy-button:hover { background: var(--highlight); }
 .fine { color: var(--muted); font-size: 0.8125rem; line-height: 1.5; max-width: 34rem; }
-@media (max-width: 480px) {
-  /* The line is longer than the box here and scrolls inside it; the fade says so. */
-  .copy pre { padding-right: 1.5rem; mask-image: linear-gradient(90deg, #000 calc(100% - 1.5rem), transparent); -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 1.5rem), transparent); }
-}
+/* A line longer than its box scrolls inside it, and the fade at the box's
+   edge says so; a line that fits ends before the fade. */
+.copy pre { padding-right: 1.5rem; mask-image: linear-gradient(90deg, #000 calc(100% - 1.5rem), transparent); -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 1.5rem), transparent); }
 
 /* The animation's caption, and the proof card under it. */
 .anim-figure figcaption { text-align: right; }
@@ -297,25 +317,173 @@ main > section:not(.hero) > * { min-width: 0; }
 }
 .claim { margin: 0 0 0.9rem; }
 .line { font-size: 1.0625rem; color: var(--text-2); max-width: var(--measure); text-wrap: pretty; }
-.two { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.5rem 2.5rem; align-items: start; }
+.line { margin-bottom: 2rem; }
+.two, .grid-2 { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.25rem; align-items: start; }
 @media (min-width: 64rem) {
-  .two { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); }
+  .two { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); gap: 1.5rem 2.5rem; }
+  .two.install { grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); }
+  .two.even { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: stretch; }
+  .two.speaks { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); }
+}
+@media (min-width: 48rem) {
+  .grid-2 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
 }
 #start .two { align-items: center; }
 #start .card .copy { margin: 0 0 0.75rem; max-width: none; }
+.card h3 { font-size: 0.9375rem; font-weight: 700; margin: 0 0 0.6rem; line-height: 1.3; }
+.card > p { font-size: 0.875rem; color: var(--text-2); }
+.card code { font-size: 0.85em; }
 
-/* The install rows: the channel on the left, what to type on the right. */
-.ways { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 0.9rem 1.25rem; margin: 0.5rem 0 1.5rem; }
-.ways dt { padding-top: 0.45rem; color: var(--muted); font-size: 0.9375rem; }
-.ways dd { margin: 0; min-width: 0; }
-.ways pre, .console { padding: 0.6rem 0.9rem; background: var(--bg-raised); border: 1px solid var(--rule); border-radius: var(--radius); }
-.ways .note { display: block; color: var(--muted); font-size: 0.875rem; margin-top: 0.35rem; max-width: var(--measure); }
-.console { margin: 0 0 1rem; max-width: 36rem; }
-@media (max-width: 640px) {
-  .ways { grid-template-columns: minmax(0, 1fr); gap: 0.2rem; }
-  .ways dt { padding-top: 0; }
-  .ways dd { margin-bottom: 1rem; }
+/* The install card: six panels, one per channel. Without the script every
+   panel shows under its own heading; with it (`.js`, from site.js) the
+   headings become tabs and one panel shows at a time. */
+.tabs { padding-bottom: 1.25rem; }
+.tablist { display: none; }
+.tabs .panel h3 { margin: 0 0 0.6rem; }
+.tabs .panel + .panel { margin-top: 1.4rem; padding-top: 1.4rem; border-top: 1px solid var(--rule); }
+.tabs .copy { max-width: none; margin: 0; padding: 0.45rem 0.45rem 0.45rem 0.9rem; }
+.tabs .copy-button { font-size: 0.8125rem; padding: 0.5rem 0.7rem; }
+.tabs .note { font-size: 0.8125rem; color: var(--muted); margin: 0.75rem 0 0; line-height: 1.5; }
+.tabs.js { align-self: stretch; }   /* the card is the shorter one with the tabs; its edge meets the terminal's */
+.tabs.js .tablist { display: flex; flex-wrap: wrap; gap: 0.1rem; margin: -0.35rem 0 1.1rem; border-bottom: 1px solid var(--rule); }
+.tabs.js .tablist button {
+  font: 700 0.8125rem/1 var(--sans);
+  color: var(--muted);
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  padding: 0.65rem 0.75rem;
+  cursor: pointer;
 }
+.tabs.js .tablist button:hover { color: var(--text); }
+.tabs.js .tablist button[aria-selected="true"] { color: var(--text); border-color: var(--amber); }
+.tabs.js .panel { display: none; margin: 0; padding: 0; border: 0; }
+.tabs.js .panel.on { display: block; }
+.tabs.js .panel h3 { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); margin: 0; }
+
+/* The terminal: a well, darker than the page in both schemes, a title bar
+   of three blank dots and the session in it; each line is a `.ln` so the
+   script can type them one at a time. */
+.term {
+  --pass: #3fb950;    /* the well is dark in both schemes, so its colours are the dark scheme's */
+  --fail: #e5484d;
+  margin: 0;
+  min-width: 0;
+  background: #0c1116;
+  color: #c3ccd6;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+}
+.term-bar { display: flex; gap: 6px; padding: 0.7rem 0.9rem; border-bottom: 1px solid #1f2831; }
+.term-bar i { display: block; width: 10px; height: 10px; border-radius: 50%; background: #2b3540; }
+.term pre { padding: 1rem 1.1rem 1.1rem; line-height: 1.75; }
+.term pre code { font-size: 0.8125rem; }
+.term .ln { display: block; white-space: pre; }
+@media (max-width: 40rem) {
+  .term .ln { white-space: pre-wrap; overflow-wrap: anywhere; }
+}
+.term .p { color: #8b97a5; }
+.term .ok, .ok { color: var(--pass); }
+.term .er, .er { color: var(--fail); }
+.term .cur { display: inline-block; width: 0.55em; height: 1em; background: var(--highlight); vertical-align: -0.15em; }
+
+/* The pipeline strip: the seed, three stages, the trace. */
+.pipeline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 1.5rem;
+  padding: 0;
+  list-style: none;
+  font: 400 0.75rem/1 var(--mono);
+  color: var(--text-2);
+}
+.pipeline li { padding: 0.45rem 0.75rem; border: 1px solid var(--rule); border-radius: 999px; background: var(--card); }
+.pipeline li.seed { color: var(--accent); border-color: var(--amber); }
+.pipeline li.arrow { padding: 0; border: 0; background: none; color: var(--muted); }
+
+/* The two run panels: four strips of cells each, the failing tick red,
+   the trace beside it, the verdict under a rule. */
+.runs { display: flex; flex-direction: column; }
+.runs h3 { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+.runs .tag { font-weight: 400; font-size: 0.75rem; color: var(--muted); white-space: nowrap; }
+.runs .tag.seed { font-family: var(--mono); color: var(--accent); }
+.runs.seeded { border-color: color-mix(in srgb, var(--pass) 35%, var(--rule)); }
+.runlist { margin: 0 0 0.9rem; padding: 0; list-style: none; }
+.run { display: grid; grid-template-columns: 2.6rem minmax(0, 1fr) 7.6rem; gap: 0.6rem; align-items: center; font-size: 0.75rem; color: var(--muted); margin: 0.55rem 0; }
+.cells { display: flex; gap: 2px; }
+.cells i { flex: 1; height: 11px; border-radius: 2px; background: var(--bg-raised); border: 1px solid var(--rule); }
+.cells i.on { background: var(--face); border-color: var(--face); }
+.cells i.hit.on { background: var(--fail); border-color: var(--fail); }
+.tr { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tr.fail { color: var(--fail); }
+.tr.dim { color: var(--muted); }
+.run-note { font-size: 0.6875rem; color: var(--muted); margin: -1.1rem 0 0.9rem 3.2rem; }
+.verdict { margin: auto 0 0; padding-top: 0.8rem; border-top: 1px solid var(--rule); font-size: 0.8125rem; color: var(--text-2); }
+.verdict.pass { color: var(--pass); }
+@media (max-width: 30rem) {
+  .run { grid-template-columns: 2.6rem minmax(0, 1fr); }
+  .run .tr { grid-column: 2; margin-top: -0.2rem; }
+  .run-note { margin-left: 3.2rem; }
+}
+
+/* The three figures under the panels: unboxed, a number and its sentence. */
+.stats { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.25rem 2rem; margin: 2rem 0 0; }
+.stats strong { display: block; font-size: 2rem; line-height: 1; letter-spacing: -0.02em; margin-bottom: 0.5rem; }
+.stats strong span { color: var(--accent); font-size: 1.125rem; }
+.stats p { font-size: 0.8125rem; color: var(--text-2); line-height: 1.45; max-width: 22em; }
+@media (min-width: 40rem) {
+  .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+/* The four comparison cards: the cell and what it is, the grey line for
+   the engines level with seedstone, then the factor beside the bars. */
+.compare .label { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.2rem 1rem; color: var(--text); font-weight: 700; margin-bottom: 0.25rem; }
+.compare .label .what { font-weight: 400; color: var(--muted); }
+.compare .tie { font-size: 0.75rem; color: var(--muted); margin: 0 0 1rem; }
+.compare .factor { font-size: 2rem; }
+.compare .proof-body { gap: 0.9rem 1.25rem; }
+@media (min-width: 30rem) {
+  .compare .proof-body { grid-template-columns: 8.5rem minmax(0, 1fr); }
+}
+.bar { grid-template-columns: 5.6em minmax(0, 1fr) 3.4em; }
+
+/* The four operations cards: a title, one line, and the excerpt pinned to
+   the card's bottom edge so the four line up. */
+.ops { align-items: stretch; }
+.op { display: flex; flex-direction: column; }
+.op > p { flex: 1 1 auto; margin-bottom: 1rem; }
+.op pre { padding: 0.7rem 0.85rem; background: var(--bg-raised); border: 1px solid var(--rule); border-radius: var(--radius); line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.op pre code { font-size: 0.75rem; }
+.op .key { color: var(--accent); }
+.op .str { color: var(--string); }
+.op .cm { color: var(--muted); }
+.op .p { color: var(--muted); }
+.steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.4rem; margin: 0 0 0.6rem; padding: 0; list-style: none; font-size: 0.75rem; line-height: 1.35; color: var(--text-2); }
+.steps li { padding: 0.5rem 0.6rem; border: 1px solid var(--rule); border-radius: var(--radius); background: var(--bg-raised); }
+.steps .step-n { display: block; font-size: 0.6875rem; font-weight: 700; color: var(--accent); margin-bottom: 0.15rem; }
+
+/* The compatibility chips: the four groups of the named list, then the
+   dashed row of what is not here yet. */
+.groups { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.25rem 1.5rem; }
+@media (min-width: 30rem) {
+  .groups { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .groups .not-yet { grid-column: 1 / -1; }
+}
+.group h3 { font-size: 0.75rem; font-weight: 700; color: var(--muted); margin: 0 0 0.5rem; }
+.chips { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.chip {
+  font: 400 0.75rem/1 var(--mono);
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--bg-raised);
+  color: var(--text);
+}
+.chip.no { background: none; border-style: dashed; color: var(--muted); }
 
 /* The footer: the lockup, the seven pages, the licence. */
 footer {

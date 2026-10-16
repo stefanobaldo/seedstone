@@ -25,7 +25,7 @@
 <noscript><style>.copy-button{display:none}</style></noscript>
 </head>
 <body>
-<div class="backdrop" aria-hidden="true"><i class="glow g1"></i><i class="glow g2"></i><i class="glow g3"></i></div>
+<div class="backdrop" aria-hidden="true"><i class="glow g1"></i></div>
 
 <header class="top">
   <a class="brand" href="/" aria-label="seedstone, home">
@@ -107,59 +107,240 @@
   <section id="install">
     <p class="eyebrow">Install</p>
     <h2 class="claim">One line. Or any of five others.</h2>
-    <p class="line">Every way in; the binary is the same on each. The packages start a service on loopback. After Homebrew or Cargo, start the server with <code>seedstone</code>.</p>
-    <dl class="ways">
-      <dt>One line</dt>
-      <dd><pre><code>curl -fsSL https://seedstone.io/install.sh | sh</code></pre><span class="note">macOS and Linux. Verifies the release's SHA-256, installs the binary, nothing else.</span></dd>
-      <dt>Container</dt>
-      <dd><pre><code>docker run -p 6379:6379 seedstone/seedstone --bind 0.0.0.0:6379 --no-auth</code></pre><span class="note">Also on <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#container-image">GHCR</a>.</span></dd>
-      <dt>Homebrew</dt>
-      <dd><pre><code>brew install seedstonelabs/tap/seedstone</code></pre><span class="note">macOS and Linux; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#homebrew-macos-and-linux">as a service</a> with <code>brew services</code>.</span></dd>
-      <dt>Cargo</dt>
-      <dd><pre><code>cargo binstall seedstone</code></pre><span class="note">The release archive in seconds; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#cargo"><code>cargo install</code></a> builds from source.</span></dd>
-      <dt>Debian, Ubuntu / Fedora, RHEL</dt>
-      <dd><span class="note">A <code>.deb</code> or <code>.rpm</code> with a systemd unit, <a href="https://github.com/stefanobaldo/seedstone/releases/latest">from the release page</a>; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#debian-ubuntu-deb-and-fedora-rhel-rpm">what the service does</a>.</span></dd>
-      <dt>Kubernetes</dt>
-      <dd><pre><code>helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --set auth.noAuth=true</code></pre><span class="note"><a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#kubernetes-helm">The chart</a>, and what <code>auth.noAuth</code> says.</span></dd>
-    </dl>
-    <p class="line">Then, with any client:</p>
-<pre class="console"><code>$ redis-cli
-127.0.0.1:6379&gt; set greeting hello ex 60
-OK
-127.0.0.1:6379&gt; ttl greeting
-(integer) 60
-127.0.0.1:6379&gt; get greeting
-"hello"</code></pre>
+    <p class="line">The binary is the same on every channel. The packages start a service on loopback; after Homebrew or Cargo, start it with <code>seedstone</code>.</p>
+    <div class="two install">
+    <div class="card tabs">
+      <div class="tablist" role="tablist" aria-label="Install channels">
+        <button type="button" role="tab" id="tab-curl" aria-controls="panel-curl" aria-selected="true" tabindex="0">curl</button>
+        <button type="button" role="tab" id="tab-docker" aria-controls="panel-docker" aria-selected="false" tabindex="-1">Docker</button>
+        <button type="button" role="tab" id="tab-brew" aria-controls="panel-brew" aria-selected="false" tabindex="-1">Homebrew</button>
+        <button type="button" role="tab" id="tab-cargo" aria-controls="panel-cargo" aria-selected="false" tabindex="-1">Cargo</button>
+        <button type="button" role="tab" id="tab-pkg" aria-controls="panel-pkg" aria-selected="false" tabindex="-1">deb / rpm</button>
+        <button type="button" role="tab" id="tab-helm" aria-controls="panel-helm" aria-selected="false" tabindex="-1">Helm</button>
+      </div>
+      <section class="panel" id="panel-curl" role="tabpanel" aria-labelledby="tab-curl">
+        <h3>curl</h3>
+        <div class="copy">
+          <pre><code>curl -fsSL https://seedstone.io/install.sh | sh</code></pre>
+          <button type="button" class="copy-button" data-copy="curl -fsSL https://seedstone.io/install.sh | sh">Copy</button>
+        </div>
+        <p class="note">macOS and Linux, x86_64 and arm64. Verifies the release's SHA-256, installs the binary, nothing else. Read it first: <a href="/install.sh">install.sh</a>.</p>
+      </section>
+      <section class="panel" id="panel-docker" role="tabpanel" aria-labelledby="tab-docker">
+        <h3>Docker</h3>
+        <div class="copy">
+          <pre><code>docker run -p 6379:6379 seedstone/seedstone --bind 0.0.0.0:6379 --no-auth</code></pre>
+          <button type="button" class="copy-button" data-copy="docker run -p 6379:6379 seedstone/seedstone --bind 0.0.0.0:6379 --no-auth">Copy</button>
+        </div>
+        <p class="note">Also on <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#container-image">GHCR</a>.</p>
+      </section>
+      <section class="panel" id="panel-brew" role="tabpanel" aria-labelledby="tab-brew">
+        <h3>Homebrew</h3>
+        <div class="copy">
+          <pre><code>brew install seedstonelabs/tap/seedstone</code></pre>
+          <button type="button" class="copy-button" data-copy="brew install seedstonelabs/tap/seedstone">Copy</button>
+        </div>
+        <p class="note">macOS and Linux; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#homebrew-macos-and-linux">as a service</a> with <code>brew services</code>.</p>
+      </section>
+      <section class="panel" id="panel-cargo" role="tabpanel" aria-labelledby="tab-cargo">
+        <h3>Cargo</h3>
+        <div class="copy">
+          <pre><code>cargo binstall seedstone</code></pre>
+          <button type="button" class="copy-button" data-copy="cargo binstall seedstone">Copy</button>
+        </div>
+        <p class="note">The release archive in seconds; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#cargo"><code>cargo install</code></a> builds from source.</p>
+      </section>
+      <section class="panel" id="panel-pkg" role="tabpanel" aria-labelledby="tab-pkg">
+        <h3>deb / rpm</h3>
+        <p class="note">A <code>.deb</code> or <code>.rpm</code> with a systemd unit, <a href="https://github.com/stefanobaldo/seedstone/releases/latest">from the release page</a>; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#debian-ubuntu-deb-and-fedora-rhel-rpm">what the service does</a>.</p>
+      </section>
+      <section class="panel" id="panel-helm" role="tabpanel" aria-labelledby="tab-helm">
+        <h3>Helm</h3>
+        <div class="copy">
+          <pre><code>helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --set auth.noAuth=true</code></pre>
+          <button type="button" class="copy-button" data-copy="helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --set auth.noAuth=true">Copy</button>
+        </div>
+        <p class="note"><a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#kubernetes-helm">The chart</a>, and what <code>auth.noAuth</code> says.</p>
+      </section>
+    </div>
+    <figure class="term" aria-label="The ten-second check, in redis-cli">
+      <div class="term-bar" aria-hidden="true"><i></i><i></i><i></i></div>
+      <pre><code><span class="ln"><span class="p">$</span> redis-cli</span><span class="ln"><span class="p">127.0.0.1:6379&gt;</span> set greeting hello ex 60</span><span class="ln"><span class="ok">OK</span></span><span class="ln"><span class="p">127.0.0.1:6379&gt;</span> ttl greeting</span><span class="ln">(integer) 60</span><span class="ln"><span class="p">127.0.0.1:6379&gt;</span> get greeting</span><span class="ln">"hello"</span><span class="ln"><span class="p">127.0.0.1:6379&gt;</span> <span class="cur" aria-hidden="true"></span></span></code></pre>
+    </figure>
+    </div>
     <p class="src">Every channel, with checksums, the packaged defaults and the service units: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md">docs/install.md</a></p>
   </section>
 
-  <section id="correct">
+  <section id="correct" class="glow-left">
     <p class="eyebrow">Correct</p>
     <h2 class="claim">The same seed, the same bug. Every time.</h2>
-    <p class="line">The whole server runs inside a deterministic simulation: a virtual clock, a simulated network, scheduled clients. Every completed command is folded into a trace hash that is a function of two seeds and nothing else, so a concurrency bug is reproduced from its seed, in a fresh process, byte for byte.</p>
-    <p class="line">CI sweeps seeds on every code change, and proves the machinery on fourteen defects planted in the server itself: each has to be caught by the counter that owns it.</p>
+    <p class="line">The whole server runs inside a deterministic simulation: a virtual clock, a simulated network, scheduled clients. Every completed command folds into a trace hash that depends on the seed and nothing else.</p>
+    <ol class="pipeline" aria-label="From seed to trace">
+      <li class="seed">seed 0x4f2a9c1e</li><li class="arrow" aria-hidden="true">→</li><li>virtual clock</li><li>simulated network</li><li>scheduled clients</li><li class="arrow" aria-hidden="true">→</li><li>trace 0x8b…31</li>
+    </ol>
+    <div class="two even">
+      <section class="card runs" aria-labelledby="runs-usual">
+        <h3 id="runs-usual">A concurrency bug, the usual way <span class="tag">no seed</span></h3>
+        <ol class="runlist">
+        <li class="run"><span class="run-n">run 1</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on hit"></i><i data-tick="7"></i><i data-tick="8"></i><i data-tick="9"></i><i data-tick="10"></i><i data-tick="11"></i><i data-tick="12"></i><i data-tick="13"></i><i data-tick="14"></i><i data-tick="15"></i><i data-tick="16"></i><i data-tick="17"></i><i data-tick="18"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 6</span></li>
+        <li class="run"><span class="run-n">run 2</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on"></i><i data-tick="10" class="on"></i><i data-tick="11" class="on"></i><i data-tick="12" class="on"></i><i data-tick="13" class="on"></i><i data-tick="14" class="on"></i><i data-tick="15" class="on"></i><i data-tick="16" class="on"></i><i data-tick="17" class="on"></i><i data-tick="18" class="on"></i><i data-tick="19" class="on"></i><i data-tick="20" class="on"></i></span><span class="tr dim">passed</span></li>
+        <li class="run"><span class="run-n">run 3</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on"></i><i data-tick="10" class="on"></i><i data-tick="11" class="on"></i><i data-tick="12" class="on"></i><i data-tick="13" class="on"></i><i data-tick="14" class="on"></i><i data-tick="15" class="on"></i><i data-tick="16" class="on"></i><i data-tick="17" class="on"></i><i data-tick="18" class="on"></i><i data-tick="19" class="on"></i><i data-tick="20" class="on"></i></span><span class="tr dim">passed</span></li>
+        <li class="run"><span class="run-n">run 4</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on hit"></i><i data-tick="10"></i><i data-tick="11"></i><i data-tick="12"></i><i data-tick="13"></i><i data-tick="14"></i><i data-tick="15"></i><i data-tick="16"></i><i data-tick="17"></i><i data-tick="18"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 9, elsewhere</span></li>
+        </ol>
+        <p class="verdict">Seen once, gone under the debugger, back in production.</p>
+      </section>
+      <section class="card runs seeded" aria-labelledby="runs-seeded">
+        <h3 id="runs-seeded">In seedstone <span class="tag seed">seed 0x4f2a9c1e</span></h3>
+        <ol class="runlist">
+        <li class="run"><span class="run-n">run 1</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on"></i><i data-tick="10" class="on"></i><i data-tick="11" class="on"></i><i data-tick="12" class="on"></i><i data-tick="13" class="on"></i><i data-tick="14" class="on"></i><i data-tick="15" class="on"></i><i data-tick="16" class="on"></i><i data-tick="17" class="on"></i><i data-tick="18" class="on hit"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 18 · 0x8b…31</span></li>
+        <li class="run"><span class="run-n">run 2</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on"></i><i data-tick="10" class="on"></i><i data-tick="11" class="on"></i><i data-tick="12" class="on"></i><i data-tick="13" class="on"></i><i data-tick="14" class="on"></i><i data-tick="15" class="on"></i><i data-tick="16" class="on"></i><i data-tick="17" class="on"></i><i data-tick="18" class="on hit"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 18 · 0x8b…31</span></li>
+        <li class="run"><span class="run-n">run 3</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on"></i><i data-tick="10" class="on"></i><i data-tick="11" class="on"></i><i data-tick="12" class="on"></i><i data-tick="13" class="on"></i><i data-tick="14" class="on"></i><i data-tick="15" class="on"></i><i data-tick="16" class="on"></i><i data-tick="17" class="on"></i><i data-tick="18" class="on hit"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 18 · 0x8b…31</span></li>
+        <li class="run"><span class="run-n">run 4</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on"></i><i data-tick="10" class="on"></i><i data-tick="11" class="on"></i><i data-tick="12" class="on"></i><i data-tick="13" class="on"></i><i data-tick="14" class="on"></i><i data-tick="15" class="on"></i><i data-tick="16" class="on"></i><i data-tick="17" class="on"></i><i data-tick="18" class="on hit"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 18 · 0x8b…31</span></li>
+        </ol>
+        <p class="run-note">run 4 on another machine, in a fresh process</p>
+        <p class="verdict pass">✓ Reproduced from the seed, byte for byte. Fixed once.</p>
+      </section>
+    </div>
+    <ul class="stats" role="list">
+      <li><strong>14 <span>/ 14</span></strong><p>defects planted in the server itself, each caught by the counter that owns it</p></li>
+      <li><strong>2 <span>seeds</span></strong><p>are all a trace hash depends on: the simulation's and the workload's</p></li>
+      <li><strong>every <span>change</span></strong><p>that touches code is swept across seeds in CI, and a failure arrives with its seed</p></li>
+    </ul>
     <p class="src">How it is built and how it is tested: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/testing.md">docs/testing.md</a></p>
   </section>
 
   <section id="fast">
     <p class="eyebrow">Fast</p>
     <h2 class="claim">Ahead of Redis where a cache lives.</h2>
-    <p class="line">Same machine, same client, median of three runs, throughput in operations per second.</p>
-    <p class="src">Every cell at every pipeline depth, the CPU per operation, the method fixed before the run, and what the numbers do not say: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/benchmarks.md">docs/benchmarks.md</a></p>
+    <p class="line">Same machine, same client, median of three runs, throughput in operations per second. Every bar is an engine this server is ahead of; the grey line names the ones level with it.</p>
+    <div class="grid-2">
+      <section class="card compare" aria-labelledby="fast-1">
+        <p class="label" id="fast-1"><span class="cell-name">SET 64 B with EX 60 · depth 64</span> <span class="what">a cache write with a deadline</span></p>
+        <p class="tie">Dragonfly reads <span data-cell="set-64-ex60-d64" data-arm="dragonfly">4.63 M</span>, level with seedstone: the client's ceiling</p>
+        <div class="proof-body">
+          <p class="factor-line"><span class="factor" data-cell="set-64-ex60-d64" data-pair="redis-iot1">2.96×</span> <span class="factor-what">Redis at one I/O thread</span></p>
+          <ul class="bars" role="list" aria-label="Operations per second by engine">
+            <li class="bar me" data-cell="set-64-ex60-d64" data-arm="seedstone" style="--w: 100.0%"><span class="arm">seedstone</span><span class="figure">4.61 M</span></li>
+            <li class="bar" data-cell="set-64-ex60-d64" data-arm="garnet" style="--w: 93.5%"><span class="arm">Garnet</span><span class="figure">4.31 M</span></li>
+            <li class="bar" data-cell="set-64-ex60-d64" data-arm="redis-iot4" style="--w: 39.5%"><span class="arm">Redis ×4</span><span class="figure">1.82 M</span></li>
+            <li class="bar" data-cell="set-64-ex60-d64" data-arm="valkey-iot4" style="--w: 35.9%"><span class="arm">Valkey ×4</span><span class="figure">1.65 M</span></li>
+            <li class="bar" data-cell="set-64-ex60-d64" data-arm="redis-iot1" style="--w: 33.8%"><span class="arm">Redis</span><span class="figure">1.56 M</span></li>
+            <li class="bar" data-cell="set-64-ex60-d64" data-arm="valkey-iot1" style="--w: 25.6%"><span class="arm">Valkey</span><span class="figure">1.18 M</span></li>
+          </ul>
+        </div>
+      </section>
+      <section class="card compare" aria-labelledby="fast-2">
+        <p class="label" id="fast-2"><span class="cell-name">SET 64 B · depth 64</span> <span class="what">the plain cache write</span></p>
+        <p class="tie">Dragonfly <span data-cell="set-64-d64" data-arm="dragonfly">4.65 M</span> and Garnet <span data-cell="set-64-d64" data-arm="garnet">4.63 M</span>, level with seedstone: the client's ceiling</p>
+        <div class="proof-body">
+          <p class="factor-line"><span class="factor" data-cell="set-64-d64" data-pair="redis-iot1">2.21×</span> <span class="factor-what">Redis at one I/O thread</span></p>
+          <ul class="bars" role="list" aria-label="Operations per second by engine">
+            <li class="bar me" data-cell="set-64-d64" data-arm="seedstone" style="--w: 100.0%"><span class="arm">seedstone</span><span class="figure">4.63 M</span></li>
+            <li class="bar" data-cell="set-64-d64" data-arm="valkey-iot4" style="--w: 56.5%"><span class="arm">Valkey ×4</span><span class="figure">2.62 M</span></li>
+            <li class="bar" data-cell="set-64-d64" data-arm="redis-iot4" style="--w: 53.7%"><span class="arm">Redis ×4</span><span class="figure">2.49 M</span></li>
+            <li class="bar" data-cell="set-64-d64" data-arm="redis-iot1" style="--w: 45.2%"><span class="arm">Redis</span><span class="figure">2.09 M</span></li>
+            <li class="bar" data-cell="set-64-d64" data-arm="valkey-iot1" style="--w: 38.4%"><span class="arm">Valkey</span><span class="figure">1.78 M</span></li>
+          </ul>
+        </div>
+      </section>
+      <section class="card compare" aria-labelledby="fast-3">
+        <p class="label" id="fast-3"><span class="cell-name">MGET 16 keys · depth 64</span> <span class="what">the multi-key read</span></p>
+        <p class="tie">Garnet reads <span data-cell="mget-16-d64" data-arm="garnet">629 k</span>, level with seedstone</p>
+        <div class="proof-body">
+          <p class="factor-line"><span class="factor" data-cell="mget-16-d64" data-pair="redis-iot1">1.86×</span> <span class="factor-what">Redis at one I/O thread</span></p>
+          <ul class="bars" role="list" aria-label="Operations per second by engine">
+            <li class="bar me" data-cell="mget-16-d64" data-arm="seedstone" style="--w: 100.0%"><span class="arm">seedstone</span><span class="figure">625 k</span></li>
+            <li class="bar" data-cell="mget-16-d64" data-arm="dragonfly" style="--w: 74.1%"><span class="arm">Dragonfly</span><span class="figure">463 k</span></li>
+            <li class="bar" data-cell="mget-16-d64" data-arm="valkey-iot4" style="--w: 70.6%"><span class="arm">Valkey ×4</span><span class="figure">442 k</span></li>
+            <li class="bar" data-cell="mget-16-d64" data-arm="redis-iot4" style="--w: 63.6%"><span class="arm">Redis ×4</span><span class="figure">398 k</span></li>
+            <li class="bar" data-cell="mget-16-d64" data-arm="redis-iot1" style="--w: 53.8%"><span class="arm">Redis</span><span class="figure">336 k</span></li>
+            <li class="bar" data-cell="mget-16-d64" data-arm="valkey-iot1" style="--w: 50.2%"><span class="arm">Valkey</span><span class="figure">314 k</span></li>
+          </ul>
+        </div>
+      </section>
+      <section class="card compare" aria-labelledby="fast-4">
+        <p class="label" id="fast-4"><span class="cell-name">GET 64 B · depth 64</span> <span class="what">the pipelined read</span></p>
+        <p class="tie">Dragonfly reads <span data-cell="get-64-d64" data-arm="dragonfly">4.65 M</span>, level with seedstone: the client's ceiling</p>
+        <div class="proof-body">
+          <p class="factor-line"><span class="factor" data-cell="get-64-d64" data-pair="redis-iot1">1.75×</span> <span class="factor-what">Redis at one I/O thread</span></p>
+          <ul class="bars" role="list" aria-label="Operations per second by engine">
+            <li class="bar me" data-cell="get-64-d64" data-arm="seedstone" style="--w: 100.0%"><span class="arm">seedstone</span><span class="figure">4.63 M</span></li>
+            <li class="bar" data-cell="get-64-d64" data-arm="garnet" style="--w: 94.3%"><span class="arm">Garnet</span><span class="figure">4.37 M</span></li>
+            <li class="bar" data-cell="get-64-d64" data-arm="valkey-iot4" style="--w: 79.1%"><span class="arm">Valkey ×4</span><span class="figure">3.66 M</span></li>
+            <li class="bar" data-cell="get-64-d64" data-arm="redis-iot4" style="--w: 71.5%"><span class="arm">Redis ×4</span><span class="figure">3.31 M</span></li>
+            <li class="bar" data-cell="get-64-d64" data-arm="redis-iot1" style="--w: 57.1%"><span class="arm">Redis</span><span class="figure">2.65 M</span></li>
+            <li class="bar" data-cell="get-64-d64" data-arm="valkey-iot1" style="--w: 49.3%"><span class="arm">Valkey</span><span class="figure">2.28 M</span></li>
+          </ul>
+        </div>
+      </section>
+    </div>
+    <p class="src">v0.3.2 on a GCP c4a-standard-16, against Redis 8.10.0, Valkey 9.1.1, Dragonfly df-v1.40.2 and Garnet 2.1.5, 2026-10-11. Every cell at every depth, the CPU per operation, the method fixed before the run, and what the numbers do not say: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/benchmarks.md">docs/benchmarks.md</a></p>
   </section>
 
-  <section id="operated">
+  <section id="operated" class="glow-right">
     <p class="eyebrow">Operated</p>
     <h2 class="claim">Says only what it can state truthfully.</h2>
-    <p class="line"><code>INFO</code> in sections that carry only what the node can state truthfully; one JSON line per event; a password that rotates without a restart; a disk that fails or fills met with refusal, not with acknowledgements the node cannot keep. A stock Prometheus exporter scrapes it in CI.</p>
+    <p class="line">Built to be run by someone who is paged for it. A stock Prometheus exporter scrapes it in CI.</p>
+    <div class="grid-2 ops">
+      <section class="card op" aria-labelledby="op-info">
+        <h3 id="op-info">INFO, without the fiction</h3>
+        <p>Sections that carry only what the node can state: no resident-set figure it would have to guess, no fork it does not have.</p>
+        <pre><code><span class="cm"># clients</span>
+<span class="key">connected_clients</span>:148
+<span class="cm"># memory</span>
+<span class="key">used_memory</span>:402653184
+<span class="key">maxmemory</span>:536870912
+<span class="cm"># persistence</span>
+<span class="key">aof_last_write_status</span>:ok
+<span class="key">refusing_executors</span>:0</code></pre>
+      </section>
+      <section class="card op" aria-labelledby="op-log">
+        <h3 id="op-log">One JSON line per event</h3>
+        <p>Every line opens with a time, a level and the event's name; a monitor selects by <code>evt</code> and reads fields by name, with no parser of its own.</p>
+        <pre><code>{<span class="key">"ts"</span>:1757800000000,<wbr><span class="key">"level"</span>:<span class="str">"info"</span>,<wbr><span class="key">"evt"</span>:<span class="str">"listening"</span>,<wbr><span class="key">"version"</span>:<span class="str">"0.1.1"</span>,<wbr><span class="key">"bind"</span>:<span class="str">"0.0.0.0"</span>,<wbr><span class="key">"port"</span>:6379}
+{<span class="key">"ts"</span>:1757800000317,<wbr><span class="key">"level"</span>:<span class="str">"warn"</span>,<wbr><span class="key">"evt"</span>:<span class="str">"error_reply"</span>,<wbr><span class="key">"code"</span>:<span class="str">"ERR"</span>,<wbr><span class="key">"cmd"</span>:<span class="str">"flushall"</span>,<wbr><span class="key">"msg"</span>:<span class="str">"ERR unknown command 'flushall'"</span>}</code></pre>
+      </section>
+      <section class="card op" aria-labelledby="op-password">
+        <h3 id="op-password">A password that rotates without a restart</h3>
+        <p>Two passwords are valid while the file holds two, so the server and its clients never have to change in the same moment.</p>
+        <ol class="steps">
+          <li><span class="step-n">1</span>add the new line, <code>SIGHUP</code></li>
+          <li><span class="step-n">2</span>move the clients, any pace</li>
+          <li><span class="step-n">3</span>drop the old line, <code>SIGHUP</code></li>
+        </ol>
+        <pre><code>{<span class="key">"ts"</span>:1757800003250,<wbr><span class="key">"level"</span>:<span class="str">"info"</span>,<wbr><span class="key">"evt"</span>:<span class="str">"password_reloaded"</span>,<wbr><span class="key">"passwords"</span>:2}</code></pre>
+      </section>
+      <section class="card op" aria-labelledby="op-disk">
+        <h3 id="op-disk">A disk that fails is met with refusal</h3>
+        <p>A write the node cannot keep is not acknowledged: writes are refused until a snapshot is durable, reads are served, and a full disk asks for space, not for a restart.</p>
+        <pre><code><span class="cm"># the disk is full, --fsync always</span>
+<span class="p">&gt;</span> SET order:9 paid
+<span class="er">-MISCONF Errors writing to the log: writes are refused until a snapshot is durable</span>
+<span class="cm"># space freed, a snapshot durable: refusal_ended</span>
+<span class="p">&gt;</span> SET order:9 paid
+<span class="ok">+OK</span></code></pre>
+      </section>
+    </div>
     <p class="src">Flags, output, signals, the password, persistence and <code>INFO</code>: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/operations.md">docs/operations.md</a></p>
   </section>
 
   <section id="compatibility">
     <p class="eyebrow">Compatibility</p>
     <h2 class="claim">A named list. Nothing answered approximately.</h2>
-    <p class="line">RESP2 over TCP, so <code>redis-cli</code> and the ordinary client libraries connect unmodified. The surface is a named list, chosen for the workloads this server targets: <strong>strings</strong>; <strong>keys and expiry</strong>; <strong>server</strong>; <strong>persistence</strong>. Anything outside the list is refused with an error naming the command, never answered approximately.</p>
-    <p class="line">Not here yet: other data types, RESP3, replication, clustering, transactions, scripting. Next: hashes, lists, sets and sorted sets, Pub/Sub, RESP3.</p>
+    <p class="line">RESP2 over TCP, so <code>redis-cli</code> and the ordinary client libraries connect unmodified. Anything outside the list is refused with an error naming the command.</p>
+    <div class="two speaks">
+      <div class="groups">
+        <div class="group"><h3>Strings</h3><ul class="chips" role="list"><li class="chip">GET</li><li class="chip">SET</li><li class="chip">SETEX</li><li class="chip">SETNX</li><li class="chip">PSETEX</li><li class="chip">MGET</li><li class="chip">INCRBY</li><li class="chip">STRLEN</li><li class="chip">TYPE</li></ul></div>
+        <div class="group"><h3>Keys &amp; expiry</h3><ul class="chips" role="list"><li class="chip">DEL</li><li class="chip">EXISTS</li><li class="chip">EXPIRE</li><li class="chip">PEXPIRE</li><li class="chip">EXPIREAT</li><li class="chip">PEXPIREAT</li><li class="chip">PERSIST</li><li class="chip">TTL</li><li class="chip">PTTL</li><li class="chip">SCAN</li><li class="chip">KEYS</li><li class="chip">DBSIZE</li><li class="chip">FLUSHDB</li></ul></div>
+        <div class="group"><h3>Server</h3><ul class="chips" role="list"><li class="chip">PING</li><li class="chip">ECHO</li><li class="chip">AUTH</li><li class="chip">HELLO</li><li class="chip">INFO</li><li class="chip">CONFIG GET</li><li class="chip">SLOWLOG</li><li class="chip">LATENCY</li><li class="chip">COMMAND</li><li class="chip">CLIENT</li><li class="chip">QUIT</li></ul></div>
+        <div class="group"><h3>Persistence</h3><ul class="chips" role="list"><li class="chip">SAVE</li><li class="chip">BGSAVE</li><li class="chip">LASTSAVE</li><li class="chip">SHUTDOWN</li></ul></div>
+        <div class="group not-yet"><h3>Not here yet — next: hashes, lists, sets, sorted sets, Pub/Sub, RESP3</h3><ul class="chips" role="list"><li class="chip no">HSET</li><li class="chip no">LPUSH</li><li class="chip no">SADD</li><li class="chip no">ZADD</li><li class="chip no">PUBLISH</li><li class="chip no">MULTI</li><li class="chip no">EVAL</li><li class="chip no">SELECT</li><li class="chip no">replication</li><li class="chip no">clustering</li></ul></div>
+      </div>
+    <figure class="term" aria-label="A refused command and a refused protocol, in redis-cli">
+      <div class="term-bar" aria-hidden="true"><i></i><i></i><i></i></div>
+      <pre><code><span class="ln"><span class="p">127.0.0.1:6379&gt;</span> set k v</span><span class="ln"><span class="ok">OK</span></span><span class="ln"><span class="p">127.0.0.1:6379&gt;</span> hset h f v</span><span class="ln"><span class="er">(error) ERR unknown command 'hset'</span></span><span class="ln"><span class="p">127.0.0.1:6379&gt;</span> hello 3</span><span class="ln"><span class="er">(error) NOPROTO unsupported protocol version</span></span><span class="ln"><span class="p">127.0.0.1:6379&gt;</span> <span class="cur" aria-hidden="true"></span></span></code></pre>
+    </figure>
+    </div>
     <p class="src">Every command, every option, every refusal and every deliberate difference from Redis: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/compatibility.md">docs/compatibility.md</a></p>
   </section>
 
