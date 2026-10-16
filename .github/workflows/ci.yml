@@ -61,7 +61,10 @@ jobs:
       # never edited; this regenerates them and refuses a byte of difference.
       - run: python3 -I scripts/brand.py --selftest && python3 -I scripts/brand.py --check
       # The site's page: every link resolves, the metadata is there, the
-      # page and what it references stay under their byte budget.
+      # page and what it references stay under their byte budget, and the
+      # installer it serves is POSIX sh by shellcheck (on the image) and
+      # checkbashisms (in devscripts, which is not).
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends devscripts
       - run: bash scripts/check-site.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # `--workspace` unifies Cargo features across every crate in the build, so
@@ -552,3 +555,38 @@ jobs:
       - name: ratio gate
         if: steps.relevant.outputs.code == 'true'
         run: bash scripts/perf_gate.sh ../base/target/release/seedstone target/release/seedstone 0.93
+
+  # The installer, for real, on each operating system it serves: its tests
+  # against a fake release, then an install of the latest release into a
+  # temporary directory, checked against the tag the repository reports.
+  # On Linux the glibc floor the script carries is read again from the
+  # binary it just installed, so a toolchain that raises the floor turns
+  # this job red instead of letting the script lie.
+  installer:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # Pinned to a commit SHA for the reason the `ci` job gives.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash scripts/test-install.sh
+      - run: SEEDSTONE_INSTALL_DIR="$RUNNER_TEMP/bin" sh site/install.sh
+      - name: the installed binary is the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest="$(gh release view --json tagName -q .tagName | sed 's/^v//')"
+          installed="$("$RUNNER_TEMP/bin/seedstone" --version)"
+          echo "$installed / latest $latest"
+          test "$installed" = "seedstone $latest"
+      - name: the glibc floor the installer carries is the binary's
+        if: runner.os == 'Linux'
+        run: |
+          binary="$(objdump -T "$RUNNER_TEMP/bin/seedstone" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)"
+          script="GLIBC_$(sed -n 's/^GLIBC_MIN=//p' site/install.sh)"
+          echo "binary $binary / script $script"
+          test "$binary" = "$script"
