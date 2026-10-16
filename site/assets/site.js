@@ -153,8 +153,12 @@ if (!reduced && "IntersectionObserver" in window) {
         const todo = document.createElement("span");
         typed.className = "typed";
         todo.className = "todo";
-        todo.textContent = texts.map((n) => n.data).join("");
-        texts[0].replaceWith(typed, todo);
+        // The space after the prompt is the prompt's, not typed: the
+        // cursor waits where the command begins.
+        const text = texts.map((n) => n.data).join("");
+        const lead = text.match(/^\s*/)[0];
+        todo.textContent = text.slice(lead.length);
+        texts[0].replaceWith(document.createTextNode(lead), typed, todo);
         for (const n of texts.slice(1)) n.remove();
       }
       const todo = ln.querySelector(".todo");
