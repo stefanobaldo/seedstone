@@ -125,16 +125,22 @@ if (anim && !reduced) {
   play();
 }
 
-// The three motions below the hero, each once, when scrolled into view.
+// The motions below the hero, each time one is scrolled into view: the
+// two terminals type, the two run panels run, the comparison bars grow.
 // The markup is every visual's final state; each is taken back to its
-// start here, as the page loads, and played by one observer the first
-// time two fifths of it are on screen. Under reduced motion none of this
-// runs and the final state stands.
+// start here, as the page loads, played by one observer when two fifths
+// of it are on screen, and taken back to its start again once it has
+// left the screen whole, so it plays again on the next entry. Under
+// reduced motion none of this runs and the final state stands.
 if (!reduced && "IntersectionObserver" in window) {
-  const plays = new Map();
+  const motions = new Map();   // target → { play, reset, armed, running, resetWhenDone }
 
   // The terminal: a prompt appears whole, what follows it is typed, a
   // reply prints at once.
+  const resetTerm = (term) => {
+    term.classList.add("play");
+    for (const ln of term.querySelectorAll(".ln")) ln.classList.remove("on", "typing");
+  };
   const typeTerm = async (term) => {
     for (const ln of term.querySelectorAll(".ln")) {
       const typed = ln.querySelector(".p")
@@ -160,14 +166,16 @@ if (!reduced && "IntersectionObserver" in window) {
     }
     term.classList.remove("play");
   };
-  const term = document.querySelector("#install .term");
-  if (term) {
-    term.classList.add("play");
-    plays.set(term, () => typeTerm(term));
+  for (const term of document.querySelectorAll(".term")) {
+    motions.set(term, { play: () => typeTerm(term), reset: () => resetTerm(term) });
   }
 
   // A run panel: each strip lights its cells up to where its run ended,
   // lands its marker, and the verdict comes last.
+  const resetRuns = (card) => {
+    card.classList.add("play");
+    for (const el of card.querySelectorAll(".cells i.on, .tr.on, .verdict.on")) el.classList.remove("on");
+  };
   const playRuns = async (card) => {
     for (const run of card.querySelectorAll(".run")) {
       const cells = [...run.querySelectorAll("i")];
@@ -183,26 +191,31 @@ if (!reduced && "IntersectionObserver" in window) {
     card.classList.remove("play");
   };
   for (const card of document.querySelectorAll(".runs")) {
-    card.classList.add("play");
-    for (const cell of card.querySelectorAll(".cells i.on")) {
-      cell.dataset.on = "1";
-      cell.classList.remove("on");
-    }
-    plays.set(card, () => playRuns(card));
+    for (const cell of card.querySelectorAll(".cells i.on")) cell.dataset.on = "1";
+    motions.set(card, { play: () => playRuns(card), reset: () => resetRuns(card) });
   }
 
-  // The bars: `--w` is each bar's share; it goes to zero now and back to
-  // its value in view, which the stylesheet transitions, row after row.
+  // The bars: `--w` is each bar's share; it goes to zero at the start and
+  // back to its value in view, which the stylesheet transitions, row
+  // after row.
   for (const card of document.querySelectorAll(".compare")) {
     const bars = [...card.querySelectorAll(".bar")];
     bars.forEach((bar, i) => {
       bar.dataset.w = bar.style.getPropertyValue("--w");
-      bar.style.setProperty("--w", "0%");
       bar.style.setProperty("--delay", `${i * 50}ms`);
     });
-    plays.set(card, () => {
-      for (const bar of bars) bar.style.setProperty("--w", bar.dataset.w);
+    motions.set(card, {
+      play: async () => {
+        for (const bar of bars) bar.style.setProperty("--w", bar.dataset.w);
+        await sleep(700 + bars.length * 50);
+      },
+      reset: () => { for (const bar of bars) bar.style.setProperty("--w", "0%"); },
     });
+  }
+
+  for (const motion of motions.values()) {
+    motion.reset();
+    motion.armed = true;
   }
 
   // The starts above are instant: the transitions are enabled only now,
@@ -210,14 +223,34 @@ if (!reduced && "IntersectionObserver" in window) {
   void document.body.offsetWidth;
   document.documentElement.classList.add("motion");
 
+  // Two fifths on screen plays an armed target; off the screen whole, a
+  // target that has played goes back to its start and is armed again. A
+  // target that leaves while still playing is reset when its play ends.
   const observer = new IntersectionObserver((entries) => {
     for (const entry of entries) {
+      const motion = motions.get(entry.target);
       const tall = entry.rootBounds && entry.intersectionRect.height >= entry.rootBounds.height * 0.5;
       if (entry.intersectionRatio >= 0.4 || tall) {
-        observer.unobserve(entry.target);
-        plays.get(entry.target)();
+        if (motion.running) motion.resetWhenDone = false;   // back before it ended: let it finish and stand
+        if (!motion.armed || motion.running) continue;
+        motion.armed = false;
+        motion.running = true;
+        Promise.resolve(motion.play()).then(() => {
+          motion.running = false;
+          if (motion.resetWhenDone) {
+            motion.resetWhenDone = false;
+            motion.reset();
+            motion.armed = true;
+          }
+        });
+      } else if (!entry.isIntersecting && !motion.armed) {
+        if (motion.running) motion.resetWhenDone = true;
+        else {
+          motion.reset();
+          motion.armed = true;
+        }
       }
     }
-  }, { threshold: [0.4] });
-  for (const target of plays.keys()) observer.observe(target);
+  }, { threshold: [0, 0.4] });
+  for (const target of motions.keys()) observer.observe(target);
 }
