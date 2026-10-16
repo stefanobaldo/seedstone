@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # The site under `site/` holds together: every link on the page resolves —
 # to a file this repository tracks, or to a heading on one of the
-# documentation pages — the page carries the metadata a crawler and a link
+# documentation pages — it loads nothing from another origin but the
+# analytics beacon, and `_headers`' policy names that host alone for
+# scripts, the page carries the metadata a crawler and a link
 # preview read, it names no `http://` URL, the mark it shows is the mark
 # `brand.py` holds, every benchmark figure it shows is the benchmark page's
 # for that cell and arm, the installer it serves is POSIX sh that talks to
@@ -32,6 +34,10 @@ BUDGET = 200 * 1024
 # Paths the page links before the file lands beside it; each entry leaves
 # with the change that adds its file.
 PENDING = set()
+# The one thing the page loads from another origin: Cloudflare's analytics
+# beacon. `_headers`' Content-Security-Policy admits its host and no other.
+BEACON = "https://static.cloudflareinsights.com/beacon.min.js"
+HEADERS = os.environ.get("CHECK_SITE_HEADERS", os.path.join(SITE, "_headers"))
 
 status = 0
 def ok(check, detail=""):
@@ -115,6 +121,50 @@ def check_links():
     else:
         ok("links", f"{len(URLS)} resolve, {len(PENDING)} pending")
     return referenced
+
+def page_policy(headers):
+    """The Content-Security-Policy lines `_headers` gives the page: those in
+    the block whose path line is `/*`, which Pages applies to every path."""
+    lines, block = [], None
+    for line in headers.splitlines():
+        if line.strip() == "" or line.lstrip().startswith("#"):
+            continue
+        if not line[0].isspace():
+            block = line.strip()
+        elif block == "/*":
+            name, _, value = line.strip().partition(":")
+            if name.lower() == "content-security-policy":
+                lines.append(value.strip())
+    return lines
+
+def check_origins():
+    """Everything the browser fetches to show the page comes from this site,
+    but the beacon; the page runs no inline script; and the policy in
+    `_headers` lets the beacon's script run and names no other script
+    source, so a script the policy would block cannot pass here."""
+    foreign = sorted(u for u in LOADED_URLS if site_file(u) is None and u != BEACON)
+    inline = re.findall(r"<script\b(?![^>]*\bsrc=)[^>]*>|\son[a-z]+=", html, re.I)
+    headers = open(HEADERS, encoding="utf-8").read() if os.path.exists(HEADERS) else ""
+    policies = page_policy(headers)
+    want = ["'self'", BEACON.split("/beacon")[0]] if BEACON in LOADED_URLS else ["'self'"]
+    if foreign:
+        fail("origins", "loaded from another origin: " + ", ".join(foreign))
+        return
+    if inline:
+        fail("origins", "an inline script or event handler, which the policy blocks: " + ", ".join(sorted(set(inline))))
+        return
+    if len(policies) != 1:
+        fail("origins", f"{len(policies)} Content-Security-Policy lines under /* in {HEADERS}, want one")
+        return
+    directives = {d.split()[0]: d.split()[1:] for d in policies[0].split(";") if d.strip()}
+    extra = sorted(d for d in directives if d.startswith("script-src-"))
+    script_src = directives.get("script-src", directives.get("default-src"))
+    if extra:
+        fail("origins", "the policy sets " + ", ".join(extra) + ", which overrides script-src")
+    elif script_src is None or sorted(script_src) != sorted(want):
+        fail("origins", f"script-src is {script_src}, want {want}")
+    else:
+        ok("origins", "this site" + (" and the analytics beacon" if BEACON in LOADED_URLS else ""))
 
 def check_metadata():
     want = {
@@ -468,6 +518,7 @@ def check_budget(referenced):
         fail("budget", f"{total} bytes over {len(files)} files, budget {BUDGET}")
 
 referenced = check_links()
+check_origins()
 check_metadata()
 check_landmarks()
 check_no_http()
