@@ -306,7 +306,14 @@ mod tests {
             SnapshotHeader::header_len(&out[..SNAPSHOT_HEADER_FIXED_LEN]),
             Ok(out.len())
         );
-        assert_eq!(SnapshotHeader::decode(&out), Ok(header));
+        assert_eq!(SnapshotHeader::decode(&out), Ok(header.clone()));
+        for version in OLDEST_READ_VERSION..=FORMAT_VERSION {
+            assert_eq!(
+                SnapshotHeader::decode(&restamped(&out, version)),
+                Ok(header.clone()),
+                "an image of version {version} is read as this build's"
+            );
+        }
         assert_eq!(SnapshotHeader::decode(&out[..10]), Err(HeaderError::Short));
         let mut bad = out.clone();
         bad[1] = b'X';
