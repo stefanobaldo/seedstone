@@ -297,6 +297,21 @@ else
   rm -rf "$TMP/tools"
 fi
 
+# wget translates its error line under a non-English locale; the tag that
+# does not exist must still be reported as a 404, not as "no answer".
+if ! command -v wget > /dev/null; then
+  skip wget-missing-tag "no wget on this machine"
+else
+  run wget-missing-tag PATH="$(tools_path)" LANG=pt_BR.UTF-8 LC_ALL=pt_BR.UTF-8 SEEDSTONE_VERSION=v0.0.1 -- \
+    sh -c "rm -f '$TMP/tools/curl'; exec sh '$INSTALLER'"
+  if [ "$RC" -eq 2 ] && has "$ERR" "404" && empty; then
+    ok wget-missing-tag "exit 2 naming the 404 under pt_BR with wget"
+  else
+    fail wget-missing-tag "exit $RC; $(tail -1 "$ERR")"
+  fi
+  rm -rf "$TMP/tools"
+fi
+
 run no-fetcher PATH="$(tools_path)" -- sh -c "rm -f '$TMP/tools/curl' '$TMP/tools/wget'; exec sh '$INSTALLER'"
 if [ "$RC" -eq 1 ] && has "$ERR" "curl" && has "$ERR" "wget" && empty; then
   ok no-fetcher "exit 1 naming curl and wget"
@@ -310,6 +325,31 @@ if [ "$RC" -eq 0 ] && installed 9.9.9 && has "$OUT" "1.0.0"; then
   ok replaces "an existing binary is replaced and its version printed beside the new one"
 else
   fail replaces "exit $RC; $(tail -1 "$ERR")"
+fi
+
+# Ctrl-C while the archive downloads: the script stops with 130, its
+# temporary directory is gone and nothing is left in the install directory.
+# A background job of a script has SIGINT ignored, and a shell cannot trap a
+# signal it entered with ignored, so the installer is started through a
+# Python that restores the default first and then execs sh in place.
+shim "$TMP/shim-slow" curl 'sleep 3; exec "$REAL_CURL" "$@"'
+DIR="$TMP/install-interrupt"; mkdir -p "$DIR"
+set +e
+env -u NO_COLOR SEEDSTONE_BASE_URL="$BASE" SEEDSTONE_INSTALL_DIR="$DIR" TERM=xterm COLORTERM= \
+  PATH="$TMP/shim-slow:$PATH" TMPDIR="$TMP/interrupt-tmp" python3 -I -c '
+import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+os.execvp("sh", ["sh", sys.argv[1]])' "$INSTALLER" > "$TMP/interrupt.out" 2> "$TMP/interrupt.err" &
+pid=$!
+mkdir -p "$TMP/interrupt-tmp"
+sleep 1
+kill -INT "$pid"
+wait "$pid"; RC=$?
+set -e
+if [ "$RC" -eq 130 ] && empty && [ -z "$(ls -A "$TMP/interrupt-tmp")" ]; then
+  ok interrupt "exit 130 on Ctrl-C, temporary directory removed, nothing installed"
+else
+  fail interrupt "exit $RC; install dir: $(find "$DIR" -mindepth 1 | tr '\n' ' '); temp: $(find "$TMP/interrupt-tmp" -mindepth 1 | tr '\n' ' '); $(tail -1 "$TMP/interrupt.err")"
 fi
 
 run path-hint -- sh "$INSTALLER"
