@@ -236,6 +236,9 @@ class Elements(HTMLParser):
     def handle_data(self, data):
         for el in self.stack:
             el["text"].append(data)
+        self.loose(data)
+    def loose(self, data):
+        pass
 
 def text_of(el):
     """The element's text, whitespace folded: the table's thousands
@@ -256,10 +259,21 @@ def check_figures():
     bad, figures, factors = [], 0, 0
     if re.search(r"benchmarks(-dark)?\.svg", html):
         bad.append("the page references the README's chart")
-    parser = Elements()
-    parser.feed(html)
     def bound(el):
         return "data-cell" in el["attrs"]
+    # A figure in the benchmark sections that no bound element carries — a
+    # `4.65 M` or a `2.96×` typed into prose — is unchecked, so it fails.
+    FIGURE = re.compile(r"\b\d+(?:\.\d+)? ?[kM]\b|\b\d\.\d\d\u00d7")
+    loose = []
+    class Page(Elements):
+        def loose(self, data):
+            chart = any(a["attrs"].get("id") == "fast" or "proof" in a["classes"] for a in self.stack)
+            if chart and not any(bound(a) for a in self.stack):
+                loose.extend(FIGURE.findall(data))
+    parser = Page()
+    parser.feed(html)
+    for text in loose:
+        bad.append(f"{text!r} is a figure in a benchmark section and is not bound to a cell")
     for el in parser.all:
         if el["classes"] & {"bar", "figure", "factor"} and not bound(el) and not any(bound(a) for a in el["ancestors"]):
             bad.append(f"<{el['tag']} class=\"{' '.join(sorted(el['classes']))}\"> showing {text_of(el)!r} is not bound to a cell")
@@ -326,7 +340,10 @@ def check_no_version_literal():
     if start < 0:
         fail("no version literal", 'no <section id="install"> on the page')
         return
-    install = html[start:html.index("<section", start + 1)]
+    # The section ends where the next top-level section starts; the install
+    # card nests a <section> per channel, so the next bare "<section" is
+    # not the end.
+    install = html[start:html.index('<section id="', start + 1)]
     hits = sorted(set(re.findall(r"(?<![\d.])\d+\.\d+\.\d+(?![\d.])", install)))
     if hits:
         fail("no version literal", "in the install section: " + ", ".join(hits))
