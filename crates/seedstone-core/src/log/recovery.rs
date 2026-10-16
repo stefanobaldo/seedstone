@@ -615,6 +615,9 @@ impl Scan {
         // The end of the record before, where a hole entered next begins,
         // and the damage bytes counted by then.
         let (mut boundary, mut bytes) = (0, 0);
+        // A segment given up past a point is unread from there, and a mark
+        // in the unread part cannot be seen: none of its damage is a tear.
+        let mut abandoned = false;
         loop {
             match reader.next_record() {
                 Ok(Some(item)) => {
@@ -631,6 +634,7 @@ impl Scan {
                 Ok(None) => break,
                 Err(_) => {
                     self.abandon(index);
+                    abandoned = true;
                     break;
                 }
             }
@@ -640,6 +644,7 @@ impl Scan {
         self.report.holes += damage.holes;
         if damage.abandoned {
             self.abandon(index);
+            abandoned = true;
         }
         if damage.bytes > 0 || damage.holes > 0 || damage.truncated_tail > 0 {
             self.unread[index] = true;
@@ -653,7 +658,15 @@ impl Scan {
         if damage.truncated_tail > 0 {
             found.push((self.position, boundary, damage.truncated_tail));
         }
-        let tear = self.tear_index == Some(index) && header.version >= SYNC_MARK_VERSION;
+        let tear =
+            self.tear_index == Some(index) && header.version >= SYNC_MARK_VERSION && !abandoned;
+        self.classify(found, tear);
+        Ok(())
+    }
+
+    /// Sorts a segment's damage, as `(position, start, bytes)`, into tear
+    /// and loss; `tear` says whether the segment can hold a tear at all.
+    fn classify(&mut self, found: Vec<(u64, u64, u64)>, tear: bool) {
         for (position, start, bytes) in found {
             // Begun at or past the last mark: no sync was issued over it.
             // Begun before, it holds bytes one was, whatever it runs into.
@@ -665,7 +678,6 @@ impl Scan {
                 self.any_loss_hole = true;
             }
         }
-        Ok(())
     }
 
     /// Charges the latest loss hole to every shard whose highest record
