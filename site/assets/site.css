@@ -546,7 +546,10 @@ footer p { max-width: 60em; }
 .motion .bar::before { transition: background-size 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) var(--delay, 0s); }
 .term.play .ln:not(.on), .term.play .ln:not(.on) *, .term.play .todo { color: transparent; }
 .term.play .cur { visibility: hidden; }
-.term.play .ln.typing::after { content: ""; display: inline-block; width: 0.55em; height: 1em; background: var(--highlight); vertical-align: -0.15em; }
+/* The cursor follows the last character typed and advances nothing: its
+   negative margin takes back its width, so the transparent rest of the
+   line never moves and never re-wraps under it. */
+.term.play .ln.typing .typed::after { content: ""; display: inline-block; width: 0.55em; margin-right: -0.55em; height: 1em; background: var(--highlight); vertical-align: -0.15em; }
 .motion .cells i { transition: background-color 0.12s, border-color 0.12s; }
 .runs.play .tr, .runs.play .verdict { opacity: 0; transition: opacity 0.25s; }
 .runs.play .tr.on, .runs.play .verdict.on { opacity: 1; }
