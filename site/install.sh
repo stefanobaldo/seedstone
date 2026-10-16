@@ -146,7 +146,7 @@ latest_tag() {
   if [ "$FETCHER" = curl ]; then
     latest_location="$(curl -fsS -o /dev/null -w '%{redirect_url}' "$BASE_URL/releases/latest" 2>/dev/null)" || latest_location=""
   else
-    latest_location="$(wget -S --max-redirect=0 -O /dev/null "$BASE_URL/releases/latest" 2>&1 | sed -n 's/^ *Location: *//p' | head -1 | tr -d '\r')"
+    latest_location="$(LC_ALL=C wget -S --max-redirect=0 -O /dev/null "$BASE_URL/releases/latest" 2>&1 | sed -n 's/^ *Location: *//p' | head -1 | tr -d '\r')"
   fi
   case "$latest_location" in
     */releases/tag/?*) printf '%s\n' "${latest_location##*/}" ;;
@@ -165,7 +165,8 @@ fetch() { # <url> <file>
       *) FETCH_ERROR="HTTP $fetch_code" ;;
     esac
   else
-    fetch_said="$(wget -nv -O "$2" "$1" 2>&1)" && return 0
+    # wget translates its error line; the status code is read under C.
+    fetch_said="$(LC_ALL=C wget -nv -O "$2" "$1" 2>&1)" && return 0
     FETCH_ERROR="$(printf '%s\n' "$fetch_said" | sed -n 's/.*ERROR \([0-9][0-9]*\).*/HTTP \1/p' | head -1)"
     [ -n "$FETCH_ERROR" ] || FETCH_ERROR="no answer"
   fi
@@ -201,6 +202,7 @@ install_binary() { # <source> <destination>
   [ -d "$INSTALL_DIR" ] || mkdir -p "$INSTALL_DIR" 2>/dev/null || true
   if [ -d "$INSTALL_DIR" ] && [ -w "$INSTALL_DIR" ]; then
     if ! { cp "$1" "$2.new" && chmod 755 "$2.new" && mv -f "$2.new" "$2"; }; then
+      rm -f "$2.new"
       die 1 "could not copy the binary into $INSTALL_DIR"
     fi
     return 0
@@ -209,7 +211,7 @@ install_binary() { # <source> <destination>
     die 1 "$INSTALL_DIR is not writable and there is no sudo; choose a directory you own with SEEDSTONE_INSTALL_DIR, e.g. SEEDSTONE_INSTALL_DIR=\$HOME/.local/bin"
   fi
   out "   $INSTALL_DIR is not writable; copying with sudo"
-  sudo sh -c 'mkdir -p "$3" && cp "$1" "$2.new" && chmod 755 "$2.new" && mv -f "$2.new" "$2"' sh "$1" "$2" "$INSTALL_DIR" ||
+  sudo sh -c 'mkdir -p "$3" && cp "$1" "$2.new" && chmod 755 "$2.new" && mv -f "$2.new" "$2" || { rm -f "$2.new"; exit 1; }' sh "$1" "$2" "$INSTALL_DIR" ||
     die 1 "sudo could not copy the binary into $INSTALL_DIR; choose a directory you own with SEEDSTONE_INSTALL_DIR"
 }
 
@@ -280,7 +282,12 @@ main() {
   FILE="seedstone-$VERSION-$TARGET.tar.gz"
   URL="$BASE_URL/releases/download/$TAG/$FILE"
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/seedstone-install.XXXXXX")" || die 1 "could not create a temporary directory under ${TMPDIR:-/tmp}"
-  trap 'rm -rf "$TMP"' EXIT INT TERM
+  # The directory goes on every exit; a signal exits, so a Ctrl-C during
+  # the download does not carry on into a false diagnosis.
+  trap 'rm -rf "$TMP"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   fetch "$URL" "$TMP/$FILE" || die 2 "could not download $FILE for $TAG ($FETCH_ERROR) from $URL; the releases are at $BASE_URL/releases"
   fetch "$URL.sha256" "$TMP/$FILE.sha256" || die 2 "could not download the checksum of $FILE for $TAG ($FETCH_ERROR) from $URL.sha256"
   step "↓" 33 Downloading "$FILE   $(megabytes "$(wc -c < "$TMP/$FILE")") MB"
