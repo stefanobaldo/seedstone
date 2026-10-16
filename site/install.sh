@@ -38,79 +38,50 @@ GLIBC_MIN=2.34
 # --- output ---------------------------------------------------------------
 
 # Colour and symbols only on a terminal, with NO_COLOR unset and TERM not
-# dumb; the sprite only when the terminal advertises 24-bit colour. Piped or
-# plain, the same lines without an escape byte, so a CI log reads as a screen.
-#
-# The sprite is printed whole before the report. On a terminal at least 100
-# columns wide the cursor then goes back up and the report is written beside
-# it, from the column after it (so the picture never appears line by line
-# while a download runs); on a narrower one the report starts below it.
+# dumb: the brand's amber where the terminal advertises 24-bit colour
+# (COLORTERM), the sixteen-colour palette otherwise. Piped or plain, the
+# same lines without an escape byte, so a CI log reads as a screen.
 COLOR=0
-SPRITE=0
-BESIDE=0
-LINE=0
 setup_output() {
   if [ -t 1 ] && [ -z "${NO_COLOR+set}" ] && [ "${TERM:-dumb}" != dumb ]; then
     COLOR=1
-    case "${COLORTERM:-}" in truecolor | 24bit) SPRITE=1 ;; esac
-  fi
-  [ "$SPRITE" -eq 1 ] || return 0
-  # The width is read from the controlling terminal: under `curl | sh`
-  # stdin is the pipe, and `tput cols` inside a substitution reports the
-  # terminfo default, not the window.
-  columns="$(stty size < /dev/tty 2>/dev/null | cut -d' ' -f2)"
-  [ -n "$columns" ] || columns="${COLUMNS:-80}"
-  n=1
-  while [ "$n" -le "$SPRITE_LINES" ]; do
-    sprite_line "$n"
-    printf '\n'
-    n=$((n + 1))
-  done
-  if [ "$columns" -ge 100 ]; then
-    BESIDE=1
-    printf '\033[%dA' "$SPRITE_LINES"
-  else
-    printf '\n'
+    case "${COLORTERM:-}" in truecolor | 24bit) COLOR=2 ;; esac
   fi
 }
 
-# Every line of the report goes through here: beside the sprite it starts
-# at the column after it, otherwise at the margin.
+# Styles, as SGR parameters: AMBER is the brand's amber on a 24-bit
+# terminal and yellow elsewhere; the rest are the same everywhere.
+style_amber() { if [ "$COLOR" -eq 2 ]; then printf '38;2;240;160;48'; else printf '33'; fi; }
+style_green() { printf '32'; }
+style_red() { printf '31'; }
+style_bold() { printf '1'; }
+style_dim() { printf '2'; }
+
+# A span in a style, or the bare text where colour is off.
+paint() { # <style parameters> <text>
+  if [ "$COLOR" -ge 1 ]; then printf '\033[%sm%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi
+}
+
+# Every line of the report starts two columns in.
 out() {
-  LINE=$((LINE + 1))
-  if [ "$BESIDE" -eq 1 ]; then printf '\033[%dG' "$((SPRITE_WIDTH + 1))"; else printf '  '; fi
-  printf '%s\n' "$1"
+  printf '  %s\n' "$1"
 }
 
-# Beside the sprite, a report that ends before the sprite's last line would
-# leave the shell's prompt in the picture: the cursor goes down past it.
-below_sprite() {
-  if [ "$BESIDE" -eq 1 ] && [ "$LINE" -lt "$SPRITE_LINES" ]; then
-    printf '\033[%dB' "$((SPRITE_LINES - LINE))"
-    LINE="$SPRITE_LINES"
-  fi
-}
-
-# A step line: a symbol in its colour, a label, a value.
-step() { # <symbol> <ansi colour> <label> <value>
-  if [ "$COLOR" -eq 1 ]; then
-    step_symbol="$(printf '\033[%sm%s\033[0m' "$2" "$1")"
-  else
-    step_symbol="$1"
-  fi
-  out "$(printf '%s  %-13s %s' "$step_symbol" "$3" "$4")"
+# A step line: a symbol in its colour, a bold label, a value, and an
+# optional note in dim.
+step() { # <symbol> <style> <label> <value> [note]
+  step_line="$(paint "$2" "$1")  $(paint "$(style_bold)" "$(printf '%-13s' "$3")") $4"
+  if [ -n "${5:-}" ]; then step_line="$step_line   $(paint "$(style_dim)" "$5")"; fi
+  out "$step_line"
 }
 
 # One sentence on stderr, then the exit code the header documents.
 die() { # <exit code> <sentence>
-  if [ "$BESIDE" -eq 1 ]; then printf '\033[%dG' "$((SPRITE_WIDTH + 1))" >&2; else printf '  ' >&2; fi
-  if [ "$COLOR" -eq 1 ]; then
-    printf '\033[31m✗\033[0m  %s\n' "$2" >&2
+  if [ "$COLOR" -ge 1 ]; then
+    printf '  \033[31m✗\033[0m  %s\n' "$2" >&2
   else
-    printf '✗  %s\n' "$2" >&2
+    printf '  ✗  %s\n' "$2" >&2
   fi
-  LINE=$((LINE + 1))
-  below_sprite
   exit "$1"
 }
 
@@ -247,7 +218,6 @@ install_binary() { # <source> <destination>
     die 1 "$INSTALL_DIR is not writable and there is no sudo; choose a directory you own with SEEDSTONE_INSTALL_DIR, e.g. SEEDSTONE_INSTALL_DIR=\$HOME/.local/bin"
   fi
   out "   $INSTALL_DIR is not writable; copying with sudo"
-  below_sprite
   sudo sh -c 'mkdir -p "$3" && cp "$1" "$2.new" && chmod 755 "$2.new" && mv -f "$2.new" "$2" || { rm -f "$2.new"; exit 1; }' sh "$1" "$2" "$INSTALL_DIR" ||
     die 1 "sudo could not copy the binary into $INSTALL_DIR; choose a directory you own with SEEDSTONE_INSTALL_DIR"
 }
@@ -257,19 +227,26 @@ install_binary() { # <source> <destination>
 # inform; nothing here is run.
 closing_block() { # <version>
   out ""
-  out "  Start a server     seedstone"
-  out "  Talk to it         redis-cli ping"
+  hint "Start a server" "seedstone"
+  hint "Talk to it" "redis-cli ping"
   if command -v apt-get > /dev/null 2>&1; then
     case "$TARGET" in x86_64-*) closing_arch=amd64 ;; *) closing_arch=arm64 ;; esac
-    out "  Run as a service   sudo apt install ./seedstone_$1-1_$closing_arch.deb   (from the release page)"
+    hint "Run as a service" "sudo apt install ./seedstone_$1-1_$closing_arch.deb" "from the release page"
   elif command -v dnf > /dev/null 2>&1; then
-    out "  Run as a service   sudo dnf install ./seedstone-$1-1.${TARGET%%-*}.rpm   (from the release page)"
+    hint "Run as a service" "sudo dnf install ./seedstone-$1-1.${TARGET%%-*}.rpm" "from the release page"
   elif command -v brew > /dev/null 2>&1; then
-    out "  Run as a service   brew services start seedstone   (after brew install seedstonelabs/tap/seedstone)"
+    hint "Run as a service" "brew services start seedstone" "after brew install seedstonelabs/tap/seedstone"
   else
-    out "  Run as a service   $DOCS"
+    hint "Run as a service" "$DOCS"
   fi
-  out "  Documentation      https://github.com/stefanobaldo/seedstone/tree/main/docs"
+  hint "Documentation" "https://github.com/stefanobaldo/seedstone/tree/main/docs"
+}
+
+# A closing line: a dim label, the command in bold, an optional dim note.
+hint() { # <label> <command> [note]
+  hint_line="$(paint "$(style_dim)" "$(printf '%-18s' "$1")") $(paint "$(style_bold)" "$2")"
+  if [ -n "${3:-}" ]; then hint_line="$hint_line   $(paint "$(style_dim)" "($3)")"; fi
+  out "  $hint_line"
 }
 
 megabytes() { # <bytes> -> N.N
@@ -299,12 +276,12 @@ main() {
   fi
   command -v tar > /dev/null 2>&1 || die 1 "tar is not on the PATH; install it and run again"
 
-  out "seedstone installer"
+  out "$(paint "$(style_amber);$(style_bold)" "◆ seedstone installer")"
   out ""
 
   detect_target
   case "$TARGET" in *-linux-gnu) check_glibc ;; esac
-  step "→" 33 Detected "$DETECTED"
+  step "→" "$(style_amber)" Detected "$DETECTED"
 
   if [ -n "${SEEDSTONE_VERSION:-}" ]; then
     TAG="$SEEDSTONE_VERSION"
@@ -314,7 +291,7 @@ main() {
     tag_how="latest"
   fi
   VERSION="${TAG#v}"
-  step "→" 33 Release "$TAG  ($tag_how)"
+  step "→" "$(style_amber)" Release "$TAG" "($tag_how)"
 
   FILE="seedstone-$VERSION-$TARGET.tar.gz"
   URL="$BASE_URL/releases/download/$TAG/$FILE"
@@ -327,10 +304,10 @@ main() {
   trap 'exit 143' TERM
   fetch "$URL" "$TMP/$FILE" || die 2 "could not download $FILE for $TAG ($FETCH_ERROR) from $URL; the releases are at $BASE_URL/releases"
   fetch "$URL.sha256" "$TMP/$FILE.sha256" || die 2 "could not download the checksum of $FILE for $TAG ($FETCH_ERROR) from $URL.sha256"
-  step "↓" 33 Downloading "$FILE   $(megabytes "$(wc -c < "$TMP/$FILE")") MB"
+  step "↓" "$(style_amber)" Downloading "$FILE" "$(megabytes "$(wc -c < "$TMP/$FILE")") MB"
 
   verify "$TMP" "$FILE"
-  step "✓" 32 Verified "sha256 matches the release"
+  step "✓" "$(style_green)" Verified "sha256 matches the release"
 
   tar -xzf "$TMP/$FILE" -C "$TMP" "seedstone-$VERSION-$TARGET/seedstone" ||
     die 2 "could not extract seedstone-$VERSION-$TARGET/seedstone from $FILE"
@@ -340,41 +317,23 @@ main() {
   fi
   install_binary "$TMP/seedstone-$VERSION-$TARGET/seedstone" "$INSTALL_DIR/seedstone"
   if [ -n "$previous" ]; then
-    step "✓" 32 Installed "$INSTALL_DIR/seedstone   (replaced $previous)"
+    step "✓" "$(style_green)" Installed "$INSTALL_DIR/seedstone" "(replaced $previous)"
   else
-    step "✓" 32 Installed "$INSTALL_DIR/seedstone"
+    step "✓" "$(style_green)" Installed "$INSTALL_DIR/seedstone"
   fi
 
   out ""
-  out "  $("$INSTALL_DIR/seedstone" --version)"
+  out "  $(paint "$(style_amber);$(style_bold)" "$("$INSTALL_DIR/seedstone" --version)")"
   case ":$PATH:" in
     *":$INSTALL_DIR:"*) ;;
     *)
       out ""
-      out "  $INSTALL_DIR is not on your PATH; for this shell:"
-      out "    export PATH=\"$INSTALL_DIR:\$PATH\""
+      out "  $(paint "$(style_dim)" "$INSTALL_DIR is not on your PATH; for this shell:")"
+      out "    $(paint "$(style_bold)" "export PATH=\"$INSTALL_DIR:\$PATH\"")"
       ;;
   esac
   closing_block "$VERSION"
 }
 
-# --- sprite ---
-# The mark, 16 by 14 pixels in half-block characters and 24-bit colour,
-# one line per call. Emitted by scripts/brand.py from the grid it holds;
-# edit the grid there, never these lines.
-SPRITE_LINES=7
-SPRITE_WIDTH=21
-sprite_line() {
-  case "$1" in
-  1) printf '     \033[38;2;31;40;49m▄\033[38;2;58;71;86m▄\033[38;2;31;40;49;48;2;58;71;86m▀\033[38;2;58;71;86m████\033[38;2;31;40;49;48;2;58;71;86m▀\033[38;2;58;71;86m▄\033[38;2;31;40;49m▄\033[0m      ' ;;
-  2) printf '   \033[38;2;31;40;49m▄\033[38;2;31;40;49;48;2;58;71;86m▀\033[38;2;58;71;86m████\033[38;2;58;71;86;48;2;240;160;48m▀▀\033[38;2;58;71;86m████\033[38;2;31;40;49;48;2;58;71;86m▀\033[38;2;31;40;49m▄\033[0m    ' ;;
-  3) printf '  \033[38;2;31;40;49m▄\033[38;2;58;71;86m█████\033[38;2;58;71;86;48;2;255;196;92m▀\033[38;2;255;196;92;48;2;240;160;48m▀\033[38;2;240;160;48m█\033[38;2;58;71;86;48;2;240;160;48m▀\033[38;2;58;71;86m█████\033[38;2;31;40;49m▄\033[0m   ' ;;
-  4) printf '  \033[38;2;31;40;49m█\033[38;2;58;71;86m████\033[38;2;58;71;86;48;2;255;196;92m▀\033[38;2;255;196;92m█\033[38;2;240;160;48m███\033[38;2;58;71;86;48;2;240;160;48m▀\033[38;2;58;71;86m████\033[38;2;31;40;49m█\033[0m   ' ;;
-  5) printf '  \033[38;2;31;40;49m▀\033[38;2;58;71;86;48;2;31;40;49m▀\033[38;2;58;71;86m███\033[38;2;255;196;92m█\033[38;2;255;196;92;48;2;240;160;48m▀\033[38;2;240;160;48m████\033[38;2;58;71;86m███\033[38;2;58;71;86;48;2;31;40;49m▀\033[38;2;31;40;49m▀\033[0m   ' ;;
-  6) printf '   \033[38;2;31;40;49m▀█\033[38;2;58;71;86;48;2;31;40;49m▀\033[38;2;58;71;86m██\033[38;2;255;196;92;48;2;58;71;86m▀\033[38;2;240;160;48m██\033[38;2;240;160;48;48;2;58;71;86m▀\033[38;2;58;71;86m██\033[38;2;58;71;86;48;2;31;40;49m▀\033[38;2;31;40;49m█▀\033[0m    ' ;;
-  7) printf '     \033[38;2;31;40;49m▀▀█\033[38;2;58;71;86;48;2;31;40;49m▀▀▀▀\033[38;2;31;40;49m█▀▀\033[0m      ' ;;
-  esac
-}
-# --- /sprite ---
 
 main "$@"
