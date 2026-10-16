@@ -4,7 +4,8 @@
 # documentation pages — the page carries the metadata a crawler and a link
 # preview read, it names no `http://` URL, the mark it shows is the mark
 # `brand.py` holds, every benchmark figure it shows is the benchmark page's
-# for that cell and arm, and the page with everything it references stays
+# for that cell and arm, the installer it serves is POSIX sh that talks to
+# the two hosts it may, and the page with everything it references stays
 # under its byte budget. Each check prints one `ok:` or `FAIL:` line.
 #
 # Usage: check-site.sh            (from the repository root)
@@ -21,14 +22,16 @@ sys.path.insert(0, "scripts")
 import brand
 
 SITE = "site"
-# A fixture may stand in for the page (the checker's own tests do that).
+# A fixture may stand in for the page or the installer (the checker's own
+# tests do that).
 INDEX = os.environ.get("CHECK_SITE_INDEX", os.path.join(SITE, "index.html"))
+INSTALLER = os.environ.get("CHECK_SITE_INSTALLER", os.path.join(SITE, "install.sh"))
 REPO = "https://github.com/stefanobaldo/seedstone/blob/main/"
 ORIGIN = "https://seedstone.io/"
 BUDGET = 200 * 1024
 # Paths the page links before the file lands beside it; each entry leaves
 # with the change that adds its file.
-PENDING = {"install.sh"}
+PENDING = set()
 
 status = 0
 def ok(check, detail=""):
@@ -417,6 +420,39 @@ def check_animation():
     else:
         fail("animation", f"{total} bytes (svg, two css blocks, site.js), budget {ANIM_BUDGET}")
 
+# The installer may talk to the repository and to the site, and to nothing
+# else; a URL on any other host is a request the reader did not sign up for.
+INSTALLER_HOSTS = ("https://github.com/stefanobaldo/seedstone", "https://seedstone.io")
+
+def check_installer():
+    """The installer is POSIX sh by two linters, every URL in it is under
+    the two allowed hosts, and `main "$@"` is its last line."""
+    if not os.path.exists(INSTALLER):
+        fail("installer", f"{INSTALLER} missing")
+        return
+    bad = []
+    for cmd in (["shellcheck", "--shell=sh", INSTALLER], ["checkbashisms", INSTALLER]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        except FileNotFoundError:
+            bad.append(f"{cmd[0]} is not on the PATH")
+            continue
+        if r.returncode != 0:
+            said = (r.stdout + r.stderr).strip().splitlines()
+            said = [l.strip() for l in said if re.search(r"SC\d+|bashism", l)] or said or [f"exit {r.returncode}"]
+            bad.append(f"{cmd[0]}: {said[0]}")
+    text = open(INSTALLER, encoding="utf-8").read()
+    urls = re.findall(r"https?://[^\s\"'`)>}]+", text)
+    for url in urls:
+        if not any(url == h or url.startswith(h + "/") for h in INSTALLER_HOSTS):
+            bad.append(f"{url} is not under {' or '.join(INSTALLER_HOSTS)}")
+    if text.rstrip("\n").rsplit("\n", 1)[-1] != 'main "$@"':
+        bad.append('the last line is not main "$@"')
+    if bad:
+        fail("installer", "; ".join(bad))
+    else:
+        ok("installer", f"shellcheck and checkbashisms clean, {len(urls)} URLs under the two hosts")
+
 def check_budget(referenced):
     files = {INDEX, *referenced}
     for path in list(files):
@@ -439,6 +475,7 @@ check_mark()
 check_figures()
 check_no_version_literal()
 check_animation()
+check_installer()
 check_budget(referenced)
 sys.exit(status)
 PY
