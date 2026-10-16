@@ -1,7 +1,13 @@
+# Scripts from this site and Cloudflare's analytics beacon, nothing inline.
+# Styles admit 'unsafe-inline' because the bars carry their width as a
+# style attribute, so a bar is drawn without a script, and one <noscript>
+# style hides the copy button where no script runs. The beacon reports to
+# cloudflareinsights.com, or to this origin when the zone proxies it.
 /*
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
   X-Frame-Options: DENY
+  Content-Security-Policy: default-src 'self'; script-src 'self' https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline'; img-src 'self'; font-src 'self'; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
 
 # The installer is read in a browser as often as it is piped to a shell,
 # and a fix to it must reach users in minutes.
