@@ -353,10 +353,12 @@ def check_no_version_literal():
 ANIM_BUDGET = 30 * 1024
 ANIM_SVG = re.compile(r'<svg[^>]*\baria-labelledby="anim-title"[^>]*>.*?</svg>', re.S)
 ANIM_CSS = re.compile(r"/\* anim \*/.*?/\* /anim \*/", re.S)
+MOTION_CSS = re.compile(r"/\* motion \*/.*?/\* /motion \*/", re.S)
 
 def check_animation():
-    """The hero animation — the inline SVG, its driver and its CSS block —
-    carries an accessible name and stays under its own budget."""
+    """Everything on the page that moves — the hero's inline SVG, the
+    script (its driver, the tabs and the scroll-triggered motions) and the
+    two CSS blocks — carries an accessible name and stays under one budget."""
     svg = ANIM_SVG.search(html)
     if not svg:
         fail("animation", 'no inline <svg> with aria-labelledby="anim-title" on the page')
@@ -365,16 +367,20 @@ def check_animation():
         fail("animation", 'the SVG lacks role="img"')
         return
     css_path, js_path = os.path.join(SITE, "assets", "site.css"), os.path.join(SITE, "assets", "site.js")
-    block = ANIM_CSS.search(open(css_path, encoding="utf-8").read())
-    if not block:
-        fail("animation", f"no /* anim */ ... /* /anim */ block in {css_path}")
-        return
-    total = (len(svg.group(0).encode()) + len(block.group(0).encode())
+    css = open(css_path, encoding="utf-8").read()
+    blocks = []
+    for name, pattern in (("anim", ANIM_CSS), ("motion", MOTION_CSS)):
+        block = pattern.search(css)
+        if not block:
+            fail("animation", f"no /* {name} */ ... /* /{name} */ block in {css_path}")
+            return
+        blocks.append(block.group(0))
+    total = (len(svg.group(0).encode()) + sum(len(b.encode()) for b in blocks)
              + (os.path.getsize(js_path) if os.path.exists(js_path) else 0))
     if total < ANIM_BUDGET:
-        ok("animation", f"{total} bytes (svg, css block, site.js), budget {ANIM_BUDGET}")
+        ok("animation", f"{total} bytes (svg, two css blocks, site.js), budget {ANIM_BUDGET}")
     else:
-        fail("animation", f"{total} bytes (svg, css block, site.js), budget {ANIM_BUDGET}")
+        fail("animation", f"{total} bytes (svg, two css blocks, site.js), budget {ANIM_BUDGET}")
 
 def check_budget(referenced):
     files = {INDEX, *referenced}
