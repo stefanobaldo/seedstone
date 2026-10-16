@@ -118,44 +118,44 @@
         <button type="button" role="tab" id="tab-pkg" aria-controls="panel-pkg" aria-selected="false" tabindex="-1">deb / rpm</button>
         <button type="button" role="tab" id="tab-helm" aria-controls="panel-helm" aria-selected="false" tabindex="-1">Helm</button>
       </div>
-      <section class="panel" id="panel-curl" role="tabpanel" aria-labelledby="tab-curl">
-        <h3>curl</h3>
+      <section class="panel" id="panel-curl" role="tabpanel" aria-labelledby="h-curl">
+        <h3 id="h-curl">curl</h3>
         <div class="copy">
           <pre><code>curl -fsSL https://seedstone.io/install.sh | sh</code></pre>
           <button type="button" class="copy-button" data-copy="curl -fsSL https://seedstone.io/install.sh | sh">Copy</button>
         </div>
         <p class="note">macOS and Linux, x86_64 and arm64. Verifies the release's SHA-256, installs the binary, nothing else. Read it first: <a href="/install.sh">install.sh</a>.</p>
       </section>
-      <section class="panel" id="panel-docker" role="tabpanel" aria-labelledby="tab-docker">
-        <h3>Docker</h3>
+      <section class="panel" id="panel-docker" role="tabpanel" aria-labelledby="h-docker">
+        <h3 id="h-docker">Docker</h3>
         <div class="copy">
           <pre><code>docker run -p 6379:6379 seedstone/seedstone --bind 0.0.0.0:6379 --no-auth</code></pre>
           <button type="button" class="copy-button" data-copy="docker run -p 6379:6379 seedstone/seedstone --bind 0.0.0.0:6379 --no-auth">Copy</button>
         </div>
         <p class="note">Also on <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#container-image">GHCR</a>.</p>
       </section>
-      <section class="panel" id="panel-brew" role="tabpanel" aria-labelledby="tab-brew">
-        <h3>Homebrew</h3>
+      <section class="panel" id="panel-brew" role="tabpanel" aria-labelledby="h-brew">
+        <h3 id="h-brew">Homebrew</h3>
         <div class="copy">
           <pre><code>brew install seedstonelabs/tap/seedstone</code></pre>
           <button type="button" class="copy-button" data-copy="brew install seedstonelabs/tap/seedstone">Copy</button>
         </div>
         <p class="note">macOS and Linux; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#homebrew-macos-and-linux">as a service</a> with <code>brew services</code>.</p>
       </section>
-      <section class="panel" id="panel-cargo" role="tabpanel" aria-labelledby="tab-cargo">
-        <h3>Cargo</h3>
+      <section class="panel" id="panel-cargo" role="tabpanel" aria-labelledby="h-cargo">
+        <h3 id="h-cargo">Cargo</h3>
         <div class="copy">
           <pre><code>cargo binstall seedstone</code></pre>
           <button type="button" class="copy-button" data-copy="cargo binstall seedstone">Copy</button>
         </div>
         <p class="note">The release archive in seconds; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#cargo"><code>cargo install</code></a> builds from source.</p>
       </section>
-      <section class="panel" id="panel-pkg" role="tabpanel" aria-labelledby="tab-pkg">
-        <h3>deb / rpm</h3>
+      <section class="panel" id="panel-pkg" role="tabpanel" aria-labelledby="h-pkg">
+        <h3 id="h-pkg">deb / rpm</h3>
         <p class="note">A <code>.deb</code> or <code>.rpm</code> with a systemd unit, <a href="https://github.com/stefanobaldo/seedstone/releases/latest">from the release page</a>; <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/install.md#debian-ubuntu-deb-and-fedora-rhel-rpm">what the service does</a>.</p>
       </section>
-      <section class="panel" id="panel-helm" role="tabpanel" aria-labelledby="tab-helm">
-        <h3>Helm</h3>
+      <section class="panel" id="panel-helm" role="tabpanel" aria-labelledby="h-helm">
+        <h3 id="h-helm">Helm</h3>
         <div class="copy">
           <pre><code>helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --set auth.noAuth=true</code></pre>
           <button type="button" class="copy-button" data-copy="helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --set auth.noAuth=true">Copy</button>
@@ -174,12 +174,12 @@
   <section id="correct" class="glow-left">
     <p class="eyebrow">Correct</p>
     <h2 class="claim">The same seed, the same bug. Every time.</h2>
-    <p class="line">The whole server runs inside a deterministic simulation: a virtual clock, a simulated network, scheduled clients. Every completed command folds into a trace hash that depends on the seed and nothing else.</p>
+    <p class="line">The whole server runs inside a deterministic simulation: a virtual clock, a simulated network, scheduled clients. Every completed command folds into a trace hash that depends on two seeds and nothing else.</p>
     <ol class="pipeline" aria-label="From seed to trace">
       <li class="seed">seed 0x4f2a9c1e</li><li class="arrow" aria-hidden="true">→</li><li>virtual clock</li><li>simulated network</li><li>scheduled clients</li><li class="arrow" aria-hidden="true">→</li><li>trace 0x8b…31</li>
     </ol>
     <div class="two even">
-      <section class="card runs" aria-labelledby="runs-usual">
+      <div class="card runs">
         <h3 id="runs-usual">A concurrency bug, the usual way <span class="tag">no seed</span></h3>
         <ol class="runlist">
         <li class="run"><span class="run-n">run 1</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on hit"></i><i data-tick="7"></i><i data-tick="8"></i><i data-tick="9"></i><i data-tick="10"></i><i data-tick="11"></i><i data-tick="12"></i><i data-tick="13"></i><i data-tick="14"></i><i data-tick="15"></i><i data-tick="16"></i><i data-tick="17"></i><i data-tick="18"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 6</span></li>
@@ -188,8 +188,8 @@
         <li class="run"><span class="run-n">run 4</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on hit"></i><i data-tick="10"></i><i data-tick="11"></i><i data-tick="12"></i><i data-tick="13"></i><i data-tick="14"></i><i data-tick="15"></i><i data-tick="16"></i><i data-tick="17"></i><i data-tick="18"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 9, elsewhere</span></li>
         </ol>
         <p class="verdict">Seen once, gone under the debugger, back in production.</p>
-      </section>
-      <section class="card runs seeded" aria-labelledby="runs-seeded">
+      </div>
+      <div class="card runs seeded">
         <h3 id="runs-seeded">In seedstone <span class="tag seed">seed 0x4f2a9c1e</span></h3>
         <ol class="runlist">
         <li class="run"><span class="run-n">run 1</span><span class="cells" aria-hidden="true"><i data-tick="1" class="on"></i><i data-tick="2" class="on"></i><i data-tick="3" class="on"></i><i data-tick="4" class="on"></i><i data-tick="5" class="on"></i><i data-tick="6" class="on"></i><i data-tick="7" class="on"></i><i data-tick="8" class="on"></i><i data-tick="9" class="on"></i><i data-tick="10" class="on"></i><i data-tick="11" class="on"></i><i data-tick="12" class="on"></i><i data-tick="13" class="on"></i><i data-tick="14" class="on"></i><i data-tick="15" class="on"></i><i data-tick="16" class="on"></i><i data-tick="17" class="on"></i><i data-tick="18" class="on hit"></i><i data-tick="19"></i><i data-tick="20"></i></span><span class="tr fail">✗ tick 18 · 0x8b…31</span></li>
@@ -199,7 +199,7 @@
         </ol>
         <p class="run-note">run 4 on another machine, in a fresh process</p>
         <p class="verdict pass">✓ Reproduced from the seed, byte for byte. Fixed once.</p>
-      </section>
+      </div>
     </div>
     <ul class="stats" role="list">
       <li><strong>14 <span>/ 14</span></strong><p>defects planted in the server itself, each caught by the counter that owns it</p></li>
@@ -214,8 +214,8 @@
     <h2 class="claim">Ahead of Redis where a cache lives.</h2>
     <p class="line">Same machine, same client, median of three runs, throughput in operations per second. Every bar is an engine this server is ahead of; the grey line names the ones level with it.</p>
     <div class="grid-2">
-      <section class="card compare" aria-labelledby="fast-1">
-        <p class="label" id="fast-1"><span class="cell-name">SET 64 B with EX 60 · depth 64</span> <span class="what">a cache write with a deadline</span></p>
+      <div class="card compare">
+        <h3 class="label"><span class="cell-name">SET 64 B with EX 60 · depth 64</span> <span class="what">a cache write with a deadline</span></h3>
         <p class="tie">Dragonfly reads <span data-cell="set-64-ex60-d64" data-arm="dragonfly">4.63 M</span>, level with seedstone: the client's ceiling</p>
         <div class="proof-body">
           <p class="factor-line"><span class="factor" data-cell="set-64-ex60-d64" data-pair="redis-iot1">2.96×</span> <span class="factor-what">Redis at one I/O thread</span></p>
@@ -228,9 +228,9 @@
             <li class="bar" data-cell="set-64-ex60-d64" data-arm="valkey-iot1" style="--w: 25.6%"><span class="arm">Valkey</span><span class="figure">1.18 M</span></li>
           </ul>
         </div>
-      </section>
-      <section class="card compare" aria-labelledby="fast-2">
-        <p class="label" id="fast-2"><span class="cell-name">SET 64 B · depth 64</span> <span class="what">the plain cache write</span></p>
+      </div>
+      <div class="card compare">
+        <h3 class="label"><span class="cell-name">SET 64 B · depth 64</span> <span class="what">the plain cache write</span></h3>
         <p class="tie">Dragonfly <span data-cell="set-64-d64" data-arm="dragonfly">4.65 M</span> and Garnet <span data-cell="set-64-d64" data-arm="garnet">4.63 M</span>, level with seedstone: the client's ceiling</p>
         <div class="proof-body">
           <p class="factor-line"><span class="factor" data-cell="set-64-d64" data-pair="redis-iot1">2.21×</span> <span class="factor-what">Redis at one I/O thread</span></p>
@@ -242,9 +242,9 @@
             <li class="bar" data-cell="set-64-d64" data-arm="valkey-iot1" style="--w: 38.4%"><span class="arm">Valkey</span><span class="figure">1.78 M</span></li>
           </ul>
         </div>
-      </section>
-      <section class="card compare" aria-labelledby="fast-3">
-        <p class="label" id="fast-3"><span class="cell-name">MGET 16 keys · depth 64</span> <span class="what">the multi-key read</span></p>
+      </div>
+      <div class="card compare">
+        <h3 class="label"><span class="cell-name">MGET 16 keys · depth 64</span> <span class="what">the multi-key read</span></h3>
         <p class="tie">Garnet reads <span data-cell="mget-16-d64" data-arm="garnet">629 k</span>, level with seedstone</p>
         <div class="proof-body">
           <p class="factor-line"><span class="factor" data-cell="mget-16-d64" data-pair="redis-iot1">1.86×</span> <span class="factor-what">Redis at one I/O thread</span></p>
@@ -257,9 +257,9 @@
             <li class="bar" data-cell="mget-16-d64" data-arm="valkey-iot1" style="--w: 50.2%"><span class="arm">Valkey</span><span class="figure">314 k</span></li>
           </ul>
         </div>
-      </section>
-      <section class="card compare" aria-labelledby="fast-4">
-        <p class="label" id="fast-4"><span class="cell-name">GET 64 B · depth 64</span> <span class="what">the pipelined read</span></p>
+      </div>
+      <div class="card compare">
+        <h3 class="label"><span class="cell-name">GET 64 B · depth 64</span> <span class="what">the pipelined read</span></h3>
         <p class="tie">Dragonfly reads <span data-cell="get-64-d64" data-arm="dragonfly">4.65 M</span>, level with seedstone: the client's ceiling</p>
         <div class="proof-body">
           <p class="factor-line"><span class="factor" data-cell="get-64-d64" data-pair="redis-iot1">1.75×</span> <span class="factor-what">Redis at one I/O thread</span></p>
@@ -272,7 +272,7 @@
             <li class="bar" data-cell="get-64-d64" data-arm="valkey-iot1" style="--w: 49.3%"><span class="arm">Valkey</span><span class="figure">2.28 M</span></li>
           </ul>
         </div>
-      </section>
+      </div>
     </div>
     <p class="src">v0.3.2 on a GCP c4a-standard-16, against Redis 8.10.0, Valkey 9.1.1, Dragonfly df-v1.40.2 and Garnet 2.1.5, 2026-10-11. Every cell at every depth, the CPU per operation, the method fixed before the run, and what the numbers do not say: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/benchmarks.md">docs/benchmarks.md</a></p>
   </section>
@@ -282,25 +282,25 @@
     <h2 class="claim">Says only what it can state truthfully.</h2>
     <p class="line">Built to be run by someone who is paged for it. A stock Prometheus exporter scrapes it in CI.</p>
     <div class="grid-2 ops">
-      <section class="card op" aria-labelledby="op-info">
+      <div class="card op">
         <h3 id="op-info">INFO, without the fiction</h3>
         <p>Sections that carry only what the node can state: no resident-set figure it would have to guess, no fork it does not have.</p>
-        <pre><code><span class="cm"># clients</span>
-<span class="key">connected_clients</span>:148
-<span class="cm"># memory</span>
-<span class="key">used_memory</span>:402653184
-<span class="key">maxmemory</span>:536870912
-<span class="cm"># persistence</span>
+        <pre><code><span class="cm"># Memory</span>
+<span class="key">maxmemory_policy</span>:allkeys-lru
+<span class="cm"># Persistence</span>
+<span class="key">loading</span>:0
+<span class="key">aof_enabled</span>:1
+<span class="key">fsync_policy</span>:interval
 <span class="key">aof_last_write_status</span>:ok
 <span class="key">refusing_executors</span>:0</code></pre>
-      </section>
-      <section class="card op" aria-labelledby="op-log">
+      </div>
+      <div class="card op">
         <h3 id="op-log">One JSON line per event</h3>
         <p>Every line opens with a time, a level and the event's name; a monitor selects by <code>evt</code> and reads fields by name, with no parser of its own.</p>
         <pre><code>{<span class="key">"ts"</span>:1757800000000,<wbr><span class="key">"level"</span>:<span class="str">"info"</span>,<wbr><span class="key">"evt"</span>:<span class="str">"listening"</span>,<wbr><span class="key">"version"</span>:<span class="str">"0.1.1"</span>,<wbr><span class="key">"bind"</span>:<span class="str">"0.0.0.0"</span>,<wbr><span class="key">"port"</span>:6379}
 {<span class="key">"ts"</span>:1757800000317,<wbr><span class="key">"level"</span>:<span class="str">"warn"</span>,<wbr><span class="key">"evt"</span>:<span class="str">"error_reply"</span>,<wbr><span class="key">"code"</span>:<span class="str">"ERR"</span>,<wbr><span class="key">"cmd"</span>:<span class="str">"flushall"</span>,<wbr><span class="key">"msg"</span>:<span class="str">"ERR unknown command 'flushall'"</span>}</code></pre>
-      </section>
-      <section class="card op" aria-labelledby="op-password">
+      </div>
+      <div class="card op">
         <h3 id="op-password">A password that rotates without a restart</h3>
         <p>Two passwords are valid while the file holds two, so the server and its clients never have to change in the same moment.</p>
         <ol class="steps">
@@ -309,8 +309,8 @@
           <li><span class="step-n">3</span>drop the old line, <code>SIGHUP</code></li>
         </ol>
         <pre><code>{<span class="key">"ts"</span>:1757800003250,<wbr><span class="key">"level"</span>:<span class="str">"info"</span>,<wbr><span class="key">"evt"</span>:<span class="str">"password_reloaded"</span>,<wbr><span class="key">"passwords"</span>:2}</code></pre>
-      </section>
-      <section class="card op" aria-labelledby="op-disk">
+      </div>
+      <div class="card op">
         <h3 id="op-disk">A disk that fails is met with refusal</h3>
         <p>A write the node cannot keep is not acknowledged: writes are refused until a snapshot is durable, reads are served, and a full disk asks for space, not for a restart.</p>
         <pre><code><span class="cm"># the disk is full, --fsync always</span>
@@ -319,7 +319,7 @@
 <span class="cm"># space freed, a snapshot durable: refusal_ended</span>
 <span class="p">&gt;</span> SET order:9 paid
 <span class="ok">+OK</span></code></pre>
-      </section>
+      </div>
     </div>
     <p class="src">Flags, output, signals, the password, persistence and <code>INFO</code>: <a href="https://github.com/stefanobaldo/seedstone/blob/main/docs/operations.md">docs/operations.md</a></p>
   </section>

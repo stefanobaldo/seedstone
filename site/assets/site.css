@@ -38,7 +38,7 @@
   --bar: var(--face);
   --focus: var(--amber);
   --pass: #3fb950;              /* the check mark and an OK; semantic, not brand */
-  --fail: #e5484d;
+  --fail: #ff6369;              /* 4.5:1 and above as 12 px text on the raised surface */
   --string: #9ad0ff;            /* a JSON string in an excerpt */
 
   --sans: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -125,12 +125,8 @@ body > * {
   height: auto;
   aspect-ratio: 1;
 }
-.glow-left::before { top: 4rem; left: -4rem; }
-.glow-right::before { top: 6rem; right: -2rem; }
-@media (max-width: 64rem) {
-  .glow-left::before { left: 0; }
-  .glow-right::before { right: 0; }
-}
+.glow-left::before { top: 4rem; left: 0; }
+.glow-right::before { top: 6rem; right: 0; }
 
 h1, h2 { font-weight: 700; margin: 0; letter-spacing: -0.02em; text-wrap: balance; }
 h1 { font-size: clamp(2.5rem, 1.5rem + 4.2vw, 4.25rem); line-height: 1.02; letter-spacing: -0.03em; }
@@ -331,7 +327,7 @@ main > section:not(.hero) > * { min-width: 0; }
 #start .two { align-items: center; }
 #start .card .copy { margin: 0 0 0.75rem; max-width: none; }
 .card h3 { font-size: 0.9375rem; font-weight: 700; margin: 0 0 0.6rem; line-height: 1.3; }
-.card > p { font-size: 0.875rem; color: var(--text-2); }
+:where(.card) > p { font-size: 0.875rem; color: var(--text-2); }   /* a card's plain paragraph; any class on it wins */
 .card code { font-size: 0.85em; }
 
 /* The install card: six panels, one per channel. Without the script every
@@ -449,7 +445,7 @@ main > section:not(.hero) > * { min-width: 0; }
 @media (min-width: 30rem) {
   .compare .proof-body { grid-template-columns: 8.5rem minmax(0, 1fr); }
 }
-.bar { grid-template-columns: 5.6em minmax(0, 1fr) 3.4em; }
+.compare .bar { grid-template-columns: 5.6em minmax(0, 1fr) 3.4em; }   /* room for "Valkey ×4" */
 
 /* The four operations cards: a title, one line, and the excerpt pinned to
    the card's bottom edge so the four line up. */
