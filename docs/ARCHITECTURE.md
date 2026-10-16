@@ -137,7 +137,10 @@ written: that is what the sync covers, and what it tells each executor is
 durable when it completes. What arrives while a sync is in flight is written
 behind it and covered by the next one, so a sync covers every write that was
 ready when it was issued, from every executor, and the device sees one
-stream of syncs for the node rather than one per executor. Under `always` an
+stream of syncs for the node rather than one per executor. Before each sync
+the writer appends a mark saying a sync is issued there, so a start can tell
+a crash's torn tail, past the last mark, from damage to bytes a sync was
+issued over, and charges only the second. Under `always` an
 executor holds the replies of a batch that wrote until the writer says the
 batch is durable; a batch that only read is answered at once, and the
 connection's in-order emission keeps the wire ordered. An executor keeps a
