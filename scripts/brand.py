@@ -15,8 +15,8 @@ Usage (from the repository root):
         mark, and are not byte-checked.
 
 The installer's sprite is the one derivative that is drawn, not computed:
-SPRITE below is the mark at 24 by 24 pixels, one character per pixel,
-snapped to the palette by hand. `emit` writes its twelve half-block lines
+SPRITE below is the mark at 16 by 14 pixels, one character per pixel,
+drawn by hand in the palette. `emit` writes its seven half-block lines
 between the sprite markers in site/install.sh, and `--check` holds them.
 
 To regenerate after a change to the mark: python3 -I scripts/brand.py emit
@@ -52,42 +52,34 @@ SHAPES_FAVICON = SHAPES[:2] + [f'<path d="{FAVICON_SEED}" fill="{AMBER}"/>']
 WORDMARKS = ("docs/assets/wordmark-light.svg", "docs/assets/wordmark-dark.svg")
 
 # The sprite: `.` transparent, `r` rim, `f` face, `a` amber, `h` highlight.
-# A 22-pixel disc on the 24-pixel grid, the rim one pixel at the sides and
-# two below, none above (the face sits one pixel up, as it does in the
-# mark); the seed two pixels wide at its tip and eight at its widest, the
-# highlight its left edge.
+# Sixteen pixels wide and fourteen tall, because a terminal cell is about
+# two and a half times as tall as it is wide and a half-block pixel is half
+# a cell: a disc that is round on screen is wider than it is tall in pixels.
+# The rim is one pixel at the sides and two below, none above (the face sits
+# up, as it does in the mark); the seed is two pixels wide at its tip and
+# six at its widest, the highlight its left edge.
 SPRITE = """\
-........................
-.........ffffff.........
-......ffffffffffff......
-.....ffffffffffffff.....
-....ffffffffffffffff....
-...rfffffffaafffffffr...
-..rffffffffhaffffffffr..
-..rfffffffhhaafffffffr..
-..rfffffffhhaafffffffr..
-.rfffffffhhaaaafffffffr.
-.rfffffffhhaaaafffffffr.
-.rffffffhhaaaaaaffffffr.
-.rffffffhhaaaaaaffffffr.
-.rffffffhhaaaaaaffffffr.
-.rrfffffhhaaaaaafffffrr.
-..rfffffhhaaaaaafffffr..
-..rrfffffhaaaaafffffrr..
-..rrffffffaaaaffffffrr..
-...rrffffffffffffffrr...
-....rrrffffffffffrrr....
-.....rrrrffffffrrrr.....
-......rrrrrrrrrrrr......
-.........rrrrrr.........
-........................
+.....rffffr.....
+...rffffffffr...
+..rffffffffffr..
+.rfffffaafffffr.
+.ffffffhaffffff.
+rfffffhaaafffffr
+rfffffhaaafffffr
+rffffhhaaaaffffr
+rffffhhaaaaffffr
+.rfffhaaaaafffr.
+.rrfffhaaafffrr.
+..rrfffaafffrr..
+...rrrffffrrr...
+.....rrrrrr.....
 """
 SPRITE_COLOURS = {"r": RIM, "f": FACE, "a": AMBER, "h": HIGHLIGHT}
 INSTALLER = "site/install.sh"
 SPRITE_MARKERS = ("# --- sprite ---\n", "# --- /sprite ---\n")
-# Two columns of margin before the sprite, four after it, so the installer's
-# lines start at the same column beside it.
-SPRITE_MARGIN = (2, 4)
+# Two columns of margin before the sprite, three after it; the installer's
+# lines start at the column after that, beside it.
+SPRITE_MARGIN = (2, 3)
 
 
 def svg(shapes, title):
@@ -105,8 +97,8 @@ def rgb(colour):
 
 
 def sprite():
-    """The sprite as twelve lines of half-block characters with 24-bit
-    colour sequences, each 24 + margins columns wide: a row pair becomes
+    """The sprite as seven lines of half-block characters with 24-bit
+    colour sequences, each 16 + margins columns wide: a row pair becomes
     one line, `▀` in the upper pixel's colour over the lower pixel's, `▄`
     where only the lower one is drawn, `█` where both share a colour, a
     space where neither is."""
@@ -137,18 +129,20 @@ def sprite():
 
 def sprite_block():
     """What sits between the markers in the installer: a function printing
-    the sprite's Nth line, or the same width of spaces past the twelfth."""
+    the sprite's Nth line, and the sprite's height and width as constants."""
     width = SPRITE_MARGIN[0] + len(SPRITE.splitlines()[0]) + SPRITE_MARGIN[1]
+    lines = sprite()
     out = [
-        "# The mark, 24 by 24 pixels in half-block characters and 24-bit colour,",
-        "# one line of the twelve per call. Emitted by scripts/brand.py from the",
-        "# grid it holds; edit the grid there, never these lines.",
+        "# The mark, 16 by 14 pixels in half-block characters and 24-bit colour,",
+        "# one line per call. Emitted by scripts/brand.py from the grid it holds;",
+        "# edit the grid there, never these lines.",
+        f"SPRITE_LINES={len(lines)}",
+        f"SPRITE_WIDTH={width}",
         "sprite_line() {",
         '  case "$1" in',
     ]
-    for n, line in enumerate(sprite(), 1):
+    for n, line in enumerate(lines, 1):
         out.append(f"  {n}) printf '{line}' ;;")
-    out.append(f"  *) printf '%{width}s' '' ;;")
     out.append("  esac")
     out.append("}")
     return "\n".join(out) + "\n"
@@ -262,12 +256,12 @@ def selftest():
     assert f'd="{FAVICON_SEED}"' in SHAPES_FAVICON[2]
     assert FAVICON_SEED == "M32 11 C25 23 18 29 18 38 A14 14 0 0 0 46 38 C46 29 39 23 32 11 Z"
     rows = SPRITE.splitlines()
-    assert len(rows) == 24 and all(len(r) == 24 for r in rows), "the sprite is not 24 by 24"
+    assert len(rows) == 14 and all(len(r) == 16 for r in rows), "the sprite is not 16 by 14"
     assert set("".join(rows)) <= set(".rfah"), "the sprite uses a character outside .rfah"
     assert all(r == r[::-1] for r in rows if "a" not in r), "the disc is not symmetric"
     lines = sprite()
-    assert len(lines) == 12, len(lines)
-    width = SPRITE_MARGIN[0] + 24 + SPRITE_MARGIN[1]
+    assert len(lines) == 7, len(lines)
+    width = SPRITE_MARGIN[0] + 16 + SPRITE_MARGIN[1]
     for line in lines:
         visible = re.sub(r"\\033\[[0-9;]*m", "", line)
         assert len(visible) == width, (len(visible), visible)

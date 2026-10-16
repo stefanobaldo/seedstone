@@ -30,7 +30,7 @@ skip() { printf 'skip: %s: %s\n' "$1" "$2"; }
 
 if [ ! -f "$INSTALLER" ]; then
   for case in installs pins missing-tag corrupted unwritable freebsd musl rosetta glibc \
-      truncated piped sprite wget no-fetcher replaces path-hint; do
+      truncated piped sprite-wide sprite-narrow sprite-refused wget wget-missing-tag no-fetcher replaces path-hint interrupt; do
     fail "$case" "$INSTALLER is missing"
   done
   exit 1
@@ -272,17 +272,56 @@ else
   fail piped "exit $RC; $(grep -c "$(printf '\033')" "$OUT") lines with escapes"
 fi
 
-# On a pseudo-terminal advertising 24-bit colour the sprite prints: twelve
-# lines carrying `38;2;` colour sequences, the half-block glyphs among them.
-run sprite COLORTERM=truecolor -- python3 -I -c '
-import os, pty, sys
-status = pty.spawn(["sh", sys.argv[1]])
-sys.exit(os.waitstatus_to_exitcode(status))' "$INSTALLER"
-sprite_lines="$(grep -c "$(printf '\033')\[38;2;" "$OUT" || true)"
-if [ "$RC" -eq 0 ] && [ "$sprite_lines" -eq 12 ] && grep -q "▀\|▄" "$OUT"; then
-  ok sprite "twelve 24-bit lines on a pty with COLORTERM=truecolor"
+# On a pseudo-terminal advertising 24-bit colour the sprite prints: seven
+# lines carrying `38;2;` colour sequences, the half-block glyphs among
+# them. On a wide terminal the report is written beside it (the cursor goes
+# back up seven lines and each line starts at column 22); on a narrow one
+# the report follows below. The pseudo-terminal's width is set before the
+# installer starts, so the case does not depend on the terminal running it.
+cat > "$TMP/on-pty.py" <<'PYEOF'
+# on-pty.py <columns> <command ...>: runs the command on a pty of that width
+import fcntl, os, pty, struct, sys, termios
+cols = int(sys.argv[1])
+pid, fd = pty.fork()
+if pid == 0:
+    fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 40, cols, 0, 0))
+    os.execvp(sys.argv[2], sys.argv[2:])
+out = b""
+while True:
+    try:
+        chunk = os.read(fd, 65536)
+    except OSError:
+        break
+    if not chunk:
+        break
+    out += chunk
+sys.stdout.buffer.write(out)
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+PYEOF
+ESC="$(printf '\033')"
+run sprite-wide COLORTERM=truecolor -- python3 -I "$TMP/on-pty.py" 120 sh "$INSTALLER"
+sprite_lines="$(grep -c "${ESC}\[38;2;" "$OUT" || true)"
+if [ "$RC" -eq 0 ] && [ "$sprite_lines" -eq 7 ] && grep -q "▀\|▄\|█" "$OUT" \
+   && grep -q "${ESC}\[7A" "$OUT" && grep -q "${ESC}\[22Gseedstone installer" "$OUT"; then
+  ok sprite-wide "seven 24-bit lines, then the report beside them from column 22"
 else
-  fail sprite "exit $RC; $sprite_lines lines with 24-bit colour"
+  fail sprite-wide "exit $RC; $sprite_lines lines with 24-bit colour; cursor-up $(grep -c "${ESC}\[7A" "$OUT" || true)"
+fi
+run sprite-narrow COLORTERM=truecolor -- python3 -I "$TMP/on-pty.py" 70 sh "$INSTALLER"
+sprite_lines="$(grep -c "${ESC}\[38;2;" "$OUT" || true)"
+if [ "$RC" -eq 0 ] && [ "$sprite_lines" -eq 7 ] && ! grep -q "${ESC}\[7A" "$OUT" \
+   && grep -q "^  seedstone installer" "$OUT"; then
+  ok sprite-narrow "seven 24-bit lines, then the report below them"
+else
+  fail sprite-narrow "exit $RC; $sprite_lines lines with 24-bit colour; cursor-up $(grep -c "${ESC}\[7A" "$OUT" || true)"
+fi
+# A refusal beside the sprite leaves the cursor below the picture, not in it.
+run sprite-refused COLORTERM=truecolor SEEDSTONE_VERSION=v0.0.1 -- python3 -I "$TMP/on-pty.py" 120 sh "$INSTALLER"
+if [ "$RC" -eq 2 ] && grep -q "${ESC}\[22G${ESC}\[31m✗" "$OUT" && grep -q "${ESC}\[[1-6]B" "$OUT"; then
+  ok sprite-refused "the refusal is written beside the sprite and the cursor moves below it"
+else
+  fail sprite-refused "exit $RC; $(grep -c "${ESC}\[[1-6]B" "$OUT" || true) cursor-down sequences"
 fi
 
 if ! command -v wget > /dev/null; then
