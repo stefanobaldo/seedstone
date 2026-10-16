@@ -15,6 +15,44 @@ server must listen beyond loopback to be reached at all, so the chart binds
 every interface and asks for a password, or for its absence, said
 deliberately.
 
+## One line
+
+```sh
+curl -fsSL https://seedstone.io/install.sh | sh
+wget -qO- https://seedstone.io/install.sh | sh     # where curl is not installed
+seedstone --version
+```
+
+The script is short and says what it does at the top; read it first, at
+[seedstone.io/install.sh](https://seedstone.io/install.sh) or in the
+repository as [`site/install.sh`](../site/install.sh).
+
+- It finds the latest release on GitHub, or the one `SEEDSTONE_VERSION`
+  names, and the archive built for this operating system and CPU: macOS or
+  Linux, x86_64 or arm64.
+- It downloads that archive and its checksum from the release's assets,
+  and talks to no host but `github.com` and the one the assets redirect to.
+- It verifies the archive's SHA-256 before anything is extracted. A
+  mismatch deletes the download and prints both hashes.
+- It copies the one binary into `/usr/local/bin`, or into
+  `SEEDSTONE_INSTALL_DIR`. If the directory is not writable it says so and
+  copies under `sudo`, once; an existing binary there is replaced, and both
+  versions are printed.
+- It starts no server, installs no service, writes no configuration and
+  touches no shell file. A service comes with the `.deb`, `.rpm` and
+  Homebrew packages below.
+- It refuses, in one sentence that names what to use instead, a machine no
+  archive is built for, a musl system such as Alpine, and a glibc older
+  than the [archives](#archives) need. On an x86_64 or arm64 machine
+  refused for its C library, the container image runs; another CPU has no
+  build at all.
+
+Three variables change what it does: `SEEDSTONE_VERSION` (a tag, such as
+`v0.3.2`), `SEEDSTONE_INSTALL_DIR` (where the binary goes) and
+`SEEDSTONE_BASE_URL` (the repository, for a mirror). It exits `0` when
+installed, `1` when it refuses, `2` when a download fails and `3` on a
+checksum mismatch.
+
 ## Container image
 
 ```sh

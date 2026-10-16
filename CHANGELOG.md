@@ -9,6 +9,22 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ### Added
 
+- **A one-line install for macOS and Linux.**
+  `curl -fsSL https://seedstone.io/install.sh | sh` finds the latest
+  release, downloads the archive built for the machine, verifies its
+  SHA-256 and copies the binary into `/usr/local/bin` (or
+  `SEEDSTONE_INSTALL_DIR`). It starts no server and writes nothing else; it
+  refuses, saying what to use instead, a machine no archive is built for, a
+  musl system and a glibc older than 2.34. `SEEDSTONE_VERSION` pins a
+  release. [docs/install.md](docs/install.md#one-line) has the whole of it.
+
+- **[seedstone.io](https://seedstone.io).** One page: how to install it,
+  on every channel; a seed reproducing a bug, run after run; the
+  benchmark cells where it is ahead of every engine measured but those
+  level with it, each named with its figure, from the
+  [benchmark page](docs/benchmarks.md); what running it looks like; and
+  what it answers. Every section stands complete without a script.
+
 - **The `recovery` line says where a start's time went.** Under
   `--data-dir`, it now carries `read_ms`, `images_ms` and `replay_ms`
   beside `elapsed_ms`: the time spent reading the log directory, loading
