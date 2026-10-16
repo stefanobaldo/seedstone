@@ -222,30 +222,21 @@ install_binary() { # <source> <destination>
     die 1 "sudo could not copy the binary into $INSTALL_DIR; choose a directory you own with SEEDSTONE_INSTALL_DIR"
 }
 
-# The lines after the version: how to start, how to talk to it, and the
-# package for this machine where apt-get, dnf or brew is on the PATH. They
-# inform; nothing here is run.
-closing_block() { # <version>
+# The lines after the version: how to start, how to talk to it, where a
+# service comes from — the packages, not this binary — and the documentation.
+# They inform; nothing here is run.
+closing_block() {
   out ""
   hint "Start a server" "seedstone"
   hint "Talk to it" "redis-cli ping"
-  if command -v apt-get > /dev/null 2>&1; then
-    case "$TARGET" in x86_64-*) closing_arch=amd64 ;; *) closing_arch=arm64 ;; esac
-    hint "Run as a service" "sudo apt install ./seedstone_$1-1_$closing_arch.deb" "from the release page"
-  elif command -v dnf > /dev/null 2>&1; then
-    hint "Run as a service" "sudo dnf install ./seedstone-$1-1.${TARGET%%-*}.rpm" "from the release page"
-  elif command -v brew > /dev/null 2>&1; then
-    hint "Run as a service" "brew services start seedstone" "after brew install seedstonelabs/tap/seedstone"
-  else
-    hint "Run as a service" "$DOCS"
-  fi
+  hint "Run as a service" "comes with the .deb, .rpm or Homebrew package, not with this binary"
   hint "Documentation" "https://github.com/stefanobaldo/seedstone/tree/main/docs"
 }
 
-# A closing line: a dim label, the command in bold, an optional dim note.
-hint() { # <label> <command> [note]
+# A closing line: a dim label, the text in bold, an optional dim note.
+hint() { # <label> <text> [note]
   hint_line="$(paint "$(style_dim)" "$(printf '%-18s' "$1")") $(paint "$(style_bold)" "$2")"
-  if [ -n "${3:-}" ]; then hint_line="$hint_line   $(paint "$(style_dim)" "($3)")"; fi
+  if [ -n "${3:-}" ]; then hint_line="$hint_line   $(paint "$(style_dim)" "$3")"; fi
   out "  $hint_line"
 }
 
@@ -332,7 +323,7 @@ main() {
       out "    $(paint "$(style_bold)" "export PATH=\"$INSTALL_DIR:\$PATH\"")"
       ;;
   esac
-  closing_block "$VERSION"
+  closing_block
 }
 
 
