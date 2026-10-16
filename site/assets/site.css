@@ -340,7 +340,7 @@ main > section:not(.hero) > * { min-width: 0; }
 .tabs .copy { max-width: none; margin: 0; padding: 0.45rem 0.45rem 0.45rem 0.9rem; }
 .tabs .copy-button { font-size: 0.8125rem; padding: 0.5rem 0.7rem; }
 .tabs .note { font-size: 0.8125rem; color: var(--muted); margin: 0.75rem 0 0; line-height: 1.5; }
-.tabs.js { align-self: stretch; }   /* the card is the shorter one with the tabs; its edge meets the terminal's */
+.tabs.js { align-self: stretch; display: flex; flex-direction: column; }   /* with the tabs the card is the shorter one: its edge meets the terminal's, and the open panel sits centred in the room under the tab row */
 .tabs.js .tablist { display: flex; flex-wrap: wrap; gap: 0.1rem; margin: -0.35rem 0 1.1rem; border-bottom: 1px solid var(--rule); }
 .tabs.js .tablist button {
   font: 700 0.8125rem/1 var(--sans);
@@ -355,7 +355,7 @@ main > section:not(.hero) > * { min-width: 0; }
 .tabs.js .tablist button:hover { color: var(--text); }
 .tabs.js .tablist button[aria-selected="true"] { color: var(--text); border-color: var(--amber); }
 .tabs.js .panel { display: none; margin: 0; padding: 0; border: 0; }
-.tabs.js .panel.on { display: block; }
+.tabs.js .panel.on { display: flex; flex-direction: column; justify-content: center; flex: 1 1 auto; }
 .tabs.js .panel h3 { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); margin: 0; }
 
 /* The terminal: a well, darker than the page in both schemes, a title bar
@@ -534,5 +534,26 @@ footer p { max-width: 60em; }
 .anim .chip text, .anim .trace { font-size: 10px; }
 .anim .fail { fill: var(--fail); }
 .anim .pass { fill: var(--pass); }
-.anim-figure figcaption { color: var(--muted); font-size: 0.8125rem; margin-top: 0.6rem; }
+.anim-figure figcaption { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; color: var(--muted); font-size: 0.8125rem; margin-top: 0.6rem; }
+/* The one control the picture has while it moves: pause, play, and replay
+   once it has rested; the script shows it, so there is none without one. */
+.anim-ctl { flex: none; font: 700 0.75rem/1 var(--sans); color: var(--text-2); background: none; border: 1px solid var(--rule); border-radius: 999px; padding: 0.35rem 0.7rem; cursor: pointer; }
+.anim-ctl:hover { color: var(--text); border-color: var(--text-2); }
 /* /anim */
+
+/* motion */
+/* What moves once, into view: the Install terminal types, the two run
+   panels run, the comparison bars grow. Everything above this block is
+   the final state, so the page is complete with no script and under
+   reduced motion; site.js takes each visual back to its start as it
+   loads (`.play`, `--w: 0%`), then lets it play when it is scrolled into
+   view. Nothing here changes a box's size, so nothing shifts. */
+.motion .bar::before { transition: background-size 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) var(--delay, 0s); }
+.term.play .ln { visibility: hidden; }
+.term.play .ln.on { visibility: visible; }
+.term.play .cur { visibility: hidden; }
+.term.play .ln.typing::after { content: ""; display: inline-block; width: 0.55em; height: 1em; background: var(--highlight); vertical-align: -0.15em; }
+.motion .cells i { transition: background-color 0.12s, border-color 0.12s; }
+.runs.play .tr, .runs.play .verdict { opacity: 0; transition: opacity 0.25s; }
+.runs.play .tr.on, .runs.play .verdict.on { opacity: 1; }
+/* /motion */
