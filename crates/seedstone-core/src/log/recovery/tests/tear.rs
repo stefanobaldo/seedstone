@@ -318,6 +318,9 @@ fn an_abandonment_past_the_last_mark_still_charges_every_shard() {
     let recovery = recover(spec(&disk, 2)).unwrap();
     assert_eq!(recovery.report.abandoned_segments, 1);
     assert_eq!(lossy(&recovery), [true, true]);
+    // Charged to every shard, so none of it is reported as a tear.
+    assert!(recovery.report.damage_bytes > 0);
+    assert_eq!(recovery.report.torn_bytes, 0);
 }
 
 #[test]
