@@ -178,8 +178,7 @@ ul { margin: 0; padding: 0; list-style: none; }
 .top nav a:hover { color: var(--text); text-decoration-color: currentColor; }
 
 /* The hero: the claim and the line on the left; the animation, frameless
-   and top-aligned, with its proof under it on the right. `.proof-line`
-   moves the proof under the fine print instead, thin and unboxed. */
+   and top-aligned, with its proof in a card under it on the right. */
 .hero {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -284,24 +283,18 @@ ul { margin: 0; padding: 0; list-style: none; }
 .src { font-size: 0.75rem; color: var(--muted); margin: 1rem 0 0; }
 .src a { text-decoration-color: var(--rule); }
 
-/* The proof as a line under the fine print instead of a card on the right. */
-.hero.proof-line .proof.card { background: none; border: 0; border-top: 1px solid var(--rule); border-radius: 0; padding: 1.25rem 0 0; }
-.hero.proof-line .bar::before { height: 6px; }
-
 @media (min-width: 64rem) {
   .hero {
     grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
     grid-template-areas: "text anim" "text proof";
     gap: 1.5rem 3rem;
-    padding: 2.5rem 0 5rem;
+    padding: 2.5rem 0 2rem;
   }
-  .hero.proof-line { grid-template-areas: "text anim" "proof anim"; }
-  .hero.proof-line .proof { margin-top: 0.5rem; }
 }
 
 /* The sections: the same skeleton each — an eyebrow, a claim, one line, a
    visual, a source line — set apart by space, not by rules. */
-main > section:not(.hero) { padding: clamp(3rem, 7vw, 4.5rem) 0; }
+main > section:not(.hero) { padding: clamp(2.5rem, 5vw, 3rem) 0; }
 main > section:not(.hero) > * { min-width: 0; }
 .eyebrow {
   font-size: 0.75rem;
