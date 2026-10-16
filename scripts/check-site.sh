@@ -207,10 +207,19 @@ def bench_cell(cell):
         cols = [c.strip() for c in line.strip().strip("|").split("|")] if line.startswith("|") else None
         if cols and len(cols) >= 2 and re.fullmatch(r"[\d\s]+", cols[1]):
             ops[cols[0]] = int(re.sub(r"\D", "", cols[1]))
-        m = re.match(r"- seedstone vs ([\w-]+): (?:ahead|behind) ([\d.]+)x on throughput", line)
+        m = re.match(r"- seedstone vs ([\w-]+): (ahead|behind) ([\d.]+)x on throughput", line)
         if m:
-            factors[m.group(1)] = m.group(2) + "\u00d7"
+            factors[m.group(1)] = (m.group(2), m.group(3) + "\u00d7")
     return ops, factors
+
+# The name the page shows for each arm of the table: a figure is bound to
+# its arm by `data-arm`, and the name a reader sees beside it must be that
+# arm's, or the right number stands under the wrong engine.
+ARM_NAME = {
+    "seedstone": "seedstone", "dragonfly": "Dragonfly", "garnet": "Garnet",
+    "redis-iot1": "Redis", "redis-iot4": "Redis \u00d74",
+    "valkey-iot1": "Valkey", "valkey-iot4": "Valkey \u00d74",
+}
 
 from html.parser import HTMLParser
 VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
@@ -251,8 +260,13 @@ def check_figures():
     arm (`data-cell`, `data-arm`), every factor to its cell and the arm it
     is against (`data-pair`), and each matches the benchmark page's table
     for exactly that cell and arm, abbreviated as the README's chart does.
+    A bound element carries the figure in a `.figure` child (`.factor` for
+    a factor) and the engine's name in an `.arm` child, and the name must
+    be the arm's, so the right number cannot stand under the wrong engine.
     A bar's width (`--w`) is its figure's share of the cell's largest shown
-    figure, so a bar cannot say one thing and its text another. An element
+    figure, so a bar cannot say one thing and its text another, and a bar
+    without a width fails rather than drawing an empty track. A factor the
+    table records as behind fails: the page shows leads only. An element
     that looks like one of these (`.bar`, `.figure`, `.factor`) and is not
     bound fails: a figure may not opt out of the check by forgetting its
     attributes."""
@@ -263,7 +277,7 @@ def check_figures():
         return "data-cell" in el["attrs"]
     # A figure in the benchmark sections that no bound element carries — a
     # `4.65 M` or a `2.96×` typed into prose — is unchecked, so it fails.
-    FIGURE = re.compile(r"\b\d+(?:\.\d+)? ?[kM]\b|\b\d\.\d\d\u00d7")
+    FIGURE = re.compile(r"\b\d+(?:\.\d+)?\s?[kM]\b|\b\d\.\d\d\u00d7")
     loose = []
     class Page(Elements):
         def loose(self, data):
@@ -294,10 +308,22 @@ def check_figures():
         if ops is None:
             bad.append(f"{cell}: no heading {CELLS[cell]} in {BENCH}")
             continue
-        figure_child = next((c for c in parser.all if el in c["ancestors"] and "figure" in c["classes"]), None)
-        shown = text_of(figure_child or el)
+        child = lambda cls: next((c for c in parser.all if el in c["ancestors"] and cls in c["classes"]), None)
+        arm = attrs.get("data-arm", attrs.get("data-pair"))
+        if arm not in ARM_NAME:
+            bad.append(f"{cell}: arm {arm!r} has no name this check knows ({', '.join(ARM_NAME)})")
+            continue
+        name = child("arm")
+        if name is None:
+            bad.append(f"{cell} {arm}: no .arm child names the engine")
+        elif text_of(name) != ARM_NAME[arm]:
+            bad.append(f"{cell} {arm}: the page names {text_of(name)!r}, the arm is {ARM_NAME[arm]!r}")
         if "data-arm" in attrs:
-            arm = attrs["data-arm"]
+            figure_child = child("figure")
+            if figure_child is None:
+                bad.append(f"{cell} {arm}: no .figure child carries the figure")
+                continue
+            shown = text_of(figure_child)
             if arm not in ops:
                 bad.append(f"{cell}: no row for arm {arm!r}")
                 continue
@@ -305,6 +331,8 @@ def check_figures():
             if shown != want:
                 bad.append(f"{cell} {arm}: the page says {shown!r}, the table {want!r}")
             style = attrs.get("style", "")
+            if "bar" in el["classes"] and "--w" not in style:
+                bad.append(f"{cell} {arm}: a bar without --w draws an empty track")
             if "--w" in style:
                 m = re.search(r"--w:\s*([\d.]+)%", style)
                 if not m:
@@ -318,12 +346,19 @@ def check_figures():
                         bad.append(f"{cell} {arm}: bar width {m.group(1)}%, the figure's share is {want_w:.1f}%")
             figures += 1
         elif "data-pair" in attrs:
-            arm = attrs["data-pair"]
+            factor_child = child("factor")
+            if factor_child is None:
+                bad.append(f"{cell} vs {arm}: no .factor child carries the factor")
+                continue
+            shown = text_of(factor_child)
             if arm not in pairs:
                 bad.append(f"{cell}: no pair line with a factor against {arm!r}")
                 continue
-            if shown != pairs[arm]:
-                bad.append(f"{cell} vs {arm}: the page says {shown!r}, the pair line {pairs[arm]!r}")
+            direction, want = pairs[arm]
+            if direction != "ahead":
+                bad.append(f"{cell} vs {arm}: the table says behind, and the page shows leads only")
+            if shown != want:
+                bad.append(f"{cell} vs {arm}: the page says {shown!r}, the pair line {want!r}")
             factors += 1
         else:
             bad.append(f"{cell}: an element with data-cell but neither data-arm nor data-pair")

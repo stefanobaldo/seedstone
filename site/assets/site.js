@@ -25,7 +25,9 @@ if (tabs) {
       const on = t === tab;
       t.setAttribute("aria-selected", String(on));
       t.tabIndex = on ? 0 : -1;
-      document.getElementById(t.getAttribute("aria-controls")).classList.toggle("on", on);
+      const panel = document.getElementById(t.getAttribute("aria-controls"));
+      panel.setAttribute("role", "tabpanel");   // a tab panel only where there are tabs
+      panel.classList.toggle("on", on);
     }
     if (focus) tab.focus();
   };
@@ -136,27 +138,45 @@ if (!reduced && "IntersectionObserver" in window) {
   const motions = new Map();   // target → { play, reset, armed, running, resetWhenDone }
 
   // The terminal: a prompt appears whole, what follows it is typed, a
-  // reply prints at once.
+  // reply prints at once. What follows a prompt is split into two spans,
+  // the typed part and the rest, and typing moves characters from one to
+  // the other; the text is in the page whole throughout, the rest in
+  // transparent ink, so the line keeps its height and a screen reader has
+  // the whole transcript at any moment.
   const resetTerm = (term) => {
     term.classList.add("play");
-    for (const ln of term.querySelectorAll(".ln")) ln.classList.remove("on", "typing");
+    for (const ln of term.querySelectorAll(".ln")) {
+      ln.classList.remove("on", "typing");
+      if (ln.querySelector(".p") && !ln.querySelector(".todo")) {
+        const texts = [...ln.childNodes].filter((n) => n.nodeType === 3);
+        const typed = document.createElement("span");
+        const todo = document.createElement("span");
+        typed.className = "typed";
+        todo.className = "todo";
+        todo.textContent = texts.map((n) => n.data).join("");
+        texts[0].replaceWith(typed, todo);
+        for (const n of texts.slice(1)) n.remove();
+      }
+      const todo = ln.querySelector(".todo");
+      if (todo) {
+        const typed = ln.querySelector(".typed");
+        todo.textContent = typed.textContent + todo.textContent;
+        typed.textContent = "";
+      }
+    }
   };
   const typeTerm = async (term) => {
     for (const ln of term.querySelectorAll(".ln")) {
-      const typed = ln.querySelector(".p")
-        ? [...ln.childNodes].filter((n) => n.nodeType === 3)
-        : [];
-      const texts = typed.map((n) => n.data);
-      for (const n of typed) n.data = "";
+      const todo = ln.querySelector(".todo");
       ln.classList.add("on");
-      if (typed.length) {
+      if (todo) {
+        const typed = ln.querySelector(".typed");
         ln.classList.add("typing");
         await sleep(350);
-        for (const [i, n] of typed.entries()) {
-          for (const ch of texts[i]) {
-            n.data += ch;
-            await sleep(35);
-          }
+        while (todo.textContent) {
+          typed.textContent += todo.textContent[0];
+          todo.textContent = todo.textContent.slice(1);
+          await sleep(35);
         }
         ln.classList.remove("typing");
         await sleep(180);
@@ -223,9 +243,11 @@ if (!reduced && "IntersectionObserver" in window) {
   void document.body.offsetWidth;
   document.documentElement.classList.add("motion");
 
-  // Two fifths on screen plays an armed target; off the screen whole, a
-  // target that has played goes back to its start and is armed again. A
-  // target that leaves while still playing is reset when its play ends.
+  // Two fifths on screen plays an armed target — or half the viewport, for
+  // a target taller than the screen, read at each tenth as it scrolls in;
+  // off the screen whole, a target that has played goes back to its start
+  // and is armed again. A target that leaves while still playing is reset
+  // when its play ends.
   const observer = new IntersectionObserver((entries) => {
     for (const entry of entries) {
       const motion = motions.get(entry.target);
@@ -251,6 +273,6 @@ if (!reduced && "IntersectionObserver" in window) {
         }
       }
     }
-  }, { threshold: [0, 0.4] });
+  }, { threshold: [0, 0.1, 0.2, 0.3, 0.4] });
   for (const target of motions.keys()) observer.observe(target);
 }
