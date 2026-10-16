@@ -83,11 +83,19 @@ pub struct Item {
     pub seq: u64,
     /// The encoded effect.
     pub payload: Vec<u8>,
+    /// The body offset the record's magic byte sits at: bytes from the end
+    /// of the segment's header.
+    pub at: u64,
+    /// The body offset just past its last byte. A hole the reader entered
+    /// after this record began here: the boundary it was at.
+    pub end: u64,
 }
 
 /// A chunked, hole-tolerant reader over one segment's records.
 pub struct Reader<R: Read> {
     src: R,
+    /// The bytes of records the source holds: the `len` it was given.
+    len: u64,
     /// Bytes of the source not yet pulled into `buf`.
     remaining: u64,
     buf: Vec<u8>,
@@ -124,6 +132,7 @@ impl<R: Read> Reader<R> {
     pub fn with_chunk(src: R, len: u64, mode: ReaderMode, chunk: usize) -> Self {
         Self {
             src,
+            len,
             remaining: len,
             buf: Vec::with_capacity(chunk.max(1)),
             at: 0,
@@ -168,10 +177,13 @@ impl<R: Read> Reader<R> {
                     payload,
                     consumed,
                 } => {
+                    let at = self.offset();
                     let item = Item {
                         shard,
                         seq,
                         payload: payload.to_vec(),
+                        at,
+                        end: at + widen(consumed),
                     };
                     self.at += consumed;
                     self.resynchronising = false;
@@ -227,6 +239,11 @@ impl<R: Read> Reader<R> {
                 return Ok(None);
             }
         }
+    }
+
+    /// The body offset the next decode starts at.
+    fn offset(&self) -> u64 {
+        self.len - self.remaining - widen(self.buf.len() - self.at)
     }
 
     /// Enters resynchronisation, counting a hole if this is a new one.
@@ -439,6 +456,35 @@ mod tests {
             "the whole damaged record was stepped over"
         );
         assert!(!damage.abandoned);
+    }
+
+    #[test]
+    fn an_item_carries_its_body_offsets_and_a_hole_lies_between_the_neighbours_ends() {
+        let r0 = record(1, 0, b"before");
+        let mut r1 = record(2, 0, b"lost to the hole");
+        r1[HEADER_LEN + BODY_FIXED_LEN + 2] ^= 0xFF;
+        let r2 = record(1, 1, b"after");
+        let buf = [&r0[..], &r1, &r2].concat();
+        let len = u64::try_from(buf.len()).unwrap();
+        let (l0, l1) = (widen(r0.len()), widen(r1.len()));
+        for chunk in [1, 2, 7, 64, 4096] {
+            let mut reader = Reader::with_chunk(
+                Cursor::new(buf.clone()),
+                len,
+                ReaderMode::Resynchronising,
+                chunk,
+            );
+            let first = reader.next_record().unwrap().unwrap();
+            assert_eq!((first.at, first.end), (0, l0), "chunk {chunk}");
+            assert_eq!(reader.damage().holes, 0);
+            let third = reader.next_record().unwrap().unwrap();
+            assert_eq!((third.at, third.end), (l0 + l1, len), "chunk {chunk}");
+            // The hole was entered at the boundary the first record ended
+            // at, and ran to where the third begins.
+            assert_eq!(reader.damage().holes, 1);
+            assert_eq!(first.end + reader.damage().bytes, third.at);
+            assert!(reader.next_record().unwrap().is_none());
+        }
     }
 
     /// The writer never writes the end marker, so a zero where a record

@@ -49,12 +49,40 @@ use crate::log::{Record, ReplicationLog, crc32_iso_hdlc, encode_record};
 pub const SEGMENT_MAGIC: [u8; 4] = *b"SSEG";
 
 /// The layout version this build writes.
-pub const FORMAT_VERSION: u8 = 4;
+pub const FORMAT_VERSION: u8 = 5;
 
-/// The oldest layout version this build reads. Version 3 is this layout
-/// without the cut points: its segment header stops after the rotation,
-/// and its snapshots are laid out as these are.
+/// The oldest layout version this build reads.
+///
+/// Version 4 is this layout without the sync marks; version 3 is it without
+/// the cut points too: its segment header stops after the rotation.
+/// Snapshots of all three are laid out alike.
 pub const OLDEST_READ_VERSION: u8 = 3;
+
+/// The first version whose segments may carry a [sync mark](encode_sync_mark).
+pub const SYNC_MARK_VERSION: u8 = 5;
+
+/// The shard id a sync mark carries: no shard, as for a snapshot's
+/// [footer](crate::log::snapshot::FOOTER_SHARD), told apart from it by the
+/// file it sits in.
+pub const SYNC_MARK_SHARD: u16 = u16::MAX;
+
+/// Appends a sync mark to `out`: a record of [`SYNC_MARK_SHARD`] at `seq`
+/// `0` with no payload.
+///
+/// The writer appends one to the segment immediately before every sync it
+/// issues on it, so the sync covers the mark. Nothing in it is read: its
+/// position is the fact — every byte before it had a sync issued over it,
+/// and no byte after it had, until the next mark.
+pub fn encode_sync_mark(out: &mut Vec<u8>) {
+    encode_record(
+        &Record {
+            shard: SYNC_MARK_SHARD,
+            seq: 0,
+            payload: &[],
+        },
+        out,
+    );
+}
 
 /// A version 3 segment header: magic, version, generation, rotation, CRC.
 const V3_SEGMENT_HEADER_LEN: usize = 4 + 1 + 8 + 4 + 4;
@@ -132,6 +160,8 @@ pub(crate) fn parse_name2(name: &str, suffix: &str) -> Option<(u64, u32)> {
 /// where that generation's start cut a shard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentHeader {
+    /// The layout version the file was written at.
+    pub version: u8,
     pub generation: u64,
     pub rotation: u32,
     /// `(shard, seq)`: the shard's `Rebase` is at `seq` in this generation.
@@ -244,12 +274,11 @@ pub fn read_segment_header<R: io::Read>(
     if !(OLDEST_READ_VERSION..=FORMAT_VERSION).contains(&header[4]) {
         return Err(version_mismatch(
             header[4],
-            [
-                (3, header.get(..V3_SEGMENT_HEADER_LEN)),
-                (FORMAT_VERSION, header.get(..SEGMENT_HEADER_LEN)),
-            ]
-            .into_iter()
-            .filter_map(|(version, layout)| Some((version, layout?))),
+            std::iter::once((3, header.get(..V3_SEGMENT_HEADER_LEN)))
+                .chain(
+                    (4..=FORMAT_VERSION).map(|version| (version, header.get(..SEGMENT_HEADER_LEN))),
+                )
+                .filter_map(|(version, layout)| Some((version, layout?))),
         ));
     }
     check_header_crc(&header)?;
@@ -258,6 +287,7 @@ pub fn read_segment_header<R: io::Read>(
     let mut rotation = [0; 4];
     rotation.copy_from_slice(&header[13..17]);
     let mut read = SegmentHeader {
+        version: header[4],
         generation: u64::from_le_bytes(generation),
         rotation: u32::from_le_bytes(rotation),
         cuts: Vec::new(),
@@ -468,7 +498,7 @@ pub fn next_generation<D: Disk>(disk: &D, wal: &Path) -> io::Result<u64> {
 }
 
 /// The counter as written, or `None` for anything that is not a number.
-fn read_generation<D: Disk>(disk: &D, wal: &Path) -> Option<u64> {
+pub(crate) fn read_generation<D: Disk>(disk: &D, wal: &Path) -> Option<u64> {
     let mut text = Vec::new();
     std::io::Read::read_to_end(
         &mut disk.open_read(&wal.join(GENERATION_FILE)).ok()?,
@@ -530,6 +560,7 @@ pub(crate) mod tests {
 
     fn decoded(generation: u64, rotation: u32, cuts: &[(u16, u64)]) -> SegmentHeader {
         SegmentHeader {
+            version: FORMAT_VERSION,
             generation,
             rotation,
             cuts: cuts.to_vec(),
@@ -616,6 +647,7 @@ pub(crate) mod tests {
         assert_eq!(
             read_segment_header(&mut src, file.len() as u64),
             Ok(Some(SegmentHeader {
+                version: 3,
                 len: v3.len(),
                 ..decoded(9, 5, &[])
             }))
@@ -657,6 +689,48 @@ pub(crate) mod tests {
                 "version byte {version}"
             );
         }
+    }
+
+    #[test]
+    fn a_version_4_header_with_a_damaged_version_byte_is_damage() {
+        // What a build of version 4 wrote: this layout, stamped 4. A start
+        // after an upgrade without a clean stop reads it, and a damaged
+        // version byte on it must be damage, not another build's file.
+        let mut out = Vec::new();
+        encode_segment_header(9, 5, &[], &mut out);
+        let v4 = restamped(&out, 4);
+        assert_eq!(
+            decode_segment_header(&v4).map(|header| header.version),
+            Ok(4)
+        );
+        for version in [0, 1, 2, 6, u8::MAX] {
+            let mut damaged = v4.clone();
+            damaged[4] = version;
+            assert_eq!(
+                decode_segment_header(&damaged),
+                Err(HeaderError::BadChecksum),
+                "version byte {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sync_mark_is_a_record_of_the_reserved_shard_with_no_payload() {
+        let mut out = Vec::new();
+        encode_sync_mark(&mut out);
+        assert_eq!(
+            out.len(),
+            crate::log::HEADER_LEN + crate::log::BODY_FIXED_LEN
+        );
+        assert!(matches!(
+            decode_record(&out),
+            Decoded::Record {
+                shard: SYNC_MARK_SHARD,
+                seq: 0,
+                payload: &[],
+                ..
+            }
+        ));
     }
 
     #[test]

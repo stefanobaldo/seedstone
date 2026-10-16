@@ -461,14 +461,15 @@ impl SimConfig {
     /// one where a hole can sit inside the durable region.
     ///
     /// Both crashes, because each decides what the other cannot. A crash
-    /// under load tears the log's last record, which lies after every
-    /// shard's highest record at the restart, so recovery charges every
-    /// shard with a possible loss and every durable read is excused: such a
-    /// seed decides no phantom and no lost restart, but nothing about
-    /// survival. A crash at rest, after the log had time to sync, tears
-    /// nothing, so recovery charges only what the disk's own faults took,
-    /// and the reads that follow decide whether a write acknowledged before
-    /// its shard's last sync came back. Sixteen shards, `eviction`'s count:
+    /// under load tears the log's unsynced tail. Recovery charges no shard
+    /// for what lies past the last sync mark — no sync was issued over it —
+    /// so the reads after such a crash decide durable writes too; what it
+    /// still charges is the span of a sync in flight whose mark survived,
+    /// since nothing on disk says that sync did not complete. A crash at
+    /// rest, after the log had time to sync, tears nothing, so recovery
+    /// charges only what the disk's own faults took. Either way, the reads
+    /// that follow decide whether a write acknowledged before its shard's
+    /// last sync came back. Sixteen shards, `eviction`'s count:
     /// the shard dimension is not what this shape is about, and a thousand
     /// cost a seed more for no read more.
     ///

@@ -6,16 +6,18 @@
 //! is served on `hostile`, whose reads corrupt and whose writes fail, and
 //! the honest node runs the same seeds clean.
 //!
-//! The shape catches it rarely, and the reason is the recovery's and not
-//! the shape's. A crash under load tears the one segment's last record,
-//! which lies after every shard's highest record, so recovery charges
-//! every shard with a possible loss and a loss the plant hides is reported
-//! anyway. A crash at rest tears nothing, and the reads after it decide
-//! durable writes — but a read-corruption hole inside the durable region,
-//! met by the recovery after one, is rare on the shape's disk: over seeds
-//! 1..=100 the plant surfaced on one, at `--fsync always`
-//! (read 2026-10-05). The claim is kept, ignored, with that reading, until
-//! recovery can tell a crash's tear from damage to what was synced.
+//! The shape catches it rarely. Recovery no longer charges a crash's tear —
+//! the damage past the log's last sync mark — to any shard, so a crash
+//! under load decides durable reads as a crash at rest does. What it still
+//! charges is the span of the sync in flight at the crash, whose mark
+//! survived: under `always` at load a sync is nearly always in flight, and
+//! a loss the plant hides there is reported anyway. Outside that span the
+//! plant needs a read-corruption hole inside the synced region, which is
+//! rare on the shape's disk. Over seeds 1..=100 the plant surfaced on none
+//! at `--fsync always`, and on one as swept, seed 30 at `interval`, which
+//! the honest node runs clean (read 2026-10-15, after the marks; one seed,
+//! 88 at `always`, on 2026-10-05, before them). The claim is kept, ignored,
+//! with that reading.
 //!
 //! The claim is "some seed catches it", in the pattern `standard_catches.rs`
 //! set, because whether a given seed puts a hole inside the durable region
@@ -29,18 +31,20 @@ use seedstone_sim::{FsyncDraw, Plant, SimConfig, SimOutcome, run_sim};
 const SEEDS: u64 = 12;
 
 /// How many seeds of `1..=DECIDING_WINDOW` the honest node must decide at
-/// least one durable read on. A seed crashed under load is charged a
-/// possible loss on every shard and decides only by luck, so about four
-/// seeds in ten decide: read on 2026-10-06, 184 of 1..=400 (26 of 1..=48)
+/// least one durable read on. While a seed crashed under load was charged a
+/// possible loss on every shard and decided only by luck, about four seeds
+/// in ten decided: read on 2026-10-06, 184 of 1..=400 (26 of 1..=48)
 /// before a refusing executor stopped appending lazy expiries, 177 (21)
-/// after. Any change to what the node appends moves every seed that
+/// after. Once recovery charged a crash's tear to no shard, seven in ten:
+/// 285 of 1..=400 (37 of 1..=48), read 2026-10-15, the floor raised from
+/// 14 to 27. Any change to what the node appends moves every seed that
 /// refuses — most of them — onto another timeline, so the count is a share,
 /// read over a window wide enough that one such change does not decide it:
 /// a floor of 5 in 12 tripped on two in a row. The floor is the mean less
 /// two deviations. A change that lowers the share is the finding — see the
 /// module doc.
 const DECIDING_WINDOW: u64 = 48;
-const DECIDING_SEEDS: u64 = 14;
+const DECIDING_SEEDS: u64 = 27;
 
 fn hostile(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
     let mut cfg = SimConfig::hostile(1, sim_seed);
@@ -49,11 +53,9 @@ fn hostile(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
 }
 
 /// The hostile shape at `--fsync always`, where a write's acknowledgement
-/// is its durable point and the durable region reaches furthest. Under the
-/// other two, a crash lands with an acknowledged tail no sync covered, its
-/// tear marks the segment's shards as possibly lossy, and a loss the reader
-/// caused is reported along with it — so the reader that reports nothing
-/// is shown where nothing else is reported for it to hide behind.
+/// is its durable point and the durable region reaches furthest: under the
+/// other two, a write is durable only once a later sync covers it, so less
+/// of what the clients read back is a durable read the plant can lose.
 fn hostile_always(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
     let mut cfg = SimConfig::hostile(1, sim_seed);
     cfg.fsync = FsyncDraw::Fixed(SyncPolicy::ALWAYS);
@@ -67,9 +69,8 @@ fn hostile_always(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
 /// expiration checks, which some seed of the range decides. Whether a seed
 /// reads a key past its deadline is its workload's draw: a seed whose
 /// recoveries reported a loss may have none left to decide, since the model
-/// gives up a deadline kept across such a recovery and a crash under load
-/// charges every shard, and seed 10 reported none and read no key past its
-/// deadline once a segment's header grew by two bytes and moved its disk's
+/// gives up a deadline kept across such a recovery, and seed 10 reported
+/// none and read no key past its deadline once a segment's header grew by two bytes and moved its disk's
 /// draws (read 2026-10-14). How many decide a durable read is the test
 /// below's.
 #[test]
@@ -152,10 +153,10 @@ fn the_hostile_disk_fails_a_sync_on_some_seed() {
 /// A reader that stops at the first damage loses records it never reports.
 ///
 /// Measured on sixteen shards, crashed under load or at rest by the seed:
-/// no seed in 1..=12 catches it; over 1..=100 one does, seed 88, at
-/// `--fsync always` (read 2026-10-05).
+/// no seed in 1..=100 catches it at `--fsync always`, and one does as
+/// swept, seed 30 at `interval` (read 2026-10-15) — see the module doc.
 #[test]
-#[ignore = "caught on one seed in a hundred while a crash's torn tail charges every shard: see the module doc"]
+#[ignore = "caught on no seed in a hundred at --fsync always: the span of a sync in flight is still charged, and a read-corruption hole inside the synced region is rare — see the module doc"]
 fn a_prefix_scan_recovery_is_caught_as_an_unreported_loss() {
     let caught = (1..=SEEDS).find(|sim_seed| {
         hostile_always(*sim_seed, Some(Plant::PrefixScanRecovery)).unreported_losses > 0

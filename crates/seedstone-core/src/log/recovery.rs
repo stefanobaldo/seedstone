@@ -28,6 +28,14 @@
 //!    trace: one whose highest record precedes the latest hole, or that has
 //!    none. A shard with a record after the hole shows what it lost there
 //!    as a gap, and a gap on a disk with damage is reported as a loss.
+//!    One exception, a crash's tear: in the log's last segment, damage that
+//!    begins at or past the end of its last sync mark lies in bytes no sync
+//!    was issued over, and is charged to no shard — counted as
+//!    `torn_bytes`, and still cutting every shard it would have charged, so
+//!    that a record it hid cannot come back at a later start. Only the last
+//!    segment, and only while its generation is the counter's: a later
+//!    start syncs every file it recovered from before it serves, so a hole
+//!    read in an older file's tail is in records a node has served.
 //! 5. **Garbage.** Every `.snap` no shard used and every `.seg` no kept
 //!    or cut record came from is removed — unless damage was met reading
 //!    it: a read can fail where the next succeeds, and the file may be the
@@ -93,13 +101,17 @@
 //! A segment whose header names a format version above this build's is
 //! refused, and the node does not start: that is not damage, it is a
 //! downgrade, and guessing at it would be worse than stopping. One whose
-//! version is below this build's is refused too: the directory was written
-//! by an earlier build, and reading its files as damage would charge a loss
-//! to every shard instead of saying what they are. A header
-//! that is short, carries the wrong magic or fails its checksum is damage:
-//! the segment is abandoned and counted, and every shard is marked lossy,
-//! because a loss nobody can attribute to a shard is a possible loss for
-//! all of them.
+//! version is below the oldest this build reads is refused too: the
+//! directory was written by an earlier build, and reading its files as
+//! damage would charge a loss to every shard instead of saying what they
+//! are. Versions 3 and 4 are read: 3 lists no cut points, and neither
+//! carries a sync mark. From version 5 the writer appends a mark before
+//! every sync it issues — a record of no shard, stepped over and counted
+//! nowhere; in an older file such a record is malformed, as it always was.
+//! A header that is short, carries the wrong magic or fails its checksum
+//! is damage: the segment is abandoned and counted, and every shard is
+//! marked lossy, because a loss nobody can attribute to a shard is a
+//! possible loss for all of them.
 
 use std::io;
 use std::path::Path;
@@ -111,7 +123,10 @@ use tokio::time::Instant;
 use crate::dict::{Dict, DictSeed, Entry, shard_seed};
 use crate::log::disk::Disk;
 use crate::log::effect::{Effect, Owned};
-use crate::log::file::{HeaderError, parse_name, parse_segment_name, read_segment_header};
+use crate::log::file::{
+    HeaderError, SYNC_MARK_SHARD, SYNC_MARK_VERSION, parse_name, parse_segment_name,
+    read_generation, read_segment_header,
+};
 use crate::log::reader::{Item, Reader};
 use crate::log::snapshot::{FOOTER_SHARD, Footer, SnapshotHeader, parse_snapshot_name};
 use crate::shard::{Now, Replayed, replay_into};
@@ -161,8 +176,9 @@ pub struct RecoveredShard {
     /// base the log does not reach. A gap alone does not set it — a gap in
     /// an intact log is not something a disk did.
     pub lossy: bool,
-    /// Whether the shard's prefix was cut, or its loss is possible: the
-    /// pool writes a `Rebase` before serving it.
+    /// Whether the shard's prefix was cut, its loss is possible, or a
+    /// crash's tear may have hidden records of it: the pool writes a
+    /// `Rebase` before serving it.
     pub cut: bool,
     /// When the image this shard was rebuilt from was taken, if any was:
     /// Unix milliseconds, from the image's header.
@@ -201,6 +217,9 @@ pub struct Report {
     pub malformed: u64,
     pub damage_bytes: u64,
     pub holes: u64,
+    /// Of `damage_bytes`, the bytes at or past the last sync mark of the
+    /// log's last segment: a crash's tear, charged to no shard.
+    pub torn_bytes: u64,
     pub abandoned_segments: u64,
     pub truncated: Vec<ShardTruncation>,
     /// Snapshot files at least one shard took its image from.
@@ -239,7 +258,14 @@ pub fn recover<D: Disk>(spec: RecoverSpec<'_, D>) -> io::Result<Recovery> {
     let mut report = Report::default();
     let (mut snaps, header_damage) = read_headers(&spec, &names, &mut report)?;
     let segments = segment_files(&names);
-    let mut scan = Scan::new(spec.shards, segments.len());
+    // The file the newest process was writing, if no start since has got
+    // as far as advancing the counter: the only one a tear can be in.
+    let counter = read_generation(spec.disk, spec.wal);
+    let tear_index = segments
+        .last()
+        .filter(|file| Some(file.generation) == counter)
+        .map(|_| segments.len() - 1);
+    let mut scan = Scan::new(spec.shards, segments.len(), tear_index);
     scan.unattributed_loss |= header_damage;
     for (index, file) in segments.iter().enumerate() {
         scan.segment(spec.disk, spec.wal, spec.reader, file, index)?;
@@ -468,18 +494,32 @@ struct Scan {
     position: u64,
     /// Per shard: the position of its record with the highest sequence.
     last: Vec<Option<(u64, u64)>>,
-    /// The position of the latest damage: before the record read there,
-    /// or at a segment's end.
-    last_hole: Option<u64>,
+    /// The position of the latest damage charged as a loss: before the
+    /// record read there, or at a segment's end.
+    last_loss_hole: Option<u64>,
+    /// Whether any damage was charged as a loss: a gap is then one too.
+    any_loss_hole: bool,
+    /// The position of the latest damage charged as a crash's tear.
+    last_tear_hole: Option<u64>,
+    /// Per shard: a tear may have taken records of it. Not a loss, but the
+    /// shard is cut, so that nothing the tear hid can return later.
+    behind_tear: Vec<bool>,
+    /// The segment a tear can be in: see [`recover`].
+    tear_index: Option<usize>,
+    /// The body offset just past the last sync mark of the segment being
+    /// read, or `0` before one.
+    last_mark_end: u64,
     /// A loss nobody can attribute to a shard: every shard may have paid.
     unattributed_loss: bool,
     /// Per segment file: damage was met reading it. Such a file is never
     /// garbage: see [`remove_garbage`].
     unread: Vec<bool>,
+    /// The layout version of the segment being read.
+    version: u8,
 }
 
 impl Scan {
-    fn new(shards: u16, files: usize) -> Self {
+    fn new(shards: u16, files: usize, tear_index: Option<usize>) -> Self {
         Self {
             report: Report::default(),
             buckets: (0..shards).map(|_| Vec::new()).collect(),
@@ -488,9 +528,15 @@ impl Scan {
             damaged: vec![false; usize::from(shards)],
             position: 0,
             last: vec![None; usize::from(shards)],
-            last_hole: None,
+            last_loss_hole: None,
+            any_loss_hole: false,
+            last_tear_hole: None,
+            behind_tear: vec![false; usize::from(shards)],
+            tear_index,
+            last_mark_end: 0,
             unattributed_loss: false,
             unread: vec![false; files],
+            version: 0,
         }
     }
 
@@ -558,23 +604,37 @@ impl Scan {
                 cuts.push((file.generation, *seq));
             }
         }
+        self.version = header.version;
+        self.last_mark_end = 0;
         let body_len = len.saturating_sub(header.len as u64);
         let mut reader = Reader::new(src, body_len, mode);
         let mut holes = 0;
+        // The damage met, as `(position, start, bytes)`: classified once the
+        // segment is read, since the mark that decides a hole may follow it.
+        let mut found: Vec<(u64, u64, u64)> = Vec::new();
+        // The end of the record before, where a hole entered next begins,
+        // and the damage bytes counted by then.
+        let (mut boundary, mut bytes) = (0, 0);
+        // A segment given up past a point is unread from there, and a mark
+        // in the unread part cannot be seen: none of its damage is a tear.
+        let mut abandoned = false;
         loop {
             match reader.next_record() {
                 Ok(Some(item)) => {
                     // A hole the reader stepped over to reach this record
                     // lies before it.
-                    if reader.damage().holes > holes {
-                        holes = reader.damage().holes;
-                        self.last_hole = Some(self.position);
+                    let damage = reader.damage();
+                    if damage.holes > holes {
+                        holes = damage.holes;
+                        found.push((self.position, boundary, damage.bytes - bytes));
                     }
+                    (boundary, bytes) = (item.end, damage.bytes);
                     self.item(&item, file.generation, index);
                 }
                 Ok(None) => break,
                 Err(_) => {
                     self.abandon(index);
+                    abandoned = true;
                     break;
                 }
             }
@@ -584,6 +644,7 @@ impl Scan {
         self.report.holes += damage.holes;
         if damage.abandoned {
             self.abandon(index);
+            abandoned = true;
         }
         if damage.bytes > 0 || damage.holes > 0 || damage.truncated_tail > 0 {
             self.unread[index] = true;
@@ -591,15 +652,38 @@ impl Scan {
         // Damage at the segment's end — a hole nothing intact followed, or
         // a cut tail, which can be a damaged length on the last record
         // rather than a crash — lies after every record read so far.
-        if damage.holes > holes || damage.truncated_tail > 0 {
-            self.last_hole = Some(self.position);
+        if damage.holes > holes {
+            found.push((self.position, boundary, damage.bytes - bytes));
         }
+        if damage.truncated_tail > 0 {
+            found.push((self.position, boundary, damage.truncated_tail));
+        }
+        let tear =
+            self.tear_index == Some(index) && header.version >= SYNC_MARK_VERSION && !abandoned;
+        self.classify(found, tear);
         Ok(())
     }
 
-    /// Charges the latest hole to every shard whose highest record precedes
-    /// it, or that has none: those are the shards it may have taken records
-    /// from with nothing left to show for it.
+    /// Sorts a segment's damage, as `(position, start, bytes)`, into tear
+    /// and loss; `tear` says whether the segment can hold a tear at all.
+    fn classify(&mut self, found: Vec<(u64, u64, u64)>, tear: bool) {
+        for (position, start, bytes) in found {
+            // Begun at or past the last mark: no sync was issued over it.
+            // Begun before, it holds bytes one was, whatever it runs into.
+            if tear && start >= self.last_mark_end {
+                self.report.torn_bytes += bytes;
+                self.last_tear_hole = Some(position);
+            } else {
+                self.last_loss_hole = Some(position);
+                self.any_loss_hole = true;
+            }
+        }
+    }
+
+    /// Charges the latest loss hole to every shard whose highest record
+    /// precedes it, or that has none: those are the shards it may have taken
+    /// records from with nothing left to show for it. The latest tear hole
+    /// marks the same shards behind it, to be cut and not charged.
     ///
     /// One file holds every shard's records, so a hole could have held any
     /// of them. A shard with an intact record after it is not charged: its
@@ -609,18 +693,32 @@ impl Scan {
     /// and not merely the last record read, so that an older record
     /// written again after the hole does not stand in for the ones it took.
     fn charge_holes(&mut self) {
-        let Some(hole) = self.last_hole else {
-            return;
-        };
-        for (damaged, last) in self.damaged.iter_mut().zip(&self.last) {
-            if last.is_none_or(|(_, at)| at < hole) {
-                *damaged = true;
+        for (hole, marks) in [
+            (self.last_loss_hole, &mut self.damaged),
+            (self.last_tear_hole, &mut self.behind_tear),
+        ] {
+            let Some(hole) = hole else {
+                continue;
+            };
+            for (mark, last) in marks.iter_mut().zip(&self.last) {
+                if last.is_none_or(|(_, at)| at < hole) {
+                    *mark = true;
+                }
             }
         }
     }
 
-    /// One intact record, bucketed by shard.
+    /// One intact record, bucketed by shard. A sync mark is no shard's
+    /// record: it is stepped over and counted nowhere, and only where it
+    /// ends is kept.
     fn item(&mut self, item: &Item, generation: u64, file: usize) {
+        if item.shard == SYNC_MARK_SHARD
+            && self.version >= SYNC_MARK_VERSION
+            && item.payload.is_empty()
+        {
+            self.last_mark_end = item.end;
+            return;
+        }
         self.report.records += 1;
         let at = self.position;
         self.position += 1;
@@ -904,6 +1002,7 @@ fn replay_tails<D: Disk>(
     report.malformed = scan.report.malformed;
     report.damage_bytes = scan.report.damage_bytes;
     report.holes = scan.report.holes;
+    report.torn_bytes = scan.report.torn_bytes;
     report.abandoned_segments = scan.report.abandoned_segments;
     let Building { dicts, due } = building;
     let mut shards = Vec::with_capacity(dicts.len());
@@ -911,8 +1010,8 @@ fn replay_tails<D: Disk>(
         .into_iter()
         .zip(due)
         .zip(scan.buckets)
-        .zip(scan.damaged);
-    for (shard, (((mut dict, due), bucket), damaged)) in (0u16..).zip(zipped) {
+        .zip(scan.damaged.into_iter().zip(scan.behind_tear));
+    for (shard, (((mut dict, due), bucket), (damaged, behind_tear))) in (0u16..).zip(zipped) {
         let index = usize::from(shard);
         let base = chosen.images[index].unwrap_or(0);
         let (records, discarded) = prefix(bucket, &rebases[index], base, &mut kept);
@@ -932,16 +1031,15 @@ fn replay_tails<D: Disk>(
         // A refused image is a loss only where the log does not reach what
         // it covered: short of its base, those records may be gone.
         let short_of_refused = chosen.refused[index].is_some_and(|refused| seq < refused);
-        // A gap where the disk had damage is records the damage took.
-        let lossy = damaged
-            || scan.unattributed_loss
-            || short_of_refused
-            || (gap && scan.last_hole.is_some());
+        // A gap where the disk had damage a sync was issued over is records
+        // the damage took; one inside a crash's tear is not.
+        let lossy =
+            damaged || scan.unattributed_loss || short_of_refused || (gap && scan.any_loss_hole);
         shards.push(RecoveredShard {
             dict,
             seq,
             lossy,
-            cut: gap || lossy,
+            cut: gap || lossy || behind_tear,
             image_unix_millis: chosen.times[index],
         });
     }

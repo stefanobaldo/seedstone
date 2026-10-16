@@ -23,13 +23,22 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ### Changed
 
-- **The log's segment format moves to version 4.** Under `--data-dir`, each
-  segment's header now lists where its process's start cut damaged shards.
-  This version reads a data directory written by 0.3.x as it is; a 0.3.x
-  server refuses one this version has written to, so going back means
-  starting from an empty directory.
+- **The log's segment format moves to version 5.** Under `--data-dir`, each
+  segment's header now lists where its process's start cut damaged shards,
+  and the segment records where each sync was issued; snapshots carry the
+  version too. This version reads a data directory written by 0.3.x as it
+  is; a 0.3.x server refuses one this version has written to, so going back
+  means starting from an empty directory.
 
 ### Fixed
+
+- **After a crash under load, `lossy_shards` no longer reports every
+  shard.** Under `--data-dir`, a crash's torn tail of the log and damage to
+  records that had been synced looked the same to a start, so it charged
+  the tear to every shard with records in it. The log now records where
+  each sync was issued; a start charges only damage before the last such
+  point, and reports the tear as `torn_bytes` on the `recovery` line,
+  charged to no shard (#88).
 
 - **`CONFIG GET slowlog-max-len` answers.** It answered an empty array, so
   a monitoring client that reads the slow log's capacity before it calls

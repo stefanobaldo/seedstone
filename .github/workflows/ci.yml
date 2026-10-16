@@ -81,8 +81,11 @@ jobs:
       # the test build as before, and the local gate still runs all of it
       # there, `debug_assert!`s included.
       - run: cargo test --workspace --exclude seedstone-sim
+      # `--no-fail-fast`: without it `cargo test` stops at the first test
+      # binary that fails, so a red unit test hides every red integration
+      # test behind it, and a run reports one failure where there are two.
       - name: the simulator's tests, in release
-        run: cargo test -p seedstone-sim --release
+        run: cargo test -p seedstone-sim --release --no-fail-fast
       # Linkage, a different axis from the feature unification the step above
       # covers: neither subsumes the other, and both are load-bearing.
       - name: no simulator crate in the production dependency graph
