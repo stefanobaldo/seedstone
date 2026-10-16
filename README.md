@@ -42,6 +42,9 @@ that is demonstrated rather than argued.
 ## Quick start
 
 ```sh
+# macOS and Linux, the release binary after checking its SHA-256 (read it first: seedstone.io/install.sh)
+curl -fsSL https://seedstone.io/install.sh | sh
+
 # Container (also on GHCR as ghcr.io/stefanobaldo/seedstone)
 docker run -p 6379:6379 seedstone/seedstone --bind 0.0.0.0:6379 --no-auth
 
