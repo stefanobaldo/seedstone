@@ -65,14 +65,14 @@ fn hostile_always(sim_seed: u64, plant: Option<Plant>) -> SimOutcome {
 
 /// The honest node, and the shape's calibration: every seed meets a disk
 /// fault of some kind — a crash does not count, since every hostile seed
-/// crashes by construction — recovers, and still decides its checks — all but the
-/// expiration checks, which some seed of the range decides. Whether a seed
-/// reads a key past its deadline is its workload's draw: a seed whose
-/// recoveries reported a loss may have none left to decide, since the model
-/// gives up a deadline kept across such a recovery, and seed 10 reported
-/// none and read no key past its deadline once a segment's header grew by two bytes and moved its disk's
-/// draws (read 2026-10-14). How many decide a durable read is the test
-/// below's.
+/// crashes by construction — recovers, and still decides its checks — all
+/// but the expiration checks, which some seed of the range decides. Whether
+/// a seed reads a key past its deadline is its workload's draw: a seed
+/// whose recoveries reported a loss may have none left to decide, since the
+/// model gives up a deadline kept across such a recovery, and seed 10
+/// reported none and read no key past its deadline once a segment's header
+/// grew by two bytes and moved its disk's draws (read 2026-10-14). How many
+/// decide a durable read is the test below's.
 #[test]
 fn the_hostile_shape_faults_on_every_seed_and_the_honest_node_holds() {
     let mut any_recovered_lossy = false;
