@@ -1301,6 +1301,20 @@ async fn a_mark_write_that_fails_is_a_write_fault_and_no_sync_is_issued() {
         1,
         "the header's sync and nothing after it"
     );
+    // A write after the fault goes to a fresh file; the failed one is never
+    // marked, nor synced, again.
+    rig.submit(0, 1, record(0, 1, b"b"));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let mark = mark();
+    assert!(
+        !body(&disk, 0).windows(mark.len()).any(|w| w == mark),
+        "a failed segment is never marked"
+    );
+    assert_eq!(
+        disk.sync_count(&Path::new(WAL).join(segment_name(1, 0))),
+        1,
+        "nor synced"
+    );
 }
 
 #[tokio::test(start_paused = true)]
