@@ -51,7 +51,7 @@ SemVer and are `0.x` while the keyspace holds only strings;
 - **After a crash under load, `lossy_shards` no longer reports every
   shard.** Under `--data-dir`, a crash's torn tail of the log and damage to
   records that had been synced looked the same to a start, so it charged
-  the tear to every shard with records in it. The log now records where
+  the tear to every shard. The log now records where
   each sync was issued; a start charges only damage before the last such
   point, and reports the tear as `torn_bytes` on the `recovery` line,
   charged to no shard (#88).
