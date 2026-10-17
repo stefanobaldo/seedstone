@@ -83,8 +83,8 @@ fn durable_on_issue_is_caught() {
     });
     let Some(seed) = caught else {
         panic!(
-            "no seed in 1..={DURABLE_ON_ISSUE_SEEDS} surfaced the early release — investigate, \
-             do not widen"
+            "no seed in 1..={DURABLE_ON_ISSUE_SEEDS} surfaced the early release — investigate; \
+             the window was widened once already, do not widen it again"
         )
     };
     eprintln!("durable-on-issue: first caught on seed {seed}");
