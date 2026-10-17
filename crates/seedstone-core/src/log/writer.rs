@@ -34,8 +34,8 @@
 use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -53,6 +53,14 @@ use crate::log::{Record, encode_record};
 use crate::shard::{
     CompactionReport, HOUSEKEEPING_TICK, LogFault, PersistenceStats, SyncPolicy, TraceSink,
 };
+
+/// A sync mark's bytes, the same for every mark: encoded once, so the
+/// writer allocates nothing per sync it issues.
+static SYNC_MARK: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    let mut mark = Vec::new();
+    encode_sync_mark(&mut mark);
+    mark
+});
 
 #[cfg(test)]
 mod tests;
@@ -509,9 +517,8 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
     /// Appends a sync mark to the open segment: the sync about to be issued
     /// covers it. Counted toward the rotation's size and no executor's lane.
     fn mark(&mut self) -> io::Result<()> {
-        let mut mark = Vec::new();
-        encode_sync_mark(&mut mark);
-        self.segment.file.write_all(&mark)?;
+        let mark: &[u8] = &SYNC_MARK;
+        self.segment.file.write_all(mark)?;
         self.segment.bytes_written += mark.len() as u64;
         Ok(())
     }
