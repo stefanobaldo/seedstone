@@ -219,7 +219,11 @@ does nothing. On start the log is read back: a shard whose records have a
 gap is replayed up to the gap and reported with `recovery_truncated`, and
 the node serves what it has. After a crash, the `recovery` line separates the
 crash's tear (`torn_bytes`, charged to no shard) from damage to what a sync
-had reached (`lossy_shards`).
+had reached (`lossy_shards`). The port opens only after the `recovery` line
+is written, so a liveness probe on the port with no initial delay gives a
+start no more than the probe's own window. Size a start probe, or an
+initial delay, against the `elapsed_ms` of the last starts, which grows with
+the log and the snapshots on disk.
 
 **When the disk fails.** A write, a sync or a rotation of the log that
 fails (`log_fault`) puts the node into refusal: every write is answered
