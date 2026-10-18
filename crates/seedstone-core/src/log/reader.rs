@@ -22,11 +22,15 @@
 //! one that crosses it is still checksummed whole, because it may be the
 //! record the hole ends at.
 //!
-//! The reader reads in chunks of [`READ_CHUNK`] rather than the whole file,
-//! and that is not an optimisation: the simulator corrupts reads per call,
-//! so a reader that pulled a segment in one call would see its damage
-//! land anywhere, while one that reads in chunks sees it confined to a
-//! region — the fault a real disk delivers.
+//! The reader reads in chunks rather than the whole file, and the chunking
+//! itself is not an optimisation: the simulator corrupts reads per call, so
+//! a reader that pulled a segment in one call would see its damage land
+//! anywhere, while one that reads in chunks sees it confined to a region —
+//! the fault a real disk delivers. The chunk's *size* is the optimisation,
+//! and a measured one: [`READ_CHUNK`] is large enough that a
+//! network-attached volume reads at its bandwidth rather than at its
+//! latency, as its own doc gives. The tests pick small chunks through
+//! [`Reader::with_chunk`], so that boundaries fall inside records.
 //!
 //! [`ReaderMode::PrefixScan`] is the reader this module exists to replace,
 //! kept so the simulator can plant it and show it caught: it treats the
@@ -37,7 +41,15 @@ use std::io::{self, Read};
 use crate::log::{BODY_FIXED_LEN, Decoded, HEADER_LEN, MAGIC, MAX_BODY_LEN, decode_record};
 
 /// How many bytes a read pulls at a time.
-pub const READ_CHUNK: usize = 64 * 1024;
+///
+/// A read is issued to the device whole, so the chunk is what a
+/// network-attached volume's latency is paid per. Measured on a 744 MB
+/// directory with read latency injected under the filesystem, cold page
+/// cache, one executor, an Axion core (2026-10-18): at 5 ms per request a
+/// start took 14.4 s with 64 KiB reads and 3.5 s with 4 MiB reads — the
+/// volume's own 200 MB/s. At 10 ms, 4 MiB reads still held that floor
+/// within a fifth (4.1 s), where 1 MiB reads did not (8.5 s).
+pub const READ_CHUNK: usize = 4 * 1024 * 1024;
 
 /// How many bytes may be checksummed while resynchronising after one hole
 /// before the rest of the segment is given up.
