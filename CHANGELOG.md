@@ -39,6 +39,21 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ### Changed
 
+- **A start reads its data directory at the disk's bandwidth.** Under
+  `--data-dir`, a start now reads the log and the snapshots in 4 MiB reads
+  and checksums them through a table. On a network-attached volume with
+  milliseconds of latency per request, a start was bound by that latency
+  and is now bound by the volume's bandwidth. Measured on a 744 MB
+  directory with one executor, on an Axion core, on 2026-10-18:
+
+  | | before | after |
+  |---|---|---|
+  | 5 ms of read latency, cold page cache | 14.4 s | 3.5 s |
+  | page cache warm | 2.0 s | 0.4 s |
+
+  The `recovery` line's `read_ms` and `images_ms` show the change on a
+  given deployment.
+
 - **The log's segment format moves to version 5.** Under `--data-dir`, each
   segment's header now lists where its process's start cut damaged shards,
   and the segment records where each sync was issued; snapshots carry the
