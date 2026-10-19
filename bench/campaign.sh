@@ -34,7 +34,10 @@
 #              is a ~0.4 s run on one arm and a ~1.9 s run on another, and
 #              background work during an arm — Redis 8.10.0 ran 12 or 13 AOF
 #              rewrites per arm in the v0.3.2 campaign — needs a window wide
-#              enough to land in every run alike.
+#              enough to land in every run alike. The default, 10 s, is the
+#              shortest window at which the logged arms' run-to-run spread
+#              stopped falling on the reference machine; the stage then takes
+#              about 20 minutes there.
 #
 # Discipline, every stage: one server up at a time, pinned to SERVER_CPUS, the
 # client pinned to CLIENT_CPUS; the keyspace populated before a read cell by
@@ -59,7 +62,8 @@
 #        It must be on a disk: a DATA_ROOT on tmpfs is refused.
 #        DURABILITY_SECONDS=<s> sizes each kept durability run from the last
 #        warmup run's throughput to last at least s seconds, never fewer
-#        operations than N; it needs WARMUP >= 1. Unset, every run is N.
+#        operations than N; it needs WARMUP >= 1. Unset, it is 10; set
+#        empty (DURABILITY_SECONDS=), every run is N, as before it existed.
 # Paths and cpusets are environment variables with the reference machine's
 # values as defaults, so the script runs elsewhere with none of them edited.
 set -uo pipefail
@@ -91,6 +95,7 @@ CANARY_REFERENCE=2551021
 CANARY_TOLERANCE=5
 
 DATA_ROOT=${DATA_ROOT:-/tmp}
+DURABILITY_SECONDS=${DURABILITY_SECONDS-10}
 DURABILITY_ARMS=${DURABILITY_ARMS:-seedstone,seedstone-never,seedstone-interval,seedstone-always,redis-iot1,redis-aof-no,redis-aof-everysec,redis-aof-always}
 
 STAGE=${1:?usage: campaign.sh <canary|calibrate|field|expiry|eviction|multikey|keys|durability|all>}
@@ -227,7 +232,7 @@ runs() {
 }
 
 # durability_runs <port> <arm> <shape> <depth>: runs, for the durability stage.
-# With DURABILITY_SECONDS unset it is runs, unchanged. With it set, the kept
+# With DURABILITY_SECONDS empty it is runs, unchanged. With it set, the kept
 # runs are sized from the last warmup run's throughput to last at least that
 # many seconds, and never fewer operations than an unsized run makes; a warmup
 # that read no throughput skips the row rather than run a kept run of nothing.
