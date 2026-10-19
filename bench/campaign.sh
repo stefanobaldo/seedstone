@@ -28,7 +28,13 @@
 #              and each engine with no log at all; GET at depth 64 with the log
 #              synced on every write, against no log. Its own arm list,
 #              DURABILITY_ARMS; each arm writes into a directory of its own
-#              under DATA_ROOT, emptied before it starts.
+#              under DATA_ROOT, emptied before it starts. Its runs can be
+#              sized as a duration, DURABILITY_SECONDS, rather than a count:
+#              the logged arms' throughput differs fivefold, so a fixed count
+#              is a ~0.4 s run on one arm and a ~1.9 s run on another, and
+#              background work during an arm — Redis 8.10.0 ran 12 or 13 AOF
+#              rewrites per arm in the v0.3.2 campaign — needs a window wide
+#              enough to land in every run alike.
 #
 # Discipline, every stage: one server up at a time, pinned to SERVER_CPUS, the
 # client pinned to CLIENT_CPUS; the keyspace populated before a read cell by
@@ -51,6 +57,9 @@
 #        DATA_ROOT=<dir> is where the durability stage's arms write (/tmp); every
 #        arm writes on the same disk, so the comparison is between engines.
 #        It must be on a disk: a DATA_ROOT on tmpfs is refused.
+#        DURABILITY_SECONDS=<s> sizes each kept durability run from the last
+#        warmup run's throughput to last at least s seconds, never fewer
+#        operations than N; it needs WARMUP >= 1. Unset, every run is N.
 # Paths and cpusets are environment variables with the reference machine's
 # values as defaults, so the script runs elsewhere with none of them edited.
 set -uo pipefail
@@ -217,6 +226,31 @@ runs() {
   for _ in 1 2 3;               do bash "$CELL" "$port" "$PID" "$arm" kept   "$shape" "$depth" 50 "$arg"; done
 }
 
+# durability_runs <port> <arm> <shape> <depth>: runs, for the durability stage.
+# With DURABILITY_SECONDS unset it is runs, unchanged. With it set, the kept
+# runs are sized from the last warmup run's throughput to last at least that
+# many seconds, and never fewer operations than an unsized run makes; a warmup
+# that read no throughput skips the row rather than run a kept run of nothing.
+durability_runs() {
+  local port=$1 arm=$2 shape=$3 depth=$4 i line= ops n
+  if [[ -z ${DURABILITY_SECONDS:-} ]]; then runs "$port" "$arm" "$shape" "$depth" -; return; fi
+  for i in $(seq 1 "$WARMUP"); do
+    line=$(bash "$CELL" "$port" "$PID" "$arm" warmup "$shape" "$depth" 50 -)
+    echo "$line"
+  done
+  ops=$(sed -nE 's/.* ops=([0-9.]+) .*/\1/p' <<< "$line")
+  n=$(awk -v o="${ops:-0}" -v s="$DURABILITY_SECONDS" -v floor="${N:-1000000}" 'BEGIN {
+    if (o + 0 <= 0) exit
+    x = o * s; x = (x == int(x)) ? x : int(x) + 1
+    printf "%d", (x > floor) ? x : floor
+  }')
+  if [[ -z $n ]]; then
+    echo "### ROW SKIPPED: warmup read 0 ops/s ($arm $shape depth $depth)"
+    SKIPPED_ROWS=$(( ${SKIPPED_ROWS:-0} + 1 )); return 1
+  fi
+  for _ in 1 2 3; do N=$n bash "$CELL" "$port" "$PID" "$arm" kept "$shape" "$depth" 50 -; done
+}
+
 canary() {
   banner canary
   echo "### canary: redis io-threads 1, GET 64 B, depth 64, 50 clients, 100 000 spread keys, populated"
@@ -345,17 +379,29 @@ durability() {
     echo "### REFUSED: $DATA_ROOT is on tmpfs, which syncs nothing; a durability cell there measures no sync at all"
     return 1
   fi
+  if [[ -n ${DURABILITY_SECONDS:-} ]]; then
+    if ! [[ $DURABILITY_SECONDS =~ ^[0-9]+$ ]] || (( DURABILITY_SECONDS < 1 )); then
+      echo "### REFUSED: DURABILITY_SECONDS must be a whole number of seconds, >= 1"; return 1
+    fi
+    if ! [[ ${WARMUP:-0} =~ ^[0-9]+$ ]] || (( ${WARMUP:-0} < 1 )); then
+      echo "### REFUSED: DURABILITY_SECONDS needs WARMUP >= 1"; return 1
+    fi
+    echo "### run length: at least $DURABILITY_SECONDS s per kept run, sized from the last warmup run, never under N=${N:-1000000}"
+  else
+    echo "### run length: N=${N:-1000000} per run"
+  fi
   durability_arm() {
-    runs "$PORT" "$1" set 64 -
-    runs "$PORT" "$1" set 1 -
-    case $1 in seedstone|seedstone-always) runs "$PORT" "$1" get 64 -;; esac
+    durability_runs "$PORT" "$1" set 64
+    durability_runs "$PORT" "$1" set 1
+    case $1 in seedstone|seedstone-always) durability_runs "$PORT" "$1" get 64;; esac
     local dir=$DATA_ROOT/bench-data-$1
     [[ -d $dir ]] && echo "    data: $(du -sh "$dir" | cut -f1) under $dir"
     case $1 in redis-aof-*)
       echo "    aof rewrites during the arm: $(grep -c 'Background append only file rewriting' "/tmp/bench-$PORT.log")";;
     esac
   }
-  ( ARMS=$DURABILITY_ARMS; each_arm populate plain durability_arm )
+  ( ARMS=$DURABILITY_ARMS; each_arm populate plain durability_arm
+    (( ${SKIPPED_ROWS:-0} == 0 )) || { echo "### $SKIPPED_ROWS row(s) skipped"; exit 1; } )
 }
 
 # A stage that fails must fail the script. The canary and the calibration are
