@@ -43,13 +43,14 @@ SemVer and are `0.x` while the keyspace holds only strings;
   `--data-dir`, a start now reads the log and the snapshots in 4 MiB reads
   and checksums them through a table. On a network-attached volume with
   milliseconds of latency per request, a start was bound by that latency
-  and is now bound by the volume's bandwidth. Measured on a 744 MB
-  directory with one executor, on an Axion core, on 2026-10-18:
+  and is now bound by the volume's bandwidth. Measured with the build
+  before this change and the build after it, on a 912 MB directory, one
+  executor, an Intel i7-1165G7 core, on 2026-10-19, medians of three:
 
   | | before | after |
   |---|---|---|
-  | 5 ms of read latency, cold page cache | 14.4 s | 3.5 s |
-  | page cache warm | 2.0 s | 0.4 s |
+  | 10 ms of latency per read, injected under the filesystem, cold page cache | 28.8 s | 3.6 s |
+  | page cache warm | 1.6 s | 0.5 s |
 
   The `recovery` line's `read_ms` and `images_ms` show the change on a
   given deployment.
