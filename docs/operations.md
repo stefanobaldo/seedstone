@@ -223,7 +223,9 @@ had reached (`lossy_shards`). The port opens only after the `recovery` line
 is written, so a liveness probe on the port with no initial delay gives a
 start no more than the probe's own window. Size a start probe, or an
 initial delay, against the `elapsed_ms` of the last starts, which grows with
-the log and the snapshots on disk.
+the log and the snapshots on disk, and leave headroom: the log is reopened
+for writing between the `recovery` line and the port, and `elapsed_ms` does
+not count that.
 
 **When the disk fails.** A write, a sync or a rotation of the log that
 fails (`log_fault`) puts the node into refusal: every write is answered

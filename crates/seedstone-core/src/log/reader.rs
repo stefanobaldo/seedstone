@@ -43,8 +43,8 @@ use crate::log::{BODY_FIXED_LEN, Decoded, HEADER_LEN, MAGIC, MAX_BODY_LEN, decod
 /// How many bytes a read pulls at a time.
 ///
 /// A read is issued to the device whole, so the chunk is what a
-/// network-attached volume's latency is paid per. Measured on a 744 MB
-/// directory with read latency injected under the filesystem, cold page
+/// network-attached volume's latency is paid per. Measured on a 913 MB
+/// directory (744 MB of it read) with read latency injected under the filesystem, cold page
 /// cache, one executor, an Axion core (2026-10-18): at 5 ms per request a
 /// start took 14.4 s with 64 KiB reads and 3.5 s with 4 MiB reads — the
 /// volume's own 200 MB/s. At 10 ms, 4 MiB reads still held that floor

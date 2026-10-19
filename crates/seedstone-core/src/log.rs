@@ -207,9 +207,10 @@ fn crc_tables() -> [[u32; 256]; 16] {
 /// output reflected, final XOR `0xFFFF_FFFF` — the parameters the format is
 /// pinned to. Computed sixteen bytes at a time through a table of the same
 /// polynomial, built at first use; the bitwise loop it replaced is kept in
-/// the tests as the reference the table must equal. The loop ran at 426 MB/s
-/// and the table at 3.4 GB/s on an Axion core (2026-10-18), and a start
-/// under `--data-dir` checksums every byte it reads.
+/// the tests as the reference the table must equal. On 64 KiB bodies the
+/// loop ran at 570 MB/s and the table at 2.9 GB/s, on an Intel i7-1165G7
+/// core (2026-10-19), and a start under `--data-dir` checksums every byte
+/// it reads.
 pub(crate) fn crc32_iso_hdlc(data: &[u8]) -> u32 {
     let tables = &*CRC_TABLES;
     let mut crc: u32 = 0xFFFF_FFFF;
