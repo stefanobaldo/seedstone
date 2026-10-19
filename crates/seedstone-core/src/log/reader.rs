@@ -146,7 +146,12 @@ impl<R: Read> Reader<R> {
             src,
             len,
             remaining: len,
-            buf: Vec::with_capacity(chunk.max(1)),
+            // A source smaller than a chunk never needs the whole chunk.
+            buf: Vec::with_capacity(
+                usize::try_from(len)
+                    .map_or(chunk, |len| len.min(chunk))
+                    .max(1),
+            ),
             at: 0,
             chunk: chunk.max(1),
             mode,
@@ -429,6 +434,19 @@ mod tests {
             assert_eq!(items[4], (3, 4, vec![4; 7]));
             assert_eq!(damage, Damage::default(), "chunk {chunk}");
         }
+    }
+
+    #[test]
+    fn a_small_source_does_not_reserve_a_whole_chunk() {
+        let buf = record(2, 0, b"small");
+        let len = u64::try_from(buf.len()).expect("a buffer length is a usize");
+        let reader = Reader::new(Cursor::new(buf), len, ReaderMode::Resynchronising);
+        assert!(
+            reader.buf.capacity() < READ_CHUNK,
+            "a {len}-byte source reserved a whole chunk"
+        );
+        let empty = Reader::new(Cursor::new(Vec::new()), 0, ReaderMode::Resynchronising);
+        assert!(empty.buf.capacity() < READ_CHUNK);
     }
 
     #[test]
