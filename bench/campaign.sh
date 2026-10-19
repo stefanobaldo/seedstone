@@ -50,6 +50,7 @@
 #        DURABILITY_ARMS=<comma list> does the same for the durability stage.
 #        DATA_ROOT=<dir> is where the durability stage's arms write (/tmp); every
 #        arm writes on the same disk, so the comparison is between engines.
+#        It must be on a disk: a DATA_ROOT on tmpfs is refused.
 # Paths and cpusets are environment variables with the reference machine's
 # values as defaults, so the script runs elsewhere with none of them edited.
 set -uo pipefail
@@ -331,7 +332,19 @@ durability() {
   echo "### no/everysec/always, plus each engine with no log at all; GET 64 B at depth 64 with"
   echo "### the log synced on every write, against no log; 50 clients; 100 000 spread keys;"
   echo "### populated; one directory per arm under $DATA_ROOT, emptied before it starts; W=$WARMUP"
-  echo "### data root: $(df -hP "$DATA_ROOT" 2>/dev/null | tail -1)"
+  # The arms' directories do not exist yet, and DATA_ROOT itself may not: the
+  # filesystem is read where the path first exists. The type is taken from the
+  # same df line that is printed, so what is checked is what a reader sees.
+  local root=$DATA_ROOT line
+  while [[ ! -e $root && $root != / ]]; do root=$(dirname "$root"); done
+  if ! line=$(df -hTP "$root" 2>/dev/null | tail -1) || [[ -z $line ]]; then
+    echo "### REFUSED: cannot read the filesystem under $DATA_ROOT"; return 1
+  fi
+  echo "### data root: $line"
+  if [[ $(awk '{print $2}' <<< "$line") == tmpfs ]]; then
+    echo "### REFUSED: $DATA_ROOT is on tmpfs, which syncs nothing; a durability cell there measures no sync at all"
+    return 1
+  fi
   durability_arm() {
     runs "$PORT" "$1" set 64 -
     runs "$PORT" "$1" set 1 -
