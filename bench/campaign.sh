@@ -239,7 +239,7 @@ runs() {
 # and never fewer operations than an unsized run makes; a warmup
 # that read no throughput skips the row rather than run a kept run of nothing.
 durability_runs() {
-  local port=$1 arm=$2 shape=$3 depth=$4 i line= ops n
+  local port=$1 arm=$2 shape=$3 depth=$4 i line='' ops n
   if [[ -z ${DURABILITY_SECONDS:-} ]]; then runs "$port" "$arm" "$shape" "$depth" -; return; fi
   for i in $(seq 1 "$WARMUP"); do
     line=$(bash "$CELL" "$port" "$PID" "$arm" warmup "$shape" "$depth" 50 -)
