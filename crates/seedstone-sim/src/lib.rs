@@ -632,6 +632,7 @@ async fn server(
     // planted twin runs.
     let disk = shared.disk.clone();
     let reports_early = planted == Some(Plant::ReportsCoveredAtOpen);
+    let finishes_early = planted == Some(Plant::FinishesBeforeLog);
     let parts = PoolParts {
         shards,
         executors,
@@ -652,6 +653,7 @@ async fn server(
                 config: SIM_CHECKPOINT,
             });
             checkpoint.reports_covered_at_open(reports_early);
+            checkpoint.finishes_before_log(finishes_early);
             checkpoint
         },
         sync: shared.policy,
@@ -677,6 +679,7 @@ async fn server(
             | Plant::DurableOnIssue
             | Plant::AcksWhileRefusing
             | Plant::DurableFromWrittenNow
+            | Plant::FinishesBeforeLog
             | Plant::RemovesUncovered,
         ) => parts.spawn(Deadlines),
     };

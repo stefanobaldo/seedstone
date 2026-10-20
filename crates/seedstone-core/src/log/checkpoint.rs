@@ -235,8 +235,8 @@ pub struct SegmentCheckpoint<D: Disk> {
     /// `LogPosition::bytes` when the last cycle opened: the live log is
     /// what the executor sent since.
     opened_at: u64,
-    /// The planted defect: report `Completed` at the open.
-    reports_covered_at_open: bool,
+    /// The planted defects it carries; none on a real node.
+    plants: Plants,
     /// The next tick opens a cycle whatever the live log: see
     /// [`Checkpoint::force`].
     forced: bool,
@@ -280,6 +280,15 @@ struct Cycle<F> {
     /// The wall clock at the open, Unix milliseconds: the image describes
     /// memory as of its bases, so this is its time.
     opened_unix: u64,
+}
+
+/// The defects a [`SegmentCheckpoint`] can be planted with.
+#[derive(Debug, Clone, Copy, Default)]
+struct Plants {
+    /// See [`SegmentCheckpoint::reports_covered_at_open`].
+    reports_covered_at_open: bool,
+    /// See [`SegmentCheckpoint::finishes_before_log`].
+    finishes_before_log: bool,
 }
 
 /// What an ended scan's footer waits for.
@@ -350,7 +359,7 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
             completed: 0,
             last_snapshot: 0,
             opened_at: 0,
-            reports_covered_at_open: false,
+            plants: Plants::default(),
             forced: false,
             nudged: false,
             open: None,
@@ -364,7 +373,17 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
     /// This server never does it; it exists so the simulator can plant
     /// exactly that and show it caught.
     pub const fn reports_covered_at_open(&mut self, plant: bool) {
-        self.reports_covered_at_open = plant;
+        self.plants.reports_covered_at_open = plant;
+    }
+
+    /// The planted defect: the footer is written the tick the scan ends,
+    /// whatever the log has made durable. What a checkpoint that took its
+    /// image for the whole story would do — a crash can then leave it
+    /// beside a tail torn below writes it holds, and the start serves a
+    /// state the shard never held. Like the one above, it exists so the
+    /// simulator can plant it and show it caught.
+    pub const fn finishes_before_log(&mut self, plant: bool) {
+        self.plants.finishes_before_log = plant;
     }
 
     /// Cycles that reached a durable footer.
@@ -596,6 +615,7 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         Self::scan(self.config, first_shard, states, now, cycle);
         let mut ask = false;
         if cycle.scanned_all()
+            && !self.plants.finishes_before_log
             && let Some(waiting) = Self::log_short_of_image(log, cycle)
         {
             // Asked once: the sync it asks for covers every batch sent
@@ -729,7 +749,7 @@ impl<D: Disk + Send + 'static> Checkpoint for SegmentCheckpoint<D> {
             self.open_cycle(states, log, now.unix_millis);
             self.forced = false;
             self.nudged = false;
-            if self.reports_covered_at_open {
+            if self.plants.reports_covered_at_open {
                 // The plant: the bases taken for the durable point.
                 let cycle = self.open.as_ref().expect("just opened");
                 early = Some(Completed {
