@@ -1,0 +1,145 @@
+### stage durability start 2026-10-12T00:41:37Z
+### load at start: 0.04 1.28 1.50
+### kernel 7.0.0-1014-gcp aarch64  cpus server=0-9 client=10-15
+### os Ubuntu 24.04.4 LTS  memtotal 62.7 GiB
+### seedstone seedstone 0.3.2  benchmark redis-benchmark 8.10.0
+
+### durability: SET 64 B at depths 64 and 1 under each durability setting — seedstone's
+### --fsync never/interval/always against Redis with appendonly and appendfsync
+### no/everysec/always, plus each engine with no log at all; GET 64 B at depth 64 with
+### the log synced on every write, against no log; 50 clients; 100 000 spread keys;
+### populated; one directory per arm under /home/stefanobaldo/bench-data, emptied before it starts; W=1
+### data root: /dev/root        38G   23G   15G  61% /
+--- seedstone [populate] pid=20567 threads=11 load:0.04
+    cmd: /home/stefanobaldo/src/seedstone-v0.3.2/target/release/seedstone --bind 127.0.0.1:6390 --max-clients 2000 --no-auth
+    redis_version:0.3.2
+    probe: 48/50 hits on key:%012d  dbsize=95112
+cell arm=seedstone kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4545454.50 user_us=1.360 sys_us=0.260 total_us=1.620 cores=7.36 client_cores=1.00 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4608295.00 user_us=1.350 sys_us=0.260 total_us=1.610 cores=7.42 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4651162.50 user_us=1.310 sys_us=0.290 total_us=1.600 cores=7.44 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4608295.00 user_us=1.360 sys_us=0.250 total_us=1.610 cores=7.42 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=warmup shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=143822.81 user_us=5.140 sys_us=5.940 total_us=11.080 cores=1.59 client_cores=1.00 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=142592.33 user_us=5.270 sys_us=5.870 total_us=11.140 cores=1.59 client_cores=1.00 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=143533.80 user_us=5.180 sys_us=5.900 total_us=11.080 cores=1.59 client_cores=1.00 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=142126.22 user_us=5.330 sys_us=5.800 total_us=11.130 cores=1.58 client_cores=1.00 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=warmup shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4587156.00 user_us=1.170 sys_us=0.290 total_us=1.460 cores=6.70 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.170 sys_us=0.290 total_us=1.460 cores=6.76 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.180 sys_us=0.270 total_us=1.450 cores=6.71 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4608295.00 user_us=1.150 sys_us=0.300 total_us=1.450 cores=6.68 client_cores=1.01 evicted=0 evicted_per_op=0.000
+
+--- seedstone-never [populate] pid=21070 threads=11 load:1.16
+    cmd: /home/stefanobaldo/src/seedstone-v0.3.2/target/release/seedstone --bind 127.0.0.1:6390 --max-clients 2000 --no-auth --data-dir /home/stefanobaldo/bench-data/bench-data-seedstone-never --fsync never
+    redis_version:0.3.2
+    probe: 49/50 hits on key:%012d  dbsize=95034
+cell arm=seedstone-never kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2557544.75 user_us=1.830 sys_us=0.200 total_us=2.030 cores=5.19 client_cores=0.54 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-never kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2652519.75 user_us=1.790 sys_us=0.240 total_us=2.030 cores=5.38 client_cores=0.56 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-never kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2123142.25 user_us=1.830 sys_us=0.230 total_us=2.060 cores=4.37 client_cores=0.45 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-never kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2192982.50 user_us=1.860 sys_us=0.220 total_us=2.080 cores=4.56 client_cores=0.47 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-never kind=warmup shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=142795.95 user_us=8.500 sys_us=9.960 total_us=18.460 cores=2.64 client_cores=1.00 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-never kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=141123.34 user_us=8.360 sys_us=10.190 total_us=18.550 cores=2.62 client_cores=0.99 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-never kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=141322.78 user_us=8.560 sys_us=10.130 total_us=18.690 cores=2.64 client_cores=1.00 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-never kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=142755.17 user_us=8.600 sys_us=9.780 total_us=18.380 cores=2.62 client_cores=0.99 evicted=0 evicted_per_op=0.000
+    data: 42M under /home/stefanobaldo/bench-data/bench-data-seedstone-never
+
+--- seedstone-interval [populate] pid=21444 threads=11 load:2.27
+    cmd: /home/stefanobaldo/src/seedstone-v0.3.2/target/release/seedstone --bind 127.0.0.1:6390 --max-clients 2000 --no-auth --data-dir /home/stefanobaldo/bench-data/bench-data-seedstone-interval --fsync interval
+    redis_version:0.3.2
+    probe: 47/50 hits on key:%012d  dbsize=95098
+cell arm=seedstone-interval kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=3095975.00 user_us=1.840 sys_us=0.230 total_us=2.070 cores=6.41 client_cores=0.66 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-interval kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2777777.75 user_us=1.830 sys_us=0.220 total_us=2.050 cores=5.69 client_cores=0.59 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-interval kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2127659.50 user_us=1.850 sys_us=0.230 total_us=2.080 cores=4.43 client_cores=0.45 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-interval kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2132196.00 user_us=1.880 sys_us=0.220 total_us=2.100 cores=4.48 client_cores=0.45 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-interval kind=warmup shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=141422.70 user_us=8.790 sys_us=10.260 total_us=19.050 cores=2.69 client_cores=0.99 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-interval kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=144133.75 user_us=8.770 sys_us=10.230 total_us=19.000 cores=2.74 client_cores=0.99 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-interval kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=142755.17 user_us=8.720 sys_us=10.560 total_us=19.280 cores=2.75 client_cores=1.00 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-interval kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=141203.05 user_us=8.880 sys_us=10.490 total_us=19.370 cores=2.74 client_cores=0.99 evicted=0 evicted_per_op=0.000
+    data: 42M under /home/stefanobaldo/bench-data/bench-data-seedstone-interval
+
+--- seedstone-always [populate] pid=21878 threads=11 load:2.61
+    cmd: /home/stefanobaldo/src/seedstone-v0.3.2/target/release/seedstone --bind 127.0.0.1:6390 --max-clients 2000 --no-auth --data-dir /home/stefanobaldo/bench-data/bench-data-seedstone-always --fsync always
+    redis_version:0.3.2
+    probe: 49/50 hits on key:%012d  dbsize=94943
+cell arm=seedstone-always kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=602772.75 user_us=1.990 sys_us=0.350 total_us=2.340 cores=1.41 client_cores=0.13 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-always kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=521920.66 user_us=2.010 sys_us=0.340 total_us=2.350 cores=1.23 client_cores=0.11 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-always kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=659630.56 user_us=2.010 sys_us=0.340 total_us=2.350 cores=1.55 client_cores=0.14 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-always kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=597014.94 user_us=2.000 sys_us=0.320 total_us=2.320 cores=1.39 client_cores=0.13 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-always kind=warmup shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=12602.71 user_us=10.570 sys_us=11.050 total_us=21.620 cores=0.27 client_cores=0.09 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-always kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=12252.20 user_us=10.280 sys_us=11.120 total_us=21.400 cores=0.26 client_cores=0.09 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-always kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=14004.23 user_us=10.390 sys_us=11.210 total_us=21.600 cores=0.30 client_cores=0.10 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-always kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=14796.84 user_us=10.420 sys_us=11.290 total_us=21.710 cores=0.32 client_cores=0.11 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-always kind=warmup shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.220 sys_us=0.280 total_us=1.500 cores=6.94 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-always kind=kept shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4608295.00 user_us=1.280 sys_us=0.230 total_us=1.510 cores=6.96 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-always kind=kept shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.230 sys_us=0.260 total_us=1.490 cores=6.90 client_cores=1.01 evicted=0 evicted_per_op=0.000
+cell arm=seedstone-always kind=kept shape=get arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=4629629.50 user_us=1.230 sys_us=0.250 total_us=1.480 cores=6.85 client_cores=1.01 evicted=0 evicted_per_op=0.000
+    data: 41M under /home/stefanobaldo/bench-data/bench-data-seedstone-always
+
+--- redis-iot1 [populate] pid=22640 threads=6 load:1.67
+    cmd: /home/stefanobaldo/redis-8.10.0/src/redis-server --port 6391 --save  --appendonly no --io-threads 1
+    redis_version:8.10.0
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    probe: 49/50 hits on key:%012d  dbsize=95039
+cell arm=redis-iot1 kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2096436.12 user_us=0.410 sys_us=0.060 total_us=0.470 cores=0.99 client_cores=0.43 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2087682.62 user_us=0.410 sys_us=0.070 total_us=0.480 cores=1.00 client_cores=0.43 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2105263.25 user_us=0.410 sys_us=0.070 total_us=0.480 cores=1.01 client_cores=0.44 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=2087682.62 user_us=0.410 sys_us=0.070 total_us=0.480 cores=1.00 client_cores=0.43 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=warmup shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=138465.80 user_us=1.540 sys_us=4.690 total_us=6.230 cores=0.86 client_cores=1.00 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=139082.06 user_us=1.630 sys_us=4.550 total_us=6.180 cores=0.86 client_cores=1.00 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=138197.89 user_us=1.620 sys_us=4.650 total_us=6.270 cores=0.87 client_cores=1.00 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=138045.28 user_us=1.590 sys_us=4.680 total_us=6.270 cores=0.87 client_cores=1.00 evicted=0 evicted_per_op=0.000
+
+--- redis-aof-no [populate] pid=23006 threads=6 load:1.77
+    cmd: /home/stefanobaldo/redis-8.10.0/src/redis-server --port 6391 --save  --appendonly yes --appendfsync no --dir /home/stefanobaldo/bench-data/bench-data-redis-aof-no --io-threads 1
+    redis_version:8.10.0
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    probe: 47/50 hits on key:%012d  dbsize=94953
+    appendfsync=no  auto-aof-rewrite-percentage=100  auto-aof-rewrite-min-size=67108864
+cell arm=redis-aof-no kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1068376.12 user_us=0.690 sys_us=0.120 total_us=0.810 cores=0.87 client_cores=0.22 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-no kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1216545.00 user_us=0.670 sys_us=0.140 total_us=0.810 cores=0.99 client_cores=0.25 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-no kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1200480.12 user_us=0.690 sys_us=0.130 total_us=0.820 cores=0.98 client_cores=0.25 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-no kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=988142.31 user_us=0.700 sys_us=0.120 total_us=0.820 cores=0.81 client_cores=0.21 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-no kind=warmup shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=143492.61 user_us=1.850 sys_us=4.770 total_us=6.620 cores=0.95 client_cores=0.98 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-no kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=146370.03 user_us=1.930 sys_us=4.640 total_us=6.570 cores=0.96 client_cores=0.99 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-no kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=145243.28 user_us=1.920 sys_us=4.670 total_us=6.590 cores=0.96 client_cores=0.98 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-no kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=146284.38 user_us=1.890 sys_us=4.700 total_us=6.590 cores=0.96 client_cores=0.99 evicted=0 evicted_per_op=0.000
+    data: 66M under /home/stefanobaldo/bench-data/bench-data-redis-aof-no
+    aof rewrites during the arm: 12
+
+--- redis-aof-everysec [populate] pid=23460 threads=6 load:1.97
+    cmd: /home/stefanobaldo/redis-8.10.0/src/redis-server --port 6391 --save  --appendonly yes --appendfsync everysec --dir /home/stefanobaldo/bench-data/bench-data-redis-aof-everysec --io-threads 1
+    redis_version:8.10.0
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    probe: 47/50 hits on key:%012d  dbsize=95014
+    appendfsync=everysec  auto-aof-rewrite-percentage=100  auto-aof-rewrite-min-size=67108864
+cell arm=redis-aof-everysec kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1189060.62 user_us=0.660 sys_us=0.160 total_us=0.820 cores=0.98 client_cores=0.24 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-everysec kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1196172.25 user_us=0.680 sys_us=0.140 total_us=0.820 cores=0.98 client_cores=0.25 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-everysec kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1199040.75 user_us=0.670 sys_us=0.130 total_us=0.800 cores=0.96 client_cores=0.25 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-everysec kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=1207729.50 user_us=0.690 sys_us=0.130 total_us=0.820 cores=0.99 client_cores=0.25 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-everysec kind=warmup shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=146606.06 user_us=1.870 sys_us=4.720 total_us=6.590 cores=0.97 client_cores=0.99 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-everysec kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=146477.22 user_us=1.910 sys_us=4.720 total_us=6.630 cores=0.97 client_cores=1.00 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-everysec kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=145900.20 user_us=1.930 sys_us=4.710 total_us=6.640 cores=0.97 client_cores=1.00 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-everysec kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=147710.48 user_us=1.860 sys_us=4.670 total_us=6.530 cores=0.96 client_cores=0.99 evicted=0 evicted_per_op=0.000
+    data: 20M under /home/stefanobaldo/bench-data/bench-data-redis-aof-everysec
+    aof rewrites during the arm: 12
+
+--- redis-aof-always [populate] pid=23854 threads=6 load:1.87
+    cmd: /home/stefanobaldo/redis-8.10.0/src/redis-server --port 6391 --save  --appendonly yes --appendfsync always --dir /home/stefanobaldo/bench-data/bench-data-redis-aof-always --io-threads 1
+    redis_version:8.10.0
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    probe: 49/50 hits on key:%012d  dbsize=95016
+    appendfsync=always  auto-aof-rewrite-percentage=100  auto-aof-rewrite-min-size=67108864
+cell arm=redis-aof-always kind=warmup shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=478697.94 user_us=0.700 sys_us=0.170 total_us=0.870 cores=0.42 client_cores=0.11 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-always kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=516528.94 user_us=0.720 sys_us=0.160 total_us=0.880 cores=0.45 client_cores=0.11 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-always kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=498753.09 user_us=0.710 sys_us=0.160 total_us=0.870 cores=0.43 client_cores=0.11 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-always kind=kept shape=set arg=- depth=64 clients=50 keyspace=100000 payload=64 n=1000000 ops=529661.00 user_us=0.700 sys_us=0.160 total_us=0.860 cores=0.46 client_cores=0.11 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-always kind=warmup shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=14781.31 user_us=1.660 sys_us=5.050 total_us=6.710 cores=0.10 client_cores=0.10 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-always kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=16341.47 user_us=1.680 sys_us=5.000 total_us=6.680 cores=0.11 client_cores=0.11 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-always kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=13846.77 user_us=1.680 sys_us=5.070 total_us=6.750 cores=0.09 client_cores=0.10 evicted=0 evicted_per_op=0.000
+cell arm=redis-aof-always kind=kept shape=set arg=- depth=1 clients=50 keyspace=100000 payload=64 n=1000000 ops=13272.46 user_us=1.570 sys_us=5.130 total_us=6.700 cores=0.09 client_cores=0.09 evicted=0 evicted_per_op=0.000
+    data: 40M under /home/stefanobaldo/bench-data/bench-data-redis-aof-always
+    aof rewrites during the arm: 13
+
+### stage durability done 2026-10-12T00:54:54Z  load:1.74 1.86 1.83

@@ -12,8 +12,10 @@ it. The raw logs the tables are computed from are in
 [`bench/results/v0.3.2/`](../bench/results/v0.3.2/), and
 `python3 bench/report.py bench/results/v0.3.2/0[3-8]-*.log` regenerates every
 table and every pair line on this page. The only readings it does not produce
-are the `v0.2.0` ones quoted under the pairs whose word changed; the same
-command over that run's logs produces those. A number here without its method
+are the `v0.2.0` ones quoted under the pairs whose word changed, which the same
+command over that run's logs produces, and the durability cell's first run,
+quoted under its tables, which `python3 bench/report.py` over
+`durability-repeat.log` produces. A number here without its method
 beside it would be a marketing number, so the method comes first.
 
 **The runs these tables replace are still here.** The raw logs of the `v0.2.0`
@@ -667,19 +669,23 @@ emptied before the arm starts; the device the directory is on, and its
 filesystem (`ext4`), are printed at the head of `08-durability.log`.
 
 **Runs sized by time, not by count.** Unlike every other cell, a kept run here
-lasts at least 10 seconds: `W` = 1 discarded run per arm per row, of a million
+is sized by time: `W` = 1 discarded run per arm per row, of a million
 operations, reads the arm's throughput, and each of the three kept runs is
-sized from it to 10 seconds, never under a million operations. The logged arms
-answer between about 13 000 and 1.9 million writes per second, so a fixed
-count is half a second on the fastest and more than a minute on the slowest,
-and on the fastest the throughput comes in bursts a fraction of a second
-apart, which a half-second run samples rather than averages. Every run's
-operation count is on its line in the log.
+sized to last 10 seconds at that throughput, never under a million operations.
+A kept run faster than the discarded one is shorter than 10 seconds; the
+shortest in this log lasted about 8.5. The logged arms answer between about
+13 000 and 1.9 million writes per second, so a million operations is half a
+second on the fastest and more than a minute on the slowest, and a
+half-second run reads whatever the server was doing in that half second.
+Every run's operation count is on its line in the log.
 
 **Re-run on 2026-10-19.** The durability cell was measured again on the same
-release and the same machine class, eight days after the other cells, with
-runs sized by time; the run of 2026-10-11 used a million operations per run
-and its logged arms spread too widely to decide the `always` pair. The cell
+release and the same machine class, a week after the other cells, with
+runs sized by time; the run of 2026-10-12 used a million operations per run
+and its logged arms spread too widely to decide the `always` pair. Its log
+stays as
+[`durability-2026-10-12.log`](../bench/results/v0.3.2/durability-2026-10-12.log),
+outside the files the command above reads. The cell
 ran twice, back to back, on one instance: the tables below are the second run,
 [`08-durability.log`](../bench/results/v0.3.2/08-durability.log); the first is
 [`durability-repeat.log`](../bench/results/v0.3.2/durability-repeat.log),
@@ -780,10 +786,8 @@ against 14 491, 1.07×), the second *behind* 0.79×, with Redis's `always` arm
 spread 12.62 % and 13.40 % and this server's 4.81 % and 8.41 %. Read the
 depth-1 `always` line as unsettled: two runs of the same build on the same
 instance put it on either side of a tie. A depth-1 `always` run is a million
-writes at about 15 000 a second, a minute or more, so its spread is not a
-matter of run length. Both engines' `always` arms drift by several percent
-over tens of seconds, with nothing in either engine's log lining up with it;
-the disk each sync waits on is the likelier source.
+writes at about 15 000 a second, a minute or more; runs longer than that were
+not tried.
 
 **Spreads over 5 %, named.** On the depth-64 row: this server's `never` at
 5.20 % and `always` at 15.68 %, and Redis's `always` at 6.43 %; the others are
@@ -867,11 +871,12 @@ python3 bench/report.py 0[3-8]-*.log
 `DATA_ROOT` is the directory the durability cell's arms write into, one
 directory each; put it on the disk that is meant to be measured. The stage
 prints its filesystem at its head and refuses a `tmpfs`, which syncs nothing,
-before any arm starts. Each durability run lasts at least 10 seconds, sized
-from the discarded run before it, so the stage needs `W` of at least 1 and
+before any arm starts. Each kept durability run is sized to last 10 seconds
+at the throughput of the discarded run before it, so the stage needs `W` of
+at least 1 and
 takes about 20 minutes on the machine above; `DURABILITY_SECONDS=<s>` sets
 another length, and `DURABILITY_SECONDS=` (empty) runs a million operations
-per run, as the run of 2026-10-11 did.
+per run, as the run of 2026-10-12 did.
 
 `W` was 1 for this run, and the calibration derives it again rather than
 assuming it. A calibration in which an arm never settles gives no `W`, and is
