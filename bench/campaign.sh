@@ -30,11 +30,13 @@
 #              DURABILITY_ARMS; each arm writes into a directory of its own
 #              under DATA_ROOT, emptied before it starts. Its runs can be
 #              sized as a duration, DURABILITY_SECONDS, rather than a count:
-#              the logged arms' throughput differs fivefold, so a fixed count
-#              is a ~0.4 s run on one arm and a ~1.9 s run on another, and
-#              background work during an arm — Redis 8.10.0 ran 12 or 13 AOF
-#              rewrites per arm in the v0.3.2 campaign — needs a window wide
-#              enough to land in every run alike. The default, 10 s, is the
+#              at depth 64 the logged arms' throughput differs about fivefold,
+#              so a million operations is under half a second on the fastest
+#              and under two seconds on the slowest, too short a window to
+#              average the background work during an arm (Redis 8.10.0's AOF
+#              rewrites, this server's compactions). Each kept run is sized to
+#              that many seconds at the last warmup run's throughput, so a kept
+#              run faster than its warmup is shorter. The default, 10 s, is the
 #              shortest window at which the logged arms' run-to-run spread
 #              stopped falling on the reference machine; the stage then takes
 #              about 20 minutes there.
@@ -60,9 +62,9 @@
 #        DATA_ROOT=<dir> is where the durability stage's arms write (/tmp); every
 #        arm writes on the same disk, so the comparison is between engines.
 #        It must be on a disk: a DATA_ROOT on tmpfs is refused.
-#        DURABILITY_SECONDS=<s> sizes each kept durability run from the last
-#        warmup run's throughput to last at least s seconds, never fewer
-#        operations than N; it needs WARMUP >= 1. Unset, it is 10; set
+#        DURABILITY_SECONDS=<s> sizes each kept durability run to last s
+#        seconds at the last warmup run's throughput, never fewer operations
+#        than N; it needs WARMUP >= 1. Unset, it is 10; set
 #        empty (DURABILITY_SECONDS=), every run is N, as before it existed.
 # Paths and cpusets are environment variables with the reference machine's
 # values as defaults, so the script runs elsewhere with none of them edited.
@@ -233,8 +235,8 @@ runs() {
 
 # durability_runs <port> <arm> <shape> <depth>: runs, for the durability stage.
 # With DURABILITY_SECONDS empty it is runs, unchanged. With it set, the kept
-# runs are sized from the last warmup run's throughput to last at least that
-# many seconds, and never fewer operations than an unsized run makes; a warmup
+# runs are sized to last that many seconds at the last warmup run's throughput,
+# and never fewer operations than an unsized run makes; a warmup
 # that read no throughput skips the row rather than run a kept run of nothing.
 durability_runs() {
   local port=$1 arm=$2 shape=$3 depth=$4 i line= ops n
@@ -391,7 +393,7 @@ durability() {
     if ! [[ ${WARMUP:-0} =~ ^[0-9]+$ ]] || (( ${WARMUP:-0} < 1 )); then
       echo "### REFUSED: DURABILITY_SECONDS needs WARMUP >= 1"; return 1
     fi
-    echo "### run length: at least $DURABILITY_SECONDS s per kept run, sized from the last warmup run, never under N=${N:-1000000}"
+    echo "### run length: each kept run sized to $DURABILITY_SECONDS s at the last warmup run's throughput, never under N=${N:-1000000}"
   else
     echo "### run length: N=${N:-1000000} per run"
   fi
