@@ -156,6 +156,16 @@ pub enum Plant {
     /// Caught by `lost_durable_writes` and `lost_durable_prefixes`, on the
     /// seeds that draw `interval` with a sync latency above one tick.
     DurableFromWrittenNow,
+    /// A checkpoint that writes its footer the tick its scan ends, without
+    /// waiting for the log to be durable through the writes the image may
+    /// already hold.
+    ///
+    /// A crash before the log's next sync can leave that image beside a
+    /// tail torn below those writes, and the start serves the image's later
+    /// values without the log's earlier ones: a state the shard never held.
+    /// Caught by `unheld_states` on the swept shape, most often under
+    /// `never`, which syncs the log least.
+    FinishesBeforeLog,
     /// The writer removes a rotation once *any* executor has covered its
     /// batches in it, not once every one has.
     ///
@@ -184,13 +194,14 @@ impl Plant {
             Self::DurableOnIssue => "durable-on-issue",
             Self::AcksWhileRefusing => "acks-while-refusing",
             Self::DurableFromWrittenNow => "durable-from-written-now",
+            Self::FinishesBeforeLog => "finishes-before-log",
             Self::RemovesUncovered => "removes-uncovered",
         }
     }
 
     /// Every plant, so a caller listing or sweeping them cannot miss one
     /// added later.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::LostUpdate,
         Self::ServeExpired,
         Self::SweepEatsAll,
@@ -204,6 +215,7 @@ impl Plant {
         Self::DurableOnIssue,
         Self::AcksWhileRefusing,
         Self::DurableFromWrittenNow,
+        Self::FinishesBeforeLog,
         Self::RemovesUncovered,
     ];
 
@@ -237,11 +249,12 @@ impl Plant {
             // including the ones with no ceiling, where the plain model is
             // exact and a vanished key is a mismatch with nothing to excuse
             // it.
-            // The three compaction plants too: a crash under load, which
+            // The four snapshot plants too: a crash under load, which
             // every swept seed has, is what makes them visible — the first
             // and third lose records to a crash before the image that would
             // cover them, the second to a crash inside a cycle followed by a
-            // start that trusts what it finds.
+            // start that trusts what it finds, the fourth to a crash that
+            // tears the log below what a finished image holds.
             // The two durability plants that break a promise of the policy
             // a seed draws: the swept shape draws every policy, and
             // `tests/planted_durability.rs` fixes the one each breaks.
@@ -252,6 +265,7 @@ impl Plant {
             | Self::ReportsCoveredAtOpen
             | Self::TrustsUnfinishedSnapshot
             | Self::RemovesUncovered
+            | Self::FinishesBeforeLog
             | Self::DurableOnIssue
             | Self::DurableFromWrittenNow => None,
             // Needs a cursor observed *between* steps of a table that is

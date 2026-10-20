@@ -1,19 +1,22 @@
 //! Compaction, shown failing and shown holding.
 //!
-//! Three defects: a checkpoint that reports its executor's batches covered
+//! Four defects: a checkpoint that reports its executor's batches covered
 //! when the cycle opens instead of at the durable footer, a writer that
 //! removes a rotation once any executor has covered its batches in it
-//! rather than every one, and a recovery that trusts a snapshot with no
-//! footer. All three are observable on the swept shape itself — a crash under
-//! load is what makes them cost data — so they are served on `standard`,
-//! and the honest node runs the same seeds clean.
+//! rather than every one, a recovery that trusts a snapshot with no
+//! footer, and a checkpoint that writes its footer before the log is
+//! durable through what its image holds. All four are observable on the
+//! swept shape itself — a crash under load is what makes them cost data or
+//! serve a state nobody held — so they are served on `standard`, and the
+//! honest node runs the same seeds clean.
 //!
 //! The claim is "some seed catches it", in the pattern `standard_catches.rs`
 //! set, because whether a given seed's crash lands inside a cycle is the
 //! draw of the crash schedule and not the plant's. A count that had to be
 //! raised to keep this green is the finding.
 
-use seedstone_sim::{Plant, SimConfig, SimOutcome, run_sim};
+use seedstone_core::shard::SyncPolicy;
+use seedstone_sim::{FsyncDraw, Plant, SimConfig, SimOutcome, run_sim};
 
 /// How many standard seeds each plant is given.
 const SEEDS: u64 = 12;
@@ -174,4 +177,39 @@ fn unrelated_plants_do_not_move_the_compaction_verdict() {
         );
         assert!(outcome.snapshot_cycles >= 1, "{plant:?}: {outcome:?}");
     }
+}
+
+/// How many standard seeds the early footer is given, all at `--fsync
+/// never`: it needs a crash that tears the log below writes a finished
+/// image already holds, and the policy that syncs the log least leaves it
+/// the most room. Six seeds of 1..=60 caught it there — 4, 12, 15, 39, 53
+/// and 58 (read 2026-10-20) — so a window of 32 misses all of them about
+/// three times in a hundred if the draws move.
+const FOOTER_SEEDS: u64 = 32;
+
+/// A footer written before the log is durable through what its image
+/// holds: a crash that tears the log below those writes leaves a start
+/// serving the image's later values without the log's earlier ones — a
+/// state the shard never held.
+#[test]
+fn finishes_before_log_is_caught() {
+    let never = |sim_seed: u64, plant: Option<Plant>| {
+        let mut cfg = SimConfig::standard(1, sim_seed);
+        cfg.fsync = FsyncDraw::Fixed(SyncPolicy::NEVER);
+        cfg.planted = plant;
+        run_sim(&cfg)
+    };
+    let caught = (1..=FOOTER_SEEDS)
+        .find(|sim_seed| never(*sim_seed, Some(Plant::FinishesBeforeLog)).unheld_states > 0);
+    let Some(seed) = caught else {
+        panic!(
+            "no seed in 1..={FOOTER_SEEDS} surfaced the early footer: no crash tore the log \
+             below a finished image — investigate, do not widen"
+        );
+    };
+    let honest = never(seed, None);
+    assert!(
+        honest.invariant_holds() && honest.held_checks > 0,
+        "seed {seed} is not clean without the plant: {honest:?}"
+    );
 }

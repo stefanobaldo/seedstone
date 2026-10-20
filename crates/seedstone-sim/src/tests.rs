@@ -309,6 +309,7 @@ fn every_plant_answers_whether_the_swept_shapes_catch_it() {
             | Plant::ReportsCoveredAtOpen
             | Plant::TrustsUnfinishedSnapshot
             | Plant::RemovesUncovered
+            | Plant::FinishesBeforeLog
             | Plant::DurableOnIssue
             | Plant::DurableFromWrittenNow => assert_eq!(
                 place,
@@ -655,7 +656,11 @@ fn the_three_compaction_plants_are_selectable_by_name() {
         Plant::from_name("removes-uncovered"),
         Some(Plant::RemovesUncovered)
     );
-    assert_eq!(Plant::ALL.len(), 14);
+    assert_eq!(
+        Plant::from_name("finishes-before-log"),
+        Some(Plant::FinishesBeforeLog)
+    );
+    assert_eq!(Plant::ALL.len(), 15);
 }
 
 /// A sync on the simulated disk completes after a latency drawn from the
