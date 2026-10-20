@@ -23,9 +23,11 @@ No adjectives. Throughput and CPU are always printed side by side.
 
 Standard library only.
 """
+import os
 import re
 import statistics
 import sys
+import tempfile
 import xml.dom.minidom
 from collections import defaultdict
 
@@ -55,7 +57,7 @@ CHART = [
     ("GET 64 B · depth 64", ("get", "-", "64"), PRIMARY + OTHER, "seedstone"),
     ("SET 10 KB · depth 64 · under a 384 MB ceiling, LRU", ("set-large", "10240", "64"),
      PRIMARY + OTHER, "seedstone"),
-    ("SET 64 B · depth 1 · synced on every write", ("set", "-", "1"),
+    ("SET 64 B · depth 64 · synced on every write", ("set", "-", "64"),
      ["seedstone-always", "redis-aof-always"], "seedstone-always"),
 ]
 LABEL = {"seedstone": "seedstone", "redis-iot1": "redis, io-threads 1",
@@ -302,6 +304,12 @@ def header(path):
                 break
     return date, machine
 
+def run_dates(paths):
+    """Every run date the logs carry, in input order, once each: a chart whose
+    panels come from stages run on different days says so."""
+    dates = [d for d in dict.fromkeys(header(p)[0] for p in paths) if d]
+    return " and ".join(filter(None, (", ".join(dates[:-1]), dates[-1]))) if dates else ""
+
 
 def cpu_count(spec):
     """How many cpus a taskset list such as `0-9` or `0-3,8` names."""
@@ -444,7 +452,7 @@ def svg_chart(out, argv):
     opts, logs = svg_args(argv)
     if not logs:
         sys.exit("--svg needs at least one log")
-    date, machine = header(logs[0])
+    date, machine = run_dates(logs), header(logs[0])[1]
     lines = [line for p in logs for line in open(p)]
     facts = log_facts(lines)
     errors = caption_errors(opts, facts)
@@ -506,6 +514,24 @@ def selftest():
     assert svg.startswith("<svg "), svg[:40]
     assert "4.50 M" in svg and "144 k" not in svg and "140 k" in svg
     assert svg.count("not measured in this run") == 2          # eviction and durability panels
+    # The synced panel reads the depth-64 row, the one the durability stage settles.
+    synced = {("set", "-", d, "50", "100000", "64"):
+              {"seedstone-always": dict(base_row, ops=ours), "redis-aof-always": dict(base_row, ops=theirs)}
+              for d, ours, theirs in (("1", 13127.0, 16653.0), ("64", 621533.0, 438486.0))}
+    both = svg_from_summaries([field, synced], "2026-09-23", "kernel 7.0.0-1011-gcp aarch64",
+                              "v0.2.0", "redis:8.10.0,valkey:9.1.1", "light")
+    assert "622 k" in both and "438 k" in both and "13.1 k" not in both and "13 k" not in both
+    assert "depth 64 · synced on every write" in both
+    # The caption names every run date its logs carry, in input order, once each.
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = []
+        for i, day in enumerate(("2026-10-11", "2026-10-11", "2026-10-12", "2026-10-19")):
+            paths.append(os.path.join(tmp, f"{i}.log"))
+            with open(paths[-1], "w") as f:
+                f.write(f"### stage x start {day}T00:00:00Z\n### kernel k\n")
+        assert run_dates(paths[:2]) == "2026-10-11"
+        assert run_dates(paths[1:3]) == "2026-10-11 and 2026-10-12"
+        assert run_dates(paths) == "2026-10-11, 2026-10-12 and 2026-10-19"
     assert "Redis 8.10.0, Valkey 9.1.1" in svg and "2026-09-23" in svg and "v0.2.0" in svg
     assert svg == svg_from_summaries([field], "2026-09-23", "kernel 7.0.0-1011-gcp aarch64",
                                      "v0.2.0", "redis:8.10.0,valkey:9.1.1", "light")
