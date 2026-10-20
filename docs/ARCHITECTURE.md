@@ -161,7 +161,12 @@ moment the image began, replayed over it, is the state. That is the reason
 the log records effects rather than commands, cashed in: a snapshot with no
 pause beyond one tick's budget and no copy of the keyspace, where a server
 that forks for its snapshot copies, page by page, every part of the heap
-written while the child runs. Once the image's commit record is synced the
+written while the child runs. The tail is the state only if it reaches every
+record the image may hold — a key imaged late carries the effect of a record
+above where the image began — so the commit record is written once the log
+is synced through what the executor had sent when the image ended, and the
+executor asks the writer for that sync where its policy would not issue one.
+Once the image's commit record is synced the
 executor tells the writer what it covers, and the writer removes every
 segment that every executor has covered; a start reads image plus tail. The
 image is ordinary log records in a file of its own, so the reader that steps

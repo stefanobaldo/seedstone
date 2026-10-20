@@ -93,6 +93,9 @@ pub enum ToWriter {
         through_batch: Option<u64>,
         snapshot_bytes: u64,
     },
+    /// The executor's snapshot waits for a sync over the batches it has
+    /// sent: issue one, at once if the policy's cadence would not.
+    SyncNow,
     /// The executor has sent its last batch and waits for `Stopped`.
     Stop { executor: u16 },
 }
@@ -252,6 +255,11 @@ pub struct Writer<D: Disk, T: TraceSink> {
     issued_at: Instant,
     /// The sync in flight was traced as slow: its end is traced too.
     slow_warned: bool,
+    /// An executor asked for a sync: the next round answers it, issued at
+    /// once where the policy's cadence would not issue one. Cleared only by
+    /// a round, so an ask that a rotation or a failure overtook costs one
+    /// round nobody waits for.
+    sync_wanted: bool,
     round: u64,
     closed: VecDeque<Closed>,
     /// Bytes of older generations' files at the open — retained log whose
@@ -330,6 +338,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
             // One interval before now, so the first write is synced at once.
             issued_at: now.checked_sub(interval).unwrap_or(now),
             slow_warned: false,
+            sync_wanted: false,
             round: 0,
             closed: VecDeque::new(),
             older_bytes,
@@ -446,6 +455,7 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
             } => {
                 self.covered(executor, cycle, through_batch, snapshot_bytes);
             }
+            ToWriter::SyncNow => self.sync_wanted = true,
             ToWriter::Stop { executor } => self.lanes[usize::from(executor)].stopped = true,
         }
     }
@@ -486,17 +496,26 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
     /// once the segment holds unsynced bytes and nothing is in flight: this
     /// runs after every drain, every completion and every tick, and most of
     /// those find nothing to sync.
+    ///
+    /// One an executor asked for is the cadence's to answer where the
+    /// cadence will: only a policy with none, or a segment a rotation left
+    /// with nothing unsynced — it syncs what it closes without telling
+    /// anyone, and a round is what says `Durable` — needs one at once.
     fn maybe_issue(&mut self) {
-        let Some(interval) = self.policy.min_interval else {
+        if self.segment.sync_failed || self.in_flight.is_some() {
             return;
-        };
-        if !self.segment.dirty || self.segment.sync_failed || self.in_flight.is_some() {
+        }
+        let cadence = self.policy.min_interval.filter(|_| self.segment.dirty);
+        let asked = self.sync_wanted && cadence.is_none();
+        if cadence.is_none() && !asked {
             return;
         }
         let now = Instant::now();
-        if now.saturating_duration_since(self.issued_at) < interval {
+        if cadence.is_some_and(|interval| now.saturating_duration_since(self.issued_at) < interval)
+        {
             return;
         }
+        self.sync_wanted = false;
         if let Err(error) = self.mark() {
             self.fail(LogFault::Write, &error);
             return;

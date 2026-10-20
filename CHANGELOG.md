@@ -64,6 +64,16 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ### Fixed
 
+- **A crash no longer brings a shard back with a later write and without an
+  earlier one.** Under `--data-dir`, a snapshot could be finished while the
+  writes it had already taken in were not yet synced in the log. A crash
+  then could leave that snapshot beside a log torn below those writes, and
+  the start served the snapshot's later values with the log's earlier ones
+  missing — a state the node never held, against the promise that what
+  survives is a prefix of what was acknowledged. A snapshot is now finished
+  only once the log is synced through every write it may hold; under
+  `--fsync never` the snapshot asks for that one sync of the log.
+
 - **After a crash under load, `lossy_shards` no longer reports every
   shard.** Under `--data-dir`, a crash's torn tail of the log and damage to
   records that had been synced looked the same to a start, so it charged

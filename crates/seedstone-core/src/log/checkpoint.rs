@@ -8,11 +8,13 @@
 //! opens a snapshot file. Each tick after that serialises up to
 //! [`CheckpointConfig::bytes_per_tick`] of entries through
 //! [`Dict::scan`](crate::dict::Dict::scan), shard by shard, into the file.
-//! When every shard's cursor has come back to `0` the footer is written and
-//! the file synced: the snapshot is durable, every record below a shard's
-//! base is covered by its image, and the tick reports [`Completed`] — which
-//! the executor hands the writer, the only thing that removes files. The
-//! checkpoint rotates nothing and removes nothing but a file it abandoned.
+//! When every shard's cursor has come back to `0`, and the log is durable
+//! through the last batch the executor had sent by then, the footer is
+//! written and the file synced: the snapshot is durable, every record below
+//! a shard's base is covered by its image, and the tick reports
+//! [`Completed`] — which the executor hands the writer, the only thing that
+//! removes files. The checkpoint rotates nothing and removes nothing but a
+//! file it abandoned.
 //!
 //! **Why fuzzy.** The image is not the state at any instant — a key
 //! scanned early may be overwritten before the cycle ends — and it does not
@@ -20,6 +22,20 @@
 //! base replayed over the image is the state, whichever tick each key was
 //! taken on. What that buys is a snapshot with no stall beyond one tick's
 //! budget and no copy of the keyspace, on a server that has no `fork`.
+//!
+//! **Why the footer waits for the log.** The tail is the state only if it
+//! reaches every record the image may hold: a key scanned late carries the
+//! effect of a record above its base. An image finished before those
+//! records were durable is one a crash can leave beside a tail torn below
+//! them, and its start would serve a later write without an earlier one —
+//! a state the shard never held. So the footer is written once the log is
+//! durable through what the executor had sent when the scan ended; the
+//! executor asks the writer for that sync, which `never` would not issue on
+//! its own, and an executor that sent nothing since the open waits for
+//! nothing. A sync of the log that does not complete therefore holds the
+//! snapshot, the `SAVE`s behind it and the compaction it would allow; one
+//! that fails puts the node into refusal, whose forced snapshot waits for
+//! nothing.
 //!
 //! **What the bound is.** The node's statement is the writer's
 //! ([`writer`](crate::log::writer)): the last snapshots, the ones being
@@ -97,11 +113,13 @@ impl CheckpointConfig {
 }
 
 /// Where the executor's log stands at a tick: bytes it has handed the
-/// writer since the process started, and the last batch it sent.
+/// writer since the process started, the last batch it sent, and the last
+/// batch a sync made durable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogPosition {
     pub bytes: u64,
     pub batch: Option<u64>,
+    pub durable: Option<u64>,
 }
 
 /// A snapshot became durable: what the executor tells the writer.
@@ -126,12 +144,16 @@ pub struct Tick {
     pub completed: Option<Completed>,
     /// The tick's step failed: the cycle ended in a fault.
     pub faulted: bool,
+    /// The cycle's footer waits for the log to be durable through what the
+    /// executor had sent: the executor asks the writer for a sync.
+    pub wants_sync: bool,
 }
 
 impl Tick {
     pub const NONE: Self = Self {
         completed: None,
         faulted: false,
+        wants_sync: false,
     };
 }
 
@@ -242,6 +264,8 @@ struct Cycle<F> {
     /// Bytes written to the file so far, header included.
     bytes: u64,
     ticks: u64,
+    /// Set on the tick the scan ended: what the footer waits for.
+    waiting: Option<Waiting>,
     /// The footer has been written to the file and awaits its sync.
     footer_written: bool,
     /// The file is synced and the directory sync is what remains.
@@ -256,6 +280,27 @@ struct Cycle<F> {
     /// The wall clock at the open, Unix milliseconds: the image describes
     /// memory as of its bases, so this is its time.
     opened_unix: u64,
+}
+
+/// What an ended scan's footer waits for.
+#[derive(Debug, Clone, Copy)]
+struct Waiting {
+    /// The last batch the executor had sent when the scan ended: the
+    /// image may hold the effect of any record up to it.
+    sent: Option<u64>,
+    /// The writer has been asked for the sync that makes it durable.
+    asked: bool,
+}
+
+/// What one tick of an open cycle came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// More ticks: the scan goes on, or its footer waits for the log —
+    /// `ask` on the tick the wait begins, when the executor asks the
+    /// writer for the sync.
+    Pending { ask: bool },
+    /// The snapshot is durable.
+    Durable,
 }
 
 impl<F> Cycle<F> {
@@ -277,6 +322,7 @@ impl<F> Cycle<F> {
             scratch: Vec::new(),
             bytes: 0,
             ticks: 0,
+            waiting: None,
             footer_written: false,
             dir_pending: false,
             overshoot,
@@ -512,15 +558,16 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         }
     }
 
-    /// One tick of an open cycle. `Ok(true)` once the snapshot is durable.
+    /// One tick of an open cycle.
     fn step<L: ReplicationLog>(
         &mut self,
         first_shard: u16,
         states: &[ShardState<L>],
         now: Now,
-    ) -> io::Result<bool> {
+        log: LogPosition,
+    ) -> io::Result<Step> {
         let mut cycle = self.open.take().expect("step runs on an open cycle");
-        let result = self.step_inner(first_shard, states, now, &mut cycle);
+        let result = self.step_inner(first_shard, states, now, log, &mut cycle);
         self.open = Some(cycle);
         result
     }
@@ -530,8 +577,9 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         first_shard: u16,
         states: &[ShardState<L>],
         now: Now,
+        log: LogPosition,
         cycle: &mut Cycle<D::File>,
-    ) -> io::Result<bool> {
+    ) -> io::Result<Step> {
         cycle.ticks += 1;
         if let Err(error) = self.ensure_file(first_shard, cycle) {
             self.restart(cycle);
@@ -540,13 +588,20 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         if cycle.dir_pending {
             self.disk.sync_dir(&self.wal)?;
             cycle.dir_pending = false;
-            return Ok(true);
+            return Ok(Step::Durable);
         }
         if cycle.footer_written {
             return self.sync_footer(cycle);
         }
         Self::scan(self.config, first_shard, states, now, cycle);
-        if cycle.scanned_all() {
+        let mut ask = false;
+        if cycle.scanned_all()
+            && let Some(waiting) = Self::log_short_of_image(log, cycle)
+        {
+            // Asked once: the sync it asks for covers every batch sent
+            // before the request, and the scan ended before it.
+            ask = !std::mem::replace(&mut waiting.asked, true);
+        } else if cycle.scanned_all() {
             let counts = cycle
                 .counts
                 .iter()
@@ -571,13 +626,28 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         if cycle.footer_written {
             return self.sync_footer(cycle);
         }
-        Ok(false)
+        Ok(Step::Pending { ask })
+    }
+
+    /// What the footer still waits for, if the log is not yet durable
+    /// through every record the image may hold: the last batch sent when
+    /// the scan ended, read on the first tick that finds it ended. Nothing
+    /// sent since the open is nothing to wait for — the bases cover it,
+    /// which is what lets a refusing executor's image end its refusal on a
+    /// log that will never sync again.
+    fn log_short_of_image(log: LogPosition, cycle: &mut Cycle<D::File>) -> Option<&mut Waiting> {
+        let through_batch = cycle.through_batch;
+        let waiting = cycle.waiting.get_or_insert(Waiting {
+            sent: log.batch,
+            asked: false,
+        });
+        (waiting.sent != through_batch && log.durable < waiting.sent).then_some(waiting)
     }
 
     /// Syncs the file and then the directory. A failed file sync abandons
     /// the file and restarts the scan into the next one, with the same
     /// bases (see the module doc); a failed directory sync is retried.
-    fn sync_footer(&mut self, cycle: &mut Cycle<D::File>) -> io::Result<bool> {
+    fn sync_footer(&mut self, cycle: &mut Cycle<D::File>) -> io::Result<Step> {
         let file = cycle.file.as_mut().expect("the footer was written");
         if let Err(error) = file.sync_data() {
             self.restart(cycle);
@@ -586,7 +656,7 @@ impl<D: Disk + Send + 'static> SegmentCheckpoint<D> {
         cycle.dir_pending = true;
         self.disk.sync_dir(&self.wal)?;
         cycle.dir_pending = false;
-        Ok(true)
+        Ok(Step::Durable)
     }
 }
 
@@ -671,20 +741,23 @@ impl<D: Disk + Send + 'static> Checkpoint for SegmentCheckpoint<D> {
                 });
             }
         }
-        match self.step(first_shard, states, now) {
-            Ok(false) => Tick {
+        match self.step(first_shard, states, now, log) {
+            Ok(Step::Pending { ask }) => Tick {
                 completed: early,
                 faulted: false,
+                wants_sync: ask,
             },
-            Ok(true) => Tick {
+            Ok(Step::Durable) => Tick {
                 completed: Some(self.finish(states, trace, log)),
                 faulted: false,
+                wants_sync: false,
             },
             Err(error) => {
                 trace.fault(first_shard, LogFault::Snapshot, &error);
                 Tick {
                     completed: early,
                     faulted: true,
+                    wants_sync: false,
                 }
             }
         }

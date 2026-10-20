@@ -147,6 +147,12 @@ pub struct SyncState {
     pub held: VecDeque<Held>,
     /// The number the next submission is tagged with.
     pub batch: u64,
+    /// The last batch a `Durable` named: what the checkpoint's footer
+    /// waits for. Kept under every policy, `never`'s included, since its
+    /// snapshots ask for the sync that says it. A `Durable` after a fault
+    /// can name batches the failed segment lost; the `Fault` reaches the
+    /// executor first, and the cycle it forces opens past them.
+    pub durable_batch: Option<u64>,
     pub mode: Mode,
     /// The writer's channel closed: nothing can be made durable again, so
     /// a refusal never ends.
@@ -167,6 +173,7 @@ impl SyncState {
             acked_bytes: 0,
             held: VecDeque::new(),
             batch: 0,
+            durable_batch: None,
             mode: Mode::Serving,
             writer_lost: false,
         }
