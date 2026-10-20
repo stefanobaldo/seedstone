@@ -62,14 +62,14 @@
 <text x="212" y="377" class="l" text-anchor="end">valkey, io-threads 4</text>
 <rect x="220" y="364" width="191.1" height="16" rx="2" fill="#3d444d"/>
 <text x="417.1" y="377" class="v">625 k</text>
-<text x="500" y="264" class="t">SET 64 B · depth 1 · synced on every write</text>
+<text x="500" y="264" class="t">SET 64 B · depth 64 · synced on every write</text>
 <text x="692" y="289" class="l" text-anchor="end">seedstone --fsync always</text>
-<rect x="700" y="276" width="154.5" height="16" rx="2" fill="#3fb950"/>
-<text x="860.5" y="289" class="v">13 k</text>
+<rect x="700" y="276" width="196.0" height="16" rx="2" fill="#3fb950"/>
+<text x="902.0" y="289" class="v">622 k</text>
 <text x="692" y="311" class="l" text-anchor="end">redis appendfsync always</text>
-<rect x="700" y="298" width="196.0" height="16" rx="2" fill="#3d444d"/>
-<text x="902.0" y="311" class="v">17 k</text>
+<rect x="700" y="298" width="138.3" height="16" rx="2" fill="#3d444d"/>
+<text x="844.3" y="311" class="v">438 k</text>
 <text x="20" y="498" class="c">Throughput, operations per second, the median of three kept runs. seedstone v0.3.2 against Redis 8.10.0, Valkey 9.1.1, Dragonfly df-v1.40.2, Garnet 2.1.5.</text>
-<text x="20" y="512" class="c">GCP c4a-standard-16 (aarch64), server on 10 cores, redis-benchmark on 6, over loopback, 2026-10-11.</text>
+<text x="20" y="512" class="c">GCP c4a-standard-16 (aarch64), server on 10 cores, redis-benchmark on 6, over loopback, 2026-10-11, 2026-10-12 and 2026-10-19.</text>
 <text x="20" y="526" class="c">Every table, the CPU per operation and what the numbers do not say: docs/benchmarks.md</text>
 </svg>
