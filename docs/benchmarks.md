@@ -1,6 +1,7 @@
 # Benchmarks
 
-**Release measured:** `v0.3.2` (commit `0d4f8df`). **Date:** 2026-10-11.
+**Release measured:** `v0.3.2` (commit `0d4f8df`). **Date:** 2026-10-11; the
+durability cell 2026-10-19.
 **Machine:** GCP `c4a-standard-16`. **Engines:** Redis 8.10.0, Valkey 9.1.1,
 Dragonfly `df-v1.40.2`, Garnet 2.1.5 — each as the engine itself reports its
 version, not as its release archive is named. **Warm-up runs discarded per arm
@@ -101,8 +102,9 @@ already up, with 50 connections, keys spread uniformly over 100 000 keys
 immediately before and after — user and system time over every thread, at the
 kernel's clock tick. Read once around a million operations the window is
 thousands of ticks wide; read around a single operation it would be quantised
-to nothing. `bench/cell.sh` is one run. The `KEYS` cell is the one exception to
-the count and the key distribution, and states its own on the section below.
+to nothing. `bench/cell.sh` is one run. The `KEYS` cell is the exception to the
+count and the key distribution, and the durability cell to the count; each
+states its own on its section below.
 
 **Populated, and declared.** Before every read cell the keyspace is written
 by the same step (`-t set -n 300000 -c 50 -P 64 -d 64 -r 100000`) and probed
@@ -661,9 +663,28 @@ other cell). Then `GET` of a 64-byte value at depth 64 with this server's log
 synced on every write, against no log. Every Redis arm runs at one I/O thread.
 Each arm writes into a directory of its own on the machine's boot disk — a GCP
 `hyperdisk-balanced` volume of 40 GB, provisioned at 3 240 IOPS and 200 MB/s —
-emptied before the arm starts; the device the directory is on is printed at
-the head of `08-durability.log`. `W` = 1 discarded run per arm per row, then
-three kept.
+emptied before the arm starts; the device the directory is on, and its
+filesystem (`ext4`), are printed at the head of `08-durability.log`.
+
+**Runs sized by time, not by count.** Unlike every other cell, a kept run here
+lasts at least 10 seconds: `W` = 1 discarded run per arm per row, of a million
+operations, reads the arm's throughput, and each of the three kept runs is
+sized from it to 10 seconds, never under a million operations. The logged arms
+answer between about 13 000 and 1.9 million writes per second, so a fixed
+count is half a second on the fastest and more than a minute on the slowest,
+and on the fastest the throughput comes in bursts a fraction of a second
+apart, which a half-second run samples rather than averages. Every run's
+operation count is on its line in the log.
+
+**Re-run on 2026-10-19.** The durability cell was measured again on the same
+release and the same machine class, eight days after the other cells, with
+runs sized by time; the run of 2026-10-11 used a million operations per run
+and its logged arms spread too widely to decide the `always` pair. The cell
+ran twice, back to back, on one instance: the tables below are the second run,
+[`08-durability.log`](../bench/results/v0.3.2/08-durability.log); the first is
+[`durability-repeat.log`](../bench/results/v0.3.2/durability-repeat.log),
+outside the files the command above reads, and what it read is stated under
+the tables.
 
 **Why these pairs.** Each line pairs the two settings that make the nearest
 promise. `--fsync always` against `appendfsync always` is the same promise on
@@ -693,79 +714,88 @@ at the matching setting, not with one reference.
 
 | arm | ops/s | user µs/op | sys µs/op | total µs/op | server cores | client cores | evicted/op |
 |---|---|---|---|---|---|---|---|
-| seedstone | 4 629 630 | 1.170 | 0.290 | 1.450 | 6.71 | 1.01 | 0.000 |
-| seedstone-always | 4 629 630 | 1.230 | 0.250 | 1.490 | 6.90 | 1.01 | 0.000 |
+| seedstone | 4 698 033 | 1.225 | 0.261 | 1.485 | 6.98 | 1.00 | 0.000 |
+| seedstone-always | 4 581 980 | 1.278 | 0.256 | 1.531 | 7.03 | 1.00 | 0.000 |
 
-- seedstone-always vs seedstone: indistinguishable on throughput; more expensive per operation 1.03x (spreads 0.46 % / 2.01 %)
+- seedstone-always vs seedstone: indistinguishable on throughput; more expensive per operation 1.03x (spreads 3.63 % / 1.18 %)
 
 #### SET at depth 1
 
 | arm | ops/s | user µs/op | sys µs/op | total µs/op | server cores | client cores | evicted/op |
 |---|---|---|---|---|---|---|---|
-| seedstone | 142 592 | 5.270 | 5.870 | 11.130 | 1.59 | 1.00 | 0.000 |
-| redis-iot1 | 138 198 | 1.620 | 4.650 | 6.270 | 0.87 | 1.00 | 0.000 |
-| seedstone-never | 141 323 | 8.560 | 10.130 | 18.550 | 2.62 | 0.99 | 0.000 |
-| redis-aof-no | 146 284 | 1.920 | 4.670 | 6.590 | 0.96 | 0.99 | 0.000 |
-| seedstone-interval | 142 755 | 8.770 | 10.490 | 19.280 | 2.74 | 0.99 | 0.000 |
-| redis-aof-everysec | 146 477 | 1.910 | 4.710 | 6.630 | 0.97 | 1.00 | 0.000 |
-| seedstone-always | 14 004 | 10.390 | 11.210 | 21.600 | 0.30 | 0.10 | 0.000 |
-| redis-aof-always | 13 847 | 1.680 | 5.070 | 6.700 | 0.09 | 0.10 | 0.000 |
+| seedstone | 141 387 | 5.376 | 5.984 | 11.381 | 1.61 | 1.00 | 0.000 |
+| redis-iot1 | 137 364 | 1.694 | 4.751 | 6.320 | 0.87 | 1.00 | 0.000 |
+| seedstone-never | 143 471 | 8.679 | 10.010 | 18.558 | 2.66 | 1.00 | 0.000 |
+| redis-aof-no | 140 718 | 1.970 | 4.752 | 6.827 | 0.96 | 0.99 | 0.000 |
+| seedstone-interval | 144 603 | 8.788 | 10.100 | 18.980 | 2.74 | 1.00 | 0.000 |
+| redis-aof-everysec | 144 918 | 1.980 | 4.682 | 6.690 | 0.97 | 0.99 | 0.000 |
+| seedstone-always | 13 127 | 10.820 | 11.550 | 22.350 | 0.29 | 0.09 | 0.000 |
+| redis-aof-always | 16 653 | 1.720 | 5.210 | 6.900 | 0.11 | 0.12 | 0.000 |
 
-- seedstone vs redis-iot1: ahead 1.03x on throughput; more expensive per operation 1.78x (spreads 0.99 % / 1.44 %)
-- seedstone-never vs redis-aof-no: behind 0.97x on throughput; more expensive per operation 2.81x (spreads 1.15 % / 1.67 %)
-- seedstone-interval vs redis-aof-everysec: behind 0.97x on throughput; more expensive per operation 2.91x (spreads 2.05 % / 1.92 %)
-- seedstone-always vs redis-aof-always: indistinguishable on throughput; more expensive per operation 3.22x (spreads 22.16 % / 1.44 %)
+- seedstone vs redis-iot1: indistinguishable on throughput; more expensive per operation 1.80x (spreads 3.59 % / 3.37 %)
+- seedstone-never vs redis-aof-no: indistinguishable on throughput; more expensive per operation 2.72x (spreads 7.80 % / 2.36 %)
+- seedstone-interval vs redis-aof-everysec: indistinguishable on throughput; more expensive per operation 2.84x (spreads 2.42 % / 2.17 %)
+- seedstone-always vs redis-aof-always: behind 0.79x on throughput; more expensive per operation 3.24x (spreads 13.40 % / 2.28 %)
 
 #### SET at depth 64
 
 | arm | ops/s | user µs/op | sys µs/op | total µs/op | server cores | client cores | evicted/op |
 |---|---|---|---|---|---|---|---|
-| seedstone | 4 608 295 | 1.350 | 0.260 | 1.610 | 7.42 | 1.01 | 0.000 |
-| redis-iot1 | 2 087 683 | 0.410 | 0.070 | 0.480 | 1.00 | 0.43 | 0.000 |
-| seedstone-never | 2 192 982 | 1.830 | 0.230 | 2.060 | 4.56 | 0.47 | 0.000 |
-| redis-aof-no | 1 200 480 | 0.690 | 0.130 | 0.820 | 0.98 | 0.25 | 0.000 |
-| seedstone-interval | 2 132 196 | 1.850 | 0.220 | 2.080 | 4.48 | 0.45 | 0.000 |
-| redis-aof-everysec | 1 199 041 | 0.680 | 0.130 | 0.820 | 0.98 | 0.25 | 0.000 |
-| seedstone-always | 597 015 | 2.010 | 0.340 | 2.350 | 1.39 | 0.13 | 0.000 |
-| redis-aof-always | 516 529 | 0.710 | 0.160 | 0.870 | 0.45 | 0.11 | 0.000 |
+| seedstone | 4 611 406 | 1.397 | 0.248 | 1.644 | 7.57 | 1.00 | 0.000 |
+| redis-iot1 | 2 039 317 | 0.411 | 0.080 | 0.491 | 1.00 | 0.42 | 0.000 |
+| seedstone-never | 1 821 286 | 1.815 | 0.206 | 2.021 | 3.67 | 0.37 | 0.000 |
+| redis-aof-no | 1 074 940 | 0.694 | 0.133 | 0.827 | 0.89 | 0.22 | 0.000 |
+| seedstone-interval | 1 875 218 | 1.844 | 0.209 | 2.057 | 3.86 | 0.39 | 0.000 |
+| redis-aof-everysec | 1 118 971 | 0.696 | 0.152 | 0.850 | 0.95 | 0.23 | 0.000 |
+| seedstone-always | 621 533 | 2.070 | 0.366 | 2.435 | 1.51 | 0.13 | 0.000 |
+| redis-aof-always | 438 486 | 0.720 | 0.166 | 0.883 | 0.39 | 0.09 | 0.000 |
 
-- seedstone vs redis-iot1: ahead 2.21x on throughput; more expensive per operation 3.35x (spreads 0.93 % / 0.62 %)
-- seedstone-never vs redis-aof-no: ahead 1.83x on throughput; more expensive per operation 2.51x (spreads 24.14 % / 2.43 %)
-- seedstone-interval vs redis-aof-everysec: ahead 1.78x on throughput; more expensive per operation 2.54x (spreads 30.49 % / 2.44 %)
-- seedstone-always vs redis-aof-always: indistinguishable on throughput; more expensive per operation 2.70x (spreads 23.07 % / 2.30 %)
+- seedstone vs redis-iot1: ahead 2.26x on throughput; more expensive per operation 3.35x (spreads 4.39 % / 0.61 %)
+- seedstone-never vs redis-aof-no: ahead 1.69x on throughput; more expensive per operation 2.44x (spreads 5.20 % / 2.92 %)
+- seedstone-interval vs redis-aof-everysec: ahead 1.68x on throughput; more expensive per operation 2.42x (spreads 2.50 % / 0.78 %)
+- seedstone-always vs redis-aof-always: ahead 1.42x on throughput; more expensive per operation 2.76x (spreads 15.68 % / 1.36 %)
 
 The `GET` row is the read path with the log synced on every write: against no
 log it is indistinguishable on throughput and 1.03× the CPU per operation.
 
-At depth 1 the two quantities point opposite ways only on the line with no
-log, where this server is ahead on throughput and more expensive per
-operation. With a log, no pair is a trade: `--fsync never` and `interval` are
-*behind* 0.97× their Redis settings and `always` is *indistinguishable*, and
-this server is more expensive per operation on every line, by 1.78× to 3.22×.
-Under `always` both engines answer about a tenth of the writes per second they
-answer with no log: 14 004 and 13 847, against 142 592 and 138 198.
+At depth 64 the two quantities point opposite ways on every line: this server
+is ahead on throughput — 2.26× with no log, 1.69× and 1.68× under `never` and
+`interval`, 1.42× under `always` — and more expensive per operation, by 2.42×
+to 3.35×, and both readings are of the same runs. Under `always`, the same
+promise on both sides, it answers 621 533 writes per second against 438 486.
 
-At depth 64 the two quantities point opposite ways on three lines — no log,
-`never` and `interval`: this server is ahead on throughput and more expensive
-per operation against each of those Redis arms, and both readings are of the
-same runs. Under `always` it is *indistinguishable* on throughput and 2.70×
-the CPU per operation.
+At depth 1 no line is a trade. With no log and under `never` and `interval`
+the two engines are *indistinguishable* on throughput; under `always` this
+server is *behind* 0.79×, 13 127 writes per second against 16 653. It is more
+expensive per operation on every line, by 1.80× to 3.24×. Under `always` both
+engines answer about a tenth of the writes per second they answer with no
+log.
 
-**The spreads on the logged arms are wide, and on the depth-64 row they decide
-a word.** This server's `never`, `interval` and `always` arms spread 24.14 %,
-30.49 % and 23.07 % over their three kept runs at depth 64, and Redis's `no`
-arm 19.03 %, against 0.96 % and 5.98 % for Redis's `everysec` and `always` and
-under 1 % for the two engines with no log. The `never` and `interval` ratios
-clear the spread their lines print. The `always` pair does not: its medians,
-597 015 against 516 529 writes per second, are 1.16× apart, inside this
-server's own 23.07 %, so the pair reads *indistinguishable*, and three kept
-runs do not resolve it. At depth 1 both engines' `always` arms are wide too,
-18.17 % and 22.16 %. Each arm's three kept runs are in the log.
+**The first run read the same word where it matters.** The `always` pair at
+depth 64 read *ahead* in both runs — 1.45× in the first (672 626 against
+465 484, spreads 3.26 % and 8.65 %) and 1.42× in the second — and so did
+every other depth-64 pair: 2.25×, 1.64× and 1.66× in the first. At depth 1 it
+did not: the first run read the `always` pair *indistinguishable* (15 556
+against 14 491, 1.07×), the second *behind* 0.79×, with Redis's `always` arm
+spread 12.62 % and 13.40 % and this server's 4.81 % and 8.41 %. Read the
+depth-1 `always` line as unsettled: two runs of the same build on the same
+instance put it on either side of a tie. A depth-1 `always` run is a million
+writes at about 15 000 a second, a minute or more, so its spread is not a
+matter of run length. Both engines' `always` arms drift by several percent
+over tens of seconds, with nothing in either engine's log lining up with it;
+the disk each sync waits on is the likelier source.
+
+**Spreads over 5 %, named.** On the depth-64 row: this server's `never` at
+5.20 % and `always` at 15.68 %, and Redis's `always` at 6.43 %; the others are
+under 5 %. On the depth-1 row: this server's `never` at 7.80 % and `always` at
+8.41 %, and Redis's `always` at 13.40 %. Each arm's three kept runs are in the
+log. The `always` pair at depth 64 clears its spread: 1.42× apart against a
+spread of 15.68 %.
 
 **What this cell does not say.** One disk class and one provisioning: a cloud
 block device at 3 240 IOPS, not a local NVMe drive, and a different disk is a
 different table. Redis rewrote its log in the background during each of its
-logged arms — 12, 12 and 13 times under `no`, `everysec` and `always`, counted
+logged arms — 36, 45 and 27 times under `no`, `everysec` and `always`, counted
 from Redis's own log and printed per arm in `08-durability.log` with the
 rewrite thresholds it ran at, Redis 8.10.0's defaults; the cell carries those
 rewrites and does not separate them out. No latency percentiles, so nothing
@@ -835,8 +865,13 @@ python3 bench/report.py 0[3-8]-*.log
 ```
 
 `DATA_ROOT` is the directory the durability cell's arms write into, one
-directory each; put it on the disk that is meant to be measured, not on a
-`tmpfs`.
+directory each; put it on the disk that is meant to be measured. The stage
+prints its filesystem at its head and refuses a `tmpfs`, which syncs nothing,
+before any arm starts. Each durability run lasts at least 10 seconds, sized
+from the discarded run before it, so the stage needs `W` of at least 1 and
+takes about 20 minutes on the machine above; `DURABILITY_SECONDS=<s>` sets
+another length, and `DURABILITY_SECONDS=` (empty) runs a million operations
+per run, as the run of 2026-10-11 did.
 
 `W` was 1 for this run, and the calibration derives it again rather than
 assuming it. A calibration in which an arm never settles gives no `W`, and is
