@@ -4,6 +4,7 @@
 use crate::config::SimConfig;
 use crate::disk::SimDisk;
 use crate::durability::{CrashRecord, DurablePoint};
+use crate::lineage::Lineage;
 use crate::trace::GOLDEN;
 use rand::SeedableRng;
 use rand::rngs::ChaCha8Rng;
@@ -141,6 +142,15 @@ pub struct SimOutcome {
     /// Reads of a value a crash left known to be durable that disagreed, on
     /// a shard the recovery did not report.
     pub lost_durable_writes: u64,
+    /// Shards a start recovered into a state no process of the node held:
+    /// records an earlier start discarded, brought back over later ones.
+    pub unheld_states: u64,
+    /// Of those, the ones the start did not report as lossy, and no start
+    /// since the same crash had.
+    pub unreported_unheld: u64,
+    /// Shards a start that served was judged on against what the node
+    /// held — the denominator of the two above.
+    pub held_checks: u64,
     /// The same disagreements on a shard the recovery did report, and the
     /// volatile keys written before a crash that read dead inside their
     /// live band on such a shard.
@@ -276,10 +286,16 @@ impl SimOutcome {
         // numbers and by what its clients read back: a recovery that resumes
         // at the right position with the wrong records under it is a loss
         // the server's numbers cannot see.
+        // And on either, a start serves a state the node held: a prefix
+        // of what its processes appended, as the starts before it left them.
         let durability = if self.hostile {
-            self.unreported_losses == 0 && self.lost_durable_writes == 0
+            self.unreported_losses == 0
+                && self.lost_durable_writes == 0
+                && self.unreported_unheld == 0
         } else {
-            self.lost_durable_prefixes == 0 && self.lost_durable_writes == 0
+            self.lost_durable_prefixes == 0
+                && self.lost_durable_writes == 0
+                && self.unheld_states == 0
         };
         counters
             && durability
@@ -427,6 +443,9 @@ pub const fn nothing_observed() -> SimOutcome {
         lost_durable_prefixes: 0,
         unreported_losses: 0,
         lost_durable_writes: 0,
+        unheld_states: 0,
+        unreported_unheld: 0,
+        held_checks: 0,
         excused_losses: 0,
         durable_checks: 0,
         phantom_writes: 0,
@@ -545,6 +564,9 @@ pub struct Shared {
     /// number, and the world instant it was issued — what a durable point
     /// is dated by. The last few only: a `Durable` names a recent round.
     pub rounds: Arc<Mutex<BTreeMap<u64, Duration>>>,
+    /// Per shard, every state it has held: what a recovered shard is
+    /// judged against.
+    pub lineage: Arc<Mutex<Vec<Lineage>>>,
 }
 
 /// How many of the writer's latest rounds [`Shared::rounds`] keeps: one in
@@ -600,6 +622,18 @@ impl Shared {
             .unwrap_or_else(|| panic!("round {round} was reported durable and never issued"))
     }
 
+    /// Whether a start since the node's last crash reported `shard` lossy
+    /// and resumed it at or below `resumed`: what that start lost down to
+    /// there was reported then.
+    #[must_use]
+    pub fn reported_lossy_since(&self, shard: u16, resumed: u64) -> bool {
+        let Some(crash) = lock(&self.crashes).len().checked_sub(1) else {
+            return false;
+        };
+        lock(&self.reported_lossy)[usize::from(shard)]
+            .is_some_and(|(at, from)| at == crash && resumed >= from)
+    }
+
     /// Whether the executor that owns `shard` is refusing.
     #[must_use]
     pub fn is_refusing(&self, shard: u16) -> bool {
@@ -635,6 +669,9 @@ impl Shared {
             refusing: Arc::new(Mutex::new(vec![false; usize::from(cfg.executors)])),
             syncs: Arc::default(),
             rounds: Arc::default(),
+            lineage: Arc::new(Mutex::new(
+                (0..shards).map(|_| Lineage::default()).collect(),
+            )),
         }
     }
 }
@@ -710,6 +747,10 @@ pub struct Tally {
     /// Reads of a plain key a crash left exactly known, as durable, that
     /// disagreed — on a shard the recovery did not report as truncated.
     pub lost_durable_writes: u64,
+    /// See [`SimOutcome`], whose fields these become.
+    pub unheld_states: u64,
+    pub unreported_unheld: u64,
+    pub held_checks: u64,
     /// Those same disagreements on a shard the recovery *did* report: a
     /// loss the node owned up to. Also counts a volatile key written before
     /// a crash that read dead inside its live band on such a shard.

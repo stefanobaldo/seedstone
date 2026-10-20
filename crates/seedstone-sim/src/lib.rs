@@ -115,6 +115,8 @@
 //! - `outcome` — what a run reports, and the tallies the hosts write into
 //!   while it runs.
 //! - `trace` — the fold that turns every command and reply into one `u64`.
+//! - `durability`, `lineage` — what a crash leaves the harness knowing:
+//!   what each shard owed its next start, and every state it held.
 //! - `contract`, `sweep` — starting runs rather than living inside one.
 
 use rand::rngs::ChaCha8Rng;
@@ -154,6 +156,7 @@ pub mod contract;
 mod config;
 mod disk;
 mod durability;
+mod lineage;
 mod model;
 mod outcome;
 mod plant;
@@ -173,6 +176,7 @@ pub use sweep::{SweepReport, sweep};
 pub use trace::mix;
 
 use durability::{CrashRecord, Observed, increment_is_durable, rest_settle};
+use lineage::Held;
 use model::Model;
 use outcome::{Shared, lock};
 use plant::{EvictsBelowCeiling, IgnoresCeiling, ScanMissesRehash, ServeExpired, SweepEatsAll};
@@ -436,6 +440,9 @@ fn outcome(cfg: &SimConfig, shared: &Shared, trace_hash: u64) -> SimOutcome {
         lost_durable_prefixes: tally.lost_durable_prefixes,
         unreported_losses: tally.unreported_losses,
         lost_durable_writes: tally.lost_durable_writes,
+        unheld_states: tally.unheld_states,
+        unreported_unheld: tally.unreported_unheld,
+        held_checks: tally.held_checks,
         excused_losses: tally.excused_losses,
         durable_checks: tally.durable_checks,
         phantom_writes: tally.phantom_writes,
@@ -787,6 +794,12 @@ fn start_log(
     } else {
         ReaderMode::Resynchronising
     };
+    // Inside the host, the simulated clock — the same reading the pool
+    // took when it replayed the log itself.
+    let now = Now {
+        instant: tokio::time::Instant::now(),
+        unix_millis: sim_wall_clock(),
+    };
     let mut recovery = recover(RecoverSpec {
         disk: &disk,
         wal: &wal,
@@ -794,13 +807,9 @@ fn start_log(
         reader: mode,
         trust_unfinished: planted == Some(Plant::TrustsUnfinishedSnapshot),
         seed,
-        // Inside the host, the simulated clock — the same reading the pool
-        // took when it replayed the log itself.
-        now: Now {
-            instant: tokio::time::Instant::now(),
-            unix_millis: sim_wall_clock(),
-        },
+        now,
     })?;
+    let held = judge_held(shared, &recovery.shards, now);
     {
         let mut tally = lock(&shared.tally);
         tally.snapshots_refused_at_start += recovery.report.snapshots_refused;
@@ -843,7 +852,44 @@ fn start_log(
         // Some of its rebases may be on disk, readable by the next start.
         return Err(failed(error, Reached::Rebasing));
     }
+    // What it serves is what it was judged to be, from past its rebases.
+    count_held(shared, &read, &held);
+    for ((lineage, state), held) in lock(&shared.lineage)
+        .iter_mut()
+        .zip(&recovery.shards)
+        .zip(held)
+    {
+        lineage.served(&state.dict, state.seq, held);
+    }
     Ok((recovery, generation, opened))
+}
+
+/// Judges every shard a start recovered against what the node held.
+fn judge_held(shared: &Shared, shards: &[RecoveredShard], now: Now) -> Vec<Held> {
+    lock(&shared.lineage)
+        .iter()
+        .zip(shards)
+        .map(|(lineage, state)| lineage.judge(&state.dict, now))
+        .collect()
+}
+
+/// Counts what a start that serves was judged to be. Only one that serves:
+/// a start that failed served nothing, and its retry is judged again over
+/// the same lineage.
+///
+/// On the disk that fails and lies a state nobody held is what damage can
+/// leave — a `Rebase` the disk took, and the records it killed back — and
+/// what the server owes there is to say so; on the disk that only tears,
+/// nothing excuses one.
+fn count_held(shared: &Shared, read: &[(u64, bool)], held: &[Held]) {
+    for (shard, ((resumed, lossy), held)) in (0u16..).zip(read.iter().zip(held)) {
+        let unheld = *held == Held::Never;
+        let unreported = unheld && !lossy && !shared.reported_lossy_since(shard, *resumed);
+        let mut tally = lock(&shared.tally);
+        tally.held_checks += 1;
+        tally.unheld_states += u64::from(unheld);
+        tally.unreported_unheld += u64::from(unreported);
+    }
 }
 
 /// What every arm of the plant match spawns from: the spec minus its policy.
