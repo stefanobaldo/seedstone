@@ -59,7 +59,11 @@ fn tick(b: &mut Bench, bytes: u64, batch: Option<u64>) -> Option<Completed> {
             &mut b.states,
             now(),
             &NoTrace,
-            LogPosition { bytes, batch },
+            LogPosition {
+                bytes,
+                batch,
+                durable: batch,
+            },
         )
         .completed
 }
@@ -69,6 +73,7 @@ const fn at(bytes: u64) -> LogPosition {
     LogPosition {
         bytes,
         batch: Some(0),
+        durable: Some(0),
     }
 }
 
@@ -240,6 +245,7 @@ fn the_image_is_complete_after_enough_ticks_and_the_footer_counts_it() {
                 LogPosition {
                     bytes,
                     batch: Some(7),
+                    durable: Some(7),
                 },
             )
             .completed;
@@ -408,6 +414,7 @@ fn a_deadline_goes_out_as_unix_milliseconds() {
             LogPosition {
                 bytes,
                 batch: Some(0),
+                durable: Some(0),
             },
         );
     }
@@ -662,6 +669,7 @@ fn bytes_written_counts_what_the_executor_sent_from_the_crossing_to_the_footer()
         LogPosition {
             bytes: at_open,
             batch: Some(0),
+            durable: Some(0),
         },
     );
     let mut sent = at_open;
@@ -676,6 +684,7 @@ fn bytes_written_counts_what_the_executor_sent_from_the_crossing_to_the_footer()
             LogPosition {
                 bytes: sent,
                 batch: Some(1),
+                durable: Some(1),
             },
         );
     }
@@ -840,4 +849,79 @@ fn force_while_open_abandons_the_cycle_and_takes_fresh_bases() {
         vec![b.states[0].seq, b.states[1].seq],
         "the bases of now"
     );
+}
+
+/// One tick at `position`, whole.
+fn tick_at(b: &mut Bench, position: LogPosition) -> Tick {
+    b.checkpoint
+        .tick(0, &mut b.states, now(), &NoTrace, position)
+}
+
+/// A write during the cycle may be in the image: the footer waits until a
+/// sync made its batch durable, asks for that sync once, and is written on
+/// the first tick that finds it.
+#[test]
+fn the_footer_waits_for_the_log_through_what_the_image_may_hold() {
+    let mut b = bench(1, STEPWISE);
+    pad(&mut b.states[0], 8);
+    b.checkpoint.nudge();
+    let opened = tick_at(
+        &mut b,
+        LogPosition {
+            bytes: 0,
+            batch: Some(0),
+            durable: Some(0),
+        },
+    );
+    assert!(opened.completed.is_none() && !opened.wants_sync);
+    // A write above the bases, in batch 1, which no sync has covered.
+    put(&mut b.states[0], b"late", b"1");
+    let bytes = flush(&mut b.states);
+    let sent = LogPosition {
+        bytes,
+        batch: Some(1),
+        durable: Some(0),
+    };
+    let mut asked = 0;
+    for _ in 0..64 {
+        let tick = tick_at(&mut b, sent);
+        assert!(tick.completed.is_none(), "the log does not reach the image");
+        asked += u32::from(tick.wants_sync);
+    }
+    assert_eq!(asked, 1, "the sync is asked for once");
+    let done = tick_at(
+        &mut b,
+        LogPosition {
+            durable: Some(1),
+            ..sent
+        },
+    );
+    assert!(
+        done.completed.is_some(),
+        "durable through batch 1: finished"
+    );
+}
+
+/// An executor that sent nothing since the open — a refusing one, whose
+/// log will not sync again — has nothing above its bases to wait for.
+#[test]
+fn a_cycle_with_nothing_sent_since_its_open_waits_for_no_sync() {
+    let mut b = bench(1, STEPWISE);
+    pad(&mut b.states[0], 8);
+    b.checkpoint.nudge();
+    let quiet = LogPosition {
+        bytes: 0,
+        batch: Some(4),
+        durable: None,
+    };
+    let mut ticks = 0;
+    loop {
+        let tick = tick_at(&mut b, quiet);
+        assert!(!tick.wants_sync);
+        if tick.completed.is_some() {
+            break;
+        }
+        ticks += 1;
+        assert!(ticks < 64, "an eight-key image finishes");
+    }
 }

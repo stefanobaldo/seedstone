@@ -685,6 +685,7 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
                 round,
             } => {
                 self.sync.acked_bytes = self.sync.acked_bytes.max(bytes);
+                self.sync.durable_batch = self.sync.durable_batch.max(through_batch);
                 let Some(through_batch) = through_batch else {
                     return;
                 };
@@ -1032,9 +1033,17 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
         // The checkpoint, last: its bases are read at a point where every
         // shard's buffer has been handed to the writer, and its budget is
         // the last thing the tick spends.
+        let batch = self.sync.batch.checked_sub(1);
         let position = LogPosition {
             bytes: self.sync.sent_bytes,
-            batch: self.sync.batch.checked_sub(1),
+            batch,
+            // No writer: the bytes went nowhere, and no sync will ever
+            // say more than this, so the footer waits for none.
+            durable: if self.sync.link.is_some() {
+                self.sync.durable_batch
+            } else {
+                batch
+            },
         };
         // A cycle forced away since the last tick took its count with it.
         if !self.checkpoint.is_open() {
@@ -1057,6 +1066,11 @@ impl<T: TraceSink, L: ReplicationLog, P: ShardPolicy, C: Checkpoint> Executor<T,
             .store(u64::from(self.checkpoint.is_open()), Ordering::Relaxed);
         if tick.faulted {
             cell.last_save_failed.store(1, Ordering::Relaxed);
+        }
+        if tick.wants_sync
+            && let Some(link) = &self.sync.link
+        {
+            let _ = link.to_writer.send(ToWriter::SyncNow);
         }
         if let Some(done) = tick.completed {
             self.stats

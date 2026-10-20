@@ -285,6 +285,39 @@ async fn under_interval_a_round_is_issued_once_per_interval_and_never_under_neve
     );
 }
 
+/// A snapshot's footer waits for its executor's batches to be durable:
+/// asked, the writer issues a round under any policy — `never`'s too — and
+/// says `Durable` through what it had written.
+#[tokio::test(start_paused = true)]
+async fn a_sync_asked_for_is_issued_at_once_under_never() {
+    let disk = MemDisk::default();
+    let mut rig = open(
+        &disk,
+        1,
+        SyncPolicy::NEVER,
+        1 << 20,
+        WriterPlants::default(),
+    );
+    rig.submit(0, 0, record(0, 0, b"a"));
+    rig.links[0].to_writer.send(ToWriter::SyncNow).unwrap();
+    let (through, _, round) = rig.durable(0).await;
+    assert_eq!((through, round), (Some(0), 1));
+    assert_eq!(
+        disk.sync_count(&Path::new(WAL).join(segment_name(1, 0))),
+        2,
+        "the header's sync and the one asked for"
+    );
+    // And only that one: the policy's own cadence is still none.
+    rig.submit(0, 1, record(0, 1, b"b"));
+    tokio::time::advance(crate::shard::HOUSEKEEPING_TICK * 10).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), rig.links[0].progress.recv())
+            .await
+            .is_err(),
+        "never issues no sync of its own"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn written_is_reported_once_a_grain_of_an_executors_bytes_is_in_the_file() {
     let disk = MemDisk::default();

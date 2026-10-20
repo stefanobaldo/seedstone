@@ -223,7 +223,12 @@ fn the_trace_hash_is_pinned_across_processes_and_builds() {
     // where it did behind the inbox, and the hash is the one from before
     // the tick outranked it. The real-time guarantee the re-ordering bought
     // (#79) is held by the inline check and by its own test.
-    const MINI_1_42: u64 = 0xf6e7_c967_9f41_f5f2;
+    //
+    // Re-pinned: a snapshot's footer now waits until the log is synced
+    // through what its image may hold, so a cycle can complete a tick or
+    // more later than it did. `expected_sum` and the four counts held
+    // still.
+    const MINI_1_42: u64 = 0x630f_4d85_774f_3bc0;
 
     let outcome = run_sim(&SimConfig::mini(1, 42));
     assert_eq!(
@@ -960,9 +965,15 @@ fn one_seed_per_durability_policy_is_pinned() {
     // Re-pinned, all three, when recovery stopped charging a crash's torn
     // tail to every shard as lossy: the hash folds each recovered shard's
     // lossy flag, and fewer are set. `MINI_1_42` held still.
-    const HOSTILE_1_3_ALWAYS: u64 = 0xfa39_9f02_193f_7614;
+    //
+    // Re-pinned, `always` and `never`, when a snapshot's footer began to
+    // wait for the log to be synced through what its image may hold: a
+    // cycle completes later, and under `never` the writer issues the sync
+    // the footer asks for, a round the policy did not issue before.
+    // `interval` held still on this seed.
+    const HOSTILE_1_3_ALWAYS: u64 = 0x4239_76da_157a_de0b;
     const HOSTILE_1_3_INTERVAL: u64 = 0x46bc_739c_e8c0_e73a;
-    const HOSTILE_1_3_NEVER: u64 = 0x0f1b_6ebf_35a4_b805;
+    const HOSTILE_1_3_NEVER: u64 = 0x2de7_22e2_4d8c_3df1;
     for (policy, pinned) in [
         (SyncPolicy::ALWAYS, HOSTILE_1_3_ALWAYS),
         (SyncPolicy::INTERVAL, HOSTILE_1_3_INTERVAL),
@@ -1067,19 +1078,20 @@ fn the_honest_node_holds_on_the_hostile_seed_whose_start_could_not_sync_its_reba
 
 /// A hostile seed where a start cut, failed writing its rebases, and the
 /// node crashed before the retry, so the next start met whatever of those
-/// rebases the crash left (10215 at `interval`, found by a sweep of
-/// 1..=30 000 when a segment's header began to carry its cut points and
-/// moved the disk's draws off 17619). It either replays what the failed
-/// start cut or reports its own cut: no loss goes unreported. `always` had
-/// a seed too, 2023, until the writer began to mark the log before every
-/// sync: of 1..=30 000 at `always`, 1 546 seeds now fail a rebase, all
+/// rebases the crash left (4614 at `interval`, found by a search of
+/// hostile seeds on 2026-10-20 when a snapshot's footer began to wait for
+/// the log and moved the disk's draws off 10215, which a segment's header
+/// carrying its cut points had moved off 17619). It either replays what the
+/// failed start cut or reports its own cut: no loss goes unreported.
+/// `always` had a seed too, 2023, until the writer began to mark the log
+/// before every sync: of 1..=30 000 at `always`, 1 546 seeds now fail a rebase, all
 /// retried before a crash, none crashed first (read 2026-10-15). The
 /// reach: a rebase failed, and no start was a retry without a crash before
 /// it — every start after a crash is counted once, and a retry with none
 /// between would count one more.
 #[test]
 fn the_honest_node_holds_when_it_crashes_before_retrying_a_failed_rebase() {
-    let mut cfg = SimConfig::hostile(1, 10215);
+    let mut cfg = SimConfig::hostile(1, 4614);
     cfg.fsync = FsyncDraw::Fixed(SyncPolicy::INTERVAL);
     let outcome = run_sim(&cfg);
     assert!(outcome.invariant_holds(), "{outcome:?}");

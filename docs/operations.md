@@ -26,7 +26,7 @@ seedstone --version | --help
 | `--requirepass-file PATH` | none | The password file: one password per line, one or two lines. See *Password and rotation*. |
 | `--no-auth` | off | Run with no password, on purpose. See *Running without a password*. |
 | `--data-dir PATH` | none | Where the node keeps its log. With it, every write is recorded and replayed on the next start; without it a restart is an empty keyspace. Snapshots keep it bounded; see *What `--data-dir` promises*. |
-| `--fsync always\|interval\|never` | `interval` | When the log is synced: `always` before a write is acknowledged, `interval` once 100 ms have passed since the last sync, while there is anything to sync, `never` only when the log rotates to its next file and at a clean stop. Only with `--data-dir`. |
+| `--fsync always\|interval\|never` | `interval` | When the log is synced: `always` before a write is acknowledged, `interval` once 100 ms have passed since the last sync, while there is anything to sync, `never` only when the log rotates to its next file, before a snapshot is finished, and at a clean stop. Only with `--data-dir`. |
 
 `--version` and `--help` answer on stdout and exit 0, in first position only.
 `SEEDSTONE_REQUIREPASS` in the environment is the other way to give a
@@ -202,10 +202,11 @@ when the log is synced, and so what a crash can cost.
   killed, as opposed to a machine that loses power, can also cost what an
   executor had handed to the writer in the last microseconds and the writer
   had not yet written.
-- **`never`**: the node issues no sync of its own. The kernel writes the log
-  when it will; the writer syncs a file when it rotates to the next one. A
-  crash keeps the last durable snapshot, plus whatever of the log the kernel
-  had written. A process that is killed, as opposed to a machine that loses
+- **`never`**: the node issues no sync of its own but one before each
+  snapshot is finished, so the snapshot never holds a write the log could
+  lose. The kernel writes the log when it will; the writer syncs a file
+  when it rotates to the next one. A crash keeps the last durable snapshot,
+  plus whatever of the log the kernel had written. A process that is killed, as opposed to a machine that loses
   power, can also cost what an executor had handed to the writer in the last
   microseconds and the writer had not yet written.
 
