@@ -101,7 +101,9 @@ impl Observed {
 impl ReplicationLog for Observed {
     fn append(&mut self, rec: Record<'_>) -> std::io::Result<()> {
         self.appended.push_back((rec.seq, world_now()));
-        self.inner.append(rec)
+        self.inner.append(rec)?;
+        lock(&self.run.lineage)[usize::from(self.shard)].appended(rec.seq, rec.payload);
+        Ok(())
     }
 
     fn flush_into(&mut self, out: &mut Vec<u8>) {

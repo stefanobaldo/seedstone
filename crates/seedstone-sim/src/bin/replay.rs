@@ -56,7 +56,7 @@ fn main() -> ExitCode {
     println!(
         "trace_hash=0x{:016x} expected={} actual={} stale={}/{} spurious={}/{} plain={}/{} \
          walk={}/{} invariant={} crashes={} recoveries={} durable={}/{} phantom={}/{} \
-         prefix_lost={} unreported={} faults={}/{} cycles={} compactions={} disk={}/{} refused={} fsync={} \
+         prefix_lost={} unreported={} unheld={}/{}/{} faults={}/{} cycles={} compactions={} disk={}/{} refused={} fsync={} \
          start_failures={} rebase_failures_at_start={}",
         outcome.trace_hash,
         outcome.expected_sum,
@@ -78,6 +78,9 @@ fn main() -> ExitCode {
         outcome.either_checks,
         outcome.lost_durable_prefixes,
         outcome.unreported_losses,
+        outcome.unheld_states,
+        outcome.unreported_unheld,
+        outcome.held_checks,
         outcome.write_faults,
         outcome.sync_faults,
         outcome.snapshot_cycles,
