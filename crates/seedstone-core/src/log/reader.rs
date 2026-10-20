@@ -384,7 +384,7 @@ fn checksummed_len(window: &[u8]) -> Option<u64> {
 
 /// A buffer length as a byte count. Never lossy on a supported target; the
 /// saturation is there so untrusted input can never reach a panic.
-fn widen(n: usize) -> u64 {
+pub(crate) fn widen(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 

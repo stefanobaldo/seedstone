@@ -127,7 +127,7 @@ use crate::log::file::{
     HeaderError, SYNC_MARK_SHARD, SYNC_MARK_VERSION, parse_name, parse_segment_name,
     read_generation, read_segment_header,
 };
-use crate::log::reader::{Item, Reader};
+use crate::log::reader::{Item, Reader, widen};
 use crate::log::snapshot::{FOOTER_SHARD, Footer, SnapshotHeader, parse_snapshot_name};
 use crate::shard::{Now, Replayed, replay_into};
 
@@ -606,7 +606,7 @@ impl Scan {
         }
         self.version = header.version;
         self.last_mark_end = 0;
-        let body_len = len.saturating_sub(header.len as u64);
+        let body_len = len.saturating_sub(widen(header.len));
         let mut reader = Reader::new(src, body_len, mode);
         let mut holes = 0;
         // The damage met, as `(position, start, bytes)`: classified once the
@@ -899,7 +899,7 @@ fn read_image<D: Disk>(
     if read_fully(&mut src, &mut skip) != header_len {
         return Verdict::Damaged;
     }
-    let mut reader = Reader::new(src, len.saturating_sub(header_len as u64), spec.reader);
+    let mut reader = Reader::new(src, len.saturating_sub(widen(header_len)), spec.reader);
     let mut counts: Vec<(u16, u64)> = header.bases.iter().map(|(shard, _)| (*shard, 0)).collect();
     let mut footer: Option<Footer> = None;
     let mut clean = true;
@@ -1015,7 +1015,7 @@ fn replay_tails<D: Disk>(
         let index = usize::from(shard);
         let base = chosen.images[index].unwrap_or(0);
         let (records, discarded) = prefix(bucket, &rebases[index], base, &mut kept);
-        let applied = records.len() as u64;
+        let applied = widen(records.len());
         report.applied += applied;
         report.discarded += discarded;
         let gap = discarded > 0;
