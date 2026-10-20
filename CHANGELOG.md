@@ -7,128 +7,67 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ## [Unreleased]
 
-### Added
-
-- **A one-line install for macOS and Linux.**
-  `curl -fsSL https://seedstone.io/install.sh | sh` finds the latest
-  release, downloads the archive built for the machine, verifies its
-  SHA-256 and copies the binary into `/usr/local/bin` (or
-  `SEEDSTONE_INSTALL_DIR`). It starts no server and writes nothing else; it
-  refuses, saying what to use instead, a machine no archive is built for, a
-  musl system and a glibc older than 2.34. `SEEDSTONE_VERSION` pins a
-  release. [docs/install.md](docs/install.md#one-line) has the whole of it.
-
-- **[seedstone.io](https://seedstone.io).** One page: how to install it,
-  on every channel; a seed reproducing a bug, run after run; the
-  benchmark cells where it is ahead of every engine measured but those
-  level with it, each named with its figure, from the
-  [benchmark page](docs/benchmarks.md); what running it looks like; and
-  what it answers. Every section stands complete without a script.
-
-- **The `recovery` line says where a start's time went.** Under
-  `--data-dir`, it now carries `read_ms`, `images_ms` and `replay_ms`
-  beside `elapsed_ms`: the time spent reading the log directory, loading
-  the snapshots, and replaying the log over them. A slow start shows which
-  of the three to look at.
-
-- **A stop whose log could not be synced says so.** Under `--data-dir`, a
-  stop whose last sync of the log failed, or that came while writes were
-  still refused after an earlier failure, now writes `shutdown_unsynced`
-  after `stopping`. It used to end as if the log had been synced; what was
-  written since the last successful sync may not be on disk.
-
 ### Changed
 
-- **A start reads its data directory at the disk's bandwidth.** Under
-  `--data-dir`, a start now reads the log and the snapshots in 4 MiB reads
-  and checksums them through a table. On a network-attached volume with
-  milliseconds of latency per request, a start was bound by that latency
-  and is now bound by the volume's bandwidth. Measured with the build
-  before this change and the build after it, on a 912 MB directory, one
-  executor, an Intel i7-1165G7 core, on 2026-10-19, medians of three:
+- **The data directory's format moves to version 5, one way.** Under
+  `--data-dir`, this version reads a directory written by 0.3.x as it is,
+  and from its first write on a 0.3.x server refuses that directory. Going
+  back to 0.3.x means starting it on an empty directory, with a cold cache.
 
-  | | before | after |
-  |---|---|---|
-  | 10 ms of latency per read, injected under the filesystem, cold page cache | 28.8 s | 3.6 s |
-  | page cache warm | 1.6 s | 0.5 s |
+- **A start that cannot recover its data directory now stops.** Under
+  `--data-dir`, a start that cannot record where a damaged shard resumes
+  writes `recovery_failed` and exits 1; it used to write `log_fault` and
+  serve with writes refused. The `recovery` line now comes before anything
+  that can fail the start, and its `elapsed_ms` covers recovery alone, no
+  longer the opening of the log for writing.
 
-  The `recovery` line's `read_ms` and `images_ms` show the change on a
-  given deployment.
+- **A start reads its data directory at the disk's bandwidth.** It reads in
+  4 MiB requests, so on a network-attached volume a start is bound by the
+  volume's bandwidth rather than its latency per request. On a 912 MB
+  directory with 10 ms injected per read, a start went from 28.8 s to
+  3.6 s (one core of an Intel i7-1165G7, 2026-10-19, medians of three).
 
-- **The log's segment format moves to version 5.** Under `--data-dir`, each
-  segment's header now lists where its process's start cut damaged shards,
-  and the segment records where each sync was issued; snapshots carry the
-  version too. This version reads a data directory written by 0.3.x as it
-  is; a 0.3.x server refuses one this version has written to, so going back
-  means starting from an empty directory.
+### Added
+
+- **The `recovery` line says where a start's time went** — `read_ms`,
+  `images_ms` and `replay_ms` beside `elapsed_ms` — and `torn_bytes`
+  reports the torn tail of the log a crash left, which no shard is charged
+  for.
+
+- **A stop whose log could not be synced says so.** Under `--data-dir`, a
+  stop whose last sync failed, or that came while writes were refused after
+  an earlier failure, writes `shutdown_unsynced` after `stopping`: what was
+  written since the last successful sync may not be on disk.
+
+- **A one-line install for macOS and Linux:**
+  `curl -fsSL https://seedstone.io/install.sh | sh`. It verifies the
+  archive's SHA-256, copies the binary into `/usr/local/bin` (or
+  `SEEDSTONE_INSTALL_DIR`) and starts nothing; `SEEDSTONE_VERSION` pins a
+  release. [docs/install.md](docs/install.md#one-line) has the whole of it,
+  and [seedstone.io](https://seedstone.io) the project in one page.
 
 ### Fixed
 
-- **A crash no longer brings a shard back with a later write and without an
-  earlier one.** Under `--data-dir`, a snapshot could be finished while the
-  writes it had already taken in were not yet synced in the log. A crash
-  then could leave that snapshot beside a log torn below those writes, and
-  the start served the snapshot's later values with the log's earlier ones
-  missing — a state the node never held, against the promise that what
-  survives is a prefix of what was acknowledged. A snapshot is now finished
-  only once the log is synced through every write it may hold; under
-  `--fsync never` the snapshot asks for that one sync of the log.
+- **A crash no longer costs synced writes or brings back a state the node
+  never held.** Under `--data-dir`, four sequences could break the promise
+  that what survives is a prefix of what was acknowledged: a snapshot
+  finished before the log was synced through the writes it held; records
+  discarded at an earlier start replayed when damage hid where they were
+  discarded; the same after a crash part-way through compaction; and a
+  failed start leaving the next one without records that had been synced.
 
-- **After a crash under load, `lossy_shards` no longer reports every
-  shard.** Under `--data-dir`, a crash's torn tail of the log and damage to
-  records that had been synced looked the same to a start, so it charged
-  the tear to every shard. The log now records where
-  each sync was issued; a start charges only damage before the last such
-  point, and reports the tear as `torn_bytes` on the `recovery` line,
-  charged to no shard (#88).
-
-- **`CONFIG GET slowlog-max-len` answers.** It answered an empty array, so
-  a monitoring client that reads the slow log's capacity before it calls
-  `SLOWLOG GET` failed its run. It now answers `128`, Redis's default.
-
-- **Under `--fsync always`, a read whose key has expired is answered at
-  once.** Removing the key writes its deletion to the log, and that made
-  the read wait for the next sync, and answer with the write refusal if the
-  sync failed. Only writes wait for the sync now.
+- **After a crash under load, `lossy_shards` names only the shards that lost
+  synced writes.** A crash's torn tail used to be charged to every shard
+  (#88).
 
 - **A large damaged stretch of a log segment no longer costs the records
-  after it.** Under `--data-dir`, a start steps over damage in a segment
-  and checks what it finds there, up to a bounded amount of work per
-  damaged stretch. A record that began within that bound but ran past it
-  was given up untried, and with it the rest of the segment. Such a record
-  is now checked whole; only the next one past the bound gives up the
-  segment, as before.
+  after it.**
 
-- **A start no longer serves records discarded at an earlier start when
-  damage hides where they were discarded.** Under `--data-dir`, a start
-  that cuts a damaged shard writes a record marking the older records past
-  the cut as discarded. If a later start could not read that record — a
-  damaged stretch of the segment holding it, or a segment it could not read
-  beside a snapshot it could — it replayed the discarded records,
-  sometimes over that process's snapshot, into a state the node never
-  held, and in the first case without reporting the shard lossy. The
-  segment headers and snapshots now say where each start cut, and a start
-  reads them as it reads the record.
+- **Under `--fsync always`, a read whose key has expired answers at once**,
+  instead of waiting for the next sync of the log.
 
-- **A failed start no longer costs the next one its synced records.** Under
-  `--data-dir`, a start that failed after reading a damaged log segment
-  could leave the next start without records that had been synced, and
-  nothing reported it. A start now keeps every segment it may still need
-  and syncs the log it recovered from before it serves; one that cannot
-  record where a damaged shard resumes now fails with `recovery_failed` and
-  exits 1, instead of writing `log_fault` and serving with writes refused.
-  The `recovery` line now comes before anything that can fail the start,
-  and its `elapsed_ms` covers recovery alone, no longer the opening of the
-  log for writing.
-
-- **A crash during compaction no longer brings back discarded records.**
-  Under `--data-dir`, once every executor has a durable snapshot the node
-  removes the files of earlier processes. It removed them in whatever order
-  the directory listed them, so a crash part-way through could leave
-  records an earlier start had discarded at a gap in a damaged log, with
-  the record that marked them discarded already gone, and the next start
-  could replay them. The files now go oldest process first, and each
-  process's removals are made durable before the next one's begin.
+- **`CONFIG GET slowlog-max-len` answers `128`**, Redis's default, instead
+  of an empty array.
 
 ## [0.3.3] - 2026-10-12
 
