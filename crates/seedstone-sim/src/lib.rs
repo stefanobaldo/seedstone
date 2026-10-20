@@ -176,7 +176,7 @@ use durability::{CrashRecord, Observed, increment_is_durable, rest_settle};
 use model::Model;
 use outcome::{Shared, lock};
 use plant::{EvictsBelowCeiling, IgnoresCeiling, ScanMissesRehash, ServeExpired, SweepEatsAll};
-use trace::{GOLDEN, HashSink, TRACE_INIT};
+use trace::{GOLDEN, HashSink, Reached, TRACE_INIT};
 use verify::{
     agrees_but_for, check_ceiling, evicted_keys, executor_timing, listed_keys, parse_u64,
 };
@@ -813,16 +813,17 @@ fn start_log(
         .iter()
         .map(|state| (state.seq, state.lossy))
         .collect();
-    let failed = |error: std::io::Error, rebase_written: bool| {
+    let failed = |error: std::io::Error, reached: Reached| {
         for (shard, (seq, lossy)) in (0u16..).zip(&read) {
-            sink.failed_start(shard, *seq, *lossy, rebase_written);
+            sink.failed_start(shard, *seq, *lossy, reached);
         }
         error
     };
     // What this start read may not be durable — a rebase whose sync failed
     // in the start before it — and it serves on it from here.
-    sync_recovered(&disk, &wal).map_err(|error| failed(error, false))?;
-    let generation = next_generation(&disk, &wal).map_err(|error| failed(error, false))?;
+    sync_recovered(&disk, &wal).map_err(|error| failed(error, Reached::Read))?;
+    let generation =
+        next_generation(&disk, &wal).map_err(|error| failed(error, Reached::Synced))?;
     let mut opened = Writer::open(WriterSpec {
         disk,
         wal,
@@ -836,11 +837,11 @@ fn start_log(
         plants: writer_plants(planted),
         stats: stats.clone(),
     })
-    .map_err(|error| failed(error, false))?;
+    .map_err(|error| failed(error, Reached::Synced))?;
     if let Err(error) = write_rebases(&mut opened.writer, &mut recovery.shards) {
         lock(&shared.tally).rebase_failures_at_start += 1;
         // Some of its rebases may be on disk, readable by the next start.
-        return Err(failed(error, true));
+        return Err(failed(error, Reached::Rebasing));
     }
     Ok((recovery, generation, opened))
 }

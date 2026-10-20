@@ -1281,3 +1281,38 @@ fn a_cut_shard_resumed_at_its_durable_point_lost_that_record() {
     assert_eq!(judged(6, false), (0, 0));
     assert_eq!(judged(5, false), (1, 1));
 }
+
+/// The records a start replays past the last sync, out of a crash's tear,
+/// are durable once it syncs the files it read them from: the next crash
+/// owes them. A start that failed before that sync owes nothing new.
+#[test]
+fn a_start_that_synced_what_it_read_owes_it_to_the_next_crash() {
+    let judged = |reached: Option<Reached>| {
+        let shared = Shared::new(&SimConfig::mini(1, 42));
+        let crash = |shared: &Shared| {
+            let durable = lock(&shared.durable).clone();
+            lock(&shared.crashes).push(CrashRecord {
+                at: Duration::ZERO,
+                durable,
+            });
+        };
+        lock(&shared.durable)[0] = Some((5, Duration::ZERO));
+        crash(&shared);
+        let sink = HashSink::new(Arc::new(Mutex::new(TRACE_INIT)), shared.clone());
+        // Records 6 to 9 survived the tear and were replayed; the shard was
+        // cut behind it, its `Rebase` at 10.
+        match reached {
+            Some(reached) => sink.failed_start(0, 10, false, reached),
+            None => seedstone_core::shard::TraceSink::recovered(&sink, 0, 11, false, true),
+        }
+        crash(&shared);
+        // The next start reads a hole inside them and calls it a tear.
+        seedstone_core::shard::TraceSink::recovered(&sink, 0, 9, false, true);
+        let tally = *lock(&shared.tally);
+        (tally.lost_durable_prefixes, tally.unreported_losses)
+    };
+    assert_eq!(judged(None), (1, 1), "served");
+    assert_eq!(judged(Some(Reached::Rebasing)), (1, 1));
+    assert_eq!(judged(Some(Reached::Synced)), (1, 1));
+    assert_eq!(judged(Some(Reached::Read)), (0, 0), "never synced");
+}

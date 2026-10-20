@@ -8,6 +8,7 @@ use seedstone_core::shard::{
     TraceSink,
 };
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::durability::world_now;
 use crate::outcome::{Shared, lock};
@@ -58,30 +59,39 @@ impl HashSink {
 
     /// A start that recovered and then failed, reported as the binary
     /// writes its `recovery` lines before `recovery_failed`. Its own resume
-    /// is judged like any other; `rebase_written` says whether its cut can
-    /// outlive it. One that failed before its rebases cannot cut anything
-    /// for good: what it cut is still in the segments it kept, and the next
-    /// start replays it. Its report then excuses nothing the next start
-    /// loses and leaves the durable points as they were — honoured, it
-    /// would hide exactly the loss of a start that destroyed what it cut.
-    /// `next_seq` is what recovery returned: no `Rebase` is counted in it.
-    pub fn failed_start(&self, shard: u16, next_seq: u64, lossy: bool, rebase_written: bool) {
-        self.judge_recovery(shard, next_seq, next_seq, lossy, rebase_written);
+    /// is judged like any other; `reached` says how far it got. One that
+    /// failed before its rebases cannot cut anything for good: what it cut
+    /// is still in the segments it kept, and the next start replays it. Its
+    /// report then excuses nothing the next start loses and lowers no
+    /// durable point — honoured, it would hide exactly the loss of a start
+    /// that destroyed what it cut. `next_seq` is what recovery returned: no
+    /// `Rebase` is counted in it.
+    pub fn failed_start(&self, shard: u16, next_seq: u64, lossy: bool, reached: Reached) {
+        self.judge_recovery(shard, next_seq, next_seq, lossy, reached);
     }
 
     /// Folded: two runs that recovered different prefixes are different
     /// runs. Checked: a shard that resumed at or below the sequence that was
     /// durable when the node last crashed lost a durable record — the
     /// invariant the log makes, measured on the server's own numbers.
-    /// `stands` is false for a start that failed before its cut could
-    /// persist: judged, but neither an excuse nor a new durable point.
+    /// A start that failed before its cut could persist is judged, but is
+    /// no excuse and lowers no durable point; one that synced what it read
+    /// raises the point to it, whether it went on to serve or not.
     ///
     /// `resumed` is where recovery resumed the shard and `next_seq` where it
     /// serves from; they differ by the `Rebase` of a cut shard. The loss is
     /// judged on the first — a shard resumed one short of its durable point
     /// lost that record, whatever its `Rebase` was written over — and the
     /// new durable point is the second, because the `Rebase` is synced.
-    fn judge_recovery(&self, shard: u16, resumed: u64, next_seq: u64, lossy: bool, stands: bool) {
+    fn judge_recovery(
+        &self,
+        shard: u16,
+        resumed: u64,
+        next_seq: u64,
+        lossy: bool,
+        reached: Reached,
+    ) {
+        let stands = reached >= Reached::Rebasing;
         // A new process: whatever its predecessor was refusing, it is not.
         self.shared.set_refusing(shard, false);
         {
@@ -146,21 +156,44 @@ impl HashSink {
             }
         }
         drop(tally);
-        // What came back is the shard's durable point now: the loss below
-        // the old one was judged here, once. Left standing, a shard that
-        // syncs nothing before the next crash would be judged against it
-        // again — the same loss, reported here, counted unreported there.
-        // The date stays: the reads are judged by crash, not by this.
-        if !stands {
+        // What came back is the shard's durable point now, once the start
+        // synced the files it came from. Below the old point: the loss
+        // was judged here, once — left standing, a shard that syncs nothing
+        // before the next crash would be judged against it again, the same
+        // loss reported here and counted unreported there. Above it: the
+        // records a crash's tear left intact past the last sync are durable
+        // from that sync on, and the next start owes them. A start that
+        // failed before its cut could persist only raises it.
+        if reached < Reached::Synced {
             return;
         }
+        let top = next_seq.saturating_sub(1);
         let mut points = lock(&self.shared.durable);
-        if let Some((seq, _)) = &mut points[usize::from(shard)]
-            && next_seq <= *seq
-        {
-            *seq = next_seq.saturating_sub(1);
+        let point = &mut points[usize::from(shard)];
+        match point {
+            // The date stays: the reads are judged by crash, not by this.
+            Some((seq, _)) if stands || top > *seq => *seq = top,
+            // Dated at the start of the world: the point claims the
+            // records, and no write a client was told of — whichever of
+            // them the tear left is not something any reply can say.
+            None if next_seq > 0 => *point = Some((top, Duration::ZERO)),
+            Some(_) | None => {}
         }
+        drop(points);
     }
+}
+
+/// How far a start got past its recovery: what its report can stand for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Reached {
+    /// It failed syncing the files it recovered from.
+    Read,
+    /// It synced them, and failed before writing any `Rebase`.
+    Synced,
+    /// It failed writing the cut shards' rebases: some may be on disk.
+    Rebasing,
+    /// It serves.
+    Serving,
 }
 
 impl TraceSink for HashSink {
@@ -216,7 +249,7 @@ impl TraceSink for HashSink {
     /// resumed it.
     fn recovered(&self, shard: u16, next_seq: u64, lossy: bool, cut: bool) {
         let resumed = next_seq.saturating_sub(u64::from(cut));
-        self.judge_recovery(shard, resumed, next_seq, lossy, true);
+        self.judge_recovery(shard, resumed, next_seq, lossy, Reached::Serving);
     }
 
     /// Folded: which executor completed which cycle with how many entries.
