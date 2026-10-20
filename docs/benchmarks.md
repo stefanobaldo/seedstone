@@ -1,7 +1,7 @@
 # Benchmarks
 
-**Release measured:** `v0.3.2` (commit `0d4f8df`). **Date:** 2026-10-11; the
-durability cell 2026-10-19.
+**Release measured:** `v0.3.2` (commit `0d4f8df`). **Date:** 2026-10-11 to
+2026-10-12; the durability cell 2026-10-19.
 **Machine:** GCP `c4a-standard-16`. **Engines:** Redis 8.10.0, Valkey 9.1.1,
 Dragonfly `df-v1.40.2`, Garnet 2.1.5 — each as the engine itself reports its
 version, not as its release archive is named. **Warm-up runs discarded per arm
