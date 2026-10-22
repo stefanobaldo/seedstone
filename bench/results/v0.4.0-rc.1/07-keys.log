@@ -1,0 +1,108 @@
+### stage keys start 2026-10-22T22:50:55Z
+### load at start: 5.03 3.66 2.19
+### kernel 7.0.0-1014-gcp aarch64  cpus server=0-9 client=10-15
+### os Ubuntu 24.04.4 LTS  memtotal 62.7 GiB
+### seedstone seedstone 0.4.0-rc.1  benchmark redis-benchmark 8.10.0
+
+### keys: KEYS over 7 000 keys of 10 240 B, 64 prefixes, one fixed prefix matched per call
+### (~109 keys); depth 1; 50 clients; 20 000 calls per run; keyspace loaded by keys-load.sh,
+### the same keys every run; W=3. ops is KEYS calls per second.
+--- seedstone [loadkeys] pid=19214 threads=11 load:5.03
+    cmd: /home/stefanobaldo/src/seedstone-v0.4.0-rc.1/target/release/seedstone --bind 127.0.0.1:6390 --max-clients 2000 --no-auth
+    redis_version:0.4.0-rc.1
+    keyspace: 7000 keys of 10240 B over 64 prefixes, 199 B a key; dbsize=7000
+    pipe: errors: 0, replies: 7000
+cell arm=seedstone kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=3454.83 user_us=2853.000 sys_us=33.500 total_us=2886.500 cores=9.97 client_cores=0.07 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=3438.79 user_us=2866.000 sys_us=31.500 total_us=2897.500 cores=9.96 client_cores=0.07 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=3438.79 user_us=2861.500 sys_us=35.000 total_us=2896.500 cores=9.96 client_cores=0.07 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=3446.49 user_us=2858.500 sys_us=34.500 total_us=2893.000 cores=9.97 client_cores=0.07 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=3438.79 user_us=2864.500 sys_us=34.500 total_us=2899.000 cores=9.97 client_cores=0.07 evicted=0 evicted_per_op=0.000
+cell arm=seedstone kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=3442.34 user_us=2862.000 sys_us=34.500 total_us=2896.500 cores=9.97 client_cores=0.07 evicted=0 evicted_per_op=0.000
+
+--- redis-iot1 [loadkeys] pid=19409 threads=6 load:7.23
+    cmd: /home/stefanobaldo/redis-8.10.0/src/redis-server --port 6391 --save  --appendonly no --io-threads 1
+    redis_version:8.10.0
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    keyspace: 7000 keys of 10240 B over 64 prefixes, 199 B a key; dbsize=7000
+    pipe: errors: 0, replies: 7000
+cell arm=redis-iot1 kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=685.78 user_us=1447.500 sys_us=10.500 total_us=1458.000 cores=1.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=683.90 user_us=1450.500 sys_us=11.500 total_us=1462.000 cores=1.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=685.00 user_us=1449.000 sys_us=11.000 total_us=1460.000 cores=1.00 client_cores=0.01 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=685.05 user_us=1448.500 sys_us=11.000 total_us=1459.500 cores=1.00 client_cores=0.01 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=685.54 user_us=1447.500 sys_us=11.000 total_us=1458.500 cores=1.00 client_cores=0.01 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot1 kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=685.12 user_us=1448.500 sys_us=11.500 total_us=1460.000 cores=1.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+
+--- redis-iot4 [loadkeys] pid=19663 threads=9 load:1.24
+    cmd: /home/stefanobaldo/redis-8.10.0/src/redis-server --port 6391 --save  --appendonly no --io-threads 4
+    redis_version:8.10.0
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    keyspace: 7000 keys of 10240 B over 64 prefixes, 199 B a key; dbsize=7000
+    pipe: errors: 0, replies: 7000
+cell arm=redis-iot4 kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=696.82 user_us=1441.500 sys_us=33.500 total_us=1475.000 cores=1.03 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=696.72 user_us=1443.000 sys_us=29.500 total_us=1472.500 cores=1.03 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=696.40 user_us=1442.000 sys_us=30.500 total_us=1472.500 cores=1.03 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=696.48 user_us=1442.000 sys_us=31.500 total_us=1473.500 cores=1.03 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=696.45 user_us=1442.000 sys_us=30.500 total_us=1472.500 cores=1.03 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=redis-iot4 kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=695.27 user_us=1448.500 sys_us=34.500 total_us=1483.000 cores=1.03 client_cores=0.02 evicted=0 evicted_per_op=0.000
+
+--- valkey-iot1 [loadkeys] pid=19997 threads=7 load:0.95
+    cmd: /home/stefanobaldo/valkey-9.1.1/src/valkey-server --port 6393 --save  --appendonly no --io-threads 1
+    redis_version:7.2.4
+    valkey_version:9.1.1
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    keyspace: 7000 keys of 10240 B over 64 prefixes, 199 B a key; dbsize=7000
+    pipe: errors: 0, replies: 7000
+cell arm=valkey-iot1 kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=696.21 user_us=1425.500 sys_us=11.000 total_us=1436.500 cores=1.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=696.38 user_us=1425.500 sys_us=10.500 total_us=1436.000 cores=1.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=696.43 user_us=1425.000 sys_us=10.500 total_us=1435.500 cores=1.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=696.79 user_us=1424.500 sys_us=10.500 total_us=1435.000 cores=1.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=697.03 user_us=1424.000 sys_us=11.000 total_us=1435.000 cores=1.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot1 kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=696.86 user_us=1423.500 sys_us=11.500 total_us=1435.000 cores=1.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+
+--- valkey-iot4 [loadkeys] pid=20375 threads=13 load:0.92
+    cmd: /home/stefanobaldo/valkey-9.1.1/src/valkey-server --port 6393 --save  --appendonly no --io-threads 4
+    redis_version:7.2.4
+    valkey_version:9.1.1
+    os:Linux 7.0.0-1014-gcp aarch64
+    gcc_version:13.3.0
+    keyspace: 7000 keys of 10240 B over 64 prefixes, 199 B a key; dbsize=7000
+    pipe: errors: 0, replies: 7000
+cell arm=valkey-iot4 kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=709.77 user_us=2788.000 sys_us=11.500 total_us=2799.500 cores=1.99 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=710.43 user_us=2803.500 sys_us=12.500 total_us=2816.000 cores=2.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=710.23 user_us=2805.000 sys_us=11.500 total_us=2816.500 cores=2.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=710.18 user_us=2804.000 sys_us=12.500 total_us=2816.500 cores=2.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=708.72 user_us=2810.000 sys_us=12.500 total_us=2822.500 cores=2.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+cell arm=valkey-iot4 kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=710.03 user_us=2806.000 sys_us=10.500 total_us=2816.500 cores=2.00 client_cores=0.02 evicted=0 evicted_per_op=0.000
+
+--- dragonfly [loadkeys] pid=20703 threads=11 load:1.78
+    cmd: /home/stefanobaldo/dragonfly/dragonfly-aarch64 --port=6392 --proactor_threads=10 --dbfilename= --logtostderr=false
+    redis_version:7.4.0
+    dragonfly_version:df-v1.40.2
+    os:Linux 7.0.0-1014-gcp aarch64
+    keyspace: 7000 keys of 10240 B over 64 prefixes, 199 B a key; dbsize=7000
+    pipe: errors: 6, replies: 7005
+cell arm=dragonfly kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=2130.15 user_us=2270.500 sys_us=87.000 total_us=2357.500 cores=5.02 client_cores=0.05 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=2164.74 user_us=2267.000 sys_us=87.000 total_us=2354.000 cores=5.10 client_cores=0.05 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=2131.29 user_us=2265.500 sys_us=90.500 total_us=2356.000 cores=5.02 client_cores=0.05 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=2104.38 user_us=2268.500 sys_us=90.000 total_us=2358.500 cores=4.96 client_cores=0.04 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=2151.23 user_us=2264.500 sys_us=90.500 total_us=2355.000 cores=5.07 client_cores=0.05 evicted=0 evicted_per_op=0.000
+cell arm=dragonfly kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=2160.99 user_us=2265.500 sys_us=87.500 total_us=2353.000 cores=5.08 client_cores=0.05 evicted=0 evicted_per_op=0.000
+
+--- garnet [loadkeys] pid=20907 threads=27 load:3.17
+    cmd: /home/stefanobaldo/garnet/net8.0/GarnetServer --port 6394
+    garnet_version:2.1.5
+    os:Unix 7.0.0.1014
+    redis_version:7.4.3
+    keyspace: 7000 keys of 10240 B over 64 prefixes, 199 B a key; dbsize=7000
+    pipe: errors: 0, replies: 7000
+cell arm=garnet kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=1446.45 user_us=6740.000 sys_us=117.000 total_us=6857.000 cores=9.92 client_cores=0.03 evicted=- evicted_per_op=-
+cell arm=garnet kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=1497.01 user_us=6528.500 sys_us=93.000 total_us=6621.500 cores=9.91 client_cores=0.04 evicted=- evicted_per_op=-
+cell arm=garnet kind=warmup shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=1485.11 user_us=6596.000 sys_us=108.500 total_us=6704.500 cores=9.96 client_cores=0.03 evicted=- evicted_per_op=-
+cell arm=garnet kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=1460.81 user_us=6695.500 sys_us=128.000 total_us=6823.500 cores=9.97 client_cores=0.03 evicted=- evicted_per_op=-
+cell arm=garnet kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=1409.24 user_us=6895.000 sys_us=192.500 total_us=7087.500 cores=9.99 client_cores=0.03 evicted=- evicted_per_op=-
+cell arm=garnet kind=kept shape=keys arg=7 depth=1 clients=50 keyspace=7000 payload=10240 n=20000 ops=1486.77 user_us=6587.000 sys_us=107.500 total_us=6694.500 cores=9.95 client_cores=0.03 evicted=- evicted_per_op=-
+
+### stage keys done 2026-10-22T23:06:06Z  load:10.13 5.05 3.04
