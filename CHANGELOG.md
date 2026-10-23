@@ -7,6 +7,8 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-23
+
 ### Changed
 
 - **The data directory's format moves to version 5, one way.** Under
@@ -323,7 +325,8 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 <!-- [0.0.0] has no definition: it was a crates.io placeholder and was never
      tagged in git, so every URL for it would 404. -->
-[Unreleased]: https://github.com/stefanobaldo/seedstone/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/stefanobaldo/seedstone/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/stefanobaldo/seedstone/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/stefanobaldo/seedstone/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/stefanobaldo/seedstone/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/stefanobaldo/seedstone/compare/v0.3.0...v0.3.1
