@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.4.0-rc.1"
+version = "0.4.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/stefanobaldo/seedstone"
@@ -23,9 +23,9 @@ disallowed_types = "deny"
 # The workspace's own crates, with a version beside the path: crates.io
 # ignores the path and needs the version, and `=` keeps the four published
 # crates of one release pointing at each other and at nothing else.
-seedstone-core = { path = "crates/seedstone-core", version = "=0.4.0-rc.1" }
-seedstone-resp = { path = "crates/seedstone-resp", version = "=0.4.0-rc.1" }
-seedstone-service = { path = "crates/seedstone-service", version = "=0.4.0-rc.1" }
+seedstone-core = { path = "crates/seedstone-core", version = "=0.4.0" }
+seedstone-resp = { path = "crates/seedstone-resp", version = "=0.4.0" }
+seedstone-service = { path = "crates/seedstone-service", version = "=0.4.0" }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "io-util"] }
 turmoil = "=0.7.2"
 siphasher = "1"
