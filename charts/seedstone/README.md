@@ -9,7 +9,7 @@ helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --version <ve
   --set auth.existingSecret=seedstone-auth
 ```
 
-The chart's version is the server's: chart `0.3.3` runs image `v0.3.3`.
+The chart's version is the server's: chart `0.4.0` runs image `v0.4.0`.
 
 ## The password
 

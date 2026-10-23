@@ -56,11 +56,11 @@ cargo binstall seedstone
 cargo install seedstone
 
 # Debian, Ubuntu / Fedora, RHEL — a package with a systemd unit, from the release page
-sudo apt install ./seedstone_0.3.3-1_amd64.deb
-sudo dnf install ./seedstone-0.3.3-1.x86_64.rpm
+sudo apt install ./seedstone_0.4.0-1_amd64.deb
+sudo dnf install ./seedstone-0.4.0-1.x86_64.rpm
 
 # Kubernetes
-helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --version 0.3.3 --set auth.noAuth=true
+helm install seedstone oci://ghcr.io/stefanobaldo/charts/seedstone --version 0.4.0 --set auth.noAuth=true
 ```
 
 The packages start a service on loopback. After Homebrew or Cargo, start
@@ -139,7 +139,7 @@ Next: hashes, lists, sets and sorted sets, Pub/Sub, RESP3. Not modelled at
 all: users beside the one password, and TLS — transport security belongs
 to the deployment, in front of the node.
 [CHANGELOG.md](CHANGELOG.md) is what changed; the current release is
-`v0.3.3`.
+`v0.4.0`.
 
 ## Documentation
 
