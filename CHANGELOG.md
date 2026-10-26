@@ -7,6 +7,17 @@ SemVer and are `0.x` while the keyspace holds only strings;
 
 ## [Unreleased]
 
+### Fixed
+
+- **Resident memory under `--data-dir` no longer climbs to about twice the
+  keyspace** ([#147](https://github.com/stefanobaldo/seedstone/issues/147)).
+  The log kept, per shard, room for the largest batch that shard had ever
+  written; over time that grew to about one more copy of the data, which
+  `used_memory` does not count and an emptied keyspace did not give back.
+  Under a cache workload with values up to 512 KiB, a 384 MB ceiling and one
+  core, resident memory went from ~1 000 MB to ~690 MB, and an emptied
+  keyspace now returns it (Intel x86-64, Ubuntu 24.04, 2026-10-26).
+
 ## [0.4.0] - 2026-10-23
 
 ### Changed
