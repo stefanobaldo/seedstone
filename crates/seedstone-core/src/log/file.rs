@@ -400,6 +400,16 @@ pub struct Segment<F: LogFile> {
     pub(crate) sync_failed: bool,
 }
 
+/// The most a [`FileLog`]'s buffer keeps reserved once it has handed over.
+///
+/// The buffer is reused, so a shard that only ever logs small records pays no
+/// allocation per batch. What it must not do is keep whatever capacity its
+/// largest batch reached: there is one buffer per shard, a thousand of them on
+/// a node, and each one ratchets up to the biggest value its shard was ever
+/// written — memory `used_memory` does not count and an emptied keyspace does
+/// not return. Above this, the buffer gives the excess back on every handover.
+pub const PENDING_RETAINED: usize = 64 * 1024;
+
 /// One shard's log: a buffer, and the points it keeps.
 pub struct FileLog {
     shard: u16,
@@ -450,6 +460,7 @@ impl ReplicationLog for FileLog {
         }
         out.extend_from_slice(&self.pending);
         self.pending.clear();
+        self.pending.shrink_to(PENDING_RETAINED);
         self.flushed_through = self.pending_through.take().or(self.flushed_through);
     }
 
@@ -791,6 +802,36 @@ pub(crate) mod tests {
             Some(7),
             "a cover is kept past a later sync"
         );
+    }
+
+    #[test]
+    fn a_handover_keeps_a_small_buffer_and_gives_back_a_large_one() {
+        let mut log = FileLog::new(3);
+        let mut out = Vec::new();
+        log.append(rec(3, 0, &[7; 100])).unwrap();
+        let small = log.pending.capacity();
+        log.flush_into(&mut out);
+        assert_eq!(
+            log.pending.capacity(),
+            small,
+            "a buffer under the bound is kept for the next batch"
+        );
+        log.append(rec(3, 1, &vec![7; 4 * PENDING_RETAINED]))
+            .unwrap();
+        assert!(log.pending.capacity() > PENDING_RETAINED);
+        log.flush_into(&mut out);
+        assert!(
+            log.pending.capacity() <= PENDING_RETAINED,
+            "a large value's capacity is not kept: {}",
+            log.pending.capacity()
+        );
+        log.append(rec(3, 2, b"c")).unwrap();
+        out.clear();
+        log.flush_into(&mut out);
+        let Decoded::Record { seq, payload, .. } = decode_record(&out) else {
+            panic!()
+        };
+        assert_eq!((seq, payload), (2, &b"c"[..]), "and the buffer still works");
     }
 
     #[test]
