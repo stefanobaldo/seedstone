@@ -49,6 +49,20 @@ schedule, which is not glibc's — an operator sizing a ceiling against the
 machine reads `used_memory` for the keyspace and the process's RSS for the
 rest, as before.
 
+Leave room between `--maxmemory` and the memory limit of the container or
+machine. The ceiling bounds `used_memory`, which counts keys and values
+with a fixed overhead per entry. Resident memory is larger by what the
+allocator holds besides: its size-class rounding, memory freed but not yet
+returned to the system, and the buffers of the request and log paths. Under
+a cache workload with values of varied size (log-normal, ~5 KB median,
+capped at 512 KiB), `--data-dir` and a 384 MB ceiling, resident memory at
+the ceiling read ~690 MB on one core and ~780 MB on four: about 1.8× and
+2× the ceiling (`RssAnon`, Intel x86-64, Ubuntu 24.04, 2026-10-27). More
+cores widen it, since each thread keeps partly used pages of its own. Size
+the limit from the process's RSS under your own load, not from
+`--maxmemory`; [#153](https://github.com/stefanobaldo/seedstone/issues/153)
+has the measurements.
+
 ## Output
 
 Everything the server writes about itself goes to **stderr**, one JSON object
