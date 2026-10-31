@@ -688,6 +688,10 @@ impl<D: Disk + Send + 'static, T: TraceSink> Writer<D, T> {
             last_batch: self.lanes.iter().map(|lane| lane.written).collect(),
             bytes: closing.bytes_written,
         });
+        self.trace.rotated(
+            closing.rotation,
+            closing.bytes_written + segment_header_len(self.cuts.len()) as u64,
+        );
         self.publish_log_size();
         self.nudge_if_due();
         true

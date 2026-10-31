@@ -590,6 +590,26 @@ fn the_disk_bound_is_the_formula_and_a_peak_past_it_is_a_violation() {
     assert!(!outcome.invariant_holds());
 }
 
+/// A closed rotation is as large as the drain that crossed its size made it,
+/// not the size it rotates at: under `never` every rotation waits for the
+/// old file's sync while the executors keep sending, and the next drain
+/// lands whole. `standard(303, 3020111)` closes rotations of up to 36 KiB
+/// at a 4 KiB segment size, and the front one, held by the slowest
+/// executor's base, overran a bound that allowed one segment for it.
+#[test]
+fn the_disk_bound_allows_the_largest_rotation_the_node_closed() {
+    let outcome = run_sim(&SimConfig::standard(303, 3_020_111));
+    assert!(
+        outcome.max_rotation_bytes > SIM_SEGMENT_BYTES,
+        "the seed no longer closes a rotation past the segment size: {outcome:?}"
+    );
+    assert!(
+        outcome.disk_peak_bytes <= outcome.disk_bound_bytes,
+        "{outcome:?}"
+    );
+    assert!(outcome.invariant_holds(), "{outcome:?}");
+}
+
 #[test]
 fn a_run_with_no_snapshot_cycle_exercised_nothing() {
     let mut outcome = crate::outcome::nothing_observed();

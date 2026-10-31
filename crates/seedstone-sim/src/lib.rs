@@ -467,11 +467,12 @@ fn outcome(cfg: &SimConfig, shared: &Shared, trace_hash: u64) -> SimOutcome {
         files_removed: tally.files_removed,
         max_snapshot_bytes: tally.max_snapshot_bytes,
         max_written_during: tally.max_written_during,
+        max_rotation_bytes: tally.max_rotation_bytes,
         disk_peak_bytes: tally.disk_peak_bytes,
         disk_bound_bytes: disk_bound(
             cfg.executors,
             SIM_CHECKPOINT,
-            SIM_SEGMENT_BYTES,
+            SIM_SEGMENT_BYTES.max(tally.max_rotation_bytes),
             tally.max_snapshot_bytes,
             tally.max_written_during,
             crashes,

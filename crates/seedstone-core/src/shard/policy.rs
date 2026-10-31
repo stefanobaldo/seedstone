@@ -119,6 +119,14 @@ pub trait TraceSink: Clone + Send + 'static {
     /// That sync ended: `ok`, and how long it took.
     fn sync_slow_ended(&self, _round: u64, _ok: bool, _duration_ms: u64) {}
 
+    /// Called when the writer closed a rotation and swapped in the next:
+    /// `bytes` is the closed file's size, header included. The segment
+    /// size is crossed by a whole drain, so this can be well past it.
+    ///
+    /// A default that does nothing; the simulator's sink holds the disk's
+    /// granularity to the largest of these.
+    fn rotated(&self, _rotation: u32, _bytes: u64) {}
+
     /// Called when an executor answers the batches it held: `wrote` is how
     /// many of their commands appended to the log, `refused` whether they
     /// went out as the refusal rather than as their replies.
