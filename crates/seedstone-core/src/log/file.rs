@@ -483,11 +483,15 @@ impl ReplicationLog for FileLog {
 /// Reads the generation counter, advances it, writes it back atomically,
 /// and returns the generation this process now owns.
 ///
-/// A counter that is missing, unparseable, or *behind* the segments on
-/// disk is not trusted: the answer is one above the highest generation any
-/// segment name carries. Behind is the case a torn write of the counter
-/// produces, and trusting it would make a new generation's segments sort
-/// before an old one's.
+/// A counter that is missing, unparseable, or *behind* the files on disk
+/// is not trusted: the answer is one above the highest generation any
+/// segment or snapshot name carries. Behind is the case a torn write of the
+/// counter produces, and trusting it would make a new generation's segments
+/// sort before an old one's. Snapshots count because a start removes every
+/// segment of a generation whose images cover its records and keeps the
+/// images: a counter that then fails to read would otherwise hand that
+/// generation out again, and the new process's files would take the names
+/// of the old one's.
 ///
 /// # Errors
 ///
@@ -497,8 +501,11 @@ pub fn next_generation<D: Disk>(disk: &D, wal: &Path) -> io::Result<u64> {
     let on_disk = disk
         .list(wal)?
         .iter()
-        .filter_map(|name| parse_segment_name(name))
-        .map(|(generation, _)| generation)
+        .filter_map(|name| {
+            parse_segment_name(name)
+                .map(|(generation, _)| generation)
+                .or_else(|| parse_name(name, ".snap").map(|(generation, _, _)| generation))
+        })
         .max()
         .unwrap_or(0);
     let next = recorded.max(on_disk) + 1;
@@ -874,6 +881,25 @@ pub(crate) mod tests {
             next_generation(&disk, wal).unwrap(),
             9,
             "a counter behind the segments is not trusted either"
+        );
+    }
+
+    #[test]
+    fn a_counter_that_does_not_read_falls_back_to_the_snapshot_names_too() {
+        // A start can remove every segment of a generation whose images
+        // cover its records, and keep the images: a counter that then fails
+        // to read must not hand the generation out again.
+        let disk = MemDisk::default();
+        let wal = Path::new("/data/wal");
+        disk.create_dir_all(wal).unwrap();
+        disk.write_file(&wal.join("0000000000000007-0002-00000001.snap"), b"")
+            .unwrap();
+        disk.write_file(&wal.join(GENERATION_FILE), b"7\xff\x00")
+            .unwrap();
+        assert_eq!(
+            next_generation(&disk, wal).unwrap(),
+            8,
+            "one above the highest generation any snapshot carries"
         );
     }
 }
