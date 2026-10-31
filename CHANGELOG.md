@@ -26,6 +26,16 @@ SemVer and are `0.x` while the keyspace holds only strings;
   The server's behaviour is unchanged; size the volume with the corrected
   figure.
 
+- **A start no longer reuses a generation when its counter fails to read**
+  ([#156](https://github.com/stefanobaldo/seedstone/issues/156)). Under
+  `--data-dir`, a start that could not read the generation counter took the
+  next one from the log files' names alone, and a start before it may have
+  removed every log file of the last generation and kept only its
+  snapshots. The generation was then handed out again, its new snapshots
+  collided with the old ones' names, and a later start could serve a shard
+  with records missing without reporting the loss. Snapshot names now count
+  too.
+
 ## [0.4.0] - 2026-10-23
 
 ### Changed
