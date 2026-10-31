@@ -18,6 +18,14 @@ SemVer and are `0.x` while the keyspace holds only strings;
   core, resident memory went from ~1 000 MB to ~690 MB, and an emptied
   keyspace now returns it (Intel x86-64, Ubuntu 24.04, 2026-10-26).
 
+- **The disk bound in the operations guide now counts a log file at its
+  real size** ([#155](https://github.com/stefanobaldo/seedstone/issues/155)).
+  It allowed one 64 MiB file of granularity, but the log rotates only after
+  a write crosses 64 MiB, and that write carries everything the executors
+  had handed over, so a file can reach about 64 MiB plus 4 MiB per executor.
+  The server's behaviour is unchanged; size the volume with the corrected
+  figure.
+
 ## [0.4.0] - 2026-10-23
 
 ### Changed

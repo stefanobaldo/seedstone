@@ -276,7 +276,7 @@ while the shards keep serving between ticks, so a snapshot never holds them
 for longer than one tick's share takes to write, and the `snapshot` line
 says when it is durable. The crossing is noticed on the next housekeeping
 tick, so the span starts up to one tick before the snapshot does. The log
-rotates into a new file every 64 MiB, and a file is removed, on the
+rotates into a new file once it passes 64 MiB, and a file is removed, on the
 `compaction` line, once every executor's durable snapshot covers what it
 wrote there. An executor that writes little would keep such files alive
 indefinitely; so the node also asks an executor for a snapshot when the log it
@@ -284,10 +284,13 @@ holds back from removal exceeds the same 64 MiB-or-its-last-snapshot bound.
 What that bounds: **the node's files never exceed the sum of the last
 snapshots, plus the ones being written, plus — per executor — the larger of
 64 MiB and its last snapshot, plus what was written from each log crossing
-its size until its snapshot was durable, plus one 64 MiB file** of
-granularity. On a keyspace that is not growing, about three times the
-snapshots plus 64 MiB per executor plus 64 MiB, and the writes of those
-spans.
+its size until its snapshot was durable, plus one log file** of
+granularity. A log file is 64 MiB plus whatever the write that crossed that
+size carried: the writer writes everything the executors have handed it at
+once, and each executor stops handing it more at about 4 MiB not yet
+written, so one file is at most about 64 MiB plus 4 MiB per executor. On a
+keyspace that is not growing, about three times the snapshots plus 64 MiB
+per executor plus one file, and the writes of those spans.
 
 After a restart, the previous process's files stay until the node has
 replaced them with snapshots of its own. They count as retained log, so the
