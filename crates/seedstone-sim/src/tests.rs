@@ -1126,6 +1126,22 @@ fn the_honest_node_holds_when_it_crashes_before_retrying_a_failed_rebase() {
     );
 }
 
+/// Hostile seeds where a start removed every segment of the generation
+/// before it, whose images covered them, and then read the counter wrong:
+/// the next generation came from the names on disk, which held only those
+/// images (2986501 with workload 299 at `never`, 2919839 with workload 292
+/// at `always`, found by the nightly sweep). Counted from segment names
+/// alone, the generation was handed out again, the new process's snapshots
+/// took the names of the old one's, and a compaction removed records no
+/// image held — lost with nothing reported.
+#[test]
+fn the_honest_node_holds_when_the_counter_fails_to_read_beside_images_alone() {
+    for (workload_seed, sim_seed) in [(299, 2_986_501), (292, 2_919_839)] {
+        let outcome = run_sim(&SimConfig::hostile(workload_seed, sim_seed));
+        assert!(outcome.invariant_holds(), "seed {sim_seed}: {outcome:?}");
+    }
+}
+
 /// A start whose rebase sync failed leaves the rebase readable and not
 /// durable, and the start after it — a retry, with no crash between —
 /// reads it, resumes behind it, cuts nothing and writes no rebase of its
