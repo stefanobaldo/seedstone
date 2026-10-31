@@ -87,33 +87,7 @@ fn main() -> ExitCode {
                 // Printed as it happens rather than collected: a sweep that is
                 // cancelled — by CI, by a person — has still reported what it
                 // found up to that point.
-                println!(
-                    "FAIL seed={} trace=0x{:016x} expected={} actual={} stale={} spurious={} \
-                     plain={} walk={} breaches={} evicted={} observed={} crashes={} \
-                     durable_lost={} phantom={} prefix_lost={} unreported={} unheld={}/{} fsync={} \
-                     start_failures={} rebase_failures_at_start={}",
-                    sim_seed,
-                    outcome.trace_hash,
-                    outcome.expected_sum,
-                    outcome.actual_sum,
-                    outcome.stale_reads,
-                    outcome.spurious_deaths,
-                    outcome.plain_mismatches,
-                    outcome.walk_mismatches,
-                    outcome.ceiling_breaches,
-                    outcome.evicted_keys,
-                    outcome.evictions_observed,
-                    outcome.crashes,
-                    outcome.lost_durable_writes,
-                    outcome.phantom_writes,
-                    outcome.lost_durable_prefixes,
-                    outcome.unreported_losses,
-                    outcome.unheld_states,
-                    outcome.unreported_unheld,
-                    outcome.fsync.name(),
-                    outcome.start_failures,
-                    outcome.rebase_failures_at_start
-                );
+                print_failure(sim_seed, outcome);
             }
         },
     );
@@ -216,6 +190,40 @@ fn unobservable_warning(plant: Plant, shape: &str) -> Option<String> {
          It is observable on {place}",
         plant.name()
     ))
+}
+
+/// The line a seed that violated an invariant prints: everything `replay`
+/// needs, and the counters that say which invariant it was.
+fn print_failure(sim_seed: u64, outcome: &seedstone_sim::SimOutcome) {
+    println!(
+        "FAIL seed={} trace=0x{:016x} expected={} actual={} stale={} spurious={} \
+         plain={} walk={} breaches={} evicted={} observed={} crashes={} \
+         durable_lost={} phantom={} prefix_lost={} unreported={} unheld={}/{} \
+         disk={}/{} fsync={} start_failures={} rebase_failures_at_start={}",
+        sim_seed,
+        outcome.trace_hash,
+        outcome.expected_sum,
+        outcome.actual_sum,
+        outcome.stale_reads,
+        outcome.spurious_deaths,
+        outcome.plain_mismatches,
+        outcome.walk_mismatches,
+        outcome.ceiling_breaches,
+        outcome.evicted_keys,
+        outcome.evictions_observed,
+        outcome.crashes,
+        outcome.lost_durable_writes,
+        outcome.phantom_writes,
+        outcome.lost_durable_prefixes,
+        outcome.unreported_losses,
+        outcome.unheld_states,
+        outcome.unreported_unheld,
+        outcome.disk_peak_bytes,
+        outcome.disk_bound_bytes,
+        outcome.fsync.name(),
+        outcome.start_failures,
+        outcome.rebase_failures_at_start
+    );
 }
 
 /// Reports a usage problem on stderr, leaving stdout for the sweep's own
