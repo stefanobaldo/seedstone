@@ -321,6 +321,13 @@ impl TraceSink for HashSink {
         lock(&self.shared.syncs).1 += 1;
     }
 
+    /// Not folded, like the snapshot's sizes: a measurement the bound
+    /// reads, not a schedule event.
+    fn rotated(&self, _rotation: u32, bytes: u64) {
+        let mut tally = lock(&self.shared.tally);
+        tally.max_rotation_bytes = tally.max_rotation_bytes.max(bytes);
+    }
+
     /// Where an executor's refusal begins, as it reports it: it answers
     /// what it held with the refusal on every one, `wrote` possibly zero.
     /// Held writes released as success while it is refusing are counted —

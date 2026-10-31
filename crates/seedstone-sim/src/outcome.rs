@@ -219,6 +219,9 @@ pub struct SimOutcome {
     /// The most log any one cycle saw written during it: the `W` of the
     /// bound.
     pub max_written_during: u64,
+    /// The largest file the writer closed a rotation at, header included:
+    /// the granularity of the bound.
+    pub max_rotation_bytes: u64,
     /// The most bytes `wal/` held at any instant the node measured it: at
     /// each snapshot's completion, before its compaction.
     pub disk_peak_bytes: u64,
@@ -380,8 +383,13 @@ pub const DISK_SLACK: u64 = 4096;
 ///
 /// Per executor, twice the largest snapshot (the previous and the one in
 /// progress), plus the live log at its trigger — `max(floor, ratio × S)` —
-/// plus what one cycle saw written; and one closed segment of the node's,
-/// since a rotation is removed whole, not record by record. That once per
+/// plus what one cycle saw written; and one closed rotation of the node's,
+/// since a rotation is removed whole, not record by record. A rotation is
+/// as large as the drain that crossed the segment size made it, so this is
+/// the largest one the writer reported closing, never less than the
+/// segment size: a rotation stays on disk until the slowest executor's
+/// image covers its last batch, so all of the front one can sit before
+/// that executor's base. That once per
 /// process the run started, plus a slack for headers, `GENERATION` and
 /// `LOCK`. Once per process because a process's files stay until a later
 /// one completes its first round of snapshots, and a crash can land before
@@ -396,7 +404,7 @@ pub const DISK_SLACK: u64 = 4096;
 pub fn disk_bound(
     executors: u16,
     config: CheckpointConfig,
-    segment_bytes: u64,
+    rotation_bytes: u64,
     max_snapshot: u64,
     max_written: u64,
     crashes: u64,
@@ -404,7 +412,7 @@ pub fn disk_bound(
     let per_executor = 2 * max_snapshot
         + config.floor.max(config.ratio.saturating_mul(max_snapshot))
         + max_written;
-    (u64::from(executors) * per_executor + segment_bytes) * (1 + crashes) + DISK_SLACK
+    (u64::from(executors) * per_executor + rotation_bytes) * (1 + crashes) + DISK_SLACK
 }
 
 /// A run that observed nothing.
@@ -470,6 +478,7 @@ pub const fn nothing_observed() -> SimOutcome {
         files_removed: 0,
         max_snapshot_bytes: 0,
         max_written_during: 0,
+        max_rotation_bytes: 0,
         disk_peak_bytes: 0,
         disk_bound_bytes: DISK_SLACK,
         snapshot_faults: 0,
@@ -772,6 +781,7 @@ pub struct Tally {
     pub files_removed: u64,
     pub max_snapshot_bytes: u64,
     pub max_written_during: u64,
+    pub max_rotation_bytes: u64,
     pub disk_peak_bytes: u64,
     pub snapshot_faults: u64,
     pub remove_faults: u64,

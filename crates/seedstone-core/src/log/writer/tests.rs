@@ -604,6 +604,31 @@ async fn the_segment_rotates_at_its_size_and_the_old_one_is_synced_first() {
     );
 }
 
+/// The closed file is traced at its size on disk: the drain that crossed
+/// the segment size lands whole, so a file can close well past it.
+#[tokio::test(start_paused = true)]
+async fn a_rotation_traces_the_closed_file_at_its_size_on_disk() {
+    let disk = MemDisk::default();
+    let story = Recorder::default();
+    let rig = open_with(
+        &disk,
+        1,
+        SyncPolicy::NEVER,
+        64,
+        WriterPlants::default(),
+        story.clone(),
+    );
+    rig.submit(0, 0, vec![1u8; 70]);
+    tokio::task::yield_now().await;
+    rig.submit(0, 1, vec![2u8; 10]);
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        *story.rotations.lock().unwrap(),
+        vec![(0, rig.segment(0).len() as u64)]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_rotation_whose_sync_fails_faults_and_nothing_is_swapped() {
     let disk = MemDisk::default();
@@ -684,6 +709,7 @@ struct Recorder {
     rounds: Arc<Mutex<Vec<u64>>>,
     slow: Arc<Mutex<Vec<(u64, u64)>>>,
     slow_ended: Arc<Mutex<Vec<(u64, bool, u64)>>>,
+    rotations: Arc<Mutex<Vec<(u32, u64)>>>,
 }
 
 impl TraceSink for Recorder {
@@ -705,6 +731,9 @@ impl TraceSink for Recorder {
             .lock()
             .unwrap()
             .push((round, ok, duration_ms));
+    }
+    fn rotated(&self, rotation: u32, bytes: u64) {
+        self.rotations.lock().unwrap().push((rotation, bytes));
     }
 }
 
