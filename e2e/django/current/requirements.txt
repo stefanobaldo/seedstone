@@ -2,9 +2,9 @@
 django-redis==7.0.0
 redis==8.1.0
 Django==6.1.2
-pytest==9.1.1
+pytest==9.2.0
 # The suite's test module imports the msgpack serializer at import time.
-msgpack==1.2.3
+msgpack==1.2.4
 # The suite's fixtures type-hint pytest-mock's MockerFixture and one test uses it.
 pytest-mock==3.17.0
 # The client's lock retries acquisition forever; a per-test bound turns a
