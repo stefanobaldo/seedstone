@@ -138,7 +138,7 @@ jobs:
       # Pinned to commit SHAs, and to the same SHAs `ci.yml` pins — see that
       # workflow's comment for why a tag is not a pin.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The last shard takes the remainder, so a window that does not divide
       # evenly is still swept whole. Workers are left at the runner's core
       # count: the shard owns the machine.
@@ -173,7 +173,7 @@ jobs:
         shard: ${{ fromJSON(needs.window.outputs.hostile-shards) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: sweep this shard's slice of the window, hostile disk
         run: |
           set -euo pipefail

@@ -42,7 +42,7 @@ jobs:
       # silence that by pinning to the deprecated runtime, which is the
       # opposite of a fix.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --workspace --locked
       - run: cargo fmt --all --check
       # Every source file stays under a size a reader can hold in one sitting;
@@ -144,7 +144,7 @@ jobs:
     steps:
       # Pinned to commit SHAs for the reason the job above gives.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # An allowlist of the irrelevant, not a denylist of the relevant: a path
       # counts as code unless *every* pattern excludes it, so anything nobody
       # anticipated still runs the sweep.
@@ -265,7 +265,7 @@ jobs:
             # match the same file at once.
             chart:
               - '{charts/**,Dockerfile}'
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         if: github.event_name != 'pull_request' || steps.relevant.outputs.code == 'true'
@@ -521,7 +521,7 @@ jobs:
               - '!LICENSE*'
               - '!.gitignore'
               - '!docs/**/*.md'
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: steps.relevant.outputs.code == 'true'
       # Bounded and retried: `apt-get update` on a runner occasionally stops
       # answering rather than failing, and an unbounded one turns a gate into
